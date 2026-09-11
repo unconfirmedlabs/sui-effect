@@ -41,6 +41,8 @@ export {
   type Built,
   type Reconciled,
   type ReconcileInput,
+  type RunError,
+  type SubmitError,
   reconcile,
   reconcileAll,
   run,

@@ -38,7 +38,12 @@ the work plan. Where this file and the spec disagree, fix this file.
 - Tests run on `bun test` with `effect/testing` (`TestClock`, `TestSchema`).
   Tests provide their own layers and never touch the network. Localnet tests sit
   behind `SUI_LOCALNET=1`.
-- Done means `bun run check` (typecheck, build, test) is green.
+- Done means `bun run check` (typecheck, build, tests, and the extension
+  template's own check) is green. `LLMS.md` is generated — `bun run llms` after
+  any public signature or example change, and a test fails if it is stale.
+  `docs/extensions.md` is generated from `docs/extensions.tpl.md` by
+  `bun run docs:extensions`, and its code blocks must stay verbatim copies of
+  `examples/extension-template/`.
 
 ## The two tiers
 
@@ -62,6 +67,16 @@ and nothing else.
 | `Journal` | A `Context.Reference` with an in-memory default. `sui-effect/journal` swaps in a durable one over `KeyValueStore`; `Tx.reconcileAll()` is the explicit startup call. |
 | `Script` | `{ sui, core, signer, network }` plus `Script.run` and `Script.exitCode`. `ScriptReadOnly` is the signer-less variant, a separate key on purpose. |
 | `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. |
+
+## Extensions
+
+Downstream SDKs are extensions: one `Context.Service` on `Sui` and `Tx`, layers
+that require `Sui` and never build a client, recipe fragments rather than
+submissions, signers as parameters, errors that declare an `outcome`, and a
+Promise face derived by `SuiExtension.fromService`. `docs/extensions.md` is the
+contract and its review checklist; `examples/extension-template/` is the
+copyable package every block of that guide is quoted from, and
+`bun run check:template` is its own check.
 
 `Tx.submit` journals `Signed` before the first execute, re-sends the identical
 bytes (never a rebuild) on a retryable `TransportError` or a timeout, and
@@ -100,8 +115,12 @@ Every failure is one flat tag; there is no error inheritance.
 
 ## Testing
 
-`sui-effect/testing` ships `SuiCoreFake.layer(script)` and `layerTest(script)`
-(the real `Sui` over the fake `SuiCore`). The fake serves in-memory objects with
+`sui-effect/testing` ships `SuiCoreFake.layer(script)`, `layerTest(script)`
+(the real `Sui` over the fake `SuiCore`), `layerExtensionTest(layer, script)`
+(an extension's own layer over that) and `SuiTest` (`putObject`, `bumpVersion`,
+`deleteObject`, `setClock`, `scriptExecute`, `scriptSimulate`,
+`scriptGetTransaction`, `calls`), which is the whole harness an extension's
+tests need. The fake serves in-memory objects with
 BCS content, the Clock object `0x6`, and scripted outcomes
 (`FakeOutcome.succeed`, `failWith`, `transportError`, `notFound`, `timeoutThen`)
 for simulate, execute, `getTransaction` and the resolver's budget simulation

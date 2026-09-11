@@ -1,0 +1,36 @@
+{
+  "name": "@your-org/example-extension",
+  "version": "0.0.0",
+  "description": "A copyable sui-effect extension package: one service, three layers, a derived Promise face.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "tsc --noEmit && bun test"
+  },
+  "peerDependencies": {
+    "@mysten/sui": "^2.28",
+    "effect": ">=4.0.0-rc.112 <4.1",
+    "sui-effect": ">=0.0.0"
+  },
+  "devDependencies": {
+    "@mysten/bcs": "2.1.1",
+    "@mysten/sui": "2.30.0",
+    "@types/bun": "1.4.2",
+    "effect": "4.0.0-rc.112",
+    "typescript": "5.9.3"
+  }
+}

@@ -9,7 +9,6 @@
  * `SUI_RPC_URL` points at a node on another chain.
  */
 import { bcs } from "@mysten/sui/bcs"
-import { BunRuntime } from "@effect/platform-bun"
 import { Config, Console, Effect } from "effect"
 import { ObjectId, Sui, SuiSchema } from "../src/index.ts"
 
@@ -20,7 +19,8 @@ const Escrow = SuiSchema.bcs(
   `${PACKAGE}::escrow::Escrow`
 )
 
-const program = Effect.gen(function*() {
+/** The program itself, exported so a test can run it against the fake. */
+export const program = Effect.gen(function*() {
   const sui = yield* Sui
   const id = yield* Config.schema(ObjectId, "ESCROW_ID")
   const escrow = yield* sui.getObject(id, { schema: Escrow })
@@ -28,4 +28,9 @@ const program = Effect.gen(function*() {
   yield* Console.log(`${escrow.id} holds ${escrow.content.amount} at ${now.toString()}`)
 })
 
-BunRuntime.runMain(program.pipe(Effect.provide(Sui.layerConfig)))
+if (import.meta.main) {
+  // Imported here rather than at the top so that a test can import `program`
+  // without pulling a platform package into the test process.
+  const { BunRuntime } = await import("@effect/platform-bun")
+  BunRuntime.runMain(program.pipe(Effect.provide(Sui.layerConfig)))
+}

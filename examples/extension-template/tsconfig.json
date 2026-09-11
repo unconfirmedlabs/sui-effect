@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "declaration": true,
+    "types": ["bun"],
+    "baseUrl": ".",
+    // Inside the sui-effect repository the template resolves `sui-effect` to
+    // the library's own sources, so it needs no install of its own and there is
+    // exactly one copy of `effect` in play. Delete this block when you copy the
+    // template out, and add `sui-effect` to `dependencies` instead.
+    "paths": {
+      "sui-effect": ["../../src/index.ts"],
+      "sui-effect/tx": ["../../src/tx.ts"],
+      "sui-effect/journal": ["../../src/journal.ts"],
+      "sui-effect/extension": ["../../src/extension.ts"],
+      "sui-effect/script": ["../../src/script.ts"],
+      "sui-effect/testing": ["../../src/testing.ts"]
+    },
+    "plugins": [{ "name": "@effect/language-service" }]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

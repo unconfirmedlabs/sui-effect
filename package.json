@@ -33,14 +33,21 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "LLMS.md",
+    "AGENTS.md",
+    "docs/extensions.md"
   ],
   "scripts": {
     "prepare": "effect-language-service patch",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "bun test",
-    "check": "tsc --noEmit && bun run build && bun test"
+    "test": "bun test test/",
+    "test:template": "cd examples/extension-template && bun test",
+    "check:template": "cd examples/extension-template && tsc --noEmit && bun test",
+    "llms": "bun scripts/llms.ts",
+    "docs:extensions": "bun scripts/extensions.ts",
+    "check": "tsc --noEmit && bun run build && bun test test/ && bun run check:template"
   },
   "repository": {
     "type": "git",
@@ -73,5 +80,6 @@
     "@types/bun": "1.4.2",
     "effect": "4.0.0-rc.112",
     "typescript": "5.9.3"
-  }
+  },
+  "sideEffects": false
 }

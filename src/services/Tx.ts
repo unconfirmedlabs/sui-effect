@@ -69,6 +69,30 @@ export const Signed = SignedTransaction
 /** What `Tx.reconcile` can be asked about. */
 export type ReconcileInput = Digest | Signed | SubmissionUnknown
 
+/**
+ * Everything {@link submit} can fail with, as one name.
+ *
+ * An extension that wraps a submission spells its own errors plus this, rather
+ * than repeating four tags that will grow with the taxonomy.
+ */
+export type SubmitError =
+  | ExecutionFailed
+  | NotApplied
+  | SubmissionUnknown
+  | JournalError
+
+/**
+ * Everything {@link run} can fail with, as one name: {@link SubmitError} plus
+ * what building, preflighting and signing can produce.
+ */
+export type RunError =
+  | BuildError
+  | SimulationFailed
+  | PolicyDenied
+  | SigningError
+  | SubmitError
+  | TransportError
+
 /** What one entry of `Tx.reconcileAll` settled to. */
 export type Reconciled = Executed | ExecutionFailed | NotApplied | SubmissionUnknown
 

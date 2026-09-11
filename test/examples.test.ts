@@ -1,0 +1,144 @@
+/**
+ * Every example runs against the fake.
+ *
+ * `examples/script-claim.ts` has its own file. This one covers the read example
+ * and both faces of the extension example, so no snippet that reaches `LLMS.md`
+ * or the README is untested.
+ */
+import { describe, expect, test } from "bun:test"
+import { readFileSync } from "node:fs"
+import { bcs as suiBcs } from "@mysten/sui/bcs"
+import type { SuiClientTypes } from "@mysten/sui/client"
+import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
+import { ConfigProvider, Effect, Layer } from "effect"
+import { TestConsole } from "effect/testing"
+import { Escrow, program as consumerProgram, readWithPromises } from "../examples/extension-consumer.ts"
+import { program as readProgram } from "../examples/read-escrow.ts"
+import { Script } from "../src/script.ts"
+import { FakeOutcome, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
+import { layerTest } from "../src/testing.ts"
+
+const PADDED = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
+const PKG = PADDED("2")
+const ESCROW_ID = PADDED("e5c0")
+const RECEIPT_ID = PADDED("7ece17")
+
+const keypair = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(5))
+const SENDER = keypair.toSuiAddress()
+const owner: SuiClientTypes.ObjectOwner = { $kind: "AddressOwner", AddressOwner: SENDER }
+
+/** The layout `examples/read-escrow.ts` reads: two fields. */
+const ReadEscrowBcs = suiBcs.struct("Escrow", { id: suiBcs.Address, amount: suiBcs.u64() })
+/** The layout `examples/extension-consumer.ts` reads: three fields. */
+const ConsumerEscrowBcs = suiBcs.struct("Escrow", {
+  id: suiBcs.Address,
+  owner: suiBcs.Address,
+  amount: suiBcs.u64()
+})
+
+const coin = {
+  objectId: PADDED("c01"),
+  version: "2",
+  digest: "11111111111111111111111111111111",
+  type: `${PKG}::coin::Coin<${PKG}::sui::SUI>`,
+  balance: "1000000000",
+  owner,
+  previousTransaction: null
+} as unknown as SuiClientTypes.Coin
+
+const env = ConfigProvider.layer(
+  ConfigProvider.fromEnvRecord({
+    SUI_NETWORK: "localnet",
+    SUI_PRIVATE_KEY: keypair.getSecretKey(),
+    ESCROW_ID
+  })
+)
+
+describe("examples/read-escrow.ts", () => {
+  test("reads the escrow and the chain time against the fake", async () => {
+    const script = {
+      clockTimestampMs: 1_700_000_000_000n,
+      objects: [
+        {
+          objectId: ESCROW_ID,
+          type: `${PKG}::escrow::Escrow`,
+          version: 3n,
+          owner,
+          content: ReadEscrowBcs.serialize({ id: ESCROW_ID, amount: "42" }).toBytes()
+        }
+      ]
+    }
+    const lines = await Effect.runPromise(
+      readProgram.pipe(
+        Effect.andThen(TestConsole.logLines),
+        Effect.provide(
+          Layer.mergeAll(layerTest(script), TestConsole.layer, env).pipe(Layer.provide(env))
+        )
+      )
+    )
+    expect(lines).toHaveLength(1)
+    expect(String(lines[0])).toContain("holds 42")
+  })
+})
+
+describe("examples/extension-consumer.ts", () => {
+  const script = {
+    objects: [
+      {
+        objectId: ESCROW_ID,
+        type: `${PKG}::escrow::Escrow`,
+        version: 3n,
+        owner,
+        content: ConsumerEscrowBcs.serialize({ id: ESCROW_ID, owner: SENDER, amount: "7" }).toBytes()
+      }
+    ],
+    coins: [coin],
+    execute: [
+      FakeOutcome.succeed({
+        created: [{ objectId: RECEIPT_ID, type: `${PKG}::escrow::Receipt`, version: 4n, owner }],
+        mutated: [{ objectId: ESCROW_ID, type: `${PKG}::escrow::Escrow`, version: 4n, owner }]
+      })
+    ]
+  }
+
+  test("the Effect consumer claims through the extension inside a script", async () => {
+    const lines: Array<string> = []
+    const code = await Script.run(consumerProgram.pipe(Effect.provide(Layer.mergeAll(Escrow.layer, env))), {
+      layer: Script.layerNoDeps.pipe(Layer.provideMerge(layerTest(script)), Layer.provide(env)),
+      exit: () => {},
+      stderr: (line) => lines.push(line),
+      signals: { on: () => {} }
+    })
+    expect(lines).toEqual([])
+    expect(code).toBe(0)
+  })
+
+  test("the Promise consumer reads through $extend with no Effect in sight", async () => {
+    const fake = Effect.runSync(
+      Effect.provide(SuiCoreFake, SuiCoreFake.layer(script), { local: true })
+    )
+    expect(await readWithPromises(fake.client, ESCROW_ID)).toBe(7n)
+  })
+})
+
+describe("README.md", () => {
+  /** The slice of a file between two anchor lines, inclusive. */
+  const slice = (text: string, first: string, last: string): string => {
+    const lines = text.split("\n")
+    const start = lines.findIndex((line) => line === first)
+    const offset = lines.slice(start).findIndex((line) => line === last)
+    expect(start).toBeGreaterThan(-1)
+    expect(offset).toBeGreaterThan(-1)
+    return lines.slice(start, start + offset + 1).join("\n")
+  }
+
+  const readme = readFileSync("README.md", "utf8")
+  const example = readFileSync("examples/script-claim.ts", "utf8")
+
+  test("the script example is the one in examples/script-claim.ts", () => {
+    const program = slice(example, "export const program = Effect.gen(function*() {", "})")
+    expect(readme).toContain(program)
+    const schema = slice(example, "const Escrow = SuiSchema.bcs(", ")")
+    expect(readme).toContain(schema)
+  })
+})

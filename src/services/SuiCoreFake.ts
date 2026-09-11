@@ -23,7 +23,7 @@ import {
   SUI_TYPE_ARG,
   toBase58
 } from "@mysten/sui/utils"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Option } from "effect"
 import type { SuiCoreService } from "./SuiCore.ts"
 import { DefectMarker, makeFromClient, SuiCore } from "./SuiCore.ts"
 
@@ -163,6 +163,12 @@ export interface SuiCoreFakeState {
   readonly aborted: Effect.Effect<number>
   /** Inserts or replaces an object. */
   readonly setObject: (object: FakeObject) => Effect.Effect<void>
+  /**
+   * The object the fake currently serves for this id, `None` when there is
+   * none. What a helper that has to change an object relative to its current
+   * state (bumping a version, rewriting content) reads first.
+   */
+  readonly readObject: (objectId: string) => Effect.Effect<Option.Option<FakeObject>>
   /** Removes an object, so a later read reports it deleted. */
   readonly deleteObject: (objectId: string) => Effect.Effect<void>
   /** Moves the Clock object forward or back. */
@@ -861,11 +867,17 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     resolveTransactionPlugin: () => resolvePlugin
   }
 
-  const client = {
+  const client: ClientWithCoreApi = {
     network: script.network ?? "localnet",
     cache: undefined,
     core,
-    $extend: () => unimplemented("$extend")
+    // The SDK's registration mechanism, implemented so an extension's derived
+    // Promise face can be tested exactly the way a consumer writes it:
+    // `client.$extend(myExtension())`.
+    $extend: (registration: { readonly name: string; readonly register: (client: ClientWithCoreApi) => unknown }) =>
+      Object.assign(Object.create(Object.getPrototypeOf(client) ?? Object.prototype), client, {
+        [registration.name]: registration.register(client)
+      })
   } as unknown as ClientWithCoreApi
 
   return {
@@ -873,6 +885,8 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     client,
     calls: Effect.sync(() => [...state.calls]),
     aborted: Effect.sync(() => state.aborted),
+    readObject: (objectId) =>
+      Effect.sync(() => Option.fromNullishOr(state.objects.get(normalizeSuiAddress(objectId)))),
     setObject: (object) =>
       Effect.sync(() => {
         const id = normalizeSuiAddress(object.objectId)

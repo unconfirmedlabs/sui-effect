@@ -18,5 +18,6 @@
     "types": ["bun"],
     "plugins": [{ "name": "@effect/language-service" }]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "examples/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "examples/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["examples/extension-template"]
 }
