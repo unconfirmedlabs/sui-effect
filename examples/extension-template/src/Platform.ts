@@ -45,6 +45,17 @@ export interface PlatformService {
 /** What the platform needs to build the packages it composes. */
 export interface PlatformOptions extends EscrowOptions {}
 
+/** What a `$extend` registration of the platform needs beyond its layer. */
+export interface PlatformRegistrationOptions extends PlatformOptions {
+  /**
+   * The chain identifier the node must be on. Required on `devnet`, `localnet`
+   * and any custom network, and **the same id every other registration on this
+   * client is given**: the base `Sui` and its sender-lock map are shared per
+   * client per chain id.
+   */
+  readonly chainId?: string
+}
+
 const make: Effect.Effect<PlatformService, never, Escrow> = Effect.gen(function*() {
   // The dependency is yielded, not constructed: the layer below provides it.
   const escrow = yield* Escrow
@@ -105,15 +116,21 @@ export class Platform extends Context.Service<Platform, PlatformService>()(
  * placeholder. Neither layer touches the network at build, which is what `warm`
  * requires.
  *
+ * `options.chainId` is threaded through rather than left to the built-in table,
+ * so this works on `devnet` and `localnet` too — and so it matches what
+ * `escrow(...)` in `extension.ts` is given. Two registrations on one client
+ * that name the same chain id share one `Sui`, one transport and one
+ * sender-lock map; two that disagree share nothing.
+ *
  * ```ts
  * const client = new SuiGrpcClient({ network: "testnet", baseUrl }).$extend(platform(options))
  * const escrow = await client.platform.escrow.get(id)
  * const recipe = client.platform.escrow.claim(escrow)
  * ```
  */
-export const platform = (options: PlatformOptions) =>
+export const platform = (options: PlatformRegistrationOptions) =>
   SuiExtension.fromService(Platform, {
     name: "platform",
     layer: Platform.layer(options),
-    warm: {}
+    warm: options.chainId === undefined ? {} : { chainId: options.chainId }
   })

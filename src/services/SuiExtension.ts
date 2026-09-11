@@ -17,8 +17,8 @@
 import type { ClientWithCoreApi, SuiClientRegistration } from "@mysten/sui/client"
 import type { Context } from "effect"
 import { Effect, Layer, ManagedRuntime, Stream } from "effect"
-import type { NetworkMismatch, TransportError } from "../domain/errors.ts"
-import { ExtensionNotReady } from "../domain/errors.ts"
+import type { TransportError } from "../domain/errors.ts"
+import { ExtensionNotReady, NetworkMismatch } from "../domain/errors.ts"
 import { KNOWN_CHAIN_IDS } from "../domain/schemas.ts"
 import type { Sui, SuiLayerOptions } from "./Sui.ts"
 import { Sui as SuiService } from "./Sui.ts"
@@ -44,6 +44,16 @@ import { SuiCore } from "./SuiCore.ts"
  * a `Date`, anything with a prototype of its own passes through whole, in the
  * type and at runtime alike. (An interface or class type is not assignable to
  * `Record<string, unknown>`, which is what keeps the two in step.)
+ *
+ * **A plain-object *value* member is the one place the two faces cannot agree.**
+ * `{ packageId: "0x…" }` is indistinguishable from a namespace of members, so
+ * the type maps it as a value while the **cold** runtime treats it as a
+ * namespace and hands back a placeholder for each key. Reading one throws
+ * `ExtensionNotReady` naming the path (`deployment.packageId`) rather than
+ * returning something the type says cannot be awaited — so the disagreement is
+ * typed and named, not silent — but the cure is `warm` or `$ready()`, not a
+ * retry. An extension that is registered lazily should expose such a value
+ * through an `Effect` member instead.
  */
 export type PromiseFace<S> = {
   readonly [K in keyof S]: S[K] extends Stream.Stream<infer A, infer _E, infer _R> ? AsyncIterable<A>
@@ -128,15 +138,25 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
    *   synchronously and `register` throws. This is the documented contract of
    *   `warm`, not an accident: an extension that needs the network at build is
    *   registered without it.
-   * - **The chain identifier is not read.** `Sui` normally calls
-   *   `getChainIdentifier` at layer build, which is a round trip. A warm
-   *   registration takes `warm.chainId` (or `sui.chainId`, or the entry in the
-   *   built-in table for `mainnet` and `testnet`) as the chain's identifier and
-   *   asks nothing, so a node on another chain is not detected at
-   *   registration. It is still detected by the chain: `Tx.build` stamps that
-   *   id on the expiration and a validator refuses bytes signed for another
-   *   chain. On `devnet`, `localnet` or a custom network there is no table
-   *   entry, so `warm` without a `chainId` throws rather than guess.
+   * - **The chain identifier is not read — not at registration, and not
+   *   later.** `Sui` normally calls `getChainIdentifier` at layer build, which
+   *   is a round trip. A warm registration takes `warm.chainId` (or
+   *   `sui.chainId`, or the entry in the built-in table for `mainnet` and
+   *   `testnet`) as the chain's identifier and asks nothing. **The node is
+   *   consulted for the first time when the extension itself makes a call**,
+   *   and that call does not check the identifier either: the pinned id is what
+   *   `Sui.chainId` reports for the life of the registration. A node on another
+   *   chain is therefore never detected here — it is detected by the chain,
+   *   because `Tx.build` stamps that id on the expiration and a validator
+   *   refuses bytes signed for another chain. Register lazily when the
+   *   assertion is what you want. On `devnet`, `localnet` or a custom network
+   *   there is no table entry, so `warm` without a `chainId` throws rather than
+   *   guess.
+   *
+   * A **lazy** registration that joins a chain id another registration already
+   * pinned still performs its own `getChainIdentifier` assertion — once, shared
+   * across every lazy registration on that base — so mixing the two on one
+   * client neither loses the check nor duplicates it.
    */
   readonly warm?: { readonly chainId?: string }
 }
@@ -171,9 +191,14 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
  * it disposes, after which the next call builds it again. That is exactly the
  * lifetime `$dispose()` documents, extended across registrations.
  *
- * Keyed by client, then by the base's own configuration, because two
- * extensions that pin different chain identifiers are not asking for the same
- * `Sui` and must not be handed one.
+ * Keyed by the client's `core`, then by the **effective chain id** — the one
+ * `warm` names, the one `sui` pins, or the built-in entry for the client's
+ * network. Two extensions that pin different chain identifiers are not asking
+ * for the same `Sui` and must not be handed one; a `warm` registration and a
+ * lazy one on the *same* chain are, and keying by the registration's style
+ * rather than by the chain was why they never shared. A network with no known
+ * id at all falls back to a single "read" key, where the base reads the
+ * identifier itself.
  *
  * **Only the base is shared.** Each registration still builds its own
  * extension layer with its own memoization, so "register once per client and
@@ -182,33 +207,97 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
  */
 type BaseLayer = Layer.Layer<Sui | SuiCore, NetworkMismatch | TransportError>
 
-const SHARED_BASES = new WeakMap<ClientWithCoreApi, Map<string, BaseLayer>>()
+/** One shared base, with everything a later registration needs to join it. */
+interface SharedBase {
+  /** The layer `raw` is always built through, so every joiner gets one `Sui`. */
+  readonly memoMap: Layer.MemoMap
+  /** The base itself, before any assertion is added to it. */
+  readonly raw: BaseLayer
+  /** The base as a registration uses it: `raw` through {@link memoMap}. */
+  readonly shared: BaseLayer
+  /** `raw` plus the one chain-id assertion, built once. */
+  asserted?: BaseLayer
+}
+
+/**
+ * Keyed by the client's `core`, not by the client.
+ *
+ * `client.$extend(a).$extend(b)` hands each `register` a **different** object:
+ * the SDK's `$extend` returns a `Proxy` of the client, and the next `$extend`
+ * proxies that. Those proxies are not equal as `WeakMap` keys, so keying by the
+ * client meant two chained registrations shared nothing. Every one of them
+ * reads through to the same `core` object, which is what "the same transport"
+ * means here anyway.
+ */
+const SHARED_BASES = new WeakMap<object, Map<string, SharedBase>>()
 
 const sharedBase = (
   client: ClientWithCoreApi,
   key: string,
   build: () => BaseLayer
-): BaseLayer => {
-  let byKey = SHARED_BASES.get(client)
+): SharedBase => {
+  const identity = client.core as unknown as object
+  let byKey = SHARED_BASES.get(identity)
   if (byKey === undefined) {
     byKey = new Map()
-    SHARED_BASES.set(client, byKey)
+    SHARED_BASES.set(identity, byKey)
   }
   const existing = byKey.get(key)
   if (existing !== undefined) return existing
   const raw = build()
-  // One memo map for this client and this configuration, shared by every
-  // registration: `Layer.effect` memoizes by layer identity, so building `raw`
-  // through it hands the second registration the `Sui` the first one built —
-  // one chain-id read, and one sender-lock map. The memo map is reference
-  // counted by Effect, so the base is released when the last registration that
-  // used it is disposed and rebuilt on the next call after that.
+  // One memo map for this client and this key, shared by every registration:
+  // `Layer.effect` memoizes by layer identity, so building `raw` through it
+  // hands the second registration the `Sui` the first one built — one chain-id
+  // read, and one sender-lock map. The memo map is reference counted by Effect,
+  // so the base is released when the last registration that used it is disposed
+  // and rebuilt on the next call after that.
   const memoMap = Layer.makeMemoMapUnsafe()
-  const shared: BaseLayer = Layer.fromBuild((_registrationMemo, scope) =>
-    Layer.buildWithMemoMap(raw, memoMap, scope)
+  const entry: SharedBase = {
+    memoMap,
+    raw,
+    shared: Layer.fromBuild((_registrationMemo, scope) =>
+      Layer.buildWithMemoMap(raw, memoMap, scope)
+    )
+  }
+  byKey.set(key, entry)
+  return entry
+}
+
+/**
+ * The chain-identifier check a **lazy** registration owes when it joins a base
+ * that was pinned rather than read.
+ *
+ * The shared base for a known chain id is `Sui.layerNoDepsPinned`, because a
+ * `warm` registration on that same id has to build it synchronously and cannot
+ * await a round trip. A lazy registration promises the opposite — that the node
+ * is asked once and a node on another chain fails the build — so it gets this
+ * alongside the base. It is one `Layer` value per shared base, built through the
+ * base's own memo map, so it runs **once** however many lazy registrations join.
+ *
+ * Fails with: `NetworkMismatch`, `TransportError`.
+ */
+const assertChainId = (
+  expected: string
+): Layer.Layer<never, NetworkMismatch | TransportError, SuiCore> =>
+  Layer.effectDiscard(
+    Effect.gen(function*() {
+      const core = yield* SuiCore
+      const { chainIdentifier } = yield* core.getChainIdentifier()
+      if (chainIdentifier !== expected) {
+        return yield* new NetworkMismatch({ expected, actual: chainIdentifier })
+      }
+    })
   )
-  byKey.set(key, shared)
-  return shared
+
+/** The shared base with {@link assertChainId} attached, memoized on the entry. */
+const assertedBase = (entry: SharedBase, chainId: string): BaseLayer => {
+  if (entry.asserted === undefined) {
+    const raw = Layer.merge(entry.raw, assertChainId(chainId).pipe(Layer.provide(entry.raw)))
+    entry.asserted = Layer.fromBuild((_registrationMemo, scope) =>
+      Layer.buildWithMemoMap(raw, entry.memoMap, scope)
+    )
+  }
+  return entry.asserted
 }
 
 /** What the Promise facade needs from the lazily built runtime. */
@@ -241,10 +330,13 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  * passes to `client.$extend(...)`.
  *
  * `register(client)` does no work by default: the `ManagedRuntime` over
- * `SuiCore.layerFromClient(client)`, `Sui.layerNoDepsWith(options.sui)` and the
- * extension's own layer is built on the first call and shared by every call
- * after it. A rejection carries the original tagged error instance, so a
- * Promise consumer can still switch on `_tag`.
+ * `SuiCore.layerFromClient(client)`, a `Sui` for the client's effective chain
+ * id and the extension's own layer is built on the first call and shared by
+ * every call after it. The `Sui` and `SuiCore` underneath are shared with every
+ * other registration on that client that names the same chain id — one
+ * transport, one chain identity and one sender-lock map. A rejection carries
+ * the original tagged error instance, so a Promise consumer can still switch on
+ * `_tag`.
  *
  * `name` is generic in a string literal, so `client.escrow` is a property of
  * the extended client's type and not an index lookup: no cast, and no
@@ -298,18 +390,45 @@ export const fromService = <Self, Shape, E, const Name extends string>(
     let runtime: Runtime | undefined
     let instance: Shape | undefined
 
-    const baseOf = (): BaseLayer =>
+    /**
+     * The chain identifier this registration knows before it asks anyone: the
+     * one `warm` names, the one `sui` pins, or the built-in entry for the
+     * client's network. `undefined` on `devnet`, `localnet` or a custom network
+     * with neither, which is the only case where the base is keyed by "read".
+     */
+    const knownChainId = options.warm?.chainId ?? options.sui?.chainId ??
+      KNOWN_CHAIN_IDS[client.network]
+
+    /**
+     * The base every registration on this client and this chain shares.
+     *
+     * The key is the **effective chain id**, not the registration's own style,
+     * so a `warm` registration and a lazy one on the same chain get one `Sui`,
+     * one transport and — the reason this matters — one sender-lock map. When
+     * the id is known the base is pinned (a `warm` registration must build it
+     * synchronously and cannot await a round trip) and a lazy registration adds
+     * {@link assertChainId} on top, which asks the node once. Only a network
+     * with no known id at all falls back to a base that reads it.
+     */
+    const baseEntry = (): SharedBase =>
       sharedBase(
         client,
-        `read:${options.sui?.chainId ?? ""}`,
+        knownChainId === undefined ? "read" : `chain:${knownChainId}`,
         () =>
           // `Sui` and `SuiCore` over the very client `$extend` was called on, so
           // the extension and the consumer share one transport, one chain-id
           // check and one sender-lock map.
-          SuiService.layerNoDepsWith(options.sui ?? {}).pipe(
-            Layer.provideMerge(SuiCore.layerFromClient(client))
-          )
+          (knownChainId === undefined
+            ? SuiService.layerNoDepsWith(options.sui ?? {})
+            : SuiService.layerNoDepsPinned(knownChainId)).pipe(
+              Layer.provideMerge(SuiCore.layerFromClient(client))
+            )
       )
+
+    const baseOf = (): BaseLayer => {
+      const entry = baseEntry()
+      return knownChainId === undefined ? entry.shared : assertedBase(entry, knownChainId)
+    }
 
     const runtimeOf = (): Runtime => {
       if (runtime === undefined) {
@@ -335,23 +454,18 @@ export const fromService = <Self, Shape, E, const Name extends string>(
      * go; a layer with an asynchronous step throws out of it, which is the
      * documented contract. The chain identifier is taken, never read.
      */
-    const warmUp = (warm: { readonly chainId?: string }): void => {
-      const chainId = warm.chainId ?? options.sui?.chainId ?? KNOWN_CHAIN_IDS[client.network]
-      if (chainId === undefined) {
+    const warmUp = (_warm: { readonly chainId?: string }): void => {
+      if (knownChainId === undefined) {
         throw new Error(
           `${options.name}: a warm registration on network "${client.network}" needs an explicit ` +
             "chain id (warm: { chainId }), because there is no built-in identifier for it and a " +
             "warm build never asks the node"
         )
       }
-      const base = sharedBase(
-        client,
-        `pinned:${chainId}`,
-        () =>
-          SuiService.layerNoDepsPinned(chainId).pipe(
-            Layer.provideMerge(SuiCore.layerFromClient(client))
-          )
-      )
+      // The **pinned** base, not the asserted one: a warm build is synchronous
+      // and `getChainIdentifier` is a round trip. It is the same base object a
+      // lazy registration on this chain joins.
+      const base = baseEntry().shared
       const warmRuntime: Runtime = ManagedRuntime.make(
         options.layer.pipe(Layer.provideMerge(base))
       )

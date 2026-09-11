@@ -137,6 +137,15 @@ The domain class is an ordinary `Schema.Class`:
 
 @@ src/schema.ts :: export class Settlement extends Schema.Class<Settlement>("Settlement")({ :: }) {}
 
+**The halfway shape must be an explicit interface.** The transformation's source
+type — what `decode` produces and `encode` consumes — is written out as its own
+interface, as `src/schema.ts` does. Reaching for `typeof Settlement.Encoded` or
+`typeof Settlement.Type` instead looks equivalent and is not: those name the
+class's *own* two sides, which inverts the direction the transformation is being
+inferred in, and the result does not compile — with an error about the wrong
+side of the transformation, several frames away from the line that caused it.
+Write the interface.
+
 `decode` produces the target's field shape and the target schema does the rest,
 so the `ObjectId` and `SuiAddress` brands are checked as part of the same
 decode. Use `SchemaTransformation.transform` for a total mapping and
@@ -192,10 +201,66 @@ when you know the type the bytes came from and the tag check runs here too:
 
 @@ src/Escrow.ts :: const stream = (owner: SuiAddress) => ::       )
 
-`expectedType` on `SuiSchema.bcs` is **optional**, for the one case that has no
-tag to compare: a Move **return value**. `sui.view(recipe, bcs.Address())` takes
-a bare `@mysten/bcs` layout, so nothing has to invent a type for a codec that
-will never meet an object.
+`expectedType` on `SuiSchema.bcs` is **optional**, and there are two cases that
+have no tag to compare. A Move **return value**: `sui.view(recipe,
+bcs.Address())` takes a bare `@mysten/bcs` layout, so nothing has to invent a
+type for a codec that will never meet an object. And an **event payload** whose
+Move type contains a package id the decoder does not know — an event decoder is
+usually written once and used against whatever package the deployment
+configured, so `SuiSchema.bcs(layout)` with no expected type is the intended
+shape for events, not a shortcut. What still guards those bytes is the
+re-serialize check the bridge always runs: a layout that parsed but whose
+re-serialization is a different length is rejected, which is what stops an
+envelope decoding as the struct it wraps.
+
+### Never `.make` a branded value from unvalidated input
+
+`ObjectId.make`, `SuiAddress.make`, `StructTag.make` and friends **validate and
+throw**. They are for a literal you wrote yourself, or a value that has already
+been through a schema. A string that came from a node, a config file, a user or
+an upstream package goes through `Schema.decodeUnknownEffect(ObjectId)` and
+becomes a typed `DecodeError`; `.make` on it is a defect in a member whose error
+union says it cannot fail.
+
+They also validate rather than normalize: `SuiAddress.make("0x1")` throws,
+because `0x1` is not a 32-byte address. Normalize first
+(`normalizeSuiAddress`) or write the padded form.
+
+When the error you would build *needs a field you do not have* — a `DecodeError`
+wants an `objectId` and you are decoding an event payload with no object — that
+is the signal to declare your own error, or to return an `Option`, rather than
+to invent a value to satisfy the schema.
+
+### Dynamic fields, and the types their keys may be
+
+`sui.streamDynamicFields(parent)` pages a parent's fields; there is no key
+filter, because the node has none, so a caller filters the stream on
+`entry.name.type`. Do that with **`SuiSchema.matchesType(expected, actual)`**,
+which is the one Move-type rule this package uses everywhere and is safe on any
+string:
+
+<!-- inline -->
+
+```ts
+import { Stream } from "effect"
+import { SuiSchema } from "sui-effect"
+
+const shares = sui.streamDynamicFields(parentId).pipe(
+  Stream.filter((entry) => SuiSchema.matchesType(shareKeyType, entry.name.type)),
+  Stream.mapEffect((entry) =>
+    SuiSchema.decode(ShareValue, entry.value.bcs, { actualType: entry.valueType })
+  )
+)
+```
+
+Do **not** reach for the SDK's `normalizeStructTag` here. A dynamic-field key is
+legally a primitive — `u64`, `bool`, `address`, `vector<u8>` — and
+`normalizeStructTag` throws on every one of them, so the obvious filter dies as
+a defect on the first `u64` key in somebody's table.
+
+A note on `Stream`: **`Stream.runCollect` returns a plain `Array` in Effect v4**,
+not a `Chunk`. `.length` and `[0]` work; `Chunk.toReadonlyArray` does not exist
+for it.
 
 ### Absence, and batch reads
 
@@ -324,7 +389,21 @@ service; the shape is `Layer.effect(Self, make).pipe(Layer.provide(Dependency.la
 @@ src/Escrow.ts :: static readonly layer = (options: EscrowOptions): Layer.Layer<Escrow, never, Sui> => ::     )
 
 `layerConfig` reads a prefixed namespace through `Config.nested`, and every
-secret is `Config.redacted`, so it cannot reach a log line:
+secret is `Config.redacted`, so it cannot reach a log line. **Every value that
+has a schema is read through it**, with `Config.schema(ObjectId, "PACKAGE_ID")`
+rather than `Config.nonEmptyString`: an override that is not an object id then
+fails where it was set, naming the variable, instead of being carried into every
+`moveCall` target and every codec and surfacing three calls later as a Move
+abort nobody can trace back to an environment variable. The template has a test
+for the malformed case; so should you.
+
+Two things not to promise in the docs you write around it. `Config.option` turns
+an **empty** variable into "unset", so `FOO=""` takes the default rather than
+failing — do not write "an empty value is a `ConfigError`" above a
+`Config.option`. And `Effect.withConfigProvider` does not exist in Effect v4
+rc.112: a test provides the provider like anything else, with
+`ConfigProvider.layer(ConfigProvider.fromEnvRecord({ … }))` or
+`Effect.provideService(effect, ConfigProvider.ConfigProvider, provider)`.
 
 @@ src/Escrow.ts :: static readonly layerConfig: Layer.Layer<Escrow, Config.ConfigError, Sui> = Layer.unwrap( :: )
 
@@ -368,7 +447,7 @@ not a rule that every extension must read an environment variable.
 
 Never maintain a Promise API beside the Effect one; derive it.
 
-@@ src/extension.ts :: export const escrow = (options: EscrowOptions) => :: SuiExtension.fromService(Escrow, { name: "escrow", layer: Escrow.layer(options) })
+@@ src/extension.ts :: export const escrow = (options: EscrowRegistrationOptions) => ::   })
 
 `register(client)` does no work until the first call. Then it builds one
 `ManagedRuntime` over your layer and a **base shared per client** —
@@ -413,27 +492,51 @@ broke in production.) Two cures, both yours to choose:
 - **`warm`**, which does the same synchronously inside `register`, so the
   consumer has to do nothing at all:
 
-@@ src/Platform.ts :: export const platform = (options: PlatformOptions) => ::   })
+@@ src/Platform.ts :: export const platform = (options: PlatformRegistrationOptions) => ::   })
 
 `warm` has two conditions and both are enforced. The layer must not perform an
 asynchronous step — a layer that reads the network at build cannot be built
 synchronously and `register` throws. And the chain identifier is **taken, not
 read**: `warm.chainId`, or `sui.chainId`, or the built-in entry for `mainnet`
 and `testnet`; on `devnet`, `localnet` or a custom network, `warm` without a
-`chainId` throws rather than guess. What still catches a node on the wrong chain
-is the chain itself — `Tx.build` stamps that id on the transaction's expiration
-and a validator refuses bytes signed for another chain.
+`chainId` throws rather than guess.
+
+Be precise about what "taken, not read" costs. The node is not asked at
+registration, and it is **not asked later either**: the pinned id is what
+`Sui.chainId` reports for the life of the registration, and the first time the
+node is consulted at all is the extension's own first call — which does not
+check the identifier. So a `warm` registration never detects a node on another
+chain. What catches it is the chain itself: `Tx.build` stamps that id on the
+transaction's expiration and a validator refuses bytes signed for another chain.
+Register lazily when the assertion is what you want.
+
+**Thread the chain id through your registration options**, the way
+`src/extension.ts` and `src/Platform.ts` both do, rather than relying on the
+built-in table. It is what makes the face work on `devnet` and `localnet`, and
+it is what lets every registration on one client agree — see the next
+paragraph. The template has a test for the warm face on a network with no
+built-in chain id; a conversion should have one too.
 
 If your extension's surface is entirely `Effect` and `Stream` members, none of
 this applies: the lazy default is right and the first `await` builds everything.
 
-### Non-plain values are leaves
+### Non-plain values are leaves, and plain ones are not
 
 The face maps plain object literals recursively and passes everything else
 through: a `BcsType`, a `Schema.Class` instance, a `Date` — anything with a
 prototype of its own — arrives whole, in the type and at runtime alike. So
 exposing a codec or a domain class as a member is safe, and a "namespace" must
 be a plain object literal to be mapped as one.
+
+The other half of that rule is the trap. A **plain-object value** member —
+`deployment: { packageId }` — is indistinguishable from a namespace of members,
+so the type maps it as the value while the **cold** face treats it as a
+namespace and hands back a placeholder for `deployment.packageId`. Reading that
+placeholder throws `ExtensionNotReady` naming the path, so the disagreement is
+typed and named rather than silent, but it is still a disagreement. Either
+register `warm` (or `await $ready()`), or expose the value through an `Effect`
+member, or give it a prototype of its own. Do not put a plain-object value
+member on a service that consumers will register lazily.
 
 ### The rest of the contract
 
@@ -448,16 +551,31 @@ consumer is done rather than between calls. Registering the same extension
 twice, or on two clients, still gives two independent runtimes and two layer
 builds — two copies of whatever *your* layer holds.
 
-**The base is shared, and it matters more than it sounds.** `Sui` owns the
-sender lock: one semaphore per address, which is what stops two `Tx.run`s from
-selecting the same gas coin. When each registration built its own `Sui`, two
-extensions on one client had two lock maps and could do exactly that, and
-"register each extension once" did not help. Now every registration on a client
-(for one base configuration — a different `sui.chainId` is a different base, on
-purpose) shares one `Sui`, one chain-id read and one lock map. It is reference
-counted: the base is built by the first registration that needs it and released
-when the **last** one is disposed, so `$dispose()` on one extension never tears
-the transport out from under another.
+**The base is shared per client per chain id, and it matters more than it
+sounds.** `Sui` owns the sender lock: one semaphore per address, which is what
+stops two `Tx.run`s from selecting the same gas coin. When each registration
+built its own `Sui`, two extensions on one client had two lock maps and could do
+exactly that, and "register each extension once" did not help.
+
+Every registration on one client whose **effective chain id** is the same —
+`warm.chainId`, else `sui.chainId`, else the built-in entry for the network —
+shares one `Sui`, one transport and one lock map. The key is the chain, not the
+registration's style, so a `warm` registration and a lazy one on the same chain
+do share; keying them apart is how the template's own pair used to end up with
+two lock maps. A registration that pins a *different* chain id is asking for a
+different `Sui` and gets one, on purpose.
+
+Because a `warm` registration has to build synchronously, the shared base for a
+known chain id is the **pinned** one, and a lazy registration joining it
+performs its own `getChainIdentifier` assertion as one extra layer — run once
+however many lazy registrations join, so nothing is lost and nothing is
+duplicated.
+
+So: **register every extension on a client the same way and with the same chain
+id**, or accept two of everything. It is reference counted: the base is built by
+the first registration that needs it and released when the **last** one is
+disposed, so `$dispose()` on one extension never tears the transport out from
+under another.
 `examples/extension-consumer.ts` in this repository shows both consumers of one
 extension side by side.
 
@@ -520,6 +638,30 @@ reaches a consumer. That narrowing is what makes the wrapper worth having —
 precise errors and stable types instead of whatever the upstream ships next
 release.
 
+### If your extension reads GraphQL
+
+`SuiGraphQL` is a tag over the SDK's own client, not a wrapper, and
+`SuiGraphQL.query(run, method?)` is the one call that sorts out the two
+failures:
+
+<!-- inline -->
+
+```ts
+import { SuiGraphQL } from "sui-effect"
+
+const chainId = SuiGraphQL.query(
+  (client) => client.query({ query: "{ chainIdentifier }", variables: {} }),
+  "chainIdentifier"
+)
+// Effect<…, GraphQLUnavailable | TransportError, SuiGraphQL>
+```
+
+A rejection from `SuiGraphQL.layerUnavailable` is already a
+`GraphQLUnavailable` and is passed through unchanged; anything else becomes
+`TransportError.fromUnknown(method, cause)`. Deriving that by hand in every
+member is how the passthrough gets forgotten and "there is no endpoint
+configured" arrives as an unclassified transport failure.
+
 ## 10. Testing
 
 `sui-effect/testing` is the whole harness. An extension's tests need nothing
@@ -578,12 +720,38 @@ the harness's.
   `ClientWithCoreApi` that implements `$extend`, so a derived Promise face can
   be tested exactly the way a consumer writes it — `fake.client.$extend(escrow(options))`
   — with no network.
-- **`getDynamicField` matches by `name.type`.** The fake looks up the parent's
-  scripted `dynamicFields` and returns the first entry whose `name.type` equals
-  the requested one; `name.bcs` bytes are *not* compared. So a test that needs
-  two fields of the same name type on one parent has to script them on
-  different parents, and a test of your own key-encoding belongs in a decode
-  test rather than here.
+- **`getDynamicField` matches on `name.type` *and* `name.bcs`.** An entry
+  scripted without `bcs` still matches any key of its type, which is what a test
+  that only cares about the type wants; two entries of the same type on one
+  parent are told apart by their bytes, so a test **can** prove which key
+  encoding a lookup used.
+- **Call recording is reached through `SuiTest.calls`**, not off the fake
+  handle: `yield* SuiTest.calls("getDynamicField")` gives every call in order
+  with the options it was sent.
+- **A scripted `commandResults` entry may leave an array out.**
+  `SuiClientTypes.CommandResult` requires both `returnValues` and
+  `mutatedReferences` on the wire, and a missing one defaults to `[]` here. A
+  complete entry for a `sui.view`:
+
+  <!-- inline -->
+
+  ```ts
+  FakeOutcome.succeed({
+    commandResults: [{ returnValues: [{ bcs: Address.serialize(owner).toBytes() }] }]
+  })
+  ```
+
+  Before the default, omitting `mutatedReferences` failed the whole `Simulation`
+  decode with an issue naming a field the test never mentioned.
+- **`getTransaction` can be answered by digest.** `FakeScript.transactions`
+  (and `SuiTest.recordTransaction(digest, outcome)`) answers a specific digest
+  before the ordered `scriptGetTransaction` is consulted, which is what a
+  `NotApplied { inputConsumed }` test needs: the rule reads
+  `changedObjects[].inputVersion` off the **consuming** transaction, and
+  `FakeChange.inputVersion` is how a test says which version that was.
+- **`Tx.build` always simulates.** A test that asserts a `simulateTransaction`
+  call count is asserting on that, so a conversion moving onto this build has to
+  move those numbers.
 - **It runs no Move code.** Execution outcomes are scripted (`FakeOutcome`), and
   what your recipe actually does on chain is localnet's business.
 
@@ -608,6 +776,13 @@ requires. `examples/extension-consumer.ts` is that script end to end.
 Because your errors declare an `outcome`, a script that fails inside your
 extension exits with the code a wrapper can act on — 5 applied, 4 not applied,
 3 unknown — with no handling lines anywhere.
+
+`SuiError.toJson` serializes your errors too. A tag in sui-effect's own taxonomy
+encodes through the taxonomy's schema; **anything else that is a
+`Schema.TaggedError` encodes through its own**, so an extension error arrives as
+`{ _tag, escrowId, outcome }` rather than a bare `{ _tag, message }`. That is
+what makes a structured log of a failed run useful, and it is a reason to give
+every field of an error a schema rather than stuffing detail into a string.
 
 Two of those deserve a second look. `UnexpectedEffects` — what
 `executed.expectCreated(type)` fails with — is **applied**, exit 5: it can only
@@ -677,10 +852,11 @@ conversion is mechanical except where the behaviour deliberately changed.
 | `getOptionalObjectContent` | `sui.getObjectOption` — `None` for missing and deleted, which is also the blessed way to express domain absence |
 | `getObjectsContent` | `sui.getObjects` — chunked, integrity-checked, a per-item `Result` instead of silently dropping errored ids; `sui.getObjectsOrFail` when every id must be there |
 | `listDynamicFields` | `sui.streamDynamicFields` |
-| filtering dynamic fields by key type | filter entries on `name.type`, then decode `name.bcs` with `SuiSchema.decode(keyCodec, entry.name.bcs)`; the entry carries both |
+| filtering dynamic fields by key type | filter entries on `name.type` with `SuiSchema.matchesType` (never `normalizeStructTag`, which throws on the primitive key types), then decode `name.bcs` with `SuiSchema.decode(keyCodec, entry.name.bcs)`; the entry carries both |
 | `deriveDynamicFieldID` + `getObjectOption` for existence | `sui.getDynamicFieldOption(parent, name)` — one call, `None` for absent |
 | `decodeBcs(codec, schema, bytes)` | `SuiSchema.bcs(codec, expectedType?)`, composed with a domain class through `Schema.decodeTo`, passed as `sui.getObject(id, { schema })`; for bytes you already have, `SuiSchema.decode(codec, bytes, { objectId?, expectedType?, actualType? })`. The codec must be a `BcsType` — codegen's `MoveStruct` / `MoveEnum` / `MoveTuple` are; a hand-rolled `{ parse }` is not |
-| `assertObjectType` | folded into the bridge's tag check, where a bare tag matches every instantiation |
+| `assertObjectType` | folded into the bridge's tag check, where a bare tag matches every instantiation — and where matching is on `address::module::name`, **not** a suffix. A call that relied on `assertObjectType` accepting a suffix (`"::escrow::Escrow"`) has to name the full tag, derived from the configured type origin |
+| `register(client)` throwing at registration | a `warm` registration surfaces a `DeploymentError`-shaped failure **synchronously, out of `register`** rather than as a rejected first call. Catch it where you register |
 | a `string` object id or address | `ObjectId.make(id)` / `SuiAddress.make(addr)` at the boundary for a literal you control, `Schema.decodeUnknownEffect(ObjectId)` for anything that came from outside. This is most of the mechanical diff: `Sui.*` takes branded ids, not `string` |
 | `TxThunk` | `Recipe = (tx) => void`. Every thunk in the SDKs is already synchronous; a **consumer's** `async (tx) => …` is not, and it hoists its `await` in front of the recipe — the read happens in the surrounding Effect, the recipe stays pure |
 | `buildTx(...thunks)` | compose recipes: `(tx) => { a(tx); b(tx) }`, then `Tx.build`. When what you need is a `Transaction` **object** to hand to something else, build it yourself: `const tx = new Transaction(); recipe(tx)` — `Tx.build` returns signed-ready bytes and needs a sender |
@@ -701,6 +877,18 @@ Five behaviour changes to put in the conversion issues:
    loop.
 5. Ids and addresses are branded. `ObjectId.make` at the boundary is not
    ceremony: it is the one place a malformed id is caught, instead of at a node.
+   It **throws**, so it is for literals you control; everything from outside
+   goes through `Schema.decodeUnknownEffect`.
+6. `Tx.build` **always** simulates, so any test asserting a
+   `simulateTransaction` call count has to move.
+7. `NotApplied { inputConsumed }` is rare on a real network: expect
+   `SubmissionUnknown` for almost every stuck submission and plan an operator or
+   `reconcileAll` path.
+
+**Name the target.** A conversion is against **one** sui-effect commit or tag —
+say which in the issue and in the vendored tarball's filename — because "the
+library changed under us" is otherwise indistinguishable from "the conversion
+was wrong".
 
 ## 14. Review checklist
 
@@ -727,7 +915,24 @@ Reject an extension that:
 - runs an Effect (`Effect.runPromise`, `runSync`, a `ManagedRuntime`) anywhere
   but the derived Promise face;
 - reads `process.env` or `Date.now()` instead of `Config` and `DateTime`;
-- ships a public member whose JSDoc does not state its error union in words.
+- ships a public member whose JSDoc does not state its error union in words;
+- declares `sui-effect`, `effect` or `@mysten/sui` in `dependencies` rather than
+  in `peerDependencies` **and** `devDependencies`;
+- hand-builds a `TransportError` instead of using `TransportError.fromUnknown`;
+- registers two extensions on one client with different chain ids, or mixes a
+  `warm` registration with a lazy one whose chain id differs;
+- puts `Layer.orDie` over `Sui.layerNoDeps` (or any layer that can fail with
+  `NetworkMismatch`) in a compatibility shim — a chain mismatch becomes a defect
+  nobody can catch;
+- proves its dynamic-field filtering with a fake that has **one key type per
+  parent**, which proves nothing about filtering;
+- has a README `catchTag` string that does not match the tag the error actually
+  carries, prefix included;
+- leaves `tests` out of the package `tsconfig`'s `include`, so its type-level
+  pins never compile;
+- calls `.make` on a branded schema with a value that came from outside;
+- promises a `ConfigError` for an empty environment variable it reads with
+  `Config.option`.
 
 The effect-ts skill's own checklist still applies underneath: v3 names,
 `Effect.gen` returned from a plain arrow, throwing inside an Effect, mutable
@@ -790,18 +995,99 @@ consumer.
 
 sui-effect is published as `sui-effect` on npm. While a conversion runs ahead of
 a release that has not happened yet — a new peer version, an unpublished
-change — the dependency needs a form that does not exist on the registry, and
-the two that work are:
+change — the dependency needs a form that does not exist on the registry.
 
-- **A workspace or `link:`.** In a monorepo, make sui-effect a workspace member
-  and depend on it by name. Outside one, `bun link` (or `"sui-effect": "link:../sui-effect"`)
-  points the consumer at a checkout. Both give one copy of `effect` and one of
-  `@mysten/sui`, which is what the peer rules above are about.
-- **A packed tarball.** `bun run build && npm pack` in the sui-effect checkout,
-  then `bun add ../sui-effect/sui-effect-0.1.0.tgz` in the consumer. This is
-  what an "isolated consumer" check wants: it proves the published `files` list
-  and the `exports` map, which a `link:` does not.
+**Use the packed tarball.** It is the default, not the fallback:
 
-Swap the dependency to the published range (`"sui-effect": "^0.1.0"`) before the
-conversion branch merges, and say in the PR which form was used while it was in
-flight. A `link:` that reaches `main` is a build that works on one machine.
+```bash
+cd /path/to/sui-effect && bun run build && npm pack
+mkdir -p vendor && cp /path/to/sui-effect/sui-effect-0.1.0.tgz vendor/
+cd /path/to/your-package && bun add -d ./vendor/sui-effect-0.1.0.tgz
+```
+
+It is also the only form that proves anything: an isolated consumer of the
+tarball exercises the published `files` list and the `exports` map, which a
+symlink does not.
+
+**A `link:` or `bun link` to an external checkout does not dedupe the peers.**
+Module resolution follows the symlink's *real* path, so the linked checkout
+resolves `effect` and `@mysten/sui` out of its own `node_modules` while your
+package resolves them out of yours. The two copies are nominally distinct: every
+class that crosses the boundary fails to typecheck with `#private` mismatches,
+and at runtime two copies of `effect` means two `Context.Service` identities and
+layers that silently do not match. Reserve `link:` for a **real workspace
+member**, where one `node_modules` serves both.
+
+**Re-pack, and diff.** A vendored tarball is a snapshot. When the library
+changes, re-pack and compare the listings (`tar -tzf new.tgz | sort` against the
+old one) before installing: a file that stopped shipping is caught there rather
+than in a consumer. Record the sui-effect commit or tag the vendor copy came
+from.
+
+**Until the first publish, bun probes the registry for every peer.** It does so
+even for a peer a local dependency already satisfies, and an unpublished name
+404s the install. The escape is
+`"peerDependenciesMeta": { "sui-effect": { "optional": true } }` in your
+`package.json` — which the template ships, because it is copied verbatim.
+
+Put both halves of the swap on the release checklist:
+
+1. replace the tarball with the published range (`"sui-effect": "^0.1.0"`);
+2. **delete the `peerDependenciesMeta` entry.** Left in, it turns a genuinely
+   missing peer into a silent `undefined` at import time;
+3. re-run the isolated-consumer check against the published package.
+
+Say in the PR which form was used while the branch was in flight. A `link:` that
+reaches `main` is a build that works on one machine.
+
+## 17. What extension authors must know
+
+The short list an independent verification of v0.1.0 said a downstream
+conversion has to carry. Everything here is documented somewhere above; this is
+the page to read before the conversion rather than after it.
+
+- **Register every extension on a client the same way and with the same chain
+  id** — all `warm: { chainId }`, or all lazy, and the same id. The base `Sui`,
+  its transport and its **sender-lock map** are shared per client per effective
+  chain id; disagreeing registrations get two of everything and two `Tx.run`s
+  for one address stop serializing.
+- **Expect `SubmissionUnknown`, not `NotApplied { inputConsumed }`,** for almost
+  every stuck submission whose PTB touched a shared object or an owned object
+  older than the gas coin. `inputConsumed` needs the *consuming* transaction's
+  own effects to report `inputVersion` equal to the version your bytes pinned,
+  and Sui's Lamport versioning means that is usually not what happened. Plan an
+  operator path or a `Tx.reconcileAll()` at startup; do not build a retry loop
+  that waits for `NotApplied`.
+- **A gRPC `NOT_FOUND` during resolution arrives as a `BuildError`** naming the
+  object inputs the resolver was about to look up. And devnet's simulate may not
+  resolve a just-created object for a while **even after `waitForTransaction`
+  returned**: visibility of a transaction is not visibility of its objects in
+  the resolver path. Retry the build, do not re-read and despair.
+- **Pin `effect@4.0.0-rc.112` exactly.** rc.113 renamed `Config.nonEmptyString`,
+  `Config.string` and `Config.redacted`, so neighbouring release candidates are
+  not interchangeable — and two copies of `effect` in one process is a different
+  and worse problem (section 16).
+- **Copy `scripts/check-package.ts`.** It resolves `sui-effect`, `effect` and
+  `@mysten/*` from your own `node_modules` first, so it works outside this
+  repository unchanged. `sui-effect` belongs in `devDependencies` and
+  `peerDependencies`, never in `dependencies`.
+- **Use `TransportError.fromUnknown`.** Building the error by hand makes you
+  guess `retryable` and throws away the status a caller needs.
+- **`sdkRefOf` is for address-owned and immutable inputs.** A shared object goes
+  in with `tx.sharedObjectRef({ objectId, initialSharedVersion, mutable })`,
+  reading `owner.Shared.initialSharedVersion`; a receiving object with
+  `tx.receivingRef`. Passing a shared object by `objectRef` produces bytes a
+  validator rejects.
+- **Under `Random.withSeed`, `SubmitConfig.nonce` is deterministic.** A test
+  that builds the same transaction twice and expects two different digests has
+  to provide `nonce` explicitly.
+- **`Tx.build` always simulates**, so call-count assertions on
+  `simulateTransaction` move when you move onto this build.
+- **A dynamic-field key may be a primitive.** Filter `name.type` with
+  `SuiSchema.matchesType`; `normalizeStructTag` throws on `u64`, `bool`,
+  `address` and `vector<u8>`.
+- **`Stream.runCollect` returns a plain `Array`** in Effect v4, not a `Chunk`.
+- **`Effect.withConfigProvider` does not exist** in rc.112: provide the
+  `ConfigProvider` service.
+- **`SuiError.describe` covers `GraphQLUnavailable` and `ExtensionNotReady`**,
+  and `Script.run` prints them like any other tag.

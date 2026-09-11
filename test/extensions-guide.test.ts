@@ -6,11 +6,20 @@
  * file — allowing for the block having been dedented out of a class or a
  * function body. So a change to the template that invalidates the guide fails
  * here rather than misleading a reader.
+ *
+ * The one exception is a block preceded by `<!-- inline -->`: a short,
+ * self-contained illustration of an idiom that has no home in the template — a
+ * two-line `Stream` pipeline, a call whose whole point is its signature. It is
+ * declared rather than assumed, so "this block is not checked" is a visible
+ * choice in the template and not an accident.
  */
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 
 const GUIDE = "docs/extensions.md"
+
+/** The marker a self-contained illustration carries instead of a source file. */
+const INLINE = "<inline>"
 
 interface Block {
   readonly source: string | undefined
@@ -26,6 +35,11 @@ const parse = (markdown: string): ReadonlyArray<Block> => {
   let index = 0
   while (index < lines.length) {
     const line = lines[index] ?? ""
+    if (line === "<!-- inline -->") {
+      source = INLINE
+      index += 1
+      continue
+    }
     const marker = /^<!-- from: (.+) -->$/.exec(line)
     if (marker !== null) {
       source = marker[1]
@@ -64,11 +78,20 @@ const containsBlock = (fileText: string, code: string): boolean => {
 
 const guide = readFileSync(GUIDE, "utf8")
 const blocks = parse(guide)
-const codeBlocks = blocks.filter((block) => block.lang === "ts" || block.lang === "json")
+const codeBlocks = blocks.filter(
+  (block) => (block.lang === "ts" || block.lang === "json") && block.source !== INLINE
+)
+const inlineBlocks = blocks.filter((block) => block.source === INLINE)
 
 describe("docs/extensions.md", () => {
   test("has code blocks at all", () => {
     expect(codeBlocks.length).toBeGreaterThan(15)
+  })
+
+  test("the inline illustrations stay few", () => {
+    // They are the exception. A guide whose examples have drifted away from the
+    // package they document is the failure mode this file exists to prevent.
+    expect(inlineBlocks.length).toBeLessThanOrEqual(6)
   })
 
   test("every code block names the template file it came from", () => {

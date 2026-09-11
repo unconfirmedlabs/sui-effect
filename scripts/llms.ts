@@ -153,6 +153,20 @@ const fieldsOf = (
     .join("\n")
 }
 
+/**
+ * The emitted declaration without its `private` members.
+ *
+ * `Executed` is a `Schema.Class` with private helpers, and the emitter writes
+ * them into the `.d.ts` as `private typeOf;` — a name with no type and no
+ * meaning to a caller, which is worse than nothing in a document whose whole
+ * job is the public surface. Never fails.
+ */
+const withoutPrivateMembers = (text: string): string =>
+  text
+    .split("\n")
+    .filter((line) => !/^\s*private\s/.test(line))
+    .join("\n")
+
 /** Past this, a one-line type is broken across lines the way the emitter does. */
 const MAX_INLINE_TYPE = 200
 
@@ -254,7 +268,7 @@ const signatureOf = (
   declaration: ts.Declaration,
   checker: ts.TypeChecker
 ): string => {
-  const text = withBrandNames(declaration.getText())
+  const text = withoutPrivateMembers(withBrandNames(declaration.getText()))
   if (ts.isClassDeclaration(declaration) && declaration.members.length === 0) {
     // A `Schema.TaggedError` class has an empty body and an extends clause the
     // emitter names `X_base`, so the fields are only visible on the type.
@@ -266,10 +280,13 @@ const signatureOf = (
   const prefix = ts.isVariableStatement(statement) ? "declare const " : ""
   const type = checker.getTypeOfSymbolAtLocation(symbol, declaration)
   const decoded = type.getProperty("Type")
-  // A schema's declaration is pages of combinator soup, and the half a caller
-  // uses is the type it decodes to, so that is printed underneath it.
-  return decoded === undefined ? `${prefix}${text}` : [
-    `${prefix}${text}`,
+  if (decoded === undefined) return `${prefix}${text}`
+  // A schema's own declaration is pages of `Schema.Struct` combinator soup —
+  // most of the 7,468 lines this file used to be — and none of it is what a
+  // caller holds. What a caller holds is the type it decodes to, so that is all
+  // that is printed: the name, and the decoded type under it.
+  return [
+    `${prefix}${declaration.name.getText()}: Schema`,
     decodesTo(typeTextOf(decoded, declaration, checker))
   ].join("\n")
 }
@@ -303,7 +320,10 @@ const docOfDeclaration = (declaration: ts.Declaration): string =>
 const errorsOf = (doc: string): string | undefined => {
   const fails = /Fails with:[\s\S]*?(?:\.\s*$|\.\n|\.$)/m.exec(doc)
   if (fails !== null) return fails[0].replace(/\s+/g, " ").trim()
-  return /Never fails\.?/.test(doc) ? "Never fails." : undefined
+  // The period is required. `fromService` says "Never fails, except a `warm`
+  // registration, which throws ...", and printing **Never fails.** under it
+  // contradicted the paragraph directly above.
+  return /Never fails\./.test(doc) ? "Never fails." : undefined
 }
 
 /** The JSDoc without the error sentence, which is printed on its own. */
@@ -318,10 +338,24 @@ const summaryOf = (doc: string): string => {
   return withoutExamples.replace(/\{@link\s+([^}]+)\}/g, "`$1`").trim()
 }
 
+/**
+ * Where each declaration was printed in full, so the second subpath that
+ * re-exports it says so in one line instead of repeating it.
+ *
+ * `Built`, `chainOf`, `maxEpochOf`, `maxTimestampMsOf`, `Signature` and
+ * `TransactionExpiration` are all `sui-effect` names that `sui-effect/tx`
+ * re-exports, and `Journal` is in both `sui-effect/tx` and
+ * `sui-effect/journal`. The key is the declaration, not the name: `Tx.run` and
+ * `Script.run` are two different functions that happen to share one.
+ */
+type Rendered = Map<ts.Declaration, string>
+
 const renderSymbol = (
   symbol: ts.Symbol,
   checker: ts.TypeChecker,
-  depth: number
+  depth: number,
+  rendered: Rendered,
+  subpath: string
 ): string | undefined => {
   const target = (symbol.flags & ts.SymbolFlags.Alias) !== 0
     ? checker.getAliasedSymbol(symbol)
@@ -334,10 +368,21 @@ const renderSymbol = (
   if (ts.isSourceFile(declaration)) {
     const members = checker
       .getExportsOfModule(target)
-      .map((member) => renderSymbol(member, checker, depth + 1))
+      .map((member) => renderSymbol(member, checker, depth + 1, rendered, subpath))
       .filter((section): section is string => section !== undefined)
     return [`${"#".repeat(depth)} \`${symbol.getName()}\` (namespace)`, "", ...members].join("\n")
   }
+
+  const first = rendered.get(declaration)
+  if (first !== undefined && first !== subpath) {
+    return [
+      `${"#".repeat(depth)} \`${symbol.getName()}\` (${kindOf(declaration)})`,
+      "",
+      `Re-exported from \`${first}\`.`,
+      ""
+    ].join("\n")
+  }
+  rendered.set(declaration, subpath)
 
   const doc = docOfDeclaration(declaration)
   const summary = summaryOf(doc)
@@ -355,15 +400,31 @@ const renderSymbol = (
   return lines.join("\n")
 }
 
-const renderApi = (): string => {
-  const files = SUBPATHS.map((subpath) => subpath.file)
-  for (const file of files) {
+/**
+ * The emitted declarations this generator reads, or the first one that is
+ * missing.
+ *
+ * `render` needs `dist/`, and `dist/` is a build away. A test that calls
+ * `render` in a tree that was never built has to *skip* with that sentence
+ * rather than kill the whole `bun test` run, which is what exiting the process
+ * from in here used to do. Never fails.
+ */
+export const missingDeclaration = (): string | undefined => {
+  for (const { file } of SUBPATHS) {
     try {
       statSync(file)
     } catch {
-      console.error(`${file} is missing: run \`bun run build\` first.`)
-      process.exit(1)
+      return file
     }
+  }
+  return undefined
+}
+
+const renderApi = (): string => {
+  const files = SUBPATHS.map((subpath) => subpath.file)
+  const missing = missingDeclaration()
+  if (missing !== undefined) {
+    throw new Error(`${missing} is missing: run \`bun run build\` first.`)
   }
   const program = ts.createProgram({
     rootNames: [...files],
@@ -378,18 +439,16 @@ const renderApi = (): string => {
   })
   const checker = program.getTypeChecker()
   const sections: Array<string> = []
+  const printed: Rendered = new Map()
   for (const subpath of SUBPATHS) {
     const source = program.getSourceFile(subpath.file)
-    if (source === undefined) {
-      console.error(`${subpath.file} is not in the program`)
-      process.exit(1)
-    }
+    if (source === undefined) throw new Error(`${subpath.file} is not in the program`)
     const moduleSymbol = checker.getSymbolAtLocation(source)
     const moduleDoc = moduleSymbol === undefined ? "" : summaryOf(docOf(moduleSymbol, checker))
     const exports = moduleSymbol === undefined ? [] : checker.getExportsOfModule(moduleSymbol)
     const rendered = [...exports]
       .sort((left, right) => left.getName().localeCompare(right.getName()))
-      .map((symbol) => renderSymbol(symbol, checker, 3))
+      .map((symbol) => renderSymbol(symbol, checker, 3, printed, subpath.name))
       .filter((section): section is string => section !== undefined)
     sections.push(
       [

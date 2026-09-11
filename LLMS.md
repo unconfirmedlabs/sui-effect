@@ -22,12 +22,7 @@ contract for building an extension package on top of it.
 ### `Balance` (const)
 
 ```ts
-declare const Balance: Schema.Struct<{
-    readonly coinType: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "CoinType">;
-    readonly balance: Schema.brand<Schema.BigIntFromString, "Mist">;
-    readonly coinBalance: Schema.brand<Schema.BigIntFromString, "Mist">;
-    readonly addressBalance: Schema.brand<Schema.BigIntFromString, "Mist">;
-}>
+declare const Balance: Schema
 // decodes to: { readonly coinType: CoinType; readonly balance: Mist; readonly coinBalance: Mist; readonly addressBalance: Mist; }
 ```
 
@@ -36,11 +31,7 @@ A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`.
 ### `BalanceChange` (const)
 
 ```ts
-declare const BalanceChange: Schema.Struct<{
-    readonly coinType: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "CoinType">;
-    readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    readonly amount: Schema.BigIntFromString;
-}>
+declare const BalanceChange: Schema
 // decodes to: { readonly coinType: CoinType; readonly address: SuiAddress; readonly amount: bigint; }
 ```
 
@@ -68,45 +59,7 @@ The transaction could not be built into bytes.
 ### `Built` (const)
 
 ```ts
-declare const Built: Schema.Struct<{
-    readonly digest: Schema.brand<Schema.String, "Digest">;
-    readonly bytes: Schema.Uint8ArrayFromBase64;
-    readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    readonly gasOwner: Schema.optional<Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">>;
-    readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-        readonly $kind: Schema.Literal<"None">;
-        readonly None: Schema.Literal<true>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Epoch">;
-        readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ValidDuring">;
-        readonly ValidDuring: Schema.Struct<{
-            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly chain: Schema.String;
-            readonly nonce: Schema.Number;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Validity">;
-        readonly Validity: Schema.Struct<{
-            readonly allowedProposers: Schema.NullOr<Schema.Struct<{
-                readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-                readonly proposers: Schema.$Array<Schema.Number>;
-            }>>;
-            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly chain: Schema.String;
-            readonly nonce: Schema.Number;
-        }>;
-    }>]>>;
-    /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
-    readonly chain: Schema.optional<Schema.String>;
-}>
+declare const Built: Schema
 // decodes to:
 // {
 //     readonly digest: Digest;
@@ -172,62 +125,7 @@ carry no chain of their own.
 ### `ChangedObject` (const)
 
 ```ts
-declare const ChangedObject: Schema.Struct<{
-    readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
-    readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-    readonly inputDigest: Schema.NullOr<Schema.String>;
-    readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-        readonly $kind: Schema.Literal<"AddressOwner">;
-        readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ObjectOwner">;
-        readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Shared">;
-        readonly Shared: Schema.Struct<{
-            readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Immutable">;
-        readonly Immutable: Schema.Literal<true>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-        readonly ConsensusAddressOwner: Schema.Struct<{
-            readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-            readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Unknown">;
-    }>]>>;
-    readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
-    readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-    readonly outputDigest: Schema.NullOr<Schema.String>;
-    readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-        readonly $kind: Schema.Literal<"AddressOwner">;
-        readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ObjectOwner">;
-        readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Shared">;
-        readonly Shared: Schema.Struct<{
-            readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Immutable">;
-        readonly Immutable: Schema.Literal<true>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-        readonly ConsensusAddressOwner: Schema.Struct<{
-            readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-            readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Unknown">;
-    }>]>>;
-    readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
-}>
+declare const ChangedObject: Schema
 // decodes to:
 // {
 //     readonly objectId: ObjectId;
@@ -313,13 +211,7 @@ rather than being handed a fabricated version 0.
 ### `CleverError` (const)
 
 ```ts
-declare const CleverError: Schema.Struct<{
-    readonly errorCode: Schema.optional<Schema.Number>;
-    readonly lineNumber: Schema.optional<Schema.Number>;
-    readonly constantName: Schema.optional<Schema.String>;
-    readonly constantType: Schema.optional<Schema.String>;
-    readonly value: Schema.optional<Schema.String>;
-}>
+declare const CleverError: Schema
 // decodes to:
 // {
 //     readonly errorCode?: number | undefined;
@@ -335,7 +227,7 @@ A decoded `#[error]` constant. Mirrors `SuiClientTypes.CleverError`.
 ### `CoinType` (const)
 
 ```ts
-declare const CoinType: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "CoinType">
+declare const CoinType: Schema
 // decodes to: CoinType
 ```
 
@@ -344,14 +236,7 @@ A coin type: a struct tag used as the type argument of `0x2::coin::Coin`.
 ### `CommandResult` (const)
 
 ```ts
-declare const CommandResult: Schema.Struct<{
-    readonly returnValues: Schema.$Array<Schema.Struct<{
-        readonly bcs: Schema.Uint8Array;
-    }>>;
-    readonly mutatedReferences: Schema.$Array<Schema.Struct<{
-        readonly bcs: Schema.Uint8Array;
-    }>>;
-}>
+declare const CommandResult: Schema
 // decodes to: { readonly returnValues: readonly { readonly bcs: Uint8Array<ArrayBufferLike>; }[]; readonly mutatedReferences: readonly { readonly bcs: Uint8Array<ArrayBufferLike>; }[]; }
 ```
 
@@ -384,7 +269,7 @@ Returns `undefined` for any other network.
 ### `Digest` (const)
 
 ```ts
-declare const Digest: Schema.brand<Schema.String, "Digest">
+declare const Digest: Schema
 // decodes to: Digest
 ```
 
@@ -393,23 +278,7 @@ A base58 transaction digest. Not normalized; rejected when not 32 bytes.
 ### `DynamicField` (const)
 
 ```ts
-declare const DynamicField: Schema.Struct<{
-    readonly fieldId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    readonly type: Schema.String;
-    readonly name: Schema.Struct<{
-        readonly type: Schema.String;
-        readonly bcs: Schema.Uint8Array;
-    }>;
-    readonly valueType: Schema.String;
-    readonly $kind: Schema.Literals<readonly ["DynamicField", "DynamicObject"]>;
-    readonly childId: Schema.optional<Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">>;
-    readonly value: Schema.Struct<{
-        readonly type: Schema.String;
-        readonly bcs: Schema.Uint8Array;
-    }>;
-    readonly version: Schema.brand<Schema.BigIntFromString, "Version">;
-    readonly digest: Schema.String;
-}>
+declare const DynamicField: Schema
 // decodes to:
 // {
 //     readonly digest: string;
@@ -435,17 +304,7 @@ A dynamic field with its value. Mirrors `SuiClientTypes.DynamicField`.
 ### `DynamicFieldEntry` (const)
 
 ```ts
-declare const DynamicFieldEntry: Schema.Struct<{
-    readonly fieldId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    readonly type: Schema.String;
-    readonly name: Schema.Struct<{
-        readonly type: Schema.String;
-        readonly bcs: Schema.Uint8Array;
-    }>;
-    readonly valueType: Schema.String;
-    readonly $kind: Schema.Literals<readonly ["DynamicField", "DynamicObject"]>;
-    readonly childId: Schema.optional<Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">>;
-}>
+declare const DynamicFieldEntry: Schema
 // decodes to:
 // {
 //     readonly $kind: "DynamicField" | "DynamicObject";
@@ -465,10 +324,7 @@ One entry of a dynamic-field listing. Mirrors `SuiClientTypes.DynamicFieldEntry`
 ### `DynamicFieldName` (const)
 
 ```ts
-declare const DynamicFieldName: Schema.Struct<{
-    readonly type: Schema.String;
-    readonly bcs: Schema.Uint8Array;
-}>
+declare const DynamicFieldName: Schema
 // decodes to: { readonly type: string; readonly bcs: Uint8Array<ArrayBufferLike>; }
 ```
 
@@ -477,13 +333,7 @@ The BCS-encoded name of a dynamic field. Mirrors `SuiClientTypes.DynamicFieldNam
 ### `Event` (const)
 
 ```ts
-declare const Event: Schema.Struct<{
-    readonly packageId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    readonly module: Schema.String;
-    readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    readonly eventType: Schema.String;
-    readonly bcs: Schema.Uint8Array;
-}>
+declare const Event: Schema
 // decodes to: { readonly packageId: ObjectId; readonly module: string; readonly sender: SuiAddress; readonly eventType: string; readonly bcs: Uint8Array<ArrayBufferLike>; }
 ```
 
@@ -498,16 +348,12 @@ export declare class Executed extends Executed_base {
      * package reports the literal `package` rather than a struct tag, so the
      * decode goes through {@link ObjectType}.
      */
-    private typeOf;
     /**
      * Everything the effects actually say about one changed object. Nothing is
      * invented: a field the node did not report stays `undefined`, so a caller
      * that needs a full builder reference can tell the difference between
      * "version 0" and "the node did not say".
      */
-    private refOf;
-    private select;
-    private static byType;
     /**
      * Objects this transaction created, optionally filtered by Move type
      * (compared with `normalizeStructTag`). Never fails.
@@ -547,8 +393,6 @@ export declare class Executed extends Executed_base {
      * Never fails.
      */
     wrapped(): ReadonlyArray<ChangedRef>;
-    private static isDeleted;
-    private static isWrapped;
     /**
      * Packages this transaction published (`PackageWrite` plus `Created`), as
      * full refs like every other accessor. A package's `type` is the literal
@@ -796,79 +640,7 @@ The transaction was applied on chain and failed. Gas was charged.
 ### `ExecutionReason` (const)
 
 ```ts
-declare const ExecutionReason: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-    readonly $kind: Schema.Literal<"MoveAbort">;
-    readonly MoveAbort: Schema.Struct<{
-        readonly abortCode: Schema.BigIntFromString;
-        readonly location: Schema.optional<Schema.Struct<{
-            readonly package: Schema.optional<Schema.String>;
-            readonly module: Schema.optional<Schema.String>;
-            readonly function: Schema.optional<Schema.Number>;
-            readonly functionName: Schema.optional<Schema.String>;
-            readonly instruction: Schema.optional<Schema.Number>;
-        }>>;
-        readonly cleverError: Schema.optional<Schema.Struct<{
-            readonly errorCode: Schema.optional<Schema.Number>;
-            readonly lineNumber: Schema.optional<Schema.Number>;
-            readonly constantName: Schema.optional<Schema.String>;
-            readonly constantType: Schema.optional<Schema.String>;
-            readonly value: Schema.optional<Schema.String>;
-        }>>;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"SizeError">;
-    readonly SizeError: Schema.Struct<{
-        readonly name: Schema.String;
-        readonly size: Schema.Number;
-        readonly maxSize: Schema.Number;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"CommandArgumentError">;
-    readonly CommandArgumentError: Schema.Struct<{
-        readonly argument: Schema.Number;
-        readonly name: Schema.String;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"TypeArgumentError">;
-    readonly TypeArgumentError: Schema.Struct<{
-        readonly typeArgument: Schema.Number;
-        readonly name: Schema.String;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"PackageUpgradeError">;
-    readonly PackageUpgradeError: Schema.Struct<{
-        readonly name: Schema.String;
-        readonly packageId: Schema.optional<Schema.String>;
-        readonly digest: Schema.optional<Schema.String>;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"IndexError">;
-    readonly IndexError: Schema.Struct<{
-        readonly index: Schema.optional<Schema.Number>;
-        readonly subresult: Schema.optional<Schema.Number>;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"CoinDenyListError">;
-    readonly CoinDenyListError: Schema.Struct<{
-        readonly name: Schema.String;
-        readonly coinType: Schema.String;
-        readonly address: Schema.optional<Schema.String>;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"CongestedObjects">;
-    readonly CongestedObjects: Schema.Struct<{
-        readonly name: Schema.String;
-        readonly objects: Schema.$Array<Schema.String>;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"ObjectIdError">;
-    readonly ObjectIdError: Schema.Struct<{
-        readonly name: Schema.optional<Schema.String>;
-        readonly objectId: Schema.String;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"Unknown">;
-}>]>
+declare const ExecutionReason: Schema
 // decodes to:
 // {
 //     readonly $kind: "MoveAbort";
@@ -954,9 +726,7 @@ carries the reason rather than being repeated in every variant.
 ### `ExecutionStatus` (const)
 
 ```ts
-declare const ExecutionStatus: Schema.Struct<{
-    readonly success: Schema.Boolean;
-}>
+declare const ExecutionStatus: Schema
 // decodes to: { readonly success: boolean; }
 ```
 
@@ -990,12 +760,7 @@ Outcome `not_applied`: nothing was sent.
 ### `GasCostSummary` (const)
 
 ```ts
-declare const GasCostSummary: Schema.Struct<{
-    readonly computationCost: Schema.brand<Schema.BigIntFromString, "Mist">;
-    readonly storageCost: Schema.brand<Schema.BigIntFromString, "Mist">;
-    readonly storageRebate: Schema.brand<Schema.BigIntFromString, "Mist">;
-    readonly nonRefundableStorageFee: Schema.brand<Schema.BigIntFromString, "Mist">;
-}>
+declare const GasCostSummary: Schema
 // decodes to: { readonly computationCost: Mist; readonly storageCost: Mist; readonly storageRebate: Mist; readonly nonRefundableStorageFee: Mist; }
 ```
 
@@ -1038,8 +803,13 @@ export interface HasOutcome {
 }
 ```
 
-An extension error may declare its own outcome; `SuiError.outcome` and
-`Script.run` honour it and default to `"not_applied"`.
+An extension error may declare its own `outcome`, and `SuiError.outcome` and
+`Script.run` honour it before anything else.
+
+An error that declares none and carries a tag the taxonomy does not own is
+`"unknown"`, not `"not_applied"`: a tag this library has never heard of says
+nothing about whether a transaction applied, and `"not_applied"` would tell
+the documented retry idiom to send again on no evidence at all.
 
 ### `JournalError` (class)
 
@@ -1066,7 +836,7 @@ and `Sui.layerNoDeps` records whatever the node reports instead of asserting.
 ### `KnownNetwork` (const)
 
 ```ts
-declare const KnownNetwork: Schema.Literals<readonly ["mainnet", "testnet", "devnet", "localnet"]>
+declare const KnownNetwork: Schema
 // decodes to: "mainnet" | "testnet" | "devnet" | "localnet"
 ```
 
@@ -1098,10 +868,20 @@ margin to reason about it.
 declare const maxTimestampMsOf: (expiration: TransactionExpiration | undefined) => bigint | undefined
 ```
 
+The wall-clock bound after which a transaction can no longer be applied, in
+milliseconds, or `undefined` when its expiration sets no such bound — which
+is `None`, `Epoch`, and the default `ValidDuring`, whose `maxTimestamp` is
+`null` unless `SubmitConfig.validFor` asks for one.
+
+`Tx.reconcile` compares it against `chainTime` with
+`SubmitConfig.expiryMargin` for skew, which the epoch bound needs none of.
+
+**Never fails.**
+
 ### `Mist` (const)
 
 ```ts
-declare const Mist: Schema.brand<Schema.BigIntFromString, "Mist">
+declare const Mist: Schema
 // decodes to: Mist
 ```
 
@@ -1110,13 +890,7 @@ An amount in MIST. Encoded as the decimal string every SDK response uses.
 ### `MoveLocation` (const)
 
 ```ts
-declare const MoveLocation: Schema.Struct<{
-    readonly package: Schema.optional<Schema.String>;
-    readonly module: Schema.optional<Schema.String>;
-    readonly function: Schema.optional<Schema.Number>;
-    readonly functionName: Schema.optional<Schema.String>;
-    readonly instruction: Schema.optional<Schema.Number>;
-}>
+declare const MoveLocation: Schema
 // decodes to:
 // {
 //     readonly function?: number | undefined;
@@ -1135,7 +909,7 @@ package that no longer parses as an object id.
 ### `Network` (const)
 
 ```ts
-declare const Network: Schema.brand<Schema.String, "Network">
+declare const Network: Schema
 // decodes to: Network
 ```
 
@@ -1163,24 +937,26 @@ export declare class NotApplied extends NotApplied_base {
 
 The transaction provably cannot have been applied, and never will be.
 
-`evidence` is why. `"inputConsumed"` is only ever produced when the node
-named a **different** transaction as the consuming one: an owned input that
-merely moved on, with no readable `previousTransaction`, is
-`SubmissionUnknown`, not this.
+`evidence` is why. `"inputConsumed"` is only ever produced when a
+**different** transaction's own effects report that it took a pinned object
+at exactly the version these bytes pinned. An owned input that merely moved
+on, one whose consumer took a later version, and one whose last mutation the
+node will not name are all `SubmissionUnknown`, not this.
 
 ### `NotAppliedEvidence` (const)
 
 ```ts
-declare const NotAppliedEvidence: Schema.Literals<readonly ["expired", "inputConsumed"]>
+declare const NotAppliedEvidence: Schema
 // decodes to: "expired" | "inputConsumed"
 ```
 
 Why a transaction provably never applied, and never will.
 
-`"expired"`: `chainTime` has passed the `maxTimestamp` in the bytes by more
-than `SubmitConfig.expiryMargin`. `"inputConsumed"`: an owned input the
-transaction pinned was consumed by a **different** transaction, whose digest
-the node reported as that object's `previousTransaction`.
+`"expired"`: the expiration window was observed closed — the current epoch
+past the recorded `maxEpoch`, or `chainTime` past a recorded `maxTimestamp`
+by more than `SubmitConfig.expiryMargin` — around a `getTransaction` miss,
+twice. `"inputConsumed"`: a **different** transaction's own effects report
+that it took an object these bytes pinned at exactly the version they pinned.
 
 Shared by `NotApplied` and by the journal entry that records it, so the two
 cannot drift.
@@ -1199,35 +975,7 @@ The object existed and has been deleted or wrapped.
 ### `ObjectEnvelope` (const)
 
 ```ts
-declare const ObjectEnvelope: Schema.Struct<{
-    readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    readonly version: Schema.brand<Schema.BigIntFromString, "Version">;
-    readonly digest: Schema.String;
-    readonly owner: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-        readonly $kind: Schema.Literal<"AddressOwner">;
-        readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ObjectOwner">;
-        readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Shared">;
-        readonly Shared: Schema.Struct<{
-            readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Immutable">;
-        readonly Immutable: Schema.Literal<true>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-        readonly ConsensusAddressOwner: Schema.Struct<{
-            readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-            readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Unknown">;
-    }>]>;
-    readonly type: Schema.Union<readonly [Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "StructTag">, Schema.Literal<"package">]>;
-}>
+declare const ObjectEnvelope: Schema
 // decodes to:
 // {
 //     readonly objectId: ObjectId;
@@ -1266,7 +1014,7 @@ the owner, type, version and digest the SDK returns unconditionally.
 ### `ObjectId` (const)
 
 ```ts
-declare const ObjectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">
+declare const ObjectId: Schema
 // decodes to: ObjectId
 ```
 
@@ -1295,35 +1043,7 @@ The object does not exist, or has never existed.
 ### `ObjectRef` (const)
 
 ```ts
-declare const ObjectRef: Schema.Struct<{
-    readonly id: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    readonly type: Schema.Union<readonly [Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "StructTag">, Schema.Literal<"package">]>;
-    readonly version: Schema.brand<Schema.BigIntFromString, "Version">;
-    readonly digest: Schema.String;
-    readonly owner: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-        readonly $kind: Schema.Literal<"AddressOwner">;
-        readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ObjectOwner">;
-        readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Shared">;
-        readonly Shared: Schema.Struct<{
-            readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Immutable">;
-        readonly Immutable: Schema.Literal<true>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-        readonly ConsensusAddressOwner: Schema.Struct<{
-            readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-            readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Unknown">;
-    }>]>;
-}>
+declare const ObjectRef: Schema
 // decodes to:
 // {
 //     readonly id: ObjectId;
@@ -1373,7 +1093,7 @@ every field the builder needs.
 ### `ObjectType` (const)
 
 ```ts
-declare const ObjectType: Schema.Union<readonly [Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "StructTag">, Schema.Literal<"package">]>
+declare const ObjectType: Schema
 // decodes to: "package" | StructTag
 ```
 
@@ -1405,29 +1125,7 @@ or a wrapper script acts on.
 ### `Owner` (const)
 
 ```ts
-declare const Owner: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-    readonly $kind: Schema.Literal<"AddressOwner">;
-    readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"ObjectOwner">;
-    readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"Shared">;
-    readonly Shared: Schema.Struct<{
-        readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"Immutable">;
-    readonly Immutable: Schema.Literal<true>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-    readonly ConsensusAddressOwner: Schema.Struct<{
-        readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-        readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"Unknown">;
-}>]>
+declare const Owner: Schema
 // decodes to:
 // {
 //     readonly $kind: "AddressOwner";
@@ -1519,7 +1217,7 @@ object has no output version, and nothing can be consumed without both.
 ### `Signature` (const)
 
 ```ts
-declare const Signature: Schema.brand<Schema.String, "Signature">
+declare const Signature: Schema
 // decodes to: Signature
 ```
 
@@ -1530,55 +1228,7 @@ where a digest or an address is expected.
 ### `SignedTransaction` (const)
 
 ```ts
-declare const SignedTransaction: Schema.Struct<{
-    readonly digest: Schema.brand<Schema.String, "Digest">;
-    readonly bytes: Schema.Uint8ArrayFromBase64;
-    readonly signatures: Schema.$Array<Schema.brand<Schema.String, "Signature">>;
-    readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-        readonly $kind: Schema.Literal<"None">;
-        readonly None: Schema.Literal<true>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Epoch">;
-        readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ValidDuring">;
-        readonly ValidDuring: Schema.Struct<{
-            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly chain: Schema.String;
-            readonly nonce: Schema.Number;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Validity">;
-        readonly Validity: Schema.Struct<{
-            readonly allowedProposers: Schema.NullOr<Schema.Struct<{
-                readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-                readonly proposers: Schema.$Array<Schema.Number>;
-            }>>;
-            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly chain: Schema.String;
-            readonly nonce: Schema.Number;
-        }>;
-    }>]>>;
-    /**
-     * The chain identifier the bytes were built against, recorded by `Tx.build`
-     * so `Tx.reconcile` can refuse to reason about a transaction with a node on
-     * another chain.
-     *
-     * A `ValidDuring` or `Validity` expiration already names its chain, and that
-     * is what is compared when it is there. This field is what an `Epoch` or
-     * `None` expiration — which name no chain at all — leaves behind instead, so
-     * a process-wide journal holding submissions from two networks cannot settle
-     * one of them against the other's epoch.
-     */
-    readonly chain: Schema.optional<Schema.String>;
-}>
+declare const SignedTransaction: Schema
 // decodes to:
 // {
 //     readonly digest: Digest;
@@ -1642,165 +1292,7 @@ A signer refused or failed to produce a signature.
 ### `Simulation` (const)
 
 ```ts
-declare const Simulation: Schema.Struct<{
-    readonly digest: Schema.brand<Schema.String, "Digest">;
-    readonly effects: Schema.Struct<{
-        readonly version: Schema.Number;
-        readonly status: Schema.Struct<{
-            readonly success: Schema.Boolean;
-        }>;
-        readonly gasUsed: Schema.Struct<{
-            readonly computationCost: Schema.brand<Schema.BigIntFromString, "Mist">;
-            readonly storageCost: Schema.brand<Schema.BigIntFromString, "Mist">;
-            readonly storageRebate: Schema.brand<Schema.BigIntFromString, "Mist">;
-            readonly nonRefundableStorageFee: Schema.brand<Schema.BigIntFromString, "Mist">;
-        }>;
-        readonly transactionDigest: Schema.brand<Schema.String, "Digest">;
-        readonly gasObject: Schema.NullOr<Schema.Struct<{
-            readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-            readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
-            readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-            readonly inputDigest: Schema.NullOr<Schema.String>;
-            readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-                readonly $kind: Schema.Literal<"AddressOwner">;
-                readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ObjectOwner">;
-                readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Shared">;
-                readonly Shared: Schema.Struct<{
-                    readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Immutable">;
-                readonly Immutable: Schema.Literal<true>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-                readonly ConsensusAddressOwner: Schema.Struct<{
-                    readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                    readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Unknown">;
-            }>]>>;
-            readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
-            readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-            readonly outputDigest: Schema.NullOr<Schema.String>;
-            readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-                readonly $kind: Schema.Literal<"AddressOwner">;
-                readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ObjectOwner">;
-                readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Shared">;
-                readonly Shared: Schema.Struct<{
-                    readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Immutable">;
-                readonly Immutable: Schema.Literal<true>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-                readonly ConsensusAddressOwner: Schema.Struct<{
-                    readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                    readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Unknown">;
-            }>]>>;
-            readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
-        }>>;
-        readonly eventsDigest: Schema.NullOr<Schema.String>;
-        readonly dependencies: Schema.$Array<Schema.String>;
-        readonly lamportVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-        readonly changedObjects: Schema.$Array<Schema.Struct<{
-            readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-            readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
-            readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-            readonly inputDigest: Schema.NullOr<Schema.String>;
-            readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-                readonly $kind: Schema.Literal<"AddressOwner">;
-                readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ObjectOwner">;
-                readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Shared">;
-                readonly Shared: Schema.Struct<{
-                    readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Immutable">;
-                readonly Immutable: Schema.Literal<true>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-                readonly ConsensusAddressOwner: Schema.Struct<{
-                    readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                    readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Unknown">;
-            }>]>>;
-            readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
-            readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-            readonly outputDigest: Schema.NullOr<Schema.String>;
-            readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-                readonly $kind: Schema.Literal<"AddressOwner">;
-                readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ObjectOwner">;
-                readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Shared">;
-                readonly Shared: Schema.Struct<{
-                    readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Immutable">;
-                readonly Immutable: Schema.Literal<true>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-                readonly ConsensusAddressOwner: Schema.Struct<{
-                    readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                    readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Unknown">;
-            }>]>>;
-            readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
-        }>>;
-        readonly unchangedConsensusObjects: Schema.$Array<Schema.Struct<{
-            readonly kind: Schema.Literals<readonly ["Unknown", "ReadOnlyRoot", "MutateConsensusStreamEnded", "ReadConsensusStreamEnded", "Cancelled", "PerEpochConfig"]>;
-            readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-            readonly version: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-            readonly digest: Schema.NullOr<Schema.String>;
-        }>>;
-        readonly auxiliaryDataDigest: Schema.NullOr<Schema.String>;
-    }>;
-    readonly events: Schema.$Array<Schema.Struct<{
-        readonly packageId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-        readonly module: Schema.String;
-        readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        readonly eventType: Schema.String;
-        readonly bcs: Schema.Uint8Array;
-    }>>;
-    readonly balanceChanges: Schema.$Array<Schema.Struct<{
-        readonly coinType: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "CoinType">;
-        readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        readonly amount: Schema.BigIntFromString;
-    }>>;
-    readonly objectTypes: Schema.$Record<Schema.String, Schema.String>;
-    readonly commandResults: Schema.$Array<Schema.Struct<{
-        readonly returnValues: Schema.$Array<Schema.Struct<{
-            readonly bcs: Schema.Uint8Array;
-        }>>;
-        readonly mutatedReferences: Schema.$Array<Schema.Struct<{
-            readonly bcs: Schema.Uint8Array;
-        }>>;
-    }>>;
-}>
+declare const Simulation: Schema
 // decodes to:
 // {
 //     readonly digest: Digest;
@@ -2062,7 +1554,7 @@ The failures of a simulation.
 ### `StructTag` (const)
 
 ```ts
-declare const StructTag: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "StructTag">
+declare const StructTag: Schema
 // decodes to: StructTag
 ```
 
@@ -2179,7 +1671,7 @@ The opinionated tier.
 ### `SuiAddress` (const)
 
 ```ts
-declare const SuiAddress: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">
+declare const SuiAddress: Schema
 // decodes to: SuiAddress
 ```
 
@@ -2364,6 +1856,32 @@ export declare class SuiGraphQL extends SuiGraphQL_base {
      * knows why the endpoint is missing. Never fails to build.
      */
     static readonly layerUnavailableWith: (reason: string) => Layer.Layer<SuiGraphQL>;
+    /**
+     * One call against the GraphQL client, with the two failures already sorted.
+     *
+     * Every extension that reads GraphQL was re-deriving the same three lines:
+     * yield the client, `Effect.tryPromise`, and remember that a rejection from
+     * `layerUnavailable` is already a `GraphQLUnavailable` and must be passed
+     * through rather than wrapped in a `TransportError` that hides why the
+     * endpoint was missing. This is those three lines, once.
+     *
+     * `method` is what a `TransportError` is labelled with; give the query's own
+     * name so a log says which read failed.
+     *
+     * Fails with: `GraphQLUnavailable` (there is no usable endpoint),
+     * `TransportError` (the call reached one and failed).
+     *
+     * @example
+     * ```ts
+     * import { SuiGraphQL } from "sui-effect"
+     *
+     * const chain = SuiGraphQL.query(
+     *   (client) => client.query({ query: "{ chainIdentifier }" }),
+     *   "chainIdentifier"
+     * )
+     * ```
+     */
+    static readonly query: <A>(run: (client: SuiGraphQLClient) => Promise<A>, method?: string) => Effect.Effect<A, GraphQLUnavailable | TransportError, SuiGraphQL>;
 }
 ```
 
@@ -2474,6 +1992,42 @@ give it and the same tag check `getObject` does runs here, under the
 the error so an operator knows which object did not decode.
 
 **Fails with: `DecodeError`.**
+
+#### `matchesType` (const)
+
+```ts
+declare const typeMatches: (expected: string, actual: string) => boolean
+```
+
+Whether an object's type tag satisfies an expected type.
+
+One rule, used everywhere a Move type is checked — the BCS bridge, the
+`expectedType` option of `Sui.getObject`, `getObjectOption` and `getObjects`,
+`SuiSchema.decode`, and the fake's owned-object filter:
+
+- **An expected tag with no type arguments names the generic itself**, so
+  `pkg::m::Composition` matches every instantiation:
+  `pkg::m::Composition<0x…::share::Share>` included. Only
+  `address::module::name` is compared, with the address normalized. This is
+  what a node does when a bare type is used as a filter, and it is what makes
+  a generic Move type usable with the bridge at all: a codec is written once
+  for `Composition<T>`, and the instantiation lives on the object.
+- **An expected tag that carries type arguments is compared in full**, after
+  `normalizeStructTag`, so `Coin<0x2::sui::SUI>` and its padded spelling are
+  the same type and `Coin<0x2::sui::SUI>` does not match `Coin<0x…::usdc::USDC>`.
+
+Anything that is not a struct tag — the literal `package`, a primitive — is
+compared as a normalized string. The object keeps its own instantiated type
+on `SuiObject.type`; this only decides whether the bytes may be decoded.
+
+**It never throws, which is the reason it is public** as
+`SuiSchema.matchesType`. A dynamic field's `name.type` is legally a primitive
+— `u64`, `bool`, `address`, `vector<u8>` — and the SDK's own
+`normalizeStructTag` throws on every one of them, so the obvious way to
+filter a `streamDynamicFields` by key type dies on the first `u64` key.
+Comparing tags with this is safe on any string at all.
+
+**Never fails.**
 
 ### `SuiService` (interface)
 
@@ -2634,7 +2188,20 @@ export interface SuiService {
     readonly streamOwnedObjects: (owner: SuiAddress, opts?: {
         readonly type?: StructTag;
     }) => Stream.Stream<SuiObject<Uint8Array>, TransportError>;
-    /** Every dynamic field of a parent, paginated. Fails with: `TransportError`. */
+    /**
+     * Every dynamic field of a parent, paginated.
+     *
+     * There is no key filter: the node has none, so a caller filters the stream
+     * on `entry.name.type`. Do that with `SuiSchema.matchesType`, not with the
+     * SDK's `normalizeStructTag` — a dynamic-field key is legally a primitive
+     * (`u64`, `bool`, `address`, `vector<u8>`) and `normalizeStructTag` throws on
+     * every one of them, which turns the first such key in a parent's fields into
+     * a defect. The value bytes are decoded with `SuiSchema.decode`, passing
+     * `actualType: entry.valueType` so the same tag check `Sui.getObject` does
+     * runs before a byte is parsed.
+     *
+     * Fails with: `TransportError`.
+     */
     readonly streamDynamicFields: (parent: ObjectId) => Stream.Stream<DynamicFieldEntry, TransportError>;
     /**
      * Serializes work for one sender, so two transactions from the same address
@@ -2649,141 +2216,7 @@ The opinionated tier over `SuiCore`.
 ### `TransactionEffects` (const)
 
 ```ts
-declare const TransactionEffects: Schema.Struct<{
-    readonly version: Schema.Number;
-    readonly status: Schema.Struct<{
-        readonly success: Schema.Boolean;
-    }>;
-    readonly gasUsed: Schema.Struct<{
-        readonly computationCost: Schema.brand<Schema.BigIntFromString, "Mist">;
-        readonly storageCost: Schema.brand<Schema.BigIntFromString, "Mist">;
-        readonly storageRebate: Schema.brand<Schema.BigIntFromString, "Mist">;
-        readonly nonRefundableStorageFee: Schema.brand<Schema.BigIntFromString, "Mist">;
-    }>;
-    readonly transactionDigest: Schema.brand<Schema.String, "Digest">;
-    readonly gasObject: Schema.NullOr<Schema.Struct<{
-        readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-        readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
-        readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-        readonly inputDigest: Schema.NullOr<Schema.String>;
-        readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-            readonly $kind: Schema.Literal<"AddressOwner">;
-            readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"ObjectOwner">;
-            readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Shared">;
-            readonly Shared: Schema.Struct<{
-                readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Immutable">;
-            readonly Immutable: Schema.Literal<true>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-            readonly ConsensusAddressOwner: Schema.Struct<{
-                readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Unknown">;
-        }>]>>;
-        readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
-        readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-        readonly outputDigest: Schema.NullOr<Schema.String>;
-        readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-            readonly $kind: Schema.Literal<"AddressOwner">;
-            readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"ObjectOwner">;
-            readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Shared">;
-            readonly Shared: Schema.Struct<{
-                readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Immutable">;
-            readonly Immutable: Schema.Literal<true>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-            readonly ConsensusAddressOwner: Schema.Struct<{
-                readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Unknown">;
-        }>]>>;
-        readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
-    }>>;
-    readonly eventsDigest: Schema.NullOr<Schema.String>;
-    readonly dependencies: Schema.$Array<Schema.String>;
-    readonly lamportVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-    readonly changedObjects: Schema.$Array<Schema.Struct<{
-        readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-        readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
-        readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-        readonly inputDigest: Schema.NullOr<Schema.String>;
-        readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-            readonly $kind: Schema.Literal<"AddressOwner">;
-            readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"ObjectOwner">;
-            readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Shared">;
-            readonly Shared: Schema.Struct<{
-                readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Immutable">;
-            readonly Immutable: Schema.Literal<true>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-            readonly ConsensusAddressOwner: Schema.Struct<{
-                readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Unknown">;
-        }>]>>;
-        readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
-        readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-        readonly outputDigest: Schema.NullOr<Schema.String>;
-        readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-            readonly $kind: Schema.Literal<"AddressOwner">;
-            readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"ObjectOwner">;
-            readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Shared">;
-            readonly Shared: Schema.Struct<{
-                readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Immutable">;
-            readonly Immutable: Schema.Literal<true>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
-            readonly ConsensusAddressOwner: Schema.Struct<{
-                readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
-                readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Unknown">;
-        }>]>>;
-        readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
-    }>>;
-    readonly unchangedConsensusObjects: Schema.$Array<Schema.Struct<{
-        readonly kind: Schema.Literals<readonly ["Unknown", "ReadOnlyRoot", "MutateConsensusStreamEnded", "ReadConsensusStreamEnded", "Cancelled", "PerEpochConfig"]>;
-        readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-        readonly version: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-        readonly digest: Schema.NullOr<Schema.String>;
-    }>>;
-    readonly auxiliaryDataDigest: Schema.NullOr<Schema.String>;
-}>
+declare const TransactionEffects: Schema
 // decodes to:
 // {
 //     readonly version: number;
@@ -2927,37 +2360,7 @@ Transaction effects. Mirrors `SuiClientTypes.TransactionEffects`.
 ### `TransactionExpiration` (const)
 
 ```ts
-declare const TransactionExpiration: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-    readonly $kind: Schema.Literal<"None">;
-    readonly None: Schema.Literal<true>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"Epoch">;
-    readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"ValidDuring">;
-    readonly ValidDuring: Schema.Struct<{
-        readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly chain: Schema.String;
-        readonly nonce: Schema.Number;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"Validity">;
-    readonly Validity: Schema.Struct<{
-        readonly allowedProposers: Schema.NullOr<Schema.Struct<{
-            readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-            readonly proposers: Schema.$Array<Schema.Number>;
-        }>>;
-        readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly chain: Schema.String;
-        readonly nonce: Schema.Number;
-    }>;
-}>]>
+declare const TransactionExpiration: Schema
 // decodes to:
 // {
 //     readonly $kind: "None";
@@ -2996,8 +2399,9 @@ When a transaction stops being valid. Mirrors the SDK's
 `TransactionExpiration` enum variant for variant, including its `$kind`
 discriminant, so our narrowing and `TransactionDataBuilder`'s agree.
 
-`ValidDuring` is what `Tx.build` sets by default: its `maxTimestamp` is the
-wall-clock bound `Tx.reconcile` reasons about, and its `chain` is a replay
+`ValidDuring` is what `Tx.build` sets by default, bounded by **epochs**:
+`maxTimestamp` is `null` unless `SubmitConfig.validFor` asks for one, because
+no Sui network accepts a timestamp expiration yet. Its `chain` is a replay
 guard, so bytes signed for testnet cannot land on mainnet.
 
 ### `TransactionLookupError` (type)
@@ -3067,12 +2471,7 @@ retried.
 ### `UnchangedConsensusObject` (const)
 
 ```ts
-declare const UnchangedConsensusObject: Schema.Struct<{
-    readonly kind: Schema.Literals<readonly ["Unknown", "ReadOnlyRoot", "MutateConsensusStreamEnded", "ReadConsensusStreamEnded", "Cancelled", "PerEpochConfig"]>;
-    readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
-    readonly version: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
-    readonly digest: Schema.NullOr<Schema.String>;
-}>
+declare const UnchangedConsensusObject: Schema
 // decodes to:
 // {
 //     readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
@@ -3106,7 +2505,7 @@ time for a transaction that already ran.
 ### `Version` (const)
 
 ```ts
-declare const Version: Schema.brand<Schema.BigIntFromString, "Version">
+declare const Version: Schema
 // decodes to: Version
 ```
 
@@ -3197,11 +2596,14 @@ An interrupted build cancels the request it started: the SDK is handed a
 client whose Core calls carry the Effect's `AbortSignal`.
 
 When the recipe set no expiration, `SubmitConfig.expiration` decides one.
-The default, `ValidDuring`, bounds the transaction at `chainTime` plus
-`SubmitConfig.validFor`, names the chain (bytes signed for testnet cannot
-land on mainnet) and carries a random nonce. The expiration that ends up in
-the bytes is recorded on the result, because it is what `Tx.reconcile` needs
-later to prove a transaction can no longer land.
+The default, `ValidDuring`, bounds the transaction to the **current epoch and
+the next**, names the chain (bytes signed for testnet cannot land on mainnet)
+and carries a `u32` nonce from `SubmitConfig.nonce`. There is **no
+wall-clock bound** unless `SubmitConfig.validFor` asks for one: no Sui
+network accepts a timestamp expiration yet, and a node refuses any
+transaction carrying one. The expiration that ends up in the bytes is
+recorded on the result, because it is what `Tx.reconcile` needs later to
+prove a transaction can no longer land.
 
 `Tx.build` takes no sender lock; `Tx.run` is what holds one from build
 through submit. Called on its own, two concurrent builds for one address can
@@ -3211,107 +2613,11 @@ pick the same gas coin.
 
 ### `Built` (const)
 
-```ts
-declare const Built: Schema.Struct<{
-    readonly digest: Schema.brand<Schema.String, "Digest">;
-    readonly bytes: Schema.Uint8ArrayFromBase64;
-    readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-    readonly gasOwner: Schema.optional<Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">>;
-    readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-        readonly $kind: Schema.Literal<"None">;
-        readonly None: Schema.Literal<true>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Epoch">;
-        readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"ValidDuring">;
-        readonly ValidDuring: Schema.Struct<{
-            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly chain: Schema.String;
-            readonly nonce: Schema.Number;
-        }>;
-    }>, Schema.Struct<{
-        readonly $kind: Schema.Literal<"Validity">;
-        readonly Validity: Schema.Struct<{
-            readonly allowedProposers: Schema.NullOr<Schema.Struct<{
-                readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-                readonly proposers: Schema.$Array<Schema.Number>;
-            }>>;
-            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-            readonly chain: Schema.String;
-            readonly nonce: Schema.Number;
-        }>;
-    }>]>>;
-    /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
-    readonly chain: Schema.optional<Schema.String>;
-}>
-// decodes to:
-// {
-//     readonly digest: Digest;
-//     readonly bytes: Uint8Array<ArrayBufferLike>;
-//     readonly sender: SuiAddress;
-//     readonly gasOwner?: SuiAddress | undefined;
-//     readonly expiration?: {
-//         readonly $kind: "None";
-//         readonly None: true;
-//     } | {
-//         readonly $kind: "Epoch";
-//         readonly Epoch: bigint;
-//     } | {
-//         readonly $kind: "ValidDuring";
-//         readonly ValidDuring: {
-//             readonly minEpoch: bigint | null;
-//             readonly maxEpoch: bigint | null;
-//             readonly minTimestamp: bigint | null;
-//             readonly maxTimestamp: bigint | null;
-//             readonly chain: string;
-//             readonly nonce: number;
-//         };
-//     } | {
-//         readonly $kind: "Validity";
-//         readonly Validity: {
-//             readonly allowedProposers: {
-//                 readonly epoch: bigint;
-//                 readonly proposers: readonly number[];
-//             } | null;
-//             readonly minEpoch: bigint | null;
-//             readonly maxEpoch: bigint | null;
-//             readonly minTimestamp: bigint | null;
-//             readonly maxTimestamp: bigint | null;
-//             readonly chain: string;
-//             readonly nonce: number;
-//         };
-//     } | undefined;
-//     readonly chain?: string | undefined;
-// }
-```
-
-A transaction built into bytes and ready to sign, with the expiration the
-builder settled on recorded so `Tx.reconcile` can decide, later and without
-the builder, whether the transaction can still land.
+Re-exported from `sui-effect`.
 
 ### `chainOf` (const)
 
-```ts
-declare const chainOf: (expiration: TransactionExpiration | undefined) => string | undefined
-```
-
-The chain identifier an expiration names, or `undefined` for the variants
-that name none (`None`, `Epoch`).
-
-This is the first half of the chain-identity guard `Tx.reconcile` applies
-before it asks a node anything: bytes built for one chain must not be
-declared expired by another chain's epoch. The second half is
-`SignedTransaction.chain`, which `Tx.build` records for the variants that
-carry no chain of their own.
-
-**Never fails.**
+Re-exported from `sui-effect`.
 
 ### `cosign` (const)
 
@@ -3505,8 +2811,6 @@ Effects and the address to sign as.
 
 Never fails: a bad address or signature surfaces as a `SigningError` from the
 member that produced it, not from construction.
-
-**Never fails.**
 
 ### `isUnresolved` (const)
 
@@ -3805,181 +3109,7 @@ the next, and `listUnresolved` returns other tests' submissions.
 ### `JournalEntry` (const)
 
 ```ts
-declare const JournalEntry: Schema.TaggedUnion<{
-    readonly Unknown: Schema.TaggedStruct<"Unknown", {
-        readonly digest: Schema.brand<Schema.String, "Digest">;
-        readonly signed: Schema.Struct<{
-            readonly digest: Schema.brand<Schema.String, "Digest">;
-            readonly bytes: Schema.Uint8ArrayFromBase64;
-            readonly signatures: Schema.$Array<Schema.brand<Schema.String, "Signature">>;
-            readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-                readonly $kind: Schema.Literal<"None">;
-                readonly None: Schema.Literal<true>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Epoch">;
-                readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ValidDuring">;
-                readonly ValidDuring: Schema.Struct<{
-                    readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly chain: Schema.String;
-                    readonly nonce: Schema.Number;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Validity">;
-                readonly Validity: Schema.Struct<{
-                    readonly allowedProposers: Schema.NullOr<Schema.Struct<{
-                        readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-                        readonly proposers: Schema.$Array<Schema.Number>;
-                    }>>;
-                    readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly chain: Schema.String;
-                    readonly nonce: Schema.Number;
-                }>;
-            }>]>>;
-            readonly chain: Schema.optional<Schema.String>;
-        }>;
-        readonly lastError: Schema.String;
-        readonly attempts: Schema.Number;
-        readonly at: Schema.DateTimeUtcFromMillis;
-    }>;
-    readonly NotApplied: Schema.TaggedStruct<"NotApplied", {
-        readonly digest: Schema.brand<Schema.String, "Digest">;
-        readonly evidence: Schema.Literals<readonly ["expired", "inputConsumed"]>;
-        readonly at: Schema.DateTimeUtcFromMillis;
-    }>;
-    readonly Signed: Schema.TaggedStruct<"Signed", {
-        readonly digest: Schema.brand<Schema.String, "Digest">;
-        readonly signed: Schema.Struct<{
-            readonly digest: Schema.brand<Schema.String, "Digest">;
-            readonly bytes: Schema.Uint8ArrayFromBase64;
-            readonly signatures: Schema.$Array<Schema.brand<Schema.String, "Signature">>;
-            readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-                readonly $kind: Schema.Literal<"None">;
-                readonly None: Schema.Literal<true>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Epoch">;
-                readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"ValidDuring">;
-                readonly ValidDuring: Schema.Struct<{
-                    readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly chain: Schema.String;
-                    readonly nonce: Schema.Number;
-                }>;
-            }>, Schema.Struct<{
-                readonly $kind: Schema.Literal<"Validity">;
-                readonly Validity: Schema.Struct<{
-                    readonly allowedProposers: Schema.NullOr<Schema.Struct<{
-                        readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-                        readonly proposers: Schema.$Array<Schema.Number>;
-                    }>>;
-                    readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-                    readonly chain: Schema.String;
-                    readonly nonce: Schema.Number;
-                }>;
-            }>]>>;
-            readonly chain: Schema.optional<Schema.String>;
-        }>;
-        readonly signedAt: Schema.DateTimeUtcFromMillis;
-    }>;
-    readonly Executed: Schema.TaggedStruct<"Executed", {
-        readonly digest: Schema.brand<Schema.String, "Digest">;
-        readonly checkpoint: Schema.optional<Schema.BigIntFromString>;
-        readonly at: Schema.DateTimeUtcFromMillis;
-    }>;
-    readonly Failed: Schema.TaggedStruct<"Failed", {
-        readonly digest: Schema.brand<Schema.String, "Digest">;
-        readonly reason: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-            readonly $kind: Schema.Literal<"MoveAbort">;
-            readonly MoveAbort: Schema.Struct<{
-                readonly abortCode: Schema.BigIntFromString;
-                readonly location: Schema.optional<Schema.Struct<{
-                    readonly package: Schema.optional<Schema.String>;
-                    readonly module: Schema.optional<Schema.String>;
-                    readonly function: Schema.optional<Schema.Number>;
-                    readonly functionName: Schema.optional<Schema.String>;
-                    readonly instruction: Schema.optional<Schema.Number>;
-                }>>;
-                readonly cleverError: Schema.optional<Schema.Struct<{
-                    readonly errorCode: Schema.optional<Schema.Number>;
-                    readonly lineNumber: Schema.optional<Schema.Number>;
-                    readonly constantName: Schema.optional<Schema.String>;
-                    readonly constantType: Schema.optional<Schema.String>;
-                    readonly value: Schema.optional<Schema.String>;
-                }>>;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"SizeError">;
-            readonly SizeError: Schema.Struct<{
-                readonly name: Schema.String;
-                readonly size: Schema.Number;
-                readonly maxSize: Schema.Number;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"CommandArgumentError">;
-            readonly CommandArgumentError: Schema.Struct<{
-                readonly argument: Schema.Number;
-                readonly name: Schema.String;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"TypeArgumentError">;
-            readonly TypeArgumentError: Schema.Struct<{
-                readonly typeArgument: Schema.Number;
-                readonly name: Schema.String;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"PackageUpgradeError">;
-            readonly PackageUpgradeError: Schema.Struct<{
-                readonly name: Schema.String;
-                readonly packageId: Schema.optional<Schema.String>;
-                readonly digest: Schema.optional<Schema.String>;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"IndexError">;
-            readonly IndexError: Schema.Struct<{
-                readonly index: Schema.optional<Schema.Number>;
-                readonly subresult: Schema.optional<Schema.Number>;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"CoinDenyListError">;
-            readonly CoinDenyListError: Schema.Struct<{
-                readonly name: Schema.String;
-                readonly coinType: Schema.String;
-                readonly address: Schema.optional<Schema.String>;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"CongestedObjects">;
-            readonly CongestedObjects: Schema.Struct<{
-                readonly name: Schema.String;
-                readonly objects: Schema.$Array<Schema.String>;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"ObjectIdError">;
-            readonly ObjectIdError: Schema.Struct<{
-                readonly name: Schema.optional<Schema.String>;
-                readonly objectId: Schema.String;
-            }>;
-        }>, Schema.Struct<{
-            readonly $kind: Schema.Literal<"Unknown">;
-        }>]>;
-        readonly at: Schema.DateTimeUtcFromMillis;
-    }>;
-}>
+declare const JournalEntry: Schema
 // decodes to:
 // {
 //     readonly _tag: "Unknown";
@@ -4200,29 +3330,11 @@ Reading and writing the submission journal.
 
 ### `maxEpochOf` (const)
 
-```ts
-declare const maxEpochOf: (expiration: TransactionExpiration | undefined) => bigint | undefined
-```
-
-The last epoch in which a transaction can still be applied, or `undefined`
-when its expiration sets no such bound (`None`, or a `ValidDuring` with no
-`maxEpoch`).
-
-An `Epoch` expiration is that epoch: the SDK's `Epoch` variant means "valid
-until the end of this epoch", so it is its own upper bound.
-
-This is the bound that matters in practice. Epochs are what the default
-expiration carries and what the validator rule is written in, and unlike a
-wall clock an epoch is a consensus fact, so `Tx.reconcile` needs no skew
-margin to reason about it.
-
-**Never fails.**
+Re-exported from `sui-effect`.
 
 ### `maxTimestampMsOf` (const)
 
-```ts
-declare const maxTimestampMsOf: (expiration: TransactionExpiration | undefined) => bigint | undefined
-```
+Re-exported from `sui-effect`.
 
 ### `reconcile` (const)
 
@@ -4247,17 +3359,22 @@ applied and aborted. A transaction the node does not know is only ever
   `SubmitConfig.expiryEvidence: "never"` to disable the rule entirely, which
   is what a deployment behind a mixed-node load balancer wants. The residual
   risk is a node whose transaction index lags its epoch view;
-- `"inputConsumed"` when the object **at the version after** one this
-  transaction pinned names a **different** transaction as the one that
-  produced it, so those exact bytes can never execute again.
+- `"inputConsumed"` when the transaction that last mutated a pinned object is
+  a **different** one **and its own effects report `inputVersion` equal to
+  the version these bytes pinned**, so those exact bytes can never execute
+  again.
 
 An input that merely advanced is not evidence: the transaction being
 reconciled is itself the likeliest thing to have advanced it, and calling
 that `NotApplied` would tell the documented retry idiom to execute the
-caller's intent a second time. When the successor version names *our* digest
-the transaction applied and `getTransaction` is asked again; when the
-successor cannot be read at all the answer is `SubmissionUnknown`, which
-carries the bytes so a later process, or a person, can settle it.
+caller's intent a second time. When the live object names *our* digest the
+transaction applied and `getTransaction` is asked again; when the consuming
+transaction took a **later** version than ours — which is the common case,
+because Sui stamps every output with the transaction's Lamport version and
+the object "one version on" from ours usually never existed — nothing is
+proven and the answer is `SubmissionUnknown`, which carries the bytes so a
+later process, or a person, can settle it. Every pinned reference is tried
+before that answer is given.
 
 **Chain identity is checked before anything is asked.** Bytes built for one
 chain must never be declared expired by another chain's epoch, which a
@@ -4497,14 +3614,7 @@ address it signs as truthfully.
 
 ### `Signature` (const)
 
-```ts
-declare const Signature: Schema.brand<Schema.String, "Signature">
-// decodes to: Signature
-```
-
-A serialized signature, as every SDK signer returns it: the base64 of the
-flag, signature and public key bytes. Branded so a signature cannot be passed
-where a digest or an address is expected.
+Re-exported from `sui-effect`.
 
 ### `SignatureScheme` (type)
 
@@ -4567,8 +3677,6 @@ can sign in either order.
 
 Never fails; the recipe it returns throws only if the recipe it wraps does,
 which `Tx.build` reports as `BuildError`.
-
-**Never fails.**
 
 ### `submit` (const)
 
@@ -4744,79 +3852,7 @@ than repeating four tags that will grow with the taxonomy.
 
 ### `TransactionExpiration` (const)
 
-```ts
-declare const TransactionExpiration: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
-    readonly $kind: Schema.Literal<"None">;
-    readonly None: Schema.Literal<true>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"Epoch">;
-    readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"ValidDuring">;
-    readonly ValidDuring: Schema.Struct<{
-        readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly chain: Schema.String;
-        readonly nonce: Schema.Number;
-    }>;
-}>, Schema.Struct<{
-    readonly $kind: Schema.Literal<"Validity">;
-    readonly Validity: Schema.Struct<{
-        readonly allowedProposers: Schema.NullOr<Schema.Struct<{
-            readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
-            readonly proposers: Schema.$Array<Schema.Number>;
-        }>>;
-        readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
-        readonly chain: Schema.String;
-        readonly nonce: Schema.Number;
-    }>;
-}>]>
-// decodes to:
-// {
-//     readonly $kind: "None";
-//     readonly None: true;
-// } | {
-//     readonly $kind: "Epoch";
-//     readonly Epoch: bigint;
-// } | {
-//     readonly $kind: "ValidDuring";
-//     readonly ValidDuring: {
-//         readonly minEpoch: bigint | null;
-//         readonly maxEpoch: bigint | null;
-//         readonly minTimestamp: bigint | null;
-//         readonly maxTimestamp: bigint | null;
-//         readonly chain: string;
-//         readonly nonce: number;
-//     };
-// } | {
-//     readonly $kind: "Validity";
-//     readonly Validity: {
-//         readonly allowedProposers: {
-//             readonly epoch: bigint;
-//             readonly proposers: readonly number[];
-//         } | null;
-//         readonly minEpoch: bigint | null;
-//         readonly maxEpoch: bigint | null;
-//         readonly minTimestamp: bigint | null;
-//         readonly maxTimestamp: bigint | null;
-//         readonly chain: string;
-//         readonly nonce: number;
-//     };
-// }
-```
-
-When a transaction stops being valid. Mirrors the SDK's
-`TransactionExpiration` enum variant for variant, including its `$kind`
-discriminant, so our narrowing and `TransactionDataBuilder`'s agree.
-
-`ValidDuring` is what `Tx.build` sets by default: its `maxTimestamp` is the
-wall-clock bound `Tx.reconcile` reasons about, and its `chain` is a replay
-guard, so bytes signed for testnet cannot land on mainnet.
+Re-exported from `sui-effect`.
 
 ### `Tx` (const)
 
@@ -5051,27 +4087,7 @@ The tags whose entries still need an answer from the network.
 
 ### `Journal` (const)
 
-```ts
-declare const Journal: Context.Reference<JournalService> & {
-    /** A fresh in-memory journal, for a test or a process that wants its own. */
-    layerMemory: Layer.Layer<never, never, never>;
-    /** The in-memory implementation, for building one directly. */
-    makeMemoryUnsafe: () => JournalService;
-}
-```
-
-The submission journal.
-
-Being a `Context.Reference`, it is never in an `R`: `Tx.submit` reads it from
-context and finds the in-memory default unless something provided another.
-
-**The default is process-wide.** A `Context.Reference`'s default value is
-computed once and cached on the reference itself, so every fiber that does
-not provide one shares a single `Map` for the life of the process. That is
-what makes a one-shot script work with zero wiring, and it is also why a
-test that runs `Tx.submit` or `Tx.run` should provide
-`Journal.layerMemory`: without it, entries from one test are visible to
-the next, and `listUnresolved` returns other tests' submissions.
+Re-exported from `sui-effect/tx`.
 
 ### `JournalKeyValueStoreOptions` (interface)
 
@@ -5094,31 +4110,7 @@ What a durable journal does about entries left over from a previous run.
 
 ### `JournalService` (interface)
 
-```ts
-export interface JournalService {
-    /**
-     * Records one entry, replacing any earlier entry for the same digest.
-     *
-     * Fails with: `JournalError`.
-     */
-    readonly put: (entry: JournalEntry) => Effect.Effect<void, JournalError>;
-    /**
-     * The entry for a digest, if this journal has one.
-     *
-     * Fails with: `JournalError`.
-     */
-    readonly get: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError>;
-    /**
-     * Every entry still waiting for an answer (`Signed` and `Unknown`), oldest
-     * first. `Tx.reconcileAll` is what a startup does with it.
-     *
-     * Fails with: `JournalError`.
-     */
-    readonly listUnresolved: Effect.Effect<ReadonlyArray<JournalEntry>, JournalError>;
-}
-```
-
-Reading and writing the submission journal.
+Re-exported from `sui-effect/tx`.
 
 ### `layerKeyValueStore` (const)
 
@@ -5210,10 +4202,13 @@ Turns an Effect service into a `SuiClientRegistration` a Promise consumer
 passes to `client.$extend(...)`.
 
 `register(client)` does no work by default: the `ManagedRuntime` over
-`SuiCore.layerFromClient(client)`, `Sui.layerNoDepsWith(options.sui)` and the
-extension's own layer is built on the first call and shared by every call
-after it. A rejection carries the original tagged error instance, so a
-Promise consumer can still switch on `_tag`.
+`SuiCore.layerFromClient(client)`, a `Sui` for the client's effective chain
+id and the extension's own layer is built on the first call and shared by
+every call after it. The `Sui` and `SuiCore` underneath are shared with every
+other registration on that client that names the same chain id — one
+transport, one chain identity and one sender-lock map. A rejection carries
+the original tagged error instance, so a Promise consumer can still switch on
+`_tag`.
 
 `name` is generic in a string literal, so `client.escrow` is a property of
 the extended client's type and not an index lookup: no cast, and no
@@ -5254,8 +4249,6 @@ when the layer needs an asynchronous step or when the network has no known
 chain identifier and none was given. Otherwise the layer's own failures
 surface as rejections of the first call that needs it.
 
-**Never fails.**
-
 ### `PromiseFace` (type)
 
 ```ts
@@ -5283,6 +4276,16 @@ only, which is what the runtime maps; a `BcsType`, a `Schema.Class` instance,
 a `Date`, anything with a prototype of its own passes through whole, in the
 type and at runtime alike. (An interface or class type is not assignable to
 `Record<string, unknown>`, which is what keeps the two in step.)
+
+**A plain-object *value* member is the one place the two faces cannot agree.**
+`{ packageId: "0x…" }` is indistinguishable from a namespace of members, so
+the type maps it as a value while the **cold** runtime treats it as a
+namespace and hands back a placeholder for each key. Reading one throws
+`ExtensionNotReady` naming the path (`deployment.packageId`) rather than
+returning something the type says cannot be awaited — so the disagreement is
+typed and named, not silent — but the cure is `warm` or `$ready()`, not a
+retry. An extension that is registered lazily should expose such a value
+through an `Effect` member instead.
 
 ### `SuiExtension` (const)
 
@@ -5344,15 +4347,25 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
      *   synchronously and `register` throws. This is the documented contract of
      *   `warm`, not an accident: an extension that needs the network at build is
      *   registered without it.
-     * - **The chain identifier is not read.** `Sui` normally calls
-     *   `getChainIdentifier` at layer build, which is a round trip. A warm
-     *   registration takes `warm.chainId` (or `sui.chainId`, or the entry in the
-     *   built-in table for `mainnet` and `testnet`) as the chain's identifier and
-     *   asks nothing, so a node on another chain is not detected at
-     *   registration. It is still detected by the chain: `Tx.build` stamps that
-     *   id on the expiration and a validator refuses bytes signed for another
-     *   chain. On `devnet`, `localnet` or a custom network there is no table
-     *   entry, so `warm` without a `chainId` throws rather than guess.
+     * - **The chain identifier is not read — not at registration, and not
+     *   later.** `Sui` normally calls `getChainIdentifier` at layer build, which
+     *   is a round trip. A warm registration takes `warm.chainId` (or
+     *   `sui.chainId`, or the entry in the built-in table for `mainnet` and
+     *   `testnet`) as the chain's identifier and asks nothing. **The node is
+     *   consulted for the first time when the extension itself makes a call**,
+     *   and that call does not check the identifier either: the pinned id is what
+     *   `Sui.chainId` reports for the life of the registration. A node on another
+     *   chain is therefore never detected here — it is detected by the chain,
+     *   because `Tx.build` stamps that id on the expiration and a validator
+     *   refuses bytes signed for another chain. Register lazily when the
+     *   assertion is what you want. On `devnet`, `localnet` or a custom network
+     *   there is no table entry, so `warm` without a `chainId` throws rather than
+     *   guess.
+     *
+     * A **lazy** registration that joins a chain id another registration already
+     * pinned still performs its own `getChainIdentifier` assertion — once, shared
+     * across every lazy registration on that base — so mixing the two on one
+     * client neither loses the check nor duplicates it.
      */
     readonly warm?: {
         readonly chainId?: string;
@@ -5612,6 +4625,19 @@ export interface FakeChange {
     readonly objectId: string;
     readonly type: string;
     readonly version?: bigint;
+    /**
+     * The version this transaction took the object at, which is what
+     * `Tx.reconcile` reads to decide that a **different** transaction consumed
+     * the version a set of bytes pinned.
+     *
+     * Sui stamps every output with the transaction's Lamport version —
+     * `max(input versions) + 1` across all of its inputs — so the input version
+     * is not "the output version minus one" on a real network, and a test that
+     * means "this transaction consumed version 3" has to say 3. It defaults to
+     * `version - 1` for a mutated or deleted object, and is `null` for a created
+     * one.
+     */
+    readonly inputVersion?: bigint;
     readonly owner?: SuiClientTypes.ObjectOwner;
     /** `PackageWrite` marks a published package; `AccumulatorWriteV1` an accumulator write. */
     readonly outputState?: SuiClientTypes.ChangedObject["outputState"];
@@ -5648,7 +4674,16 @@ export interface FakeExecution {
     readonly deleted?: ReadonlyArray<FakeChange>;
     readonly events?: ReadonlyArray<SuiClientTypes.Event>;
     readonly balanceChanges?: ReadonlyArray<SuiClientTypes.BalanceChange>;
-    readonly commandResults?: ReadonlyArray<SuiClientTypes.CommandResult>;
+    /**
+     * The per-command results a simulation reports.
+     *
+     * Both arrays of `SuiClientTypes.CommandResult` are required on the wire and
+     * either may be left out here: a missing one defaults to empty, which is what
+     * the node reports for a command that returned nothing. Giving only
+     * `returnValues` used to fail the whole `Simulation` decode with an issue
+     * naming `mutatedReferences`, a field the test never mentioned.
+     */
+    readonly commandResults?: ReadonlyArray<Partial<SuiClientTypes.CommandResult>>;
     readonly gasUsed?: SuiClientTypes.GasCostSummary;
     readonly checkpoint?: string;
     readonly timestampMs?: number;
@@ -5750,6 +4785,22 @@ export interface FakeScript {
     readonly buildSimulate?: ReadonlyArray<FakeOutcome>;
     readonly execute?: ReadonlyArray<FakeOutcome>;
     readonly getTransaction?: ReadonlyArray<FakeOutcome>;
+    /**
+     * Transactions the node knows **by digest**, served before the ordered
+     * `getTransaction` script is consulted.
+     *
+     * The ordered script answers "what does the node say the next time it is
+     * asked", which is what a reconcile test drives. This answers "what does the
+     * node say about *that* transaction", which is what `Tx.reconcile` needs when
+     * it follows a pinned object's `previousTransaction` to find out which
+     * version the consuming transaction actually took: the answer has to depend
+     * on the digest, not on the call count.
+     *
+     * Give the consuming transaction's effects with an explicit `inputVersion` on
+     * the object in question — that equality is the whole of the
+     * `NotApplied { inputConsumed }` rule.
+     */
+    readonly transactions?: Readonly<Record<string, FakeOutcome>>;
 }
 ```
 
@@ -5838,11 +4889,23 @@ from the outside:
 - **`listOwnedObjects` filters like a node.** The `type` option goes through
   the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
   instantiation of a generic rather than only its own spelling.
-- **`getDynamicField` matches on `name.type` alone.** It returns the first
-  scripted entry of the parent whose `name.type` equals the requested one; the
-  `name.bcs` bytes are not compared. Two fields of the same key type on one
-  parent cannot be told apart here — script them on different parents, and
-  test your key encoding with a decode test instead.
+- **`getDynamicField` matches on `name.type` *and* `name.bcs`.** An entry
+  scripted without `bcs` still matches any key of its type, which is what a
+  test that only cares about the type wants; two entries of one type on one
+  parent are told apart by their bytes, so a test can prove which key encoding
+  a lookup used.
+- **Call recording is reached through `SuiTest.calls`.** Every call the fake
+  received, oldest first, optionally filtered by method:
+  `yield* SuiTest.calls("getDynamicField")`. That is how a test asserts what
+  an extension *sent* — the include set on a read, the fact that a recipe
+  fragment reached exactly one `executeTransaction` — rather than only what it
+  got back.
+- **`getTransaction` can be answered by digest.** `FakeScript.transactions`
+  (and `SuiTest.recordTransaction`) answers a specific digest before the
+  ordered `getTransaction` script is consulted, which is what `Tx.reconcile`
+  needs when it follows a pinned object's `previousTransaction` to find out
+  which version the consuming transaction took. `FakeChange.inputVersion` is
+  how a test says which version that was.
 
 ### `SuiCoreFakeState` (interface)
 
@@ -5874,6 +4937,11 @@ export interface SuiCoreFakeState {
     readonly setClock: (timestampMs: bigint) => Effect.Effect<void>;
     /** Moves the epoch `getCurrentSystemState` reports. */
     readonly setEpoch: (epoch: bigint) => Effect.Effect<void>;
+    /**
+     * Teaches the fake about one transaction **by digest**, the way
+     * `FakeScript.transactions` does for a script written up front.
+     */
+    readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void>;
     /** Replaces the remaining scripted outcomes of a method. */
     readonly setOutcomes: (method: "simulate" | "execute" | "getTransaction" | "buildSimulate", outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void>;
 }
@@ -5890,6 +4958,7 @@ declare const SuiTest: {
         readonly content?: Uint8Array;
         readonly consumedBy?: string;
     }) => Effect.Effect<bigint, never, SuiCoreFake>;
+    readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void, never, SuiCoreFake>;
     readonly deleteObject: (objectId: string) => Effect.Effect<void, never, SuiCoreFake>;
     readonly setClock: (timestampMs: bigint) => Effect.Effect<void, never, SuiCoreFake>;
     readonly setEpoch: (epoch: bigint) => Effect.Effect<void, never, SuiCoreFake>;
@@ -5984,8 +5053,11 @@ export class Escrow extends Context.Service<Escrow, {
             ["ObjectNotFound", "ObjectDeleted"],
             () => Effect.fail(new EscrowNotFound({ escrowId: id }))
           ),
+          // `TransportError.fromUnknown`, never the constructor: it classifies
+          // the cause — gRPC status, HTTP status, abort — instead of guessing
+          // `retryable: false` and dropping it.
           Effect.catchTag("ObjectUnavailable", (cause) =>
-            Effect.fail(new TransportError({ method: "escrow.get", retryable: false, cause })))
+            Effect.fail(TransportError.fromUnknown("escrow.get", cause)))
         )
       })
 
@@ -6181,8 +5253,14 @@ export {
   type EscrowService
 } from "./Escrow.ts"
 export { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
-export { escrow } from "./extension.ts"
-export { Platform, platform, type PlatformOptions, type PlatformService } from "./Platform.ts"
+export { escrow, type EscrowRegistrationOptions } from "./extension.ts"
+export {
+  Platform,
+  platform,
+  type PlatformOptions,
+  type PlatformRegistrationOptions,
+  type PlatformService
+} from "./Platform.ts"
 export {
   ESCROW_PACKAGE,
   EscrowContent,
@@ -6593,8 +5671,16 @@ const SettlementStatus = Schema.Struct({
 const decodeSettlement = Schema.decodeUnknownEffect(SettlementStatus)
 const decodeAddress = Schema.decodeUnknownEffect(SuiAddress)
 
+/**
+ * The one mapping from a third-party rejection to this package's error union.
+ *
+ * Always `TransportError.fromUnknown`, never the constructor: building one by
+ * hand makes the author guess `retryable` and throws away the gRPC status, the
+ * HTTP status or the abort a caller needs to decide whether to try again. The
+ * guide's rule, applied in the guide's own template.
+ */
 const transport = (method: string) => (cause: unknown): TransportError =>
-  new TransportError({ method, retryable: false, cause })
+  TransportError.fromUnknown(method, cause)
 
 const make = (
   options: {
@@ -6789,13 +5875,25 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
    * The same layer from the environment: `ESCROW_PACKAGE_ID`, `ESCROW_URL` and
    * `ESCROW_API_KEY`, which is `Config.redacted` because it is a secret.
    *
+   * **The package id is read through its schema, not as a string.**
+   * `Config.schema(ObjectId, ...)` is the typed deployment path: an override
+   * that is not a 32-byte object id fails here, with the variable's name, at
+   * the moment the layer is built — instead of being carried into every
+   * `moveCall` target and every codec and surfacing three calls later as a Move
+   * abort nobody can trace back to an environment variable. Read every
+   * deployment value that has a branded schema this way.
+   *
+   * `Config.option` would be the wrong tool for any of these: it turns an
+   * **empty** variable into "unset", so `ESCROW_URL=""` would silently take a
+   * default rather than fail.
+   *
    * Fails with: `ConfigError`.
    */
   static readonly layerConfig: Layer.Layer<Escrow, Config.ConfigError, Sui> = Layer.unwrap(
     Effect.gen(function*() {
       const options = yield* Config.all({
-        packageId: Config.nonEmptyString("PACKAGE_ID").pipe(
-          Config.withDefault(ESCROW_PACKAGE)
+        packageId: Config.schema(ObjectId, "PACKAGE_ID").pipe(
+          Config.withDefault(ObjectId.make(ESCROW_PACKAGE))
         ),
         url: Config.nonEmptyString("URL"),
         apiKey: Config.redacted("API_KEY")
@@ -6941,6 +6039,25 @@ import { SuiExtension } from "sui-effect/extension"
 import type { EscrowOptions } from "./Escrow.ts"
 import { Escrow } from "./Escrow.ts"
 
+/** What a `$extend` registration needs beyond what the layer does. */
+export interface EscrowRegistrationOptions extends EscrowOptions {
+  /**
+   * The chain identifier the node must be on, as `getChainIdentifier` reports
+   * it.
+   *
+   * **Required on `devnet`, `localnet` and any custom network**, because a
+   * `warm` registration takes the chain id rather than asking for it and there
+   * is no built-in entry for those; `register` throws without it. On `mainnet`
+   * and `testnet` the built-in table answers and this is optional.
+   *
+   * Give the same id to **every** registration on one client. The base `Sui`,
+   * its transport and its sender-lock map are shared per client **per chain
+   * id**, so two registrations that disagree get two of everything and two
+   * `Tx.run`s for one address stop serializing.
+   */
+  readonly chainId?: string
+}
+
 /**
  * The registration a Promise consumer passes to `client.$extend(...)`.
  *
@@ -6951,13 +6068,25 @@ import { Escrow } from "./Escrow.ts"
  * await client.escrow.dispose()
  * ```
  *
- * `register(client)` does no work until the first call, and then builds one
- * runtime over `SuiCore.layerFromClient(client)`, `Sui.layerNoDeps` and
- * `Escrow.layer`, so the extension and the consumer share one transport and one
- * chain-identifier check. Never fails.
+ * It is registered `warm`, like `platform` in `Platform.ts`: the service has
+ * synchronous members — `packageId`, the `claim` recipe fragment, the codecs —
+ * and a consumer that reads one the moment it registers should get the value
+ * rather than a placeholder that throws `ExtensionNotReady`. Neither layer
+ * touches the network at build, which is what `warm` requires.
+ *
+ * The runtime is built inside `register`, over `SuiCore.layerFromClient(client)`,
+ * a `Sui` pinned to `options.chainId` and `Escrow.layer`, so the extension and
+ * the consumer share one transport, one chain identity and one sender-lock map.
+ *
+ * Throws out of `register` when the network has no built-in chain identifier
+ * and `options.chainId` was not given.
  */
-export const escrow = (options: EscrowOptions) =>
-  SuiExtension.fromService(Escrow, { name: "escrow", layer: Escrow.layer(options) })
+export const escrow = (options: EscrowRegistrationOptions) =>
+  SuiExtension.fromService(Escrow, {
+    name: "escrow",
+    layer: Escrow.layer(options),
+    warm: options.chainId === undefined ? {} : { chainId: options.chainId }
+  })
 ```
 
 ### `examples/extension-template/test/escrow.test.ts`
@@ -6975,6 +6104,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
 import {
   Cause,
+  ConfigProvider,
   DateTime,
   Effect,
   Exit,
@@ -6988,12 +6118,12 @@ import {
 import { TestClock } from "effect/testing"
 import type { Sui, SuiCore } from "sui-effect"
 import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiSchema } from "sui-effect"
-import type { SuiCoreFake } from "sui-effect/testing"
-import { FakeOutcome, layerExtensionTest, layerTest, SuiTest } from "sui-effect/testing"
+import { FakeOutcome, layerExtensionTest, layerTest, SuiCoreFake, SuiTest } from "sui-effect/testing"
 import { Journal, Signer } from "sui-effect/tx"
 import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
+import { escrow as escrowRegistration } from "../src/extension.ts"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "../src/errors.ts"
-import { Platform } from "../src/Platform.ts"
+import { Platform, platform as platformRegistration } from "../src/Platform.ts"
 import { ESCROW_PACKAGE, receiptType, Settlement, SettlementContent } from "../src/schema.ts"
 
 /** The type constants under the package this test's fixtures use. */
@@ -7422,6 +6552,105 @@ describe("the test fee collector", () => {
     expect(String(address)).toBe(padded("1"))
   })
 })
+
+describe("the Promise face: registering on a client", () => {
+  const apiKey = Redacted.make("test-key")
+  const options = { packageId: ESCROW_PACKAGE, url: "https://settlement.example", apiKey }
+  /** devnet has no built-in chain identifier, which is the whole point here. */
+  const LOCAL_CHAIN = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
+
+  /** The fake's own SDK client, which implements `$extend`. */
+  const fakeClientOf = (network: SuiClientTypes.Network, chainId: string) =>
+    Effect.runSync(
+      Effect.provide(
+        Effect.map(SuiCoreFake, (fake) => fake.client),
+        // The fake `SuiCore` alone, not `layerTest`: `layerTest` builds `Sui`,
+        // which reads the chain identifier, and the whole point here is a
+        // registration that builds synchronously.
+        SuiCoreFake.layer({ ...script, network, chainId }),
+        { local: true }
+      )
+    )
+
+  test("a warm registration on a network with no built-in chain id needs one", () => {
+    // `warm` takes the chain identifier rather than asking the node for it, and
+    // devnet's is regenerated, so there is nothing to take. Without
+    // `options.chainId` this throws out of `register` — which is the failure a
+    // copier hits the first time they point the template at a local network.
+    const client = fakeClientOf("devnet", LOCAL_CHAIN)
+    expect(() => client.$extend(escrowRegistration(options))).toThrow(/chain id/)
+  })
+
+  test("threading options.chainId makes the warm face work on devnet", async () => {
+    const client = fakeClientOf("devnet", LOCAL_CHAIN)
+    const extended = client.$extend(escrowRegistration({ ...options, chainId: LOCAL_CHAIN }))
+    // A synchronous member is the real value immediately: that is what `warm`
+    // buys, and reading it off a lazy registration would throw
+    // `ExtensionNotReady`.
+    expect(extended.escrow.packageId).toBe(ESCROW_PACKAGE)
+    const found = await extended.escrow.get(ESCROW_ID)
+    expect(found.content.amount).toBe("5")
+    await extended.escrow.$dispose()
+  })
+
+  test("two registrations naming one chain id both work off one client", async () => {
+    // The rule from `docs/extensions.md`: the base `Sui`, its transport and its
+    // sender-lock map are shared per client **per chain id**. Registering the
+    // escrow extension and the platform that composes it with the same id is
+    // what keeps two `Tx.run`s for one address serialized.
+    const client = fakeClientOf("devnet", LOCAL_CHAIN)
+    const extended = client
+      .$extend(escrowRegistration({ ...options, chainId: LOCAL_CHAIN }))
+      .$extend(platformRegistration({ ...options, chainId: LOCAL_CHAIN }))
+    expect(extended.escrow.packageId).toBe(ESCROW_PACKAGE)
+    expect(extended.platform.escrow.packageId).toBe(ESCROW_PACKAGE)
+    await extended.escrow.$dispose()
+    await extended.platform.$dispose()
+  })
+})
+
+describe("layerConfig validates through the typed deployment path", () => {
+  /**
+   * `Effect.withConfigProvider` does not exist in Effect v4 rc.112. A test
+   * provides the `ConfigProvider` the way it provides anything else — here with
+   * `ConfigProvider.layer`, which is `Effect.provideService(…,
+   * ConfigProvider.ConfigProvider, …)` as a layer.
+   */
+  const withEnvironment = (values: Record<string, string>) =>
+    Effect.runPromiseExit(
+      Effect.provide(
+        Effect.map(Escrow, (service) => service.packageId),
+        Layer.mergeAll(
+          Escrow.layerConfig.pipe(
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord(values)))
+          ),
+          Layer.empty
+        ).pipe(Layer.provide(layerTest(script))),
+        { local: true }
+      )
+    )
+
+  test("a well-formed package id builds the layer", async () => {
+    const exit = await withEnvironment({
+      ESCROW_PACKAGE_ID: padded("abc"),
+      ESCROW_URL: "https://settlement.example",
+      ESCROW_API_KEY: "secret"
+    })
+    expect(Exit.isSuccess(exit)).toBe(true)
+    if (Exit.isSuccess(exit)) expect(exit.value).toBe(padded("abc"))
+  })
+
+  test("a malformed package id is a ConfigError, not a Move abort three calls later", async () => {
+    const exit = await withEnvironment({
+      ESCROW_PACKAGE_ID: "not-an-object-id",
+      ESCROW_URL: "https://settlement.example",
+      ESCROW_API_KEY: "secret"
+    })
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(String(exit)).toContain("PACKAGE_ID")
+    expect(String(exit)).toContain("32-byte Sui object id")
+  })
+})
 ```
 
 ### `examples/extension-template/package.json`
@@ -7454,10 +6683,16 @@ describe("the test fee collector", () => {
   "peerDependencies": {
     "@mysten/bcs": "^2.1.1",
     "@mysten/sui": "^2.28",
-    "effect": ">=4.0.0-rc.112 <4.1",
+    "effect": "4.0.0-rc.112",
     "sui-effect": "^0.1.0"
   },
+  "peerDependenciesMeta": {
+    "sui-effect": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@effect/language-service": "0.87.2",
     "@mysten/bcs": "2.1.1",
     "@mysten/sui": "2.30.0",
     "@types/bun": "1.4.2",

@@ -10,6 +10,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
 import {
   Cause,
+  ConfigProvider,
   DateTime,
   Effect,
   Exit,
@@ -23,12 +24,12 @@ import {
 import { TestClock } from "effect/testing"
 import type { Sui, SuiCore } from "sui-effect"
 import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiSchema } from "sui-effect"
-import type { SuiCoreFake } from "sui-effect/testing"
-import { FakeOutcome, layerExtensionTest, layerTest, SuiTest } from "sui-effect/testing"
+import { FakeOutcome, layerExtensionTest, layerTest, SuiCoreFake, SuiTest } from "sui-effect/testing"
 import { Journal, Signer } from "sui-effect/tx"
 import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
+import { escrow as escrowRegistration } from "../src/extension.ts"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "../src/errors.ts"
-import { Platform } from "../src/Platform.ts"
+import { Platform, platform as platformRegistration } from "../src/Platform.ts"
 import { ESCROW_PACKAGE, receiptType, Settlement, SettlementContent } from "../src/schema.ts"
 
 /** The type constants under the package this test's fixtures use. */
@@ -455,5 +456,104 @@ describe("the test fee collector", () => {
     // arrived as a `TransportError` from a member that never touched a network.
     const address = await provide(Effect.flatMap(Escrow, (service) => service.feeCollector))
     expect(String(address)).toBe(padded("1"))
+  })
+})
+
+describe("the Promise face: registering on a client", () => {
+  const apiKey = Redacted.make("test-key")
+  const options = { packageId: ESCROW_PACKAGE, url: "https://settlement.example", apiKey }
+  /** devnet has no built-in chain identifier, which is the whole point here. */
+  const LOCAL_CHAIN = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
+
+  /** The fake's own SDK client, which implements `$extend`. */
+  const fakeClientOf = (network: SuiClientTypes.Network, chainId: string) =>
+    Effect.runSync(
+      Effect.provide(
+        Effect.map(SuiCoreFake, (fake) => fake.client),
+        // The fake `SuiCore` alone, not `layerTest`: `layerTest` builds `Sui`,
+        // which reads the chain identifier, and the whole point here is a
+        // registration that builds synchronously.
+        SuiCoreFake.layer({ ...script, network, chainId }),
+        { local: true }
+      )
+    )
+
+  test("a warm registration on a network with no built-in chain id needs one", () => {
+    // `warm` takes the chain identifier rather than asking the node for it, and
+    // devnet's is regenerated, so there is nothing to take. Without
+    // `options.chainId` this throws out of `register` — which is the failure a
+    // copier hits the first time they point the template at a local network.
+    const client = fakeClientOf("devnet", LOCAL_CHAIN)
+    expect(() => client.$extend(escrowRegistration(options))).toThrow(/chain id/)
+  })
+
+  test("threading options.chainId makes the warm face work on devnet", async () => {
+    const client = fakeClientOf("devnet", LOCAL_CHAIN)
+    const extended = client.$extend(escrowRegistration({ ...options, chainId: LOCAL_CHAIN }))
+    // A synchronous member is the real value immediately: that is what `warm`
+    // buys, and reading it off a lazy registration would throw
+    // `ExtensionNotReady`.
+    expect(extended.escrow.packageId).toBe(ESCROW_PACKAGE)
+    const found = await extended.escrow.get(ESCROW_ID)
+    expect(found.content.amount).toBe("5")
+    await extended.escrow.$dispose()
+  })
+
+  test("two registrations naming one chain id both work off one client", async () => {
+    // The rule from `docs/extensions.md`: the base `Sui`, its transport and its
+    // sender-lock map are shared per client **per chain id**. Registering the
+    // escrow extension and the platform that composes it with the same id is
+    // what keeps two `Tx.run`s for one address serialized.
+    const client = fakeClientOf("devnet", LOCAL_CHAIN)
+    const extended = client
+      .$extend(escrowRegistration({ ...options, chainId: LOCAL_CHAIN }))
+      .$extend(platformRegistration({ ...options, chainId: LOCAL_CHAIN }))
+    expect(extended.escrow.packageId).toBe(ESCROW_PACKAGE)
+    expect(extended.platform.escrow.packageId).toBe(ESCROW_PACKAGE)
+    await extended.escrow.$dispose()
+    await extended.platform.$dispose()
+  })
+})
+
+describe("layerConfig validates through the typed deployment path", () => {
+  /**
+   * `Effect.withConfigProvider` does not exist in Effect v4 rc.112. A test
+   * provides the `ConfigProvider` the way it provides anything else — here with
+   * `ConfigProvider.layer`, which is `Effect.provideService(…,
+   * ConfigProvider.ConfigProvider, …)` as a layer.
+   */
+  const withEnvironment = (values: Record<string, string>) =>
+    Effect.runPromiseExit(
+      Effect.provide(
+        Effect.map(Escrow, (service) => service.packageId),
+        Layer.mergeAll(
+          Escrow.layerConfig.pipe(
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord(values)))
+          ),
+          Layer.empty
+        ).pipe(Layer.provide(layerTest(script))),
+        { local: true }
+      )
+    )
+
+  test("a well-formed package id builds the layer", async () => {
+    const exit = await withEnvironment({
+      ESCROW_PACKAGE_ID: padded("abc"),
+      ESCROW_URL: "https://settlement.example",
+      ESCROW_API_KEY: "secret"
+    })
+    expect(Exit.isSuccess(exit)).toBe(true)
+    if (Exit.isSuccess(exit)) expect(exit.value).toBe(padded("abc"))
+  })
+
+  test("a malformed package id is a ConfigError, not a Move abort three calls later", async () => {
+    const exit = await withEnvironment({
+      ESCROW_PACKAGE_ID: "not-an-object-id",
+      ESCROW_URL: "https://settlement.example",
+      ESCROW_API_KEY: "secret"
+    })
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(String(exit)).toContain("PACKAGE_ID")
+    expect(String(exit)).toContain("32-byte Sui object id")
   })
 })

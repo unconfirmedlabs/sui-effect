@@ -166,8 +166,16 @@ const SettlementStatus = Schema.Struct({
 const decodeSettlement = Schema.decodeUnknownEffect(SettlementStatus)
 const decodeAddress = Schema.decodeUnknownEffect(SuiAddress)
 
+/**
+ * The one mapping from a third-party rejection to this package's error union.
+ *
+ * Always `TransportError.fromUnknown`, never the constructor: building one by
+ * hand makes the author guess `retryable` and throws away the gRPC status, the
+ * HTTP status or the abort a caller needs to decide whether to try again. The
+ * guide's rule, applied in the guide's own template.
+ */
 const transport = (method: string) => (cause: unknown): TransportError =>
-  new TransportError({ method, retryable: false, cause })
+  TransportError.fromUnknown(method, cause)
 
 const make = (
   options: {
@@ -362,13 +370,25 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
    * The same layer from the environment: `ESCROW_PACKAGE_ID`, `ESCROW_URL` and
    * `ESCROW_API_KEY`, which is `Config.redacted` because it is a secret.
    *
+   * **The package id is read through its schema, not as a string.**
+   * `Config.schema(ObjectId, ...)` is the typed deployment path: an override
+   * that is not a 32-byte object id fails here, with the variable's name, at
+   * the moment the layer is built — instead of being carried into every
+   * `moveCall` target and every codec and surfacing three calls later as a Move
+   * abort nobody can trace back to an environment variable. Read every
+   * deployment value that has a branded schema this way.
+   *
+   * `Config.option` would be the wrong tool for any of these: it turns an
+   * **empty** variable into "unset", so `ESCROW_URL=""` would silently take a
+   * default rather than fail.
+   *
    * Fails with: `ConfigError`.
    */
   static readonly layerConfig: Layer.Layer<Escrow, Config.ConfigError, Sui> = Layer.unwrap(
     Effect.gen(function*() {
       const options = yield* Config.all({
-        packageId: Config.nonEmptyString("PACKAGE_ID").pipe(
-          Config.withDefault(ESCROW_PACKAGE)
+        packageId: Config.schema(ObjectId, "PACKAGE_ID").pipe(
+          Config.withDefault(ObjectId.make(ESCROW_PACKAGE))
         ),
         url: Config.nonEmptyString("URL"),
         apiKey: Config.redacted("API_KEY")

@@ -78,12 +78,17 @@ const putObject = (object: FakeObject): Effect.Effect<void, never, SuiCoreFake> 
  *
  * The direct way to stand in for a transaction the test did not run. Pass
  * `consumedBy` to say who moved it: `Tx.reconcile` reads that digest back as
- * `previousTransaction` and it is the difference between the three answers a
- * bumped input can produce — a **different** digest is `NotApplied
- * { inputConsumed }`, **the transaction's own** digest means it applied after
- * all, and **no digest** means the node proved nothing and the outcome is
- * `SubmissionUnknown`. Omitting it therefore models the last of the three, not
- * the first.
+ * the object's `previousTransaction`, and it is the start of every answer a
+ * bumped input can produce — **the transaction's own** digest means it applied
+ * after all, and **no digest** means the node proved nothing and the outcome is
+ * `SubmissionUnknown`.
+ *
+ * A **different** digest is only `NotApplied { inputConsumed }` when that
+ * transaction's own effects say it took the object at exactly the version the
+ * bytes pinned, so a test that wants that answer also scripts the consuming
+ * transaction — `FakeScript.transactions` or {@link recordTransaction} — with
+ * an explicit `inputVersion`. Without it the answer is `SubmissionUnknown`,
+ * which is what a real network gives for almost every stuck submission.
  *
  * Dies when the fake has no such object: a test that bumps something that is
  * not there is a broken test, not a failing one.
@@ -108,6 +113,21 @@ const bumpVersion = (
       }).pipe(Effect.as(next))
     })
   )
+
+/**
+ * Teaches the fake what the node says about one transaction, **by digest**.
+ *
+ * The ordered `scriptGetTransaction` answers "what comes back the next time
+ * `getTransaction` is called", which is what drives a reconcile. This answers
+ * "what does the node say about *that* transaction", which is what
+ * `Tx.reconcile` asks when it follows a moved object's `previousTransaction` to
+ * find out which version the consuming transaction took. Never fails.
+ */
+const recordTransaction = (
+  digest: string,
+  outcome: FakeOutcome
+): Effect.Effect<void, never, SuiCoreFake> =>
+  withFake((fake) => fake.recordTransaction(digest, outcome))
 
 /** Removes an object, so every later read reports it deleted. Never fails. */
 const deleteObject = (objectId: string): Effect.Effect<void, never, SuiCoreFake> =>
@@ -192,6 +212,7 @@ const calls = (
 export const SuiTest = {
   putObject,
   bumpVersion,
+  recordTransaction,
   deleteObject,
   setClock,
   setEpoch,

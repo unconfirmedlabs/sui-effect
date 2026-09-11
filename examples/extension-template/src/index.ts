@@ -16,8 +16,14 @@ export {
   type EscrowService
 } from "./Escrow.ts"
 export { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
-export { escrow } from "./extension.ts"
-export { Platform, platform, type PlatformOptions, type PlatformService } from "./Platform.ts"
+export { escrow, type EscrowRegistrationOptions } from "./extension.ts"
+export {
+  Platform,
+  platform,
+  type PlatformOptions,
+  type PlatformRegistrationOptions,
+  type PlatformService
+} from "./Platform.ts"
 export {
   ESCROW_PACKAGE,
   EscrowContent,

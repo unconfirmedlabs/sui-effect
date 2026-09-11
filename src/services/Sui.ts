@@ -295,7 +295,20 @@ export interface SuiService {
     opts?: { readonly type?: StructTag }
   ) => Stream.Stream<SuiObject<Uint8Array>, TransportError>
 
-  /** Every dynamic field of a parent, paginated. Fails with: `TransportError`. */
+  /**
+   * Every dynamic field of a parent, paginated.
+   *
+   * There is no key filter: the node has none, so a caller filters the stream
+   * on `entry.name.type`. Do that with `SuiSchema.matchesType`, not with the
+   * SDK's `normalizeStructTag` — a dynamic-field key is legally a primitive
+   * (`u64`, `bool`, `address`, `vector<u8>`) and `normalizeStructTag` throws on
+   * every one of them, which turns the first such key in a parent's fields into
+   * a defect. The value bytes are decoded with `SuiSchema.decode`, passing
+   * `actualType: entry.valueType` so the same tag check `Sui.getObject` does
+   * runs before a byte is parsed.
+   *
+   * Fails with: `TransportError`.
+   */
   readonly streamDynamicFields: (
     parent: ObjectId
   ) => Stream.Stream<DynamicFieldEntry, TransportError>

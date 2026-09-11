@@ -502,3 +502,183 @@ and `Built.chain`; `SubmitConfig.expiryEvidence`, `reconcileRecheck`,
 `awaitVisibility`, `visibilityTimeout`, `nonce` and the `ExpiryEvidencePolicy`
 type; `Tx.run`'s `sponsor` option; `Script.exitCode`'s `ExitCodeOptions`;
 `FakeChange.balance`. Nothing was removed.
+
+## Final batch (2026-09-11)
+
+The last pre-release pass: the independent verification's findings
+(`docs/reviews/final-verification.md`, sections A to C and G) and the
+twenty-two items queued from the real downstream conversions
+(`docs/reviews/conversion-feedback.md`). Regression tests for the blockers and
+majors are in `test/final-batch.test.ts`; the rule changes moved the tests that
+described the old rule.
+
+### Blockers
+
+- **A1 — the `effect` peer is exactly `4.0.0-rc.112`.** rc.113 renamed
+  `Config.nonEmptyString` / `string` / `redacted` to `Config.NonEmptyString` /
+  `String` / `Redacted`, which this package calls at four sites (`Script.ts:64,66`,
+  `Signer.ts:150,154`, `SuiCore.ts:458-462`, `SuiGraphQL.ts:73-77`). The peer is
+  the exact version, rc.113 is out of the CI matrix and the README table, and
+  DESIGN §1 records the four call sites and that widening the range means
+  supporting both spellings and proving the wider one in CI.
+- **A2 — every CI job can pass as written.** Both matrix jobs run `bun run build`
+  before `bun test`; the LLMS generator throws instead of exiting the process and
+  `test/llms.test.ts` skips with a clear message when `dist/` is absent; the
+  isolated-consumer job resolves the tarball by an absolute path and typechecks
+  with the repository's own pinned `tsc` instead of an unpinned `bunx tsc`.
+- **A3 — one base per client per chain id.** The shared `Sui` is keyed by the
+  **effective** chain id (`warm.chainId`, else `sui.chainId`, else
+  `KNOWN_CHAIN_IDS[network]`), so a `warm` registration and a lazy one on one
+  chain share a base, a transport and a sender-lock map; a lazy registration
+  joining a pinned base performs its `getChainIdentifier` assertion once,
+  separately. The map is keyed by the client's `core` rather than the client, so
+  chained `$extend` still shares. The template's two registrations both thread
+  `options.chainId` and both register `warm`.
+
+### Majors
+
+- **B1 — implemented.** `Tx.build`'s abortable client now rebuilds the gRPC
+  resolve plugin: `GrpcCoreClient` is public, so constructing one over a
+  `SuiGrpcClient` whose `transactionExecutionService.simulateTransaction` adds
+  `{ abort: signal }` (and whose `core` is the already-signalled proxy) yields
+  the SDK's own plugin with the signal attached. Nothing is re-implemented.
+  Proved at the transport with a recording `RpcTransport` under a real
+  `SuiGrpcClient`: the transport sees `SimulateTransaction` carrying an
+  `AbortSignal`, and the signal is aborted when the build times out.
+- **B2 — the `v + 1` rule is gone.** `NotApplied { inputConsumed }` now requires
+  the **consuming transaction's own** `changedObjects[].inputVersion` to equal
+  the version the bytes pinned: reconcile follows the live object's
+  `previousTransaction` to that transaction and reads its effects (out of
+  `ExecutionFailed` as readily as out of `Executed`). A greater `inputVersion` is
+  `SubmissionUnknown`; so is a deleted object, a node that names no transaction,
+  and a transaction the node has pruned. `inputEvidence` tries **every** pinned
+  reference before giving up. `SuiCore.getObjectAtVersion` stays public and is no
+  longer part of the rule. The fake records `inputVersion` on changed objects
+  (`FakeChange.inputVersion`) and answers `getTransaction` by digest
+  (`FakeScript.transactions`, `SuiTest.recordTransaction`).
+- **B3 — the template's packed-package check is portable.** It resolves
+  `sui-effect`, `effect` and `@mysten/*` from the template's own `node_modules`
+  first and only falls back to `../..` when that really is the sui-effect
+  repository (it checks the manifest's `name`). Documented in the template
+  README.
+- **B4 — `TransportError.fromUnknown`** in the template's `Escrow.ts` and in
+  `examples/extension-consumer.ts`, with the reason in a comment.
+- **B5 — `Tx.build`'s JSDoc** no longer documents a `chainTime + validFor`
+  default; it says epochs, and says `maxTimestamp` is null unless `validFor`
+  asks.
+- **B6 — a nonce outside the `u32` range is a `BuildError`**, which is what
+  `SubmitConfig.ts` promised and what DESIGN §6 now states.
+
+### Minor and nits (section C)
+
+- `npm pack` no longer ships `examples/extension-template/dist/**`: `files`
+  carries a negation entry (verified at 0 template `dist` files).
+- LLMS.md: schemas print as their **decoded type only** (255KB, down from the
+  7,468-line combinator dump); a re-exported symbol prints one
+  "Re-exported from" line instead of the whole entry again; `private` members
+  are stripped from an emitted class body; `**Never fails.**` requires the
+  period, so `fromService`'s "Never fails, except a `warm` registration…" no
+  longer prints a contradiction above itself.
+- Stale JSDoc fixed: `NotApplied` (errors.ts), `NotAppliedEvidence` and
+  `TransactionExpiration` (schemas.ts), `HasOutcome` (errors.ts), and
+  `maxTimestampMsOf`, whose JSDoc block had drifted above `maxEpochOf`.
+- `SUI_ERROR_TAGS` in `Script.ts` includes `GraphQLUnavailable` and
+  `ExtensionNotReady`, so `Script.run` describes them.
+- `Tx.ts`'s live read still asks for `previousTransaction` — under the new rule
+  it is the field the whole rule turns on, so `tx.test.ts`'s include-set pin
+  stays.
+- The dead `TransportError` case in `reconcileAll` is gone; the default branch
+  maps any non-`SubmissionUnknown` failure to one, so the union cannot shrink
+  under a caller.
+- `Tx.run` compares the gas owner with the sender **normalized** before choosing
+  the lock list.
+- `awaitVisible` uses `Effect.catch`, not `Effect.catchCause`: a defect is no
+  longer turned into a warning line.
+- A gRPC `NOT_FOUND` from the resolver's simulate is a `BuildError` naming the
+  object inputs the resolver was about to look up.
+- The "always simulates" claim is scoped in README and AGENTS: the resolver does
+  it when there is anything to resolve, and `Tx.build` runs one explicitly when
+  there is not.
+- The template README's install line is `bun add -d` into `devDependencies`
+  alongside `peerDependencies`, and `@effect/language-service` — the plugin the
+  tsconfig names — is in the template's `devDependencies`.
+- CI: `bunx tsc` replaced with the repository's pinned binary; the
+  `../../$GITHUB_WORKSPACE` path replaced with an absolute tarball lookup.
+- The house skill's `consumers-and-docs.md` no longer reads as though a
+  synchronous member is a `Promise` before the runtime exists, and gains the
+  plain-object-value-member trap.
+- The devnet observation (a transaction being visible is not its objects being
+  resolvable) is recorded in AGENTS.md and in the guide's section 17.
+
+### Conversion feedback (`docs/reviews/conversion-feedback.md`)
+
+1. Guide §16 recommends the packed tarball as the default and explains why
+   `link:`/`bun link` to an external checkout does not dedupe the peers
+   (resolution follows the symlink's real path; `#private` mismatches and two
+   `Context.Service` identities).
+2. Guide §16 documents `peerDependenciesMeta.<name>.optional: true` as the
+   escape from bun's registry probe for an unpublished peer, with the swap
+   checklist that undoes it.
+3. Guide §3 names the explicit-interface pattern for the halfway shape of
+   `Schema.decodeTo(DomainClass, SchemaTransformation.transform(...))` and says
+   why `typeof Class.Encoded` / `typeof Class.Type` inverts the direction.
+4. The template's `package.json` carries the optional-peer block and its README
+   explains it, because the file is copied verbatim.
+5. `SuiSchema.matchesType` is exported — the safe type-string matcher — with the
+   dynamic-field recipe in the guide and a note on `streamDynamicFields`'
+   JSDoc, which lands in LLMS.md.
+6. The template's `extension.ts` threads `options.chainId` into
+   `warm: { chainId }`; the template's tests cover the warm face on a network
+   with no built-in chain id, and the guide requires it.
+7. `Escrow.layerConfig` reads its package id with `Config.schema(ObjectId, …)`,
+   the typed deployment path, and the template has a malformed-value test.
+8. The guide names the target commit or tag for a conversion and the "re-pack
+   and diff" step; migration rows added for suffix-matching `assertObjectType`
+   and for a registration error surfacing synchronously from `$extend` under
+   `warm`; checklist lines added for `Layer.orDie` over a failing layer, a fake
+   with one key type per parent, and README `catchTag` strings.
+9. The LLMS/AGENTS note that `SuiCoreFake` call recording is reached through
+   `SuiTest.calls`.
+10. Covered with item 2: the optional-peer escape is reverted on the npm swap,
+    on the release checklist.
+11. `FakeExecution.commandResults` accepts a partial entry and the fake defaults
+    the missing array to `[]`; a complete entry is shown in the guide.
+12. The `Stream.runCollect` callout (a plain `Array`, not a `Chunk`) is in the
+    guide's dynamic-field section and in section 17.
+13. The guide says `SuiSchema.bcs` **without** an expected type is the intended
+    shape for an event decoder, and that the re-serialize check is what still
+    guards it.
+14. `SuiError.toJson` encodes any `Schema.TaggedError` through its own schema,
+    so an extension error serializes with its fields.
+15. The guide says `Effect.withConfigProvider` does not exist in rc.112 and
+    shows the provider being provided; the template's `layerConfig` test does it.
+16. `PromiseFace`'s JSDoc, DESIGN §13.2, the guide and the house skill all
+    document the plain-object-value-member split precisely.
+17. `SuiGraphQL.query(run, method?)` is added:
+    `Effect<A, GraphQLUnavailable | TransportError, SuiGraphQL>`, with the
+    passthrough built in.
+18. The guide has a "never `.make` a branded value from unvalidated input"
+    section, and the checklist rejects it and the missing `tests` tsconfig
+    `include`.
+19. The guide says `Config.option` turns an empty variable into "unset", so a
+    `ConfigError` must not be promised for it.
+20. The npm-swap notes and section 17 say `Tx.build` always simulates, so
+    `simulateTransaction` call-count assertions move.
+21. `SuiCoreFake.getDynamicField` matches on `name.type` **and** `name.bcs`; an
+    entry scripted without `bcs` still matches any key of its type.
+22. `fromService`'s JSDoc, DESIGN §13.2 and the guide state that `warm` takes
+    `sui.chainId` as the pinned id and never asserts it — and that the node is
+    first consulted on the extension's own first call.
+
+Section G of the verification is now the guide's section 17, "What extension
+authors must know".
+
+**Public surface added:** `SuiGraphQL.query`; `SuiSchema.matchesType`;
+`SuiTest.recordTransaction`; `SuiCoreFakeState.recordTransaction`;
+`FakeScript.transactions`; `FakeChange.inputVersion`; the template's
+`EscrowRegistrationOptions` and `PlatformRegistrationOptions`;
+`missingDeclaration` in `scripts/llms.ts`. **Widened:** `SuiError.toJson` takes
+any tagged error; `FakeExecution.commandResults` takes partial entries; the
+template's `escrow(...)` and `platform(...)` take an optional `chainId`.
+**Retagged:** a nonce outside the `u32` range is now `BuildError`, not
+`TransportError`. Nothing was removed.

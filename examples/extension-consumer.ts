@@ -68,8 +68,11 @@ export class Escrow extends Context.Service<Escrow, {
             ["ObjectNotFound", "ObjectDeleted"],
             () => Effect.fail(new EscrowNotFound({ escrowId: id }))
           ),
+          // `TransportError.fromUnknown`, never the constructor: it classifies
+          // the cause — gRPC status, HTTP status, abort — instead of guessing
+          // `retryable: false` and dropping it.
           Effect.catchTag("ObjectUnavailable", (cause) =>
-            Effect.fail(new TransportError({ method: "escrow.get", retryable: false, cause })))
+            Effect.fail(TransportError.fromUnknown("escrow.get", cause)))
         )
       })
 

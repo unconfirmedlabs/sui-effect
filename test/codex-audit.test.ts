@@ -223,15 +223,14 @@ describe("2. the consumer of a pinned version, not the latest mutation", () => {
     expect(result.failure._tag).toBe("SubmissionUnknown")
   })
 
-  test("with the bytes, our own digest at the successor version means it applied", async () => {
+  test("with the bytes, our own digest on the live object means it applied", async () => {
     const result = await run(
       Effect.gen(function*() {
         const built = yield* Tx.build(claim, { sender: SENDER })
         const signed = yield* Tx.sign(built, signer)
         const outcome = yield* Effect.result(Tx.submit(signed))
-        // Someone else moves the object on afterwards; the live object now
-        // names them, and only the versioned read still names us.
-        yield* SuiTest.bumpVersion(ESCROW_ID, { consumedBy: OTHER_DIGEST })
+        // The escrow now names our digest as the transaction that last mutated
+        // it, and the node asked for the receipt has not caught up.
         yield* SuiTest.scriptGetTransaction([FakeOutcome.notFound(), executed])
         return { outcome, settled: yield* Effect.result(Tx.reconcile(signed)) }
       }),
@@ -241,17 +240,57 @@ describe("2. the consumer of a pinned version, not the latest mutation", () => {
     expect(result.settled._tag).toBe("Success")
   })
 
-  test("a different transaction at the successor version is still inputConsumed", async () => {
+  test("a later transaction that consumed a version we did not pin proves nothing", async () => {
+    // The Lamport-version reality (final verification B2): our transaction
+    // pinned version 3 and produced version 4, and the transaction that moved
+    // the object on took version 4, not 3. It says nothing about ours, and the
+    // object "one version on from 3" is the one our own transaction produced.
     const error = await run(
       Effect.gen(function*() {
         const built = yield* Tx.build(claim, { sender: SENDER })
         const signed = yield* Tx.sign(built, signer)
-        // Version 4 was produced by someone else entirely: these bytes, which
-        // pinned version 3, can never execute.
         yield* SuiTest.bumpVersion(ESCROW_ID, { consumedBy: OTHER_DIGEST })
         return yield* Tx.reconcile(signed).pipe(Effect.flip)
       }),
-      { ...baseScript, getTransaction: [FakeOutcome.notFound()] },
+      {
+        ...baseScript,
+        getTransaction: [FakeOutcome.notFound()],
+        transactions: {
+          [OTHER_DIGEST]: FakeOutcome.succeed({
+            digest: OTHER_DIGEST,
+            mutated: [
+              { objectId: ESCROW_ID, type: ESCROW_TYPE, version: 5n, inputVersion: 4n, owner }
+            ]
+          })
+        }
+      },
+      noRecheck
+    )
+    expect(error._tag).toBe("SubmissionUnknown")
+  })
+
+  test("a different transaction that consumed the pinned version is inputConsumed", async () => {
+    const error = await run(
+      Effect.gen(function*() {
+        const built = yield* Tx.build(claim, { sender: SENDER })
+        const signed = yield* Tx.sign(built, signer)
+        // Someone else took the escrow at version 3 — exactly the version these
+        // bytes pinned — so these bytes can never execute.
+        yield* SuiTest.bumpVersion(ESCROW_ID, { consumedBy: OTHER_DIGEST })
+        return yield* Tx.reconcile(signed).pipe(Effect.flip)
+      }),
+      {
+        ...baseScript,
+        getTransaction: [FakeOutcome.notFound()],
+        transactions: {
+          [OTHER_DIGEST]: FakeOutcome.succeed({
+            digest: OTHER_DIGEST,
+            mutated: [
+              { objectId: ESCROW_ID, type: ESCROW_TYPE, version: 4n, inputVersion: 3n, owner }
+            ]
+          })
+        }
+      },
       noRecheck
     )
     expect(error._tag).toBe("NotApplied")
@@ -968,7 +1007,10 @@ describe("16. the nonce is configurable", () => {
       baseScript,
       withConfig({ nonce: Effect.succeed(-1) })
     )
-    expect(error._tag).toBe("TransportError")
+    // A `BuildError`: nothing was sent and no node was asked, so calling it a
+    // transport failure put a configuration mistake on the retry path.
+    expect(error._tag).toBe("BuildError")
+    if (error._tag === "BuildError") expect(error.message).toContain("not a u32")
   })
 })
 
