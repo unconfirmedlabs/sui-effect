@@ -8,16 +8,28 @@ import { bcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
-import { Effect, Fiber, Layer, Stream } from "effect"
+import {
+  Cause,
+  DateTime,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Redacted,
+  Schema,
+  Stream
+} from "effect"
 import { TestClock } from "effect/testing"
 import type { Sui, SuiCore } from "sui-effect"
-import { ObjectId, SuiAddress } from "sui-effect"
+import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiSchema } from "sui-effect"
 import type { SuiCoreFake } from "sui-effect/testing"
-import { FakeOutcome, layerExtensionTest, SuiTest } from "sui-effect/testing"
+import { FakeOutcome, layerExtensionTest, layerTest, SuiTest } from "sui-effect/testing"
 import { Journal, Signer } from "sui-effect/tx"
-import { Escrow } from "../src/Escrow.ts"
-import { EscrowNotFound, EscrowSettlementUnknown } from "../src/errors.ts"
-import { ESCROW_PACKAGE, RECEIPT_TYPE } from "../src/schema.ts"
+import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
+import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "../src/errors.ts"
+import { Platform } from "../src/Platform.ts"
+import { ESCROW_PACKAGE, RECEIPT_TYPE, Settlement, SettlementContent } from "../src/schema.ts"
 
 const padded = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
 const ESCROW_ID = ObjectId.make(padded("e5c0"))
@@ -238,5 +250,120 @@ describe("Escrow under the two clocks", () => {
     expect(attempts).toBe(2)
     // The same bytes both times: `Tx.submit` never rebuilds.
     expect(bytes).toBe(1)
+  })
+})
+
+describe("Settlement: a domain class over the BCS bridge", () => {
+  const SettlementBcs = bcs.struct("Settlement", {
+    escrow_id: bcs.Address,
+    settled_at_ms: bcs.u64(),
+    claimed_by: bcs.Address
+  })
+
+  test("snake_case Move fields decode into the camelCase domain class", async () => {
+    const bytes = SettlementBcs.serialize({
+      escrow_id: ESCROW_ID,
+      settled_at_ms: "1700000000000",
+      claimed_by: SENDER
+    }).toBytes()
+    const settlement = await Effect.runPromise(SuiSchema.decode(SettlementContent, bytes))
+    expect(settlement).toBeInstanceOf(Settlement)
+    expect(settlement.escrowId).toBe(ESCROW_ID)
+    expect(settlement.claimedBy).toBe(SENDER)
+    expect(DateTime.toEpochMillis(settlement.settledAt)).toBe(1_700_000_000_000)
+  })
+
+  test("the encode direction is the inverse mapper", async () => {
+    const bytes = SettlementBcs.serialize({
+      escrow_id: ESCROW_ID,
+      settled_at_ms: "1700000000000",
+      claimed_by: SENDER
+    }).toBytes()
+    const settlement = await Effect.runPromise(SuiSchema.decode(SettlementContent, bytes))
+    const encoded = await Effect.runPromise(
+      Schema.encodeUnknownEffect(SettlementContent)(settlement)
+    )
+    expect(Array.from(encoded)).toEqual(Array.from(bytes))
+  })
+
+  test("a failure inside the domain transform is still a DecodeError", async () => {
+    const bytes = SettlementBcs.serialize({
+      escrow_id: ESCROW_ID,
+      // Beyond what a `Date` can be, so the domain mapping is what fails.
+      settled_at_ms: "99999999999999999",
+      claimed_by: SENDER
+    }).toBytes()
+    const error = await Effect.runPromise(
+      Effect.flip(SuiSchema.decode(SettlementContent, bytes, { objectId: ESCROW_ID }))
+    )
+    expect(error._tag).toBe("DecodeError")
+    expect(error.objectId).toBe(ESCROW_ID)
+  })
+})
+
+describe("layerBundled: the deployment follows the client's network", () => {
+  const apiKey = Redacted.make("test-key")
+
+  test("picks the package id bundled for the network the client is on", async () => {
+    const packageId = await Effect.runPromise(
+      Effect.provide(
+        Effect.map(Escrow, (escrow) => escrow.packageId),
+        Layer.provide(Escrow.layerBundled({ apiKey }), layerTest({ network: "testnet", chainId: KNOWN_CHAIN_IDS["testnet"]! })),
+        { local: true }
+      )
+    )
+    expect(packageId).toBe(DEPLOYMENTS["testnet"]!.packageId)
+  })
+
+  test("a network this release does not bundle is a typed layer failure", async () => {
+    const exit = await Effect.runPromise(
+      Effect.exit(
+        Effect.provide(
+          Effect.map(Escrow, (escrow) => escrow.packageId),
+          Layer.provide(Escrow.layerBundled({ apiKey }), layerTest({ network: "localnet" })),
+          { local: true }
+        )
+      )
+    )
+    expect(exit._tag).toBe("Failure")
+    const error = Exit.isFailure(exit)
+      ? Option.getOrUndefined(Cause.findErrorOption(exit.cause))
+      : undefined
+    expect(error).toBeInstanceOf(EscrowUnsupportedNetwork)
+    expect((error as EscrowUnsupportedNetwork).network).toBe("localnet")
+  })
+})
+
+describe("Platform: one extension composed on another", () => {
+  test("the dependency's surface is a namespace on the composition", async () => {
+    const amount = await Effect.runPromise(
+      Effect.provide(
+        Effect.flatMap(Platform, (platform) => platform.escrow.get(ESCROW_ID)),
+        Layer.mergeAll(
+          // The composition's own test layer over the harness: one fake for the
+          // chain, and the dependency's own fake for its operator service.
+          layerExtensionTest(Platform.layerTest({ settled: true }), script),
+          Journal.layerMemory
+        ),
+        { local: true }
+      ).pipe(Effect.map((escrow) => escrow.content.amount))
+    )
+    expect(amount).toBe("5")
+  })
+
+  test("an operation that spans the composed packages keeps the union honest", async () => {
+    const claimed = await Effect.runPromise(
+      Effect.provide(
+        Effect.flatMap(Platform, (platform) =>
+          platform.claimEverything([ESCROW_ID], { signer })),
+        Layer.mergeAll(
+          layerExtensionTest(Platform.layerTest({ settled: true }), script),
+          Journal.layerMemory
+        ),
+        { local: true }
+      )
+    )
+    expect(claimed).toHaveLength(1)
+    expect(claimed[0]?.id).toBe(ObjectId.make(RECEIPT_ID))
   })
 })

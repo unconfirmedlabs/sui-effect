@@ -29,7 +29,7 @@ import {
 } from "sui-effect"
 import type { RunError, Signer } from "sui-effect/tx"
 import { Tx } from "sui-effect/tx"
-import { EscrowNotFound, EscrowSettlementUnknown } from "./errors.ts"
+import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
 import { EscrowContent, ESCROW_PACKAGE, RECEIPT_TYPE } from "./schema.ts"
 import type { SettlementApi } from "./upstream.ts"
 import { settlementApi } from "./upstream.ts"
@@ -251,7 +251,11 @@ const make = (
           // is.
           SuiSchema.decode(EscrowContent, object.content, {
             objectId: object.id,
-            expectedType: escrowType
+            // The type the object actually has. Give it and `SuiSchema.decode`
+            // runs the same tag check `getObject` does, under the same rule: a
+            // bare expected tag matches every instantiation of it, a
+            // parameterized one is compared in full.
+            actualType: object.type
           }).pipe(Effect.map((content): EscrowObject => ({ ...object, content })))
         )
       )
@@ -268,6 +272,27 @@ const make = (
       }
     }
   })
+
+/**
+ * What this release knows about a network: the package it was published to,
+ * and the operator that settles for it.
+ */
+export interface EscrowDeployment {
+  readonly packageId: string
+  readonly url: string
+}
+
+/**
+ * The deployments this release bundles.
+ *
+ * Every extension over a Move package has one of these, because a package id is
+ * per network and a consumer should not have to carry a table of them. Replace
+ * the ids with yours.
+ */
+export const DEPLOYMENTS: Readonly<Record<string, EscrowDeployment>> = {
+  testnet: { packageId: ESCROW_PACKAGE, url: "https://settlement.testnet.example" },
+  mainnet: { packageId: ESCROW_PACKAGE, url: "https://settlement.example" }
+}
 
 /** The in-memory settlement service `layerTest` runs against. */
 const fakeApi = (settled: boolean): SettlementApi => ({
@@ -316,6 +341,39 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
       return Escrow.layer(options)
     })
   )
+
+  /**
+   * The layer for whatever network the client is already on, from the table
+   * this release bundles.
+   *
+   * This is the shape every extension over a Move package wants: the consumer
+   * has already chosen a network by building a client, and the package id
+   * follows from it. `Layer.unwrap` is what lets the layer *read* `Sui` before
+   * deciding which layer to be, and the network that has no entry is a typed
+   * failure rather than an `undefined` that surfaces as a Move abort three
+   * calls later.
+   *
+   * `layerConfig` still earns its place beside this one when configuration
+   * carries something the table cannot: the operator URL of a private
+   * deployment, a credential, a package id under test. When the only
+   * configuration *is* the package id, this layer is the one to ship and
+   * `layerConfig` is the override.
+   *
+   * Fails with: `EscrowUnsupportedNetwork`.
+   */
+  static readonly layerBundled = (
+    options: { readonly apiKey: Redacted.Redacted<string> }
+  ): Layer.Layer<Escrow, EscrowUnsupportedNetwork, Sui> =>
+    Layer.unwrap(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        const deployment = DEPLOYMENTS[sui.network]
+        if (deployment === undefined) {
+          return yield* new EscrowUnsupportedNetwork({ network: sui.network })
+        }
+        return Escrow.layer({ ...deployment, apiKey: options.apiKey })
+      })
+    )
 
   /**
    * The test layer: the real service over an in-memory settlement service, so

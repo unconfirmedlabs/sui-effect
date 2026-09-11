@@ -22,6 +22,14 @@ the work plan. Where this file and the spec disagree, fix this file.
   which is a process entrypoint and whose whole job is to fork the root fiber,
   await its `Exit` and exit.
 - No `any`. No `unknown` in an error channel. No `console.log` in `src/`.
+- **One Move type rule.** `typeMatches(expected, actual)` (`src/domain/bcs.ts`)
+  is the only comparison: a bare expected tag matches every instantiation of the
+  generic, a parameterized one is compared in full after normalization. The
+  bridge, `expectedType`, `SuiSchema.decode`'s `actualType` and the fake's
+  owned-object filter all go through it, and so must anything new.
+- **A `TransportError` for your own transport** comes from
+  `TransportError.fromUnknown(method, cause, retryable?)`, never from
+  hand-building the three fields.
 - Every public function carries a JSDoc block that **states its error union in
   words** ("Fails with: `ObjectNotFound`, `TransportError`."), so `LLMS.md` can be
   generated from the source.
@@ -54,7 +62,7 @@ the work plan. Where this file and the spec disagree, fix this file.
 | Tier | What it is | When to use it |
 |---|---|---|
 | `SuiCore` | A 1:1 Effect wrap of `ClientWithCoreApi`. One member per `SuiClientTypes.TransportMethods` key plus `getObject`, `getDynamicObjectField`, `waitForTransaction`, `signAndExecuteTransaction` and `use`. `Include` generics preserved. | Reaching a field or method `Sui` does not expose, and inside extension implementations. |
-| `Sui` | The opinionated tier over `SuiCore`: fixed include sets, decoded BCS content, `Option` where absence is normal, chunked and integrity-checked batch reads, `Stream` pagination, one sender lock. | Almost all application and extension code. |
+| `Sui` | The opinionated tier over `SuiCore`: fixed include sets, decoded BCS content, `Option` where absence is normal, chunked and integrity-checked batch reads (`getObjects` per-item `Result`, `getObjectsOrFail` first-error-wins), `Stream` pagination, one sender lock. | Almost all application and extension code. |
 
 Reads go through `Sui`; writes go through `Tx`. An extension never calls
 `SuiCore.executeTransaction` directly. `Sui` exposes the `SuiCore` it was built
@@ -70,7 +78,8 @@ and nothing else.
 | `SubmitConfig` | A `Context.Reference` holding expiration policy, the optional `validFor` wall-clock bound, the gas-budget ceiling, `preflight`, the sender lock, and the resubmit schedule, attempts, timeout and expiry margin. |
 | `Journal` | A `Context.Reference` with an in-memory default. `sui-effect/journal` swaps in a durable one over `KeyValueStore`; `Tx.reconcileAll()` is the explicit startup call. |
 | `Script` | `{ sui, core, signer, network }` plus `Script.run` and `Script.exitCode`. `ScriptReadOnly` is the signer-less variant, a separate key on purpose. |
-| `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. |
+| `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. Options: `sui` (chain pinning), `warm` (build the runtime synchronously in `register`). The face carries `$ready()` and `$dispose()`; a synchronous member called before the runtime exists fails with `ExtensionNotReady`. |
+| `SuiGraphQL` | A bare tag over the SDK's `SuiGraphQLClient` (`layer`, `layerConfig`, `layerUnavailable`). sui-effect wraps no GraphQL API; the tag exists so extensions share one client. |
 
 ## Extensions
 
@@ -117,6 +126,7 @@ Every failure is one flat tag; there is no error inheritance.
 | `SubmissionUnknown` | Bytes may have been sent; the outcome is unknown. Carries the signed bytes, unless it came from reconciling a bare digest. |
 | `NotApplied` | Provably never applied. `expired`: the epoch window closed. `inputConsumed`: the node named a **different** transaction as the one that consumed a pinned input. An input that merely moved on is not evidence. |
 | `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` / `UnexpectedEffects` | Signing, building, preflight policy, journal, and effects that did not contain what was expected. |
+| `GraphQLUnavailable` / `ExtensionNotReady` | No usable GraphQL endpoint; a synchronous Promise-face member used before its runtime existed. Both `not_applied`. |
 
 `SuiError.outcome(e)` puts every failure on the axis a wrapper script acts on:
 `"applied"` for `ExecutionFailed`, `"unknown"` for `SubmissionUnknown`,
@@ -145,4 +155,7 @@ against the fake's `client` resolves gas and object inputs from the script with
 no network, and it keys transactions by
 `TransactionDataBuilder.getDigestFromBytes` of the bytes it was handed. Any
 method the script does not cover dies with a message naming it: a test never
-silently passes against a stub.
+silently passes against a stub. Its `client` implements `$extend`, so a derived
+Promise face is testable the way a consumer writes it; `listOwnedObjects`
+filters through `typeMatches` rather than string equality, and `getDynamicField`
+matches an entry by `name.type` only, not by the `name.bcs` bytes.

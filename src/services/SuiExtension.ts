@@ -18,7 +18,9 @@ import type { ClientWithCoreApi, SuiClientRegistration } from "@mysten/sui/clien
 import type { Context } from "effect"
 import { Effect, Layer, ManagedRuntime, Stream } from "effect"
 import type { NetworkMismatch, TransportError } from "../domain/errors.ts"
-import type { Sui } from "./Sui.ts"
+import { ExtensionNotReady } from "../domain/errors.ts"
+import { KNOWN_CHAIN_IDS } from "../domain/schemas.ts"
+import type { Sui, SuiLayerOptions } from "./Sui.ts"
 import { Sui as SuiService } from "./Sui.ts"
 import { SuiCore } from "./SuiCore.ts"
 
@@ -30,6 +32,18 @@ import { SuiCore } from "./SuiCore.ts"
  * `Stream` member becomes an `AsyncIterable`, a nested plain object of members
  * is mapped the same way (platform SDKs namespace their surface as
  * `client.miso.protocol.*`), and anything else passes through untouched.
+ *
+ * **A synchronous member stays synchronous**: a recipe builder
+ * `(p: Params) => Recipe` is still `(p: Params) => Recipe` here, and a plain
+ * value is still that value. The type says so and, once the runtime exists, the
+ * runtime agrees — see `warm` and `$ready` on {@link fromService} for the
+ * window before it does.
+ *
+ * **A class instance is a leaf.** The recursion is into plain object literals
+ * only, which is what the runtime maps; a `BcsType`, a `Schema.Class` instance,
+ * a `Date`, anything with a prototype of its own passes through whole, in the
+ * type and at runtime alike. (An interface or class type is not assignable to
+ * `Record<string, unknown>`, which is what keeps the two in step.)
  */
 export type PromiseFace<S> = {
   readonly [K in keyof S]: S[K] extends Stream.Stream<infer A, infer _E, infer _R> ? AsyncIterable<A>
@@ -40,6 +54,30 @@ export type PromiseFace<S> = {
       ? (...args: Args) => Promise<A>
     : S[K] extends Record<string, unknown> ? PromiseFace<S[K]>
     : S[K]
+}
+
+/**
+ * What every registration carries besides the service's own members, under
+ * `$`-prefixed names so an extension is free to call a member `ready` or
+ * `dispose` itself.
+ */
+export interface ExtensionFace {
+  /**
+   * Builds the runtime and resolves the service, so every member afterwards is
+   * the real thing — synchronous members included.
+   *
+   * Call it once after `$extend` when the extension has synchronous members
+   * (recipe builders, ids, codecs) and the registration is not `warm`. It is
+   * idempotent and costs nothing after the first time.
+   */
+  readonly $ready: () => Promise<void>
+  /**
+   * Releases everything the layer acquired and forgets the runtime. Not final:
+   * the next call builds a fresh one.
+   */
+  readonly $dispose: () => Promise<void>
+  /** The name `$dispose` had first. The same function. */
+  readonly dispose: () => Promise<void>
 }
 
 /** What `fromService` needs to know beyond the service key itself. */
@@ -54,11 +92,57 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
    */
   readonly name: Name
   /**
-   * The extension's layer. It may require `Sui` and `SuiCore`, which this
-   * module builds over the client `$extend` was called on, and nothing else.
+   * The extension's layer.
+   *
+   * The bound is `Layer<Self, E, Sui | SuiCore>`: it may require either tier,
+   * because this module builds both over the client `$extend` was called on,
+   * and **nothing else**. An extension with a dependency of its own — an
+   * `HttpClient`, a `SuiGraphQL` — provides it inside this layer
+   * (`Layer.provide(SuiGraphQL.layerConfig)`) or in the function that builds
+   * the registration. The rule is not "requires `Sui` and nothing else"; it is
+   * "requires nothing the consumer's client could have provided".
    */
   readonly layer: Layer.Layer<Self, E, Sui | SuiCore>
+  /**
+   * Options for the `Sui` layer built under the extension's own.
+   *
+   * `sui.chainId` pins the chain identifier the node must report, overriding
+   * the built-in table for `mainnet` and `testnet` and asserting one where
+   * there is none — which is how an extension whose deployment names a custom
+   * network's `chainIdentifier` refuses to run against a different chain.
+   */
+  readonly sui?: SuiLayerOptions
+  /**
+   * Build the runtime **inside `register`**, synchronously, instead of on the
+   * first call.
+   *
+   * Give it when the extension has synchronous members — recipe builders, a
+   * package id, a codec — that a consumer expects to read the moment it
+   * registers. Every member is then the real thing immediately, and
+   * `$ready()` has nothing left to do.
+   *
+   * Two conditions, both enforced:
+   *
+   * - **The layer must not perform an asynchronous step.** A layer that reads
+   *   the network, opens a connection or awaits anything cannot be built
+   *   synchronously and `register` throws. This is the documented contract of
+   *   `warm`, not an accident: an extension that needs the network at build is
+   *   registered without it.
+   * - **The chain identifier is not read.** `Sui` normally calls
+   *   `getChainIdentifier` at layer build, which is a round trip. A warm
+   *   registration takes `warm.chainId` (or `sui.chainId`, or the entry in the
+   *   built-in table for `mainnet` and `testnet`) as the chain's identifier and
+   *   asks nothing, so a node on another chain is not detected at
+   *   registration. It is still detected by the chain: `Tx.build` stamps that
+   *   id on the expiration and a validator refuses bytes signed for another
+   *   chain. On `devnet`, `localnet` or a custom network there is no table
+   *   entry, so `warm` without a `chainId` throws rather than guess.
+   */
+  readonly warm?: { readonly chainId?: string }
 }
+
+/** The names the face adds to every service, which a member cannot shadow. */
+const RESERVED = ["$ready", "$dispose", "dispose"] as const
 
 const isEffect = (value: unknown): value is Effect.Effect<unknown, unknown, unknown> =>
   typeof value === "object" && value !== null && Effect.isEffect(value)
@@ -99,45 +183,55 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  * Turns an Effect service into a `SuiClientRegistration` a Promise consumer
  * passes to `client.$extend(...)`.
  *
- * `register(client)` does no work: the `ManagedRuntime` over
- * `SuiCore.layerFromClient(client)`, `Sui.layerNoDeps` and the extension's own
- * layer is built on the first call and shared by every call after it. A
- * rejection carries the original tagged error instance, so a Promise consumer
- * can still switch on `_tag`.
- *
- * Until the runtime has been built once, a member that is a plain value cannot
- * be read as a value — nothing knows what it is yet — and comes back as a
- * callable, iterable placeholder that resolves on use. After the first
- * `await`, every member is the real thing.
+ * `register(client)` does no work by default: the `ManagedRuntime` over
+ * `SuiCore.layerFromClient(client)`, `Sui.layerNoDepsWith(options.sui)` and the
+ * extension's own layer is built on the first call and shared by every call
+ * after it. A rejection carries the original tagged error instance, so a
+ * Promise consumer can still switch on `_tag`.
  *
  * `name` is generic in a string literal, so `client.escrow` is a property of
  * the extended client's type and not an index lookup: no cast, and no
  * `| undefined` under `noUncheckedIndexedAccess`.
  *
+ * **The window before the runtime exists.** Until then nothing knows what a
+ * member *is*, so a member read off the face is a placeholder. An `Effect` or
+ * `Stream` member behaves exactly as its type says — the call returns a
+ * Promise, the iteration works — because that is what the face promises for
+ * them anyway. A **synchronous** member does not: `PromiseFace` types a recipe
+ * builder as returning a `Recipe` and a plain value as that value, and a
+ * placeholder has neither. So a synchronous member used in that window fails
+ * with `ExtensionNotReady` naming itself, rather than quietly handing back a
+ * Promise where the type says `Recipe` — which is a bug that only shows up on
+ * the *second* call, when the member has become real. Two cures:
+ *
+ * - `await client.<name>.$ready()` once after `$extend`, which builds the
+ *   runtime and resolves the service; every member is real from then on;
+ * - register with `warm`, which does the same synchronously inside `register`,
+ *   for a layer that needs no network.
+ *
  * Two lifetimes worth knowing:
  *
- * - **`dispose()` is not final.** It releases everything the layer acquired and
- *   forgets the runtime; the next call builds a fresh one. That is what a
+ * - **`$dispose()` is not final.** It releases everything the layer acquired
+ *   and forgets the runtime; the next call builds a fresh one. That is what a
  *   long-lived page wants (a disposed extension is usable again after a
- *   reconnect) and it does mean a `dispose()` that races an in-flight call can
+ *   reconnect) and it does mean a `$dispose()` that races an in-flight call can
  *   leave the caller's Promise rejected while a new runtime starts behind it.
- *   Dispose when the consumer is done, not between calls.
+ *   Dispose when the consumer is done, not between calls. `dispose()` is the
+ *   same function under the name it had first.
  * - **Each `register` is independent.** Registering the same extension on two
  *   clients — or twice on one — gives two runtimes, two layer builds and two
  *   copies of whatever the layer holds (a cache, a connection). Register once
  *   per client and keep the extended client.
  *
- * Never fails; the layer's own failures surface as rejections of the first
- * call that needs it.
+ * Never fails, except a `warm` registration, which throws out of `register`
+ * when the layer needs an asynchronous step or when the network has no known
+ * chain identifier and none was given. Otherwise the layer's own failures
+ * surface as rejections of the first call that needs it.
  */
 export const fromService = <Self, Shape, E, const Name extends string>(
   service: Context.Key<Self, Shape>,
   options: SuiExtensionOptions<Self, E, Name>
-): SuiClientRegistration<
-  ClientWithCoreApi,
-  Name,
-  PromiseFace<Shape> & { readonly dispose: () => Promise<void> }
-> => ({
+): SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & ExtensionFace> => ({
   name: options.name,
   register: (client: ClientWithCoreApi) => {
     type Runtime = ManagedRuntime.ManagedRuntime<
@@ -152,7 +246,7 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         // `Sui` and `SuiCore` over the very client `$extend` was called on, so
         // the extension and the consumer share one transport and one chain-id
         // check.
-        const base = SuiService.layerNoDeps.pipe(
+        const base = SuiService.layerNoDepsWith(options.sui ?? {}).pipe(
           Layer.provideMerge(SuiCore.layerFromClient(client))
         )
         runtime = ManagedRuntime.make(options.layer.pipe(Layer.provideMerge(base)))
@@ -170,6 +264,32 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       })
     }
 
+    /**
+     * The warm path: one synchronous build inside `register`.
+     *
+     * `ManagedRuntime.runSync` forces the layer and resolves the service in one
+     * go; a layer with an asynchronous step throws out of it, which is the
+     * documented contract. The chain identifier is taken, never read.
+     */
+    const warmUp = (warm: { readonly chainId?: string }): void => {
+      const chainId = warm.chainId ?? options.sui?.chainId ?? KNOWN_CHAIN_IDS[client.network]
+      if (chainId === undefined) {
+        throw new Error(
+          `${options.name}: a warm registration on network "${client.network}" needs an explicit ` +
+            "chain id (warm: { chainId }), because there is no built-in identifier for it and a " +
+            "warm build never asks the node"
+        )
+      }
+      const base = SuiService.layerNoDepsPinned(chainId).pipe(
+        Layer.provideMerge(SuiCore.layerFromClient(client))
+      )
+      const warmRuntime: Runtime = ManagedRuntime.make(
+        options.layer.pipe(Layer.provideMerge(base))
+      )
+      runtime = warmRuntime
+      instance = warmRuntime.runSync(service as unknown as Effect.Effect<Shape, never, Self>)
+    }
+
     const resolve = async (): Promise<Shape> => {
       if (instance === undefined) {
         instance = await runtimeOf().runPromise(
@@ -178,6 +298,12 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       }
       return instance
     }
+
+    const notReady = (member: ReadonlyArray<string>): ExtensionNotReady =>
+      new ExtensionNotReady({
+        extension: options.name,
+        member: member.length === 0 ? "<the service>" : member.join(".")
+      })
 
     const lazy = (path: ReadonlyArray<string>): unknown => {
       const at = async () => {
@@ -189,10 +315,29 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       const node = (...args: ReadonlyArray<unknown>) =>
         at().then((member) => {
           const mapped = mapMember(member, bridge)
-          return typeof mapped === "function"
-            ? (mapped as (...a: ReadonlyArray<unknown>) => unknown)(...args)
-            : mapped
+          if (typeof mapped !== "function") {
+            // The member was a plain value, and the caller used it as a
+            // function because nothing knew what it was yet.
+            throw notReady(path)
+          }
+          const result = (mapped as (...a: ReadonlyArray<unknown>) => unknown)(...args)
+          // A member that returns an `Effect` or a `Stream` is typed as
+          // Promise-returning, so answering with a Promise is the truth. A
+          // member that returns anything else is typed as **synchronous**, and
+          // a Promise of its value is not the value: say so instead of handing
+          // back something the type says cannot be awaited.
+          if (result instanceof Promise) return result
+          if (typeof result === "object" && result !== null && Symbol.asyncIterator in result) {
+            return result
+          }
+          throw notReady(path)
         })
+      // Every synchronous use of a placeholder — a plain value read as a
+      // string, a number, a JSON payload — lands on one of these, and each one
+      // says the same thing: the runtime does not exist yet.
+      const guard = () => {
+        throw notReady(path)
+      }
       return new Proxy(node, {
         get: (target, key) => {
           if (key === Symbol.asyncIterator) {
@@ -202,10 +347,22 @@ export const fromService = <Self, Shape, E, const Name extends string>(
               yield* mapped as AsyncIterable<unknown>
             }
           }
+          // Every synchronous use lands on one of these: a coercion, a
+          // `JSON.stringify`, or an `await` of what the type says is a value.
+          if (
+            key === Symbol.toPrimitive || key === "toJSON" || key === "valueOf" ||
+            key === "then"
+          ) {
+            return guard()
+          }
           if (typeof key !== "string") return Reflect.get(target, key)
           return lazy([...path, key])
         }
       })
+    }
+
+    const ready = async (): Promise<void> => {
+      await resolve()
     }
 
     const dispose = async () => {
@@ -214,10 +371,19 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       instance = undefined
     }
 
+    if (options.warm !== undefined) warmUp(options.warm)
+
+    const own = (key: string): unknown => {
+      if (key === "$ready") return ready
+      if (key === "$dispose" || key === "dispose") return dispose
+      return undefined
+    }
+
     return new Proxy({} as Record<string | symbol, unknown>, {
       get: (_target, key) => {
-        if (key === "dispose") return dispose
         if (typeof key !== "string") return undefined
+        const reserved = own(key)
+        if (reserved !== undefined) return reserved
         if (instance !== undefined) {
           const member = (instance as Record<string, unknown>)[key]
           return member === undefined ? undefined : mapMember(member, bridge)
@@ -225,11 +391,16 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         return lazy([key])
       },
       has: (_target, key) =>
-        key === "dispose" ||
+        key === "$ready" || key === "$dispose" || key === "dispose" ||
         (instance !== undefined && typeof key === "string" && key in (instance as object)),
-      ownKeys: () => (instance === undefined ? ["dispose"] : [...Object.keys(instance as object), "dispose"]),
+      ownKeys: () =>
+        instance === undefined
+          ? [...RESERVED]
+          // A `Proxy` refuses duplicate keys, so a service member that happens
+          // to be called `dispose` must not be listed twice.
+          : [...new Set([...Object.keys(instance as object), ...RESERVED])],
       getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true })
-    }) as PromiseFace<Shape> & { readonly dispose: () => Promise<void> }
+    }) as PromiseFace<Shape> & ExtensionFace
   }
 })
 

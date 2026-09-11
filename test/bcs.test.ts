@@ -168,3 +168,79 @@ describe("SuiObject", () => {
     expect(object.content.balance).toBe("123456789")
   })
 })
+
+describe("typeMatches: bare tags and instantiations", () => {
+  const COMPOSITION = `${PADDED("c0de")}::composition::Composition`
+  const SHARE = `${PADDED("5ha4e")}::share::Share`
+
+  test("a bare expected tag accepts every instantiation of it", () => {
+    expect(typeMatches(COMPOSITION, `${COMPOSITION}<${SHARE}>`)).toBe(true)
+    expect(typeMatches("0x2::coin::Coin", COIN_TYPE)).toBe(true)
+    expect(typeMatches("0xc0de::composition::Composition", `${COMPOSITION}<${SHARE}>`)).toBe(true)
+  })
+
+  test("a bare expected tag still refuses another type", () => {
+    expect(typeMatches(COMPOSITION, `${PADDED("c0de")}::composition::Draft<${SHARE}>`)).toBe(false)
+    expect(typeMatches(COMPOSITION, `${PADDED("beef")}::composition::Composition`)).toBe(false)
+    expect(typeMatches(COMPOSITION, "package")).toBe(false)
+  })
+
+  test("an expected tag with type arguments is compared in full", () => {
+    expect(typeMatches(`${COMPOSITION}<${SHARE}>`, `${COMPOSITION}<${SHARE}>`)).toBe(true)
+    expect(typeMatches(`${COMPOSITION}<${SHARE}>`, COMPOSITION)).toBe(false)
+    expect(typeMatches(`${COMPOSITION}<${SHARE}>`, `${COMPOSITION}<0x2::sui::SUI>`)).toBe(false)
+  })
+
+  test("a non-struct type compares as a normalized string", () => {
+    expect(typeMatches("package", "package")).toBe(true)
+    expect(typeMatches("package", COMPOSITION)).toBe(false)
+  })
+
+  test("a bare codec decodes an instantiated object's content", () => {
+    const Generic = suiBcs.struct("Composition", { id: suiBcs.Address })
+    const codec = bcs(Generic, COMPOSITION)
+    const bytes = Generic.serialize({ id: OBJECT_ID }).toBytes()
+    const decoded = run(
+      decodeContent(codec, bytes, {
+        objectId: ObjectId.make(OBJECT_ID),
+        actualType: `${COMPOSITION}<${SHARE}>`
+      })
+    )
+    expect(Result.isSuccess(decoded)).toBe(true)
+  })
+
+  test("SuiSchema.decode refuses bytes whose actual type is another struct", () => {
+    const Generic = suiBcs.struct("Composition", { id: suiBcs.Address })
+    const codec = bcs(Generic, COMPOSITION)
+    const bytes = Generic.serialize({ id: OBJECT_ID }).toBytes()
+    const decoded = run(
+      SuiSchema.decode(codec, bytes, {
+        objectId: ObjectId.make(OBJECT_ID),
+        actualType: `${PADDED("c0de")}::composition::Draft`
+      })
+    )
+    expect(Result.isFailure(decoded)).toBe(true)
+    if (Result.isFailure(decoded)) {
+      expect(decoded.failure._tag).toBe("DecodeError")
+      expect(decoded.failure.expectedType).toBe(normalizeStructTag(COMPOSITION))
+      expect(decoded.failure.issue).toContain("Draft")
+    }
+  })
+})
+
+describe("SuiSchema.bcs without an expected type", () => {
+  test("carries no Move type and checks none", () => {
+    const codec = bcs(suiBcs.Address)
+    expect(expectedTypeOf(codec)).toBeUndefined()
+    const bytes = suiBcs.Address.serialize(OBJECT_ID).toBytes()
+    const decoded = run(decodeContent(codec, bytes, { actualType: "0x2::whatever::Thing" }))
+    expect(Result.isSuccess(decoded)).toBe(true)
+    if (Result.isSuccess(decoded)) expect(decoded.success).toBe(OBJECT_ID)
+  })
+
+  test("still rejects trailing bytes, which is the check that does not need a type", () => {
+    const codec = bcs(suiBcs.Address)
+    const bytes = new Uint8Array([...suiBcs.Address.serialize(OBJECT_ID).toBytes(), 7])
+    expect(Result.isFailure(run(decodeContent(codec, bytes)))).toBe(true)
+  })
+})

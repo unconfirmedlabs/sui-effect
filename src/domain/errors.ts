@@ -32,7 +32,98 @@ export class TransportError extends Schema.TaggedError<TransportError>()("Transp
   retryable: Schema.Boolean,
   status: Schema.optional(Schema.String),
   cause: Schema.Defect()
-}) {}
+}) {
+  /**
+   * Builds a `TransportError` out of whatever a call threw, classifying the
+   * status and the retryability the way `SuiCore` does for the SDK's own
+   * failures.
+   *
+   * This is for an extension that makes its own network calls — an operator
+   * HTTP API, a GraphQL endpoint, a sidecar — and wants its failures to sit on
+   * the same axis as the library's: `retryable` read off a gRPC status name, an
+   * HTTP status number (5xx and 429), or an abort or timeout, and `status`
+   * recorded as the node or the transport spelled it. Hand-building the three
+   * fields per call site is how they drift.
+   *
+   * `retryable` may be forced when the caller knows better than the shape of
+   * the cause — an idempotent read that is always safe to repeat, a write that
+   * never is. Left out, it is inferred, and inferred conservatively: an
+   * unrecognisable cause is **not** retryable.
+   *
+   * Never fails.
+   *
+   * @example
+   * ```ts
+   * import { TransportError } from "sui-effect"
+   * import { Effect } from "effect"
+   *
+   * const status = Effect.tryPromise({
+   *   try: (signal) => fetch("https://operator.example/status", { signal }),
+   *   catch: (cause) => TransportError.fromUnknown("operator.status", cause)
+   * })
+   * ```
+   */
+  static readonly fromUnknown = (
+    method: string,
+    cause: unknown,
+    retryable?: boolean
+  ): TransportError => {
+    const classified = classifyTransportCause(cause)
+    return new TransportError({
+      method,
+      retryable: retryable ?? classified.retryable,
+      ...(classified.status === undefined ? {} : { status: classified.status }),
+      cause
+    })
+  }
+}
+
+/**
+ * gRPC status names a read may be retried on, plus HTTP 5xx and 429. Timeouts
+ * map to `DEADLINE_EXCEEDED` with `retryable: true`.
+ *
+ * `INTERNAL` and `UNKNOWN` are transport-level failures, not answers from the
+ * node: `@protobuf-ts/grpcweb-transport` turns a rejected `fetch` (connection
+ * refused, DNS failure) into an `RpcError` with code `INTERNAL`, and its
+ * grpc-web format maps HTTP 500 to `UNKNOWN` (503 to `UNAVAILABLE`, 504 to
+ * `DEADLINE_EXCEEDED`, 429 to `RESOURCE_EXHAUSTED`). Without them a read
+ * against a node that is merely down or restarting is never retried.
+ */
+export const RETRYABLE_GRPC_STATUSES: ReadonlySet<string> = new Set([
+  "UNAVAILABLE",
+  "DEADLINE_EXCEEDED",
+  "RESOURCE_EXHAUSTED",
+  "INTERNAL",
+  "UNKNOWN"
+])
+
+const isRetryableHttpStatus = (status: number): boolean => status === 429 || status >= 500
+
+/**
+ * The `status` and `retryable` of a thrown value: a timeout or an abort, an
+ * HTTP status number, a gRPC status name, or nothing recognisable. Never fails.
+ */
+export const classifyTransportCause = (
+  cause: unknown
+): { readonly status?: string; readonly retryable: boolean } => {
+  if (typeof cause !== "object" || cause === null) return { retryable: false }
+  const record = cause as Record<string, unknown>
+  const tag = record["_tag"]
+  const name = record["name"]
+  if (tag === "TimeoutError" || name === "TimeoutError" || name === "AbortError") {
+    return { status: "DEADLINE_EXCEEDED", retryable: true }
+  }
+  const httpStatus = record["status"]
+  if (typeof httpStatus === "number") {
+    return { status: String(httpStatus), retryable: isRetryableHttpStatus(httpStatus) }
+  }
+  const code = record["code"]
+  if (typeof code === "string") {
+    return { status: code, retryable: RETRYABLE_GRPC_STATUSES.has(code) }
+  }
+  if (typeof code === "number") return { status: String(code), retryable: false }
+  return { retryable: false }
+}
 
 /** The object does not exist, or has never existed. */
 export class ObjectNotFound extends Schema.TaggedError<ObjectNotFound>()("ObjectNotFound", {
@@ -135,6 +226,43 @@ export class UnexpectedEffects extends Schema.TaggedError<UnexpectedEffects>()(
   { digest: Digest, expected: Schema.String, found: Schema.Array(ObjectId) }
 ) {}
 
+/**
+ * The GraphQL endpoint an extension needs is not usable: none was configured,
+ * or the one that was could not be reached.
+ *
+ * sui-effect does not wrap the GraphQL API — it owns the {@link SuiGraphQL}
+ * *tag*, so two extensions that both read GraphQL share one client rather than
+ * opening two. This is the failure the tag's `layerUnavailable` produces, which
+ * is what an application provides when it has no endpoint: every call rejects
+ * with this instead of the extension discovering a missing dependency at
+ * construction. An extension maps it into its own union, or lets it through.
+ *
+ * Outcome `not_applied`: a read that did not happen changed nothing.
+ */
+export class GraphQLUnavailable extends Schema.TaggedError<GraphQLUnavailable>()(
+  "GraphQLUnavailable",
+  { method: Schema.String, reason: Schema.String }
+) {}
+
+/**
+ * A synchronous member of a Promise-faced extension was called before its
+ * runtime existed.
+ *
+ * `SuiExtension.fromService` builds its `ManagedRuntime` on first use, so until
+ * something has been awaited there is no service object and no synchronous
+ * member to read. Rather than hand back a Promise where the type says a value,
+ * the face throws this. Two cures, both in the extension's own hands:
+ * `await client.<name>.$ready()` once after registering, or register with
+ * `warm`, which builds the runtime inside `register` and makes every member
+ * real immediately.
+ *
+ * Outcome `not_applied`: nothing was sent.
+ */
+export class ExtensionNotReady extends Schema.TaggedError<ExtensionNotReady>()(
+  "ExtensionNotReady",
+  { extension: Schema.String, member: Schema.String }
+) {}
+
 /** Every failure sui-effect can produce. */
 export type SuiError =
   | TransportError
@@ -153,6 +281,8 @@ export type SuiError =
   | PolicyDenied
   | JournalError
   | UnexpectedEffects
+  | GraphQLUnavailable
+  | ExtensionNotReady
 
 /** The schema of the whole taxonomy, used for serialization. */
 export const SuiErrorSchema = Schema.Union([
@@ -171,7 +301,9 @@ export const SuiErrorSchema = Schema.Union([
   BuildError,
   PolicyDenied,
   JournalError,
-  UnexpectedEffects
+  UnexpectedEffects,
+  GraphQLUnavailable,
+  ExtensionNotReady
 ])
 
 /**
@@ -214,7 +346,9 @@ const TAXONOMY_TAGS: ReadonlySet<string> = new Set([
   "BuildError",
   "PolicyDenied",
   "JournalError",
-  "UnexpectedEffects"
+  "UnexpectedEffects",
+  "GraphQLUnavailable",
+  "ExtensionNotReady"
 ])
 
 /**
@@ -336,6 +470,10 @@ const describe = (error: SuiError): string => {
       return "JournalError"
     case "UnexpectedEffects":
       return `UnexpectedEffects ${error.digest} expected ${error.expected} but found ${error.found.length}`
+    case "GraphQLUnavailable":
+      return `GraphQLUnavailable ${error.method}: ${error.reason}`
+    case "ExtensionNotReady":
+      return `ExtensionNotReady ${error.extension}.${error.member} was called before the runtime existed: await client.${error.extension}.$ready() first, or register with warm`
   }
 }
 

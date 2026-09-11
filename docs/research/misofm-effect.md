@@ -4,12 +4,18 @@ Found 2026-09-11 after the design converged. `misofm/sdks/packages/effect` (`@mi
 
 ## What it provides
 
-- `SuiClient`: `Context.Service<SuiClient, ClientWithCoreApi>` with `SuiClient.layer(client) = Layer.succeed`. Also `SuiGraphQL` service for a `SuiGraphQLClient`, used only by platform catalog "type discovery" reads.
+- `SuiClient`: `Context.Service<SuiClient, ClientWithCoreApi>` with `SuiClient.layer(client) = Layer.succeed`. Also `SuiGraphQL` service for a `SuiGraphQLClient`, used by platform's catalog "type discovery" reads **and by musicos** (`queries.ts`, `client.ts`) — it is not platform-only, which is why the tag moved into sui-effect rather than staying in one package.
 - Errors (`Schema.TaggedError`): `ObjectNotFoundError { objectId }`, `ObjectTypeMismatchError { objectId, expected, actual }`, `SuiRpcError { operation, cause }`, `BcsDecodeError { type, objectId?, cause }`, `TransactionFailedError { digest, status }`, `GraphQLUnavailableError`, `DeploymentError { message }`. Not-found is detected by duck-typing `code` plus regexes on messages (pre-2.26 SDK).
 - Reads: `getObjectContent(id) -> { content: Uint8Array, type, version }`, `getOptionalObjectContent -> Option`, `getObjectsContent(ids) -> ReadonlyMap<id, { content, type }>` (single un-chunked call, errored ids silently dropped), `listDynamicFields(parent): Stream` via `Stream.paginate`, `decodeBcs(codec, schema, bytes, ctx)` (generated `.parse` codec then `Schema.decodeUnknownEffect` into a domain class), `assertObjectType(id, actual, expected)` (exact string compare, no normalization).
 - Execute: `TxThunk = (tx) => void | Promise<void>` (in practice every implementation is synchronous), `buildTx(...thunks): Effect<Transaction>`, `signAndExecute(signer, tx)` via `core.signAndExecuteTransaction` with `include { effects, objectTypes, balanceChanges }` then `waitForTransaction`, `execThunks(signer, ...thunks)`, `ExecResult { digest, changedObjects, objectTypes, balanceChanges, gasUsed: number }` with pure extractors `publishedPackageId`, `allPublishedPackageIds`, `createdByType(substr)`, `maybeCreatedByType`, `createdByExactType`, `allCreatedByType(substr)`, `balanceDelta(address, coinType): string`.
 
-Call-site counts across sdks, app, cli and api: `decodeBcs` 22, `getOptionalObjectContent` 20, `getObjectsContent` 12, `allCreatedByType` 7, `assertObjectType` 6, `listDynamicFields` 4, `buildTx` 4, `getObjectContent` 3, `createdByType` 3, `createdByExactType` 3, `signAndExecute` 2, `publishedPackageId` 2, `execThunks` 2, `balanceDelta` 1.
+Call-site counts across sdks, app, cli and api. Method, so a later reader can
+redo them: for each name, `rg -o '\b<name>\(' <roots> | wc -l` over
+`packages/*/src`, `app/src`, `cli/src` and `api/src` with `node_modules`
+excluded — **occurrences, not files**, and the trailing `(` is what keeps import
+lines and type positions out. The numbers below are the 2026-09-10 tree and will
+drift; they were counted to size the conversion, not to be an invariant.
+`decodeBcs` 22, `getOptionalObjectContent` 20, `getObjectsContent` 12, `allCreatedByType` 7, `assertObjectType` 6, `listDynamicFields` 4, `buildTx` 4, `getObjectContent` 3, `createdByType` 3, `createdByExactType` 3, `signAndExecute` 2, `publishedPackageId` 2, `execThunks` 2, `balanceDelta` 1.
 
 ## How the platform SDK is shaped today
 
@@ -22,7 +28,7 @@ Publishing is per-package version tags (`effect-v*`, `platform-v*` ...) through 
 | `@misofm/effect` | sui-effect |
 |---|---|
 | `SuiClient.layer(client)` | `SuiCore.layerFromClient(client)` under `Sui.layerNoDeps` (adds the chain-id check that platform's `ready()` does by hand) |
-| `SuiGraphQL` | stays a platform-owned service; not sui-effect's concern (GraphQL layer deferred) |
+| `SuiGraphQL` | sui-effect's `SuiGraphQL` tag over the SDK's `SuiGraphQLClient` (`layer`, `layerConfig`, `layerUnavailable`); the queries stay in the packages, and a failure is `GraphQLUnavailable`. No Effect-native GraphQL API tier: that is still deferred |
 | `ObjectNotFoundError` | `ObjectNotFound` (plus `ObjectDeleted`, `ObjectUnavailable` from the SDK's own `reason`) |
 | `ObjectTypeMismatchError` | `DecodeError { objectId, expectedType, issue }` from the BCS bridge's normalized tag check |
 | `SuiRpcError { operation }` | `TransportError { method }` |
@@ -41,7 +47,7 @@ Publishing is per-package version tags (`effect-v*`, `platform-v*` ...) through 
 
 ## Requirements this adds for Phase 1 (feed to the implementer)
 
-1. `SuiSchema.bcs` must accept any codec with `parse(bytes: Uint8Array): T`, not only a `@mysten/bcs` `BcsType`, because the generated `@mysten/codegen` contracts are the codecs every misofm package uses. The expected type must be compared after `normalizeStructTag` on both sides.
+1. ~~`SuiSchema.bcs` must accept any codec with `parse(bytes: Uint8Array): T`, not only a `@mysten/bcs` `BcsType`.~~ **Retired** (2026-09-11). The bridge requires a `BcsType` on purpose: it re-serializes what it parsed and compares the length, which is what stops an `objectBcs` envelope decoding as the struct it wraps, and only a real layout can serialize. The requirement was written from the belief that codegen output is a `{ parse }` object; it is not — `MoveStruct`, `MoveEnum` and `MoveTuple` extend `BcsStruct`, `BcsEnum` and `BcsTuple`, which are `BcsType`s, so every generated codec already qualifies. Ad-hoc mapping codecs do not, and their mapping belongs in `Schema.decodeTo` (see `docs/extensions.md` section 3). What *was* implemented is the type comparison: `typeMatches` parses both tags, accepts a bare expected tag as any instantiation of it, and compares a parameterized one in full after normalization.
 2. `Executed.created(type)` matches on the normalized full struct tag. Add `createdWhere(predicate)` so the substring-based `createdByType`/`allCreatedByType` call sites (10 in total) have a direct replacement without reintroducing substring matching as the default.
 3. `Executed.balanceChange(address, coinType)` returns `Mist` (`bigint`), and `gasUsedTotal` is `bigint`; consumers currently use `number`, which is a known precision hazard.
 4. `Sui.getObjects` returning per-item `Result` is a deliberate behaviour change from `getObjectsContent` silently dropping errored ids; the conversion issues must call it out.

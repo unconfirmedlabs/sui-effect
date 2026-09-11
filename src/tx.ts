@@ -10,11 +10,12 @@
  * @since 0.1.0
  */
 
-/** The credential value type and its four constructors. */
+/** The credential value type and its five constructors. */
 export {
   ephemeral,
   fromConfig,
   fromKeypair,
+  fromSdkSigner,
   remote,
   type RemoteSigner,
   Signer,

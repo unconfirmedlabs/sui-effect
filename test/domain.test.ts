@@ -6,6 +6,8 @@ import {
   DecodeError,
   ExecutionFailed,
   ExecutionReason,
+  ExtensionNotReady,
+  GraphQLUnavailable,
   JournalError,
   NetworkMismatch,
   NotApplied,
@@ -250,9 +252,11 @@ describe("error classes", () => {
         digest: f.digest,
         expected: StructTag.make("0x2::coin::Coin<0x2::sui::SUI>"),
         found: []
-      })
+      }),
+      new GraphQLUnavailable({ method: "query", reason: "no endpoint" }),
+      new ExtensionNotReady({ extension: "miso", member: "tx.purchaseRecord" })
     ]
-    expect(instances).toHaveLength(16)
+    expect(instances).toHaveLength(18)
     for (const instance of instances) {
       const json = SuiError.toJson(instance)
       expect(json._tag).toBe(instance._tag)
@@ -315,9 +319,14 @@ describe("error classes", () => {
           ),
           found: [f.objectId]
         })
+      ],
+      [GraphQLUnavailable, new GraphQLUnavailable({ method: "query", reason: "no endpoint" })],
+      [
+        ExtensionNotReady,
+        new ExtensionNotReady({ extension: "miso", member: "tx.purchaseRecord" })
       ]
     ]
-    expect(cases).toHaveLength(16)
+    expect(cases).toHaveLength(18)
     for (const [schema, instance] of cases) {
       const asserts = new TestSchema.Asserts(schema)
       const encoded = Schema.encodeUnknownSync(schema)(instance)
@@ -446,5 +455,43 @@ describe("error classes", () => {
       SuiError.isRetryable(new TransportError({ method: "getObject", retryable: false, cause: "x" }))
     ).toBe(false)
     expect(SuiError.isRetryable(new SigningError({ cause: "x" }))).toBe(false)
+  })
+})
+
+describe("TransportError.fromUnknown", () => {
+  test("classifies a gRPC status name the way SuiCore does", () => {
+    const error = TransportError.fromUnknown("operator.status", { code: "UNAVAILABLE" })
+    expect(error.method).toBe("operator.status")
+    expect(error.status).toBe("UNAVAILABLE")
+    expect(error.retryable).toBe(true)
+  })
+
+  test("classifies an HTTP status number, 5xx and 429 retryable", () => {
+    expect(TransportError.fromUnknown("x", { status: 503 }).retryable).toBe(true)
+    expect(TransportError.fromUnknown("x", { status: 429 }).retryable).toBe(true)
+    const notFound = TransportError.fromUnknown("x", { status: 404 })
+    expect(notFound.retryable).toBe(false)
+    expect(notFound.status).toBe("404")
+  })
+
+  test("an abort or a timeout is a retryable DEADLINE_EXCEEDED", () => {
+    const aborted = TransportError.fromUnknown("x", new DOMException("aborted", "AbortError"))
+    expect(aborted.status).toBe("DEADLINE_EXCEEDED")
+    expect(aborted.retryable).toBe(true)
+  })
+
+  test("an unrecognisable cause is not retryable, and the caller may override", () => {
+    const error = TransportError.fromUnknown("x", new Error("who knows"))
+    expect(error.retryable).toBe(false)
+    expect(error.status).toBeUndefined()
+    expect(TransportError.fromUnknown("x", new Error("who knows"), true).retryable).toBe(true)
+    expect(TransportError.fromUnknown("x", { code: "UNAVAILABLE" }, false).retryable).toBe(false)
+  })
+
+  test("the cause is kept, so describe has something to print", () => {
+    const cause = new Error("connection refused")
+    const error = TransportError.fromUnknown("operator.status", cause)
+    expect(error.cause).toBe(cause)
+    expect(SuiError.describe(error)).toContain("connection refused")
   })
 })

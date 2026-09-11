@@ -18,7 +18,7 @@ Three audiences, each with a stated entry point:
 
 | Subpath | Contents |
 |---|---|
-| `sui-effect` | `SuiCore`, `Sui`, errors, branded schemas, `SuiSchema.bcs`, `Executed` |
+| `sui-effect` | `SuiCore`, `Sui`, `SuiGraphQL`, errors, branded schemas, `SuiSchema.bcs`, `Executed` |
 | `sui-effect/tx` | `Signer`, `Tx.*`, `SubmitConfig`, `Journal`, `JournalEntry` |
 | `sui-effect/journal` | durable `Journal` layer over `KeyValueStore` (`effect/unstable/persistence`) |
 | `sui-effect/extension` | `SuiExtension.fromService` (Effect service to `$extend` registration), authoring conventions and helpers |
@@ -51,7 +51,9 @@ A hand-written 1:1 Effect wrap of `ClientWithCoreApi` from `@mysten/sui/client`.
 
 ## 3. `Sui`: the opinionated tier
 
-`layerNoDeps: Layer<Sui, NetworkMismatch | TransportError, SuiCore>`; `layer = layerNoDeps` over `SuiCore.layerGrpc`; `layerTest = layerNoDeps` over `SuiCoreFake.layer`. At build it calls `getChainIdentifier` once and records the answer on `Sui.chainId`.
+`layerNoDeps: Layer<Sui, NetworkMismatch | TransportError, SuiCore>`; `layer = layerNoDeps` over `SuiCore.layerGrpc`. At build it calls `getChainIdentifier` once and records the answer on `Sui.chainId`. The test layer is **not** a static on `Sui`: `layerTest(script)` is a function in `sui-effect/testing` (`Sui.layerNoDeps` over `SuiCoreFake.layer(script)`), so nothing under `src/services/Sui.ts` depends on the fake.
+
+`layerNoDepsPinned(chainId)` builds `Sui` **without** reading the chain identifier, taking the one it is given. It exists for `SuiExtension.fromService`'s `warm` option (13.2), which builds its runtime synchronously inside `register` and therefore cannot await a round trip. Nothing is asserted because nothing is asked; what still catches a node on the wrong chain is `Tx.build` stamping that id on the expiration, which a validator enforces.
 
 Whether it asserts is decided by one exported table, `KNOWN_CHAIN_IDS`, holding the genesis checkpoint digests observed on the live networks (`mainnet` `4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S`, `testnet` `69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD`); the SDK ships no such table. When the client's network is in the table, a node reporting a different identifier fails the layer with `NetworkMismatch { expected, actual }`. `devnet`, `localnet` and custom networks are regenerated and have no fixed identifier, so nothing is asserted and the observed one is recorded. `layerNoDepsWith({ chainId })` pins any network and overrides the table.
 
@@ -70,14 +72,18 @@ getObjectOption<S>(id, opts?):                                        // not fou
   Effect<Option<SuiObject<S>>, ObjectUnavailable | DecodeError | TransportError>
 getObjects<S>(ids, opts?):                                            // ids normalized and deduped, chunked by 50, response integrity checked
   Effect<ReadonlyArray<Result<SuiObject<S>, ObjectNotFound | ObjectDeleted | ObjectUnavailable | DecodeError>>, TransportError>
+getObjectsOrFail<S>(ids, opts?):                                      // the fail-first variant: the first item error is the failure
+  Effect<ReadonlyArray<SuiObject<S>>, ObjectNotFound | ObjectDeleted | ObjectUnavailable | DecodeError | TransportError>
 getBalance(owner: SuiAddress, coinType?: CoinType): Effect<Balance, TransportError>
 getDynamicFieldOption(parent: ObjectId, name: DynamicFieldName): Effect<Option<DynamicField>, TransportError>
   // the base client rethrows ObjectError from getDynamicField (client/core.mjs:48), so SuiCore.getDynamicField and
   // getDynamicObjectField declare the object-error union; Sui folds not-found and deleted into None and the rest
   // into TransportError
 getTransaction(digest: Digest): Effect<Executed, ExecutionFailed | TransactionNotFound | TransportError>
-simulate(input: Recipe | Transaction | Uint8Array): Effect<Simulation, SimulationFailed | BuildError | TransportError>
-view<S>(recipe: Recipe, schema: Schema.Codec<S, Uint8Array>, opts?: { command?: number; result?: number }):
+simulate(input: Recipe | Transaction | Uint8Array, opts?: { sender?: SuiAddress }):
+  Effect<Simulation, SimulationFailed | BuildError | TransportError>
+view<S, I>(recipe: Recipe, schema: Schema.Codec<S, Uint8Array> | BcsType<S, I>,
+           opts?: { command?: number; result?: number; sender?: SuiAddress }):
   Effect<S, SimulationFailed | BuildError | DecodeError | TransportError>
 streamOwnedObjects(owner, opts?: { type?: StructTag }): Stream<SuiObject, TransportError>
 streamDynamicFields(parent): Stream<DynamicFieldEntry, TransportError>
@@ -88,7 +94,7 @@ Fixed include sets: objects always `content + owner + type + version + digest`; 
 
 Decisions recorded:
 - `getTransaction` on a historical transaction whose status is failed fails with `ExecutionFailed`, the same as `Tx.submit` and `Tx.reconcile`, so there is exactly one representation of an on-chain failure.
-- `view` decodes return value `result` (default 0) of command `command` (default the last command) from `simulate` with `commandResults`, and `checksEnabled: false` so non-entry functions can be inspected.
+- `view` decodes return value `result` (default 0) of command `command` (default the last command) from `simulate` with `commandResults`, and `checksEnabled: false` so non-entry functions can be inspected. It accepts a bare `@mysten/bcs` `BcsType` as well as a `Schema.Codec`, because a Move **return value** has no struct tag: `view(recipe, bcs.Address())` needs no invented type. `opts.sender` is set with `setSenderIfNotSet` on both `view` and `simulate`, so a recipe that set its own sender wins and an omitted sender is the SDK's own zero-address default.
 - `SuiObject<S>` carries `id`, `version`, `digest`, `type`, `owner` as a tagged union, `content: S`, and `ref: ObjectRef` for feeding the builder. `type` is `ObjectType`, a union of `StructTag` and the literal `package`: gRPC reports `package` for a Move package object, and a package is a readable object like any other. `Simulation.objectTypes` and `Executed.objectTypes` are plain strings for the same reason.
 
 ## 4. `Executed`
@@ -105,7 +111,8 @@ A credential is data, and one process may hold two (onara verifies a sender sign
 
 ```ts
 interface Signer { address: SuiAddress; scheme: SignatureScheme; signTransaction(bytes): Effect<Signature, SigningError>; signPersonalMessage(bytes): Effect<Signature, SigningError> }
-Signer.fromKeypair(kp)
+Signer.fromSdkSigner(signer)                                                  // any @mysten/sui/cryptography Signer: Ledger, wallet, KMS
+Signer.fromKeypair(kp)                                                        // a thin alias; a Keypair is an SDK Signer
 Signer.fromConfig(name = "SUI_PRIVATE_KEY"): Effect<Signer, ConfigError>     // Config.redacted + decodeSuiPrivateKey + scheme dispatch
 Signer.ephemeral: Effect<Signer>
 Signer.remote(f): Signer                                                      // KMS or wallet
@@ -189,15 +196,23 @@ All `Schema.TaggedError` so they serialize. Flat tags, no inheritance.
 | `BuildError` | `message`, `cause` |
 | `PolicyDenied` | `rule`, `message` |
 | `JournalError` | `cause` |
+| `GraphQLUnavailable` | `method`, `reason` (what `SuiGraphQL.layerUnavailable` rejects every call with; outcome `not_applied`) |
+| `ExtensionNotReady` | `extension`, `member` (a synchronous member of a Promise face called before its runtime existed; outcome `not_applied`, see 13.2) |
 | `UnexpectedEffects` | `digest`, `expected: string`, `found: ObjectId[]` (the ids that did match, so zero and many are told apart; `expected` is the string the caller asked for, because fabricating a valid `StructTag` from an invalid one is worse than repeating it) |
 
 `ExecutionReason` and `Owner` are `Schema.Union([...]).pipe(Schema.toTaggedUnion("$kind"))` rather than `_tag` unions, so the discriminant is the SDK's own `$kind` and our narrowing and the SDK's agree. `ExecutionReason` mirrors `SuiClientTypes.ExecutionError` exactly (`MoveAbort` with `abortCode: bigint`, `location`, `cleverError`; `SizeError`; `CommandArgumentError`; `TypeArgumentError`; `PackageUpgradeError`; `IndexError`; `CoinDenyListError`; `CongestedObjects`; `ObjectIdError`; `Unknown`). Clever-error constant names are decoded automatically; a per-package abort registry is deferred.
+
+`TransportError.fromUnknown(method, cause, retryable?)` is the constructor an extension uses for its own network calls: it classifies `status` and `retryable` exactly as `SuiCore` does for the SDK's failures (gRPC status names, HTTP 5xx and 429, aborts and timeouts), so a hand-built `TransportError` never drifts from the library's.
 
 `SuiError` is the union plus four helpers every repo hand-rolls today: `isRetryable(e)`, `outcome(e): "applied" | "not_applied" | "unknown"` (`applied` for `ExecutionFailed`, `unknown` for `SubmissionUnknown`, `not_applied` for every other tag **in the taxonomy**, and `unknown` for anything else — see 13.1), `describe(e): string` (one actionable line, for example `ExecutionFailed MoveAbort 0x..::escrow::claim code 3 (EAlreadyClaimed) in command 1`), and `toJson(e)`.
 
 ## 11. Branded schemas and the BCS bridge
 
-`SuiAddress`, `ObjectId`, `Digest`, `StructTag`, `CoinType`, `Signature`, `Mist` (`bigint`) as `Schema.String.pipe(Schema.check(...), Schema.brand(...))` with normalization on decode via `SchemaGetter.transform` (`normalizeSuiAddress`, `normalizeStructTag`). `SuiSchema.bcs(bcsType, expectedType)` turns a `@mysten/bcs` `BcsType<T>` into `Schema.Codec<T, Uint8Array>` that decodes from `content` bytes only (never the transport-varying `json`) and compares the object's type tag with `normalizeStructTag` so generic instantiations match. It must be a `BcsType`, not merely a `{ parse }` codec: the bridge re-serializes what it parsed to reject trailing bytes, which is what stops an `objectBcs` envelope from decoding as the struct it wraps (generated codegen output is a `BcsType`, so this costs nothing in practice). The expected type is stored as a schema annotation and read back by walking the encoding chain, so `SuiSchema.bcs(...).pipe(Schema.decodeTo(DomainClass, ...))` keeps the check; `getObject`, `getObjectOption` and `getObjects` also accept an explicit `expectedType` for codecs built some other way. A `Uint8Array` field that can reach an error or a journal entry (`SignedTransaction.bytes`) uses a base64 codec, so `SuiError.toJson` is JSON.
+`SuiAddress`, `ObjectId`, `Digest`, `StructTag`, `CoinType`, `Signature`, `Mist` (`bigint`) as `Schema.String.pipe(Schema.check(...), Schema.brand(...))` with normalization on decode via `SchemaGetter.transform` (`normalizeSuiAddress`, `normalizeStructTag`). `SuiSchema.bcs(bcsType, expectedType?)` turns a `@mysten/bcs` `BcsType<T>` into `Schema.Codec<T, Uint8Array>` that decodes from `content` bytes only (never the transport-varying `json`).
+
+**One type-matching rule, everywhere.** `typeMatches(expected, actual)` parses both with `parseStructTag`. When the expected tag carries **no type arguments** it names the generic itself and only `address::module::name` is compared, so `pkg::m::Composition` accepts `pkg::m::Composition<0x…::share::Share>` — which is what a node does with a bare type filter, and what makes one codec usable for a generic Move type. When the expected tag **carries** type arguments the two are compared in full after `normalizeStructTag`, so `Coin<0x2::sui::SUI>` matches its padded spelling and not `Coin<…::usdc::USDC>`. Anything that is not a struct tag (the literal `package`) compares as a normalized string. The object keeps its own instantiated type on `SuiObject.type`. The same function decides the `expectedType` option of `getObject` / `getObjectOption` / `getObjects`, the `actualType` check inside `SuiSchema.decode`, and the `type` filter of `SuiCoreFake.listOwnedObjects`, which would otherwise be stricter than a node.
+
+`expectedType` is **optional**: a Move return value has no struct tag, so `SuiSchema.bcs(bcs.Address())` for a `Sui.view` carries none and nothing is compared. The re-serialize length check is still what rejects mis-shaped bytes. It must be a `BcsType`, not merely a `{ parse }` codec: the bridge re-serializes what it parsed to reject trailing bytes, which is what stops an `objectBcs` envelope from decoding as the struct it wraps (generated codegen output is a `BcsType`, so this costs nothing in practice). The expected type is stored as a schema annotation and read back by walking the encoding chain, so `SuiSchema.bcs(...).pipe(Schema.decodeTo(DomainClass, ...))` keeps the check; `getObject`, `getObjectOption` and `getObjects` also accept an explicit `expectedType` for codecs built some other way. A `Uint8Array` field that can reach an error or a journal entry (`SignedTransaction.bytes`) uses a base64 codec, so `SuiError.toJson` is JSON.
 
 ## 12. `Script` preset (`sui-effect/script`)
 
@@ -259,7 +274,7 @@ Conventions, enforced by the guide and by review:
 - **Every method returns an Effect** whose error union is the sui-effect taxonomy plus the extension's own `Schema.TaggedError` classes. No `unknown`, no plain `Error`, no `Promise` in the interface.
 - **Reads go through `Sui`, writes through `Tx`.** An extension never calls `SuiCore.executeTransaction` directly; it calls `Tx.submit` or `Tx.run` so the journal, expiration, sender lock and reconcile apply to every transaction on the platform. It reaches `SuiCore` only for fields or methods `Sui` does not expose.
 - **Transaction contributions are recipes, not submissions.** An extension that adds commands to a transaction exposes recipe fragments (`(tx) => void`) or recipe transformers (`Recipe => Recipe`, like `Tx.sponsored`). Consumers compose several extensions into one PTB and submit once. An extension only submits on the consumer's behalf when that is its purpose (onara's sponsor-and-run), and then it exposes the recipe-level pieces too.
-- **Layers** follow the house skill: `layer(opts)`, `layerConfig` reading `<PREFIX>_*` through `Config` with secrets as `Config.redacted`, `layerTest` backed by a `Ref`. The layer requires `Sui`; it never constructs its own client.
+- **Layers** follow the house skill: `layer(opts)`, `layerConfig` reading `<PREFIX>_*` through `Config` with secrets as `Config.redacted`, `layerTest` backed by a `Ref`, and for an extension over a published Move package a `layerBundled` that reads `sui.network` through `Layer.unwrap` and fails with the package's own deployment error on a network it does not bundle. A layer never constructs its own client; it may require `Sui | SuiCore` and provides everything else — including another extension's service — inside itself.
 - **Errors** are `Schema.TaggedError` with a unique tag prefixed by the package name where collision is plausible. An extension error may declare its outcome for the script exit-code axis by implementing `outcome: "applied" | "not_applied" | "unknown"`; `SuiError.outcome` and `Script.run` honour it. `describe` uses the error's `message`.
 - **Declare `outcome` on every error you define.** An error that neither carries a taxonomy tag nor declares an `outcome` is *unclassified*, and the two helpers answer differently on purpose. `SuiError.outcome` returns `"unknown"`: a tag this library has never heard of says nothing about whether a transaction applied, and `"not_applied"` would tell the documented retry idiom to send again on no evidence at all. `Script.exitCode` returns 1, the code that also means defect, rather than 3: exit 3 tells a wrapper there is a digest to reconcile, and an unrecognised error is not evidence that anything was ever sent. The `"not_applied"` default is for sui-effect's own taxonomy, not for yours.
 - **Observability** comes for free from `Effect.fn("Onara.sponsor")` on every method.
@@ -276,7 +291,15 @@ const client = new SuiGrpcClient({ network: "testnet", baseUrl }).$extend(onara(
 const status = await client.onara.status()
 ```
 
-`fromService` returns a `SuiClientRegistration` whose `register(client)` builds, lazily on first call, a `ManagedRuntime` over `SuiCore.layerFromClient(client)`, `Sui.layerNoDeps` and the extension layer, and exposes each interface member as a Promise-returning method (or an `AsyncIterable` for Streams), mapping nested plain objects of members recursively so a namespaced surface (`client.miso.protocol.*`) works. Because the member list only exists once the layer has been built, and building it is asynchronous, the registration is a proxy: before the first call every member is a callable, async-iterable placeholder that builds the runtime on use, and after it every member is the mapped value, so a non-function member reads as itself. Rejections are the same tagged error instances, so a Promise consumer can still switch on `_tag`. The registration exposes `dispose()` for clean shutdown. One implementation, two faces; the Effect face is the one agents and our own scripts use.
+`fromService` returns a `SuiClientRegistration` whose `register(client)` builds a `ManagedRuntime` over `SuiCore.layerFromClient(client)`, `Sui.layerNoDepsWith(options.sui)` and the extension layer, and exposes each interface member as a Promise-returning method (or an `AsyncIterable` for Streams), mapping nested **plain** objects of members recursively so a namespaced surface (`client.miso.protocol.*`) works. A class instance — a `BcsType`, a `Schema.Class` — is a leaf, in the type and at runtime alike. Rejections are the same tagged error instances, so a Promise consumer can still switch on `_tag`. One implementation, two faces; the Effect face is the one agents and our own scripts use.
+
+Options beyond `name` and `layer`:
+
+- `layer` is bounded by `Layer<Self, E, Sui | SuiCore>`. The rule is not "requires `Sui` and nothing else" but *requires nothing the consumer's client could have provided*: an extension's own dependencies (an `HttpClient`, a `SuiGraphQL`, another extension's service) are provided inside its layer or in the function that builds the registration.
+- `sui?: SuiLayerOptions` is routed to `Sui.layerNoDepsWith`, so an extension whose deployment names a custom network's `chainIdentifier` can pin it and refuse another chain.
+- `warm?: { chainId? }` builds the runtime **synchronously inside `register`**, with `Sui.layerNoDepsPinned`. A layer that needs an asynchronous step throws out of `register` — that is the contract, not an accident — and the chain identifier is taken rather than read (`warm.chainId`, `sui.chainId`, or the `KNOWN_CHAIN_IDS` entry; on a network with no entry, `warm` throws rather than guess).
+
+**The synchronous-member rule.** By default the runtime is built on first use, and until it exists nothing knows what a member is. An `Effect` or `Stream` member behaves as the face promises anyway. A **synchronous** member — a recipe builder, a package id — does not: `PromiseFace` types those as synchronous, so the face fails with `ExtensionNotReady` (naming the member) instead of returning a `Promise` where the type says a value. The face carries `$ready(): Promise<void>`, which builds the runtime and resolves the service so every member is real afterwards, and `$dispose()` (`dispose()` is kept as an alias). `$dispose` is not final: the next call builds a fresh runtime. Each `register` is independent.
 
 ### 13.3 Third-party packages: we maintain Effect-native variants
 
@@ -291,12 +314,23 @@ Consequences:
 
 ### 13.4 The extension authoring guide (a v1 deliverable)
 
-`docs/extensions.md`, shipped in the package and included in `LLMS.md`, covering: the service shape above with a complete worked example (the onara rewrite is the canonical one); how to define errors and declare outcomes; recipe fragments versus submissions and how consumers compose them; `layer`, `layerConfig`, `layerTest`; deriving the Promise face with `fromService`; testing on `Sui.layerTest` and `TestClock` with zero network; a review checklist mirroring the effect-ts skill's (reject any Promise in an interface, any direct `executeTransaction`, any signer held in a layer, any `unknown` in an error channel). `examples/extension-template/` is a copyable package skeleton that typechecks against the pinned rcs. `sui-effect/testing` ships an extension harness: a `Sui.layerTest` plus fake `SuiCore` with helpers to script object state and execution outcomes for an extension's tests.
+`docs/extensions.md`, shipped in the package and included in `LLMS.md`, covering: the service shape above with a complete worked example (the onara rewrite is the canonical one); how to define errors and declare outcomes; recipe fragments versus submissions and how consumers compose them; `layer`, `layerConfig`, `layerTest`; deriving the Promise face with `fromService`; testing on `layerTest` from `sui-effect/testing` and `TestClock` with zero network; composing extensions; converting an existing facade; a layer that picks its deployment from `sui.network`; how to depend on sui-effect before a release; a review checklist mirroring the effect-ts skill's (reject any Promise in an interface, any direct `executeTransaction`, any signer held in a layer, any `unknown` in an error channel). `examples/extension-template/` is a copyable package skeleton that typechecks against the pinned rcs. `sui-effect/testing` ships an extension harness: `layerTest` plus the fake `SuiCore` with helpers to script object state and execution outcomes for an extension's tests.
+
+### 13.5 `SuiGraphQL`: one tag, no wrapper
+
+sui-effect does not wrap the GraphQL API, and the Effect-native GraphQL tier stays deferred (section 15). What it owns is the **tag**: `SuiGraphQL` is `Context.Service<SuiGraphQL, SuiGraphQLClient>()("sui-effect/SuiGraphQL")` over the SDK's own client, exported from the core subpath, so two extensions that both read GraphQL — and the application that configures the endpoint — agree on one client instead of each opening its own and each inventing a name for the failure.
+
+- `SuiGraphQL.layer(client)` over a client the caller built.
+- `SuiGraphQL.layerConfig` reads `SUI_GRAPHQL_URL` and `SUI_NETWORK` (the same variable `SuiCore.layerConfig` reads: an endpoint for one chain and a node for another is a misconfiguration no error can describe afterwards).
+- `SuiGraphQL.layerUnavailable` (and `layerUnavailableWith(reason)`) provides a client whose every call rejects with `GraphQLUnavailable { method, reason }`. This is what an application with no endpoint provides: the absence becomes the failure the extension already handles, at the call it would have made, instead of a layer that will not build.
+
+An extension calls `query` or `execute` inside `Effect.tryPromise` and maps the rejection into its own union — `GraphQLUnavailable` as it is, or `TransportError.fromUnknown` for a call that reached the endpoint and failed.
 
 ## 14. Testing
 
 - `SuiCoreFake.layer(script)` in `sui-effect/testing`: a `Map` of objects plus scripted outcomes for `getChainIdentifier`, `getReferenceGasPrice`, `getObjects`, `listCoins`, `simulateTransaction`, `executeTransaction`, `getTransaction`, the resolver's budget simulation (`buildSimulate`, which is how a test makes `Tx.build` fail with `SimulationFailed`), and the Clock object `0x6`. Outcomes include `succeed`, `failWith(reason)`, `transportError(status)`, `notFound()`, `timeoutThen(found)`. It also implements `resolveTransactionPlugin`, so `transaction.build({ client })` resolves gas price, gas budget, gas payment and object inputs from the script with no network, and it keys pending and known transactions by `TransactionDataBuilder.getDigestFromBytes` of the bytes it was given, so journal and reconcile tests are stable. No Move execution, no dynamic fields; localnet covers those.
-- `layerTest(script)` in `sui-effect/testing` is `Sui.layerNoDeps` over the fake, so tests exercise the real high tier and the real `Tx.submit` under `TestClock`, under the production chain-id rules.
+- `layerTest(script)` in `sui-effect/testing` is `Sui.layerNoDeps` over the fake, so tests exercise the real high tier and the real `Tx.submit` under `TestClock`, under the production chain-id rules. `layerExtensionTest(layer, script)` puts an extension's own layer over it, and composes with whatever fakes that layer carries for the things that are not the chain.
+- The fake's `client` is a `ClientWithCoreApi` and **implements `$extend`**, so a derived Promise face is testable the way a consumer writes it. Its `listOwnedObjects` filters by `typeMatches`, not string equality, so a bare tag matches every instantiation as it does on a node; its `getDynamicField` matches an entry by `name.type` only, not by the `name.bcs` bytes.
 - `TestSchema.Asserts` round-trips every error class and every `JournalEntry` variant.
 - The `TransportMethods` completeness type test.
 - Localnet integration tests behind `SUI_LOCALNET=1`. (A devnet proof of the default expiration and the whole `Tx.run` lifecycle ships now, behind `SUI_LIVE=1`, in `test/live.devnet.test.ts`.)
@@ -304,7 +338,7 @@ Consequences:
 
 ## 15. Deferred
 
-`sui-effect/ai` toolkit, event and transaction streams (first in line once the bcs-only decoding rule is settled), gRPC subscriptions, per-package abort registry, `waitForCheckpoint`, GraphQL layer, `effect/unstable/workflow` integration, Move ABI to Schema codegen, MVR conveniences, `Tx.runEffect` with an effectful recipe, a generic `SuiExtension.lift` for not-yet-wrapped upstream packages.
+`sui-effect/ai` toolkit, event and transaction streams (first in line once the bcs-only decoding rule is settled), gRPC subscriptions, per-package abort registry, `waitForCheckpoint`, a GraphQL-backed `SuiCore` and any Effect-native wrapping of the GraphQL API (the `SuiGraphQL` tag in 13.5 is not that), `effect/unstable/workflow` integration, Move ABI to Schema codegen, MVR conveniences, `Tx.runEffect` with an effectful recipe, a generic `SuiExtension.lift` for not-yet-wrapped upstream packages.
 
 ## 16. Phases
 
