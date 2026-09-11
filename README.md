@@ -87,13 +87,25 @@ and `R = Sui`. `Tx.run` holds the sender lock from build through submit, builds
 signs, journals the signed bytes before the first execute, re-sends the
 identical bytes — never a rebuild — on a retryable transport failure or a
 timeout, and if it still does not know what happened, reconciles: `Executed`,
-`ExecutionFailed`, `NotApplied { evidence }` when the expiration has passed or
-an input has moved on, or `SubmissionUnknown` carrying the bytes. A
+`ExecutionFailed`, `NotApplied { evidence }` when the epoch window has closed or
+an input was provably consumed by a *different* transaction, or
+`SubmissionUnknown` carrying the bytes. An input that merely moved on is not
+evidence — this transaction is the likeliest thing to have moved it — so
+reconcile asks the node which digest consumed it before it says anything. A
 `TransportError` never escapes once bytes may have been sent. `Signer` is a
 value, not a service, so one process can hold two credentials; `SubmitConfig`
 and `Journal` are `Context.Reference`s with working defaults, so none of this
 needs wiring, and `sui-effect/journal` swaps the memory journal for a durable
 one over `KeyValueStore`.
+
+When the recipe sets no expiration, `Tx.build` sets one: `ValidDuring` bounded
+to the current epoch and the next, carrying the chain identifier as a replay
+guard. Two epochs is what the validator rule allows for a transaction with no
+address-owned inputs — a PTB over shared objects, or any sponsored transaction —
+and the chain field is enforced, so bytes signed for testnet cannot land on
+mainnet. There is deliberately no wall-clock bound: every Sui network refuses a
+transaction that carries one today. `SubmitConfig.validFor` adds one for the day
+that changes.
 
 ## Extensions
 
@@ -114,7 +126,7 @@ no error inheritance to match on.
 
 | Tag | Fields | Means |
 |---|---|---|
-| `TransportError` | `method`, `retryable`, `status?`, `cause` | The request did not reach a usable answer. Timeouts land here with `retryable: true` and `status: "DEADLINE_EXCEEDED"` |
+| `TransportError` | `method`, `retryable`, `status?`, `cause` | The request did not reach a usable answer. Inside `Tx.submit` a timed-out `executeTransaction` lands here with `retryable: true` and `status: "DEADLINE_EXCEEDED"`; anywhere else `Effect.timeout` produces Effect's own `TimeoutError`, which is not part of this taxonomy |
 | `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | `objectId`, `version?` | The three `ObjectError.reason` values |
 | `TransactionNotFound` | `digest` | No transaction with that digest is known |
 | `NetworkMismatch` | `expected`, `actual` | The node is on another chain than the layer was built for |
@@ -126,7 +138,7 @@ no error inheritance to match on.
 | `SigningError` | `cause` | A signer refused or failed |
 | `BuildError` | `message`, `cause` | The transaction could not be built |
 | `PolicyDenied` | `rule`, `message` | A preflight policy refused it before it was signed |
-| `JournalError` | `cause` | The journal could not be read or written |
+| `JournalError` | `cause` | The journal could not be read or written. It escapes `Tx.submit` only from the write that happens **before** the first send; after the network has answered, a failed write is logged and the answer stands |
 | `UnexpectedEffects` | `digest`, `expected`, `found` | The effects did not contain what the caller expected |
 
 `ExecutionReason` mirrors the SDK's `ExecutionError` variant for variant, with
@@ -134,7 +146,11 @@ no error inheritance to match on.
 `SuiError.isRetryable`, `SuiError.outcome`, `SuiError.describe` and
 `SuiError.toJson` are the four helpers every repo otherwise hand-rolls;
 `outcome` puts every failure on the `"applied" | "not_applied" | "unknown"`
-axis, and an extension error may declare its own.
+axis, and an extension error may declare its own. An error that is neither a tag
+above nor declares an `outcome` is *unclassified*: `outcome` answers `"unknown"`,
+because an unrecognised tag is no evidence that nothing happened, and
+`Script.exitCode` exits 1 rather than 3, because it is no evidence that anything
+was sent either. Declare `outcome` on every error your extension defines.
 
 ## Scripts
 
@@ -145,19 +161,24 @@ axis, and an extension error may declare its own.
 | `SUI_NETWORK` | yes, no default | `mainnet`, `testnet`, `devnet`, `localnet` or your own |
 | `SUI_ALLOW_MAINNET` | only for mainnet | `1` or `true`; a script that means mainnet has to say so twice |
 | `SUI_RPC_URL` | no | The gRPC endpoint; defaulted per known network |
-| `SUI_PRIVATE_KEY` | `Script` only | A Bech32 `suiprivkey1…` key, read through `Config.redacted` |
+| `SUI_PRIVATE_KEY` | `Script` only | A Bech32 `suiprivkey1…` key, read through `Config.redacted`. A key that does not decode fails with one fixed sentence and no cause: the Bech32 decoder quotes the whole input it rejected, so nothing derived from it is ever printed |
 
 `Script.layerReadOnly` provides `ScriptReadOnly`, which has no signer at all —
 a separate service key, so a script written to sign cannot silently build over a
 layer that cannot. `Script.run` installs SIGINT and SIGTERM handlers, interrupts
 the root fiber so finalizers run, writes one diagnostic line per failure to
-stderr (stdout carries only what the script printed), and exits:
+stderr, and exits. stdout carries only what the script itself printed: the
+logger is bound to stderr for the whole run, so an `Effect.log` anywhere in the
+call tree cannot corrupt the output. On an interrupt or a defect the unresolved
+entries of the default journal are printed too, so a script killed mid-submit
+still leaves the digest and the bytes. A second SIGINT is ignored on purpose —
+the first one is what lets the finalizers that record those bytes finish.
 
 | Code | Means |
 |---|---|
 | 0 | success |
 | 1 | a defect, or an unclassified failure |
-| 2 | configuration: `ConfigError`, `NetworkMismatch`, the mainnet gate |
+| 2 | configuration: `ConfigError`, `NetworkMismatch`, `SchemaError`, the mainnet gate |
 | 3 | unknown outcome: reconcile before sending anything else |
 | 4 | nothing applied: safe to retry |
 | 5 | applied and failed on chain: gas was charged, do not retry |

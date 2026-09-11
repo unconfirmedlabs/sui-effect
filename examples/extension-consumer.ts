@@ -19,7 +19,7 @@
 import { bcs } from "@mysten/sui/bcs"
 import type { ClientWithCoreApi } from "@mysten/sui/client"
 import { Config, Console, Context, Effect, Layer, Schema } from "effect"
-import type { ChangedRef, DecodeError, Recipe, SuiObject } from "../src/index.ts"
+import type { ChangedRef, DecodeError, Recipe, SuiObject, UnexpectedEffects } from "../src/index.ts"
 import { ObjectId, type Outcome, SuiSchema, Sui, TransportError } from "../src/index.ts"
 import { SuiExtension } from "../src/extension.ts"
 import { Script } from "../src/script.ts"
@@ -52,7 +52,10 @@ export class Escrow extends Context.Service<Escrow, {
   readonly claimFor: (
     id: ObjectId,
     opts: { readonly signer: Signer }
-  ) => Effect.Effect<ChangedRef, EscrowNotFound | DecodeError | TransportError | RunError>
+  ) => Effect.Effect<
+    ChangedRef,
+    EscrowNotFound | DecodeError | TransportError | UnexpectedEffects | RunError
+  >
 }>()("example/Escrow") {
   static readonly layer: Layer.Layer<Escrow, never, Sui> = Layer.effect(
     Escrow,
@@ -83,10 +86,11 @@ export class Escrow extends Context.Service<Escrow, {
       ) {
         const escrow = yield* get(id)
         const executed = yield* Tx.run(claim(escrow), { signer: opts.signer })
-        return yield* executed.expectCreated(`${PKG}::escrow::Receipt`).pipe(
-          Effect.mapError((cause) =>
-            new TransportError({ method: "escrow.claimFor", retryable: false, cause }))
-        )
+        // The claim is on chain and gas was charged; only the receipt is
+        // missing. `UnexpectedEffects` says exactly that, and `outcome` puts it
+        // on "applied". Mapping it to `TransportError` would say the opposite —
+        // "not applied, safe to retry" — about a transaction that ran.
+        return yield* executed.expectCreated(`${PKG}::escrow::Receipt`)
         // `Tx.*` requires `Sui`; providing the one the layer already has is
         // what keeps the service's own members free of requirements.
       }, Effect.provideService(Sui, sui))
@@ -122,11 +126,10 @@ export const readWithPromises = async (
   client: ClientWithCoreApi,
   id: string
 ): Promise<bigint> => {
-  const extended = client.$extend(escrow())
-  // The SDK types `$extend`'s result through an indexed access, which
-  // `noUncheckedIndexedAccess` widens with `undefined`. The property is always
-  // there; naming it once keeps the rest of the function clean.
-  const api = extended.escrow as NonNullable<typeof extended.escrow>
+  // `fromService` is generic in the registration name, so `extended.escrow` is
+  // a property of the extended client's type: no cast, and no `| undefined`
+  // under `noUncheckedIndexedAccess`.
+  const api = client.$extend(escrow()).escrow
   try {
     const found = await api.get(ObjectId.make(id))
     return BigInt(found.content.amount)

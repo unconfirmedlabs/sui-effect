@@ -183,14 +183,15 @@ know, and what a later phase inherits.
    fields, every variant carries `at`, and `lastError` is the `describe` line
    (section 9).
 7. A `Context.Reference`'s layer is `Layer<never, ...>` in v4, so
-   `Journal.layerKeyValueStore` is typed that way (section 8).
+   `layerKeyValueStore` from `sui-effect/journal` is typed that way (section 8).
 8. `Signature` is a new branded schema (section 11).
 
 ### Still open, and what a later phase inherits
 
-- **`SubmitConfig.expiration: "epoch"`** is implemented through
-  `getCurrentSystemState`, which the fake does not serve, so that branch has no
-  test. Either script it in the fake or cover it on localnet.
+- ~~**`SubmitConfig.expiration: "epoch"`** has no test.~~ Closed: the fake
+  serves `getCurrentSystemState` (`FakeScript.epoch`, `SuiTest.setEpoch`), and
+  both the `"epoch"` policy and the epoch bounds of the default `"validDuring"`
+  are tested.
 - **`Tx.build` simulating** is only reachable in tests through the fake's new
   `buildSimulate` script slot; the real path is the transport's own resolver.
   Localnet is what proves the production path.
@@ -203,6 +204,34 @@ know, and what a later phase inherits.
 - **Localnet integration tests** (`SUI_LOCALNET=1`) are still unwritten; they
   are what would prove the resolver's simulate, the gas-budget ceiling and
   `NotApplied { evidence: "inputConsumed" }` against a real node.
+  `test/live.devnet.test.ts` (behind `SUI_LIVE=1`) now covers the part that
+  could not wait: a faucet-funded `Tx.run` and a shared-object-only `Tx.build`
+  against devnet, which is how the timestamp-expiration finding below was
+  made.
+
+## Phase 1 notes (written after the verification review of 2026-09-11)
+
+`docs/reviews/phase1-verification.md` is the review; this records what its fix
+list changed and the one thing it could not have known.
+
+- **A live node refuses timestamp expiration.** The reviewer's A5 asked for
+  `minEpoch`/`maxEpoch` *alongside* `maxTimestamp`. Devnet (protocol 100,
+  epoch 91) refuses any transaction carrying a timestamp bound at all:
+  `Feature is not supported: Timestamp-based transaction expiration is not yet
+  supported`, with or without epochs. So the default `ValidDuring` is
+  epoch-bounded and carries no `maxTimestamp`; `SubmitConfig.validFor` became
+  optional and unset, and is the opt-in for the day a network supports one.
+  `Tx.reconcile` gained the epoch rule for `NotApplied { expired }`, which is
+  now the one that fires in practice. DESIGN.md sections 6 and 7 say so.
+- **`NotApplied { inputConsumed }` needs a consuming digest** (A1), and
+  `JournalEntry` gained a terminal `NotApplied` variant (B1) so a durable
+  journal can resolve one.
+- **The journal never changes an answer** (A2): `JournalError` escapes only
+  from the `Signed` write, before anything is sent.
+- **`SuiSchema.decode`** is public, for extensions that hold bytes.
+- **`Script.layerReadOnlyNoDeps`** was added so `ScriptReadOnly` is testable
+  against the fake without a network, the same role `layerNoDeps` plays for
+  `Script`.
 
 ## Phase 1 notes (written after WP10 and WP11 landed)
 

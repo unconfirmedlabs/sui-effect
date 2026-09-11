@@ -52,6 +52,16 @@ export interface FakeObject {
   readonly content: Uint8Array
   readonly digest?: string
   readonly owner?: SuiClientTypes.ObjectOwner
+  /**
+   * The digest of the transaction that last mutated this object, served when
+   * the caller includes `previousTransaction`.
+   *
+   * This is the field `Tx.reconcile` reads to tell "someone else spent our
+   * input" from "we spent it ourselves and this node has not caught up", so a
+   * test that bumps a version has to say who bumped it. `undefined` models a
+   * node that will not say, which is evidence of nothing.
+   */
+  readonly previousTransaction?: string
 }
 
 /** A created, mutated or deleted object in a scripted execution. */
@@ -128,6 +138,17 @@ export interface FakeScript {
   readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>
   /** How many items a list method returns per page. Defaults to 50. */
   readonly pageSize?: number
+  /**
+   * The epoch `getCurrentSystemState` reports. Defaults to
+   * {@link DEFAULT_EPOCH}.
+   *
+   * This one is defaulted rather than left to die unscripted, because it is an
+   * ambient fact about the chain the way `chainId` and the reference gas price
+   * are, not an outcome a test is asserting on: `Tx.build` reads it for every
+   * default `ValidDuring` expiration, which bounds a transaction to this epoch
+   * and the next. Set it when the epoch is what the test is about.
+   */
+  readonly epoch?: bigint
   readonly simulate?: ReadonlyArray<FakeOutcome>
   /**
    * What the resolve plugin's budget simulation does during
@@ -173,6 +194,8 @@ export interface SuiCoreFakeState {
   readonly deleteObject: (objectId: string) => Effect.Effect<void>
   /** Moves the Clock object forward or back. */
   readonly setClock: (timestampMs: bigint) => Effect.Effect<void>
+  /** Moves the epoch `getCurrentSystemState` reports. */
+  readonly setEpoch: (epoch: bigint) => Effect.Effect<void>
   /** Replaces the remaining scripted outcomes of a method. */
   readonly setOutcomes: (
     method: "simulate" | "execute" | "getTransaction" | "buildSimulate",
@@ -184,6 +207,7 @@ interface Mutable {
   objects: Map<string, FakeObject>
   deleted: Set<string>
   clockTimestampMs: bigint
+  epoch: bigint
   calls: Array<RecordedCall>
   aborted: number
   cursors: { simulate: number; execute: number; getTransaction: number; buildSimulate: number }
@@ -228,15 +252,25 @@ const clockObject = (timestampMs: bigint): FakeObject => ({
   }).toBytes()
 })
 
-const toSdkObject = (object: FakeObject): SuiClientTypes.Object<{ content: true }> =>
+/**
+ * The SDK shape of an object, with the optional fields served only when the
+ * caller asked for them — the way a real node behaves, and what lets a test
+ * assert that `Tx.reconcile` sent `previousTransaction` in its include set.
+ */
+const toSdkObject = (
+  object: FakeObject,
+  include?: SuiClientTypes.ObjectInclude
+): SuiClientTypes.Object<{ content: true }> =>
   ({
     objectId: normalizeSuiAddress(object.objectId),
     version: object.version.toString(),
     digest: object.digest ?? fakeDigest(Number(object.version % 200n) + 1),
     owner: object.owner ?? addressOwner("0x1"),
     type: object.type,
-    content: object.content,
-    previousTransaction: undefined,
+    content: include === undefined || include.content === true ? object.content : undefined,
+    previousTransaction: include?.previousTransaction === true
+      ? object.previousTransaction ?? null
+      : undefined,
     objectBcs: undefined,
     json: undefined,
     display: undefined
@@ -307,6 +341,39 @@ const executionToTransaction = (
 }
 
 /** A gRPC-shaped rejection, so `mapSdkError` reads `code` off it. */
+/** The epoch the fake reports when a script does not set one. */
+export const DEFAULT_EPOCH = 100n
+
+/** A plausible `SystemStateInfo` around the one field anything here reads. */
+const systemState = (epoch: bigint, timestampMs: bigint): SuiClientTypes.SystemStateInfo => ({
+  systemStateVersion: "2",
+  epoch: epoch.toString(),
+  protocolVersion: "70",
+  referenceGasPrice: "1000",
+  epochStartTimestampMs: timestampMs.toString(),
+  safeMode: false,
+  safeModeStorageRewards: "0",
+  safeModeComputationRewards: "0",
+  safeModeStorageRebates: "0",
+  safeModeNonRefundableStorageFee: "0",
+  parameters: {
+    epochDurationMs: "86400000",
+    stakeSubsidyStartEpoch: "0",
+    maxValidatorCount: "150",
+    minValidatorJoiningStake: "30000000000000000",
+    validatorLowStakeThreshold: "20000000000000000",
+    validatorLowStakeGracePeriod: "7"
+  },
+  storageFund: { totalObjectStorageRebates: "0", nonRefundableBalance: "0" },
+  stakeSubsidy: {
+    balance: "0",
+    distributionCounter: "0",
+    currentDistributionAmount: "0",
+    stakeSubsidyPeriodLength: "10",
+    stakeSubsidyDecreaseRate: 1000
+  }
+})
+
 const rpcError = (status: string): Error => {
   const error = new Error(`fake transport error: ${status}`)
   Object.assign(error, { code: status, name: "RpcError" })
@@ -379,6 +446,7 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
       objects,
       deleted: new Set(),
       clockTimestampMs: script.clockTimestampMs ?? 1_700_000_000_000n,
+      epoch: script.epoch ?? DEFAULT_EPOCH,
       calls: [],
       aborted: 0,
       cursors: { simulate: 0, execute: 0, getTransaction: 0, buildSimulate: 0 },
@@ -492,6 +560,9 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
               type: change.type,
               version: change.version ?? (existing === undefined ? 2n : existing.version + 1n),
               content: existing?.content ?? new Uint8Array(),
+              // The executing transaction is now what last mutated it, which is
+              // what `Tx.reconcile`'s evidence rules read back.
+              previousTransaction: resolved,
               ...(change.owner === undefined ? {} : { owner: change.owner })
             })
           }
@@ -664,14 +735,14 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   const core = {
     getObject: async (options: SuiClientTypes.GetObjectOptions) => {
       record("getObject", options)
-      return { object: toSdkObject(lookup(options.objectId)) }
+      return { object: toSdkObject(lookup(options.objectId), options.include) }
     },
     getObjects: async (options: SuiClientTypes.GetObjectsOptions) => {
       record("getObjects", options)
       return {
         objects: options.objectIds.map((id) => {
           try {
-            return toSdkObject(lookup(id))
+            return toSdkObject(lookup(id), options.include)
           } catch (cause) {
             return cause as Error
           }
@@ -689,7 +760,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       })
       const result = page(owned, options.cursor, options.limit)
       return {
-        objects: result.items.map(toSdkObject),
+        objects: result.items.map((object) => toSdkObject(object, options.include)),
         hasNextPage: result.hasNextPage,
         cursor: result.cursor
       }
@@ -822,7 +893,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     getCurrentSystemState: async (options?: SuiClientTypes.GetCurrentSystemStateOptions) => {
       record("getCurrentSystemState", options)
-      return unimplemented("getCurrentSystemState")
+      return { systemState: systemState(state.epoch, state.clockTimestampMs) }
     },
     getProtocolConfig: async (options?: SuiClientTypes.GetProtocolConfigOptions) => {
       record("getProtocolConfig", options)
@@ -902,6 +973,10 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     setClock: (timestampMs) =>
       Effect.sync(() => {
         state.clockTimestampMs = timestampMs
+      }),
+    setEpoch: (epoch) =>
+      Effect.sync(() => {
+        state.epoch = epoch
       }),
     setOutcomes: (method, outcomes) =>
       Effect.sync(() => {

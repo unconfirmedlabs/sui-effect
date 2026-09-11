@@ -57,6 +57,8 @@ const INHERITED = new Set([
   "toString",
   "stack",
   "name",
+  "message",
+  "cause",
   "asEffect",
   "_op",
   "_tag",
@@ -66,15 +68,42 @@ const INHERITED = new Set([
   "EncodingServices"
 ])
 
+/**
+ * The field names a `Schema.TaggedError` actually declares, read off the
+ * schema's own `Encoded` type.
+ *
+ * The instance type is not enough: it also carries everything `Error` brings —
+ * `message`, `stack`, `name` — and a declared `cause` is indistinguishable from
+ * the inherited one, because the two declarations merge. `Encoded` is the
+ * schema, so it holds exactly the fields the error was defined with.
+ */
+const declaredFieldsOf = (
+  symbol: ts.Symbol,
+  declaration: ts.Declaration,
+  checker: ts.TypeChecker
+): ReadonlySet<string> | undefined => {
+  const statics = checker.getTypeOfSymbolAtLocation(symbol, declaration)
+  const encoded = statics.getProperty("Encoded")
+  if (encoded === undefined) return undefined
+  const names = checker
+    .getTypeOfSymbolAtLocation(encoded, declaration)
+    .getProperties()
+    .map((property) => property.getName())
+    .filter((name) => name !== "_tag")
+  return names.length === 0 ? undefined : new Set(names)
+}
+
 /** The declared fields of a class, for classes whose emitted body is empty. */
 const fieldsOf = (
   symbol: ts.Symbol,
   declaration: ts.Declaration,
   checker: ts.TypeChecker
 ): string | undefined => {
+  const declared = declaredFieldsOf(symbol, declaration, checker)
   const instance = checker.getDeclaredTypeOfSymbol(symbol)
   const properties = instance.getProperties().filter((property) => {
     const name = property.getName()
+    if (declared !== undefined) return declared.has(name)
     // `__@iterator@302` and friends are how the emitter spells symbol-keyed
     // members; they are Effect machinery, not fields.
     return !name.startsWith("~") && !name.startsWith("[") && !name.startsWith("__@") &&
@@ -145,6 +174,25 @@ const docOf = (symbol: ts.Symbol, checker: ts.TypeChecker): string =>
   ts.displayPartsToString(symbol.getDocumentationComment(checker)).trim()
 
 /**
+ * The JSDoc of **one** declaration.
+ *
+ * `symbol.getDocumentationComment` concatenates every declaration a name has,
+ * which for the `interface Signer` / `const Signer` pair glued the namespace's
+ * blurb onto the end of the interface's. The constructors that blurb names are
+ * exported and documented on their own, so printing the declaration that is
+ * actually being shown is both shorter and true.
+ */
+const docOfDeclaration = (declaration: ts.Declaration): string =>
+  ts
+    .getJSDocCommentsAndTags(declaration)
+    .filter((node) => ts.isJSDoc(node))
+    // `getTextOfJSDocComment` is what flattens the mixed text-and-`{@link}`
+    // node array a JSDoc comment becomes once it contains a link.
+    .map((doc) => ts.getTextOfJSDocComment(doc.comment) ?? "")
+    .join("\n\n")
+    .trim()
+
+/**
  * The "Fails with: …" sentence every public function's JSDoc carries, or the
  * "Never fails." it carries instead, as one line.
  */
@@ -157,7 +205,11 @@ const errorsOf = (doc: string): string | undefined => {
 /** The JSDoc without the error sentence, which is printed on its own. */
 const summaryOf = (doc: string): string => {
   const withoutErrors = doc.replace(/Fails with:[\s\S]*?(?:\.\s*$|\.\n|\.$)/m, "").trim()
-  const withoutExamples = withoutErrors.split("\n@")[0] ?? withoutErrors
+  // A bare trailing "Never fails." is printed on its own as the error line;
+  // leaving it in the prose too said it twice. "Never fails: …" and
+  // "Never fails; …" carry more than the line does and stay.
+  const withoutNeverFails = withoutErrors.replace(/\s*Never fails\.(?=\s*$)/, "").trim()
+  const withoutExamples = withoutNeverFails.split("\n@")[0] ?? withoutNeverFails
   // `{@link X}` is for an IDE, not for a reader of plain markdown.
   return withoutExamples.replace(/\{@link\s+([^}]+)\}/g, "`$1`").trim()
 }
@@ -183,7 +235,7 @@ const renderSymbol = (
     return [`${"#".repeat(depth)} \`${symbol.getName()}\` (namespace)`, "", ...members].join("\n")
   }
 
-  const doc = docOf(target, checker)
+  const doc = docOfDeclaration(declaration)
   const summary = summaryOf(doc)
   const errors = errorsOf(doc)
   const lines = [

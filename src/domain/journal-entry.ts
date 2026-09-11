@@ -9,15 +9,21 @@
  * @since 0.1.0
  */
 import { Schema } from "effect"
-import { Digest, ExecutionReason, SignedTransaction } from "./schemas.ts"
+import { Digest, ExecutionReason, NotAppliedEvidence, SignedTransaction } from "./schemas.ts"
 
 /**
  * One line of the submission journal.
  *
  * `Signed` is written before the first `executeTransaction` and means the bytes
- * may be on the wire. `Executed` and `Failed` are terminal: the network
- * answered. `Unknown` means the answer never arrived and the bytes are kept so
- * `Tx.reconcile` can settle it later.
+ * may be on the wire. `Executed`, `Failed` and `NotApplied` are terminal:
+ * `Executed` and `Failed` because the network answered, `NotApplied` because
+ * the transaction was proven never to have applied and never will. `Unknown`
+ * means the answer never arrived and the bytes are kept so `Tx.reconcile` can
+ * settle it later.
+ *
+ * Without a terminal `NotApplied`, a durable journal would hold a proven-dead
+ * submission as `Unknown` forever and `onUnresolved: "fail"` would refuse to
+ * build for the life of the store.
  */
 export const JournalEntry = Schema.TaggedUnion({
   Signed: {
@@ -40,6 +46,11 @@ export const JournalEntry = Schema.TaggedUnion({
     signed: SignedTransaction,
     lastError: Schema.String,
     attempts: Schema.Number,
+    at: Schema.DateTimeUtcFromMillis
+  },
+  NotApplied: {
+    digest: Digest,
+    evidence: NotAppliedEvidence,
     at: Schema.DateTimeUtcFromMillis
   }
 })

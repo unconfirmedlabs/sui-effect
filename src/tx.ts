@@ -55,6 +55,7 @@ export {
 
 /** The expiration union and the bound `Tx.reconcile` reasons about. */
 export {
+  maxEpochOf,
   maxTimestampMsOf,
   Signature,
   TransactionExpiration

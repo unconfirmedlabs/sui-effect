@@ -91,6 +91,38 @@ describe("Signer.fromConfig", () => {
     expect(error._tag).toBe("ConfigError")
     expect(error.message).toContain("SUI_PRIVATE_KEY")
   })
+
+  test("a corrupted key leaks nothing: no run of it reaches the message or the JSON", async () => {
+    // One character wrong in a real key. The Bech32 decoder's own message is
+    // `Invalid checksum in suiprivkey1…` with the whole input in it, and
+    // `Script.run` prints the ConfigError's message on stderr, so a typo in a
+    // live key would otherwise put a recoverable secret in a log.
+    const secret = new Ed25519Keypair().getSecretKey()
+    const corrupted = `${secret.slice(0, -1)}${secret.endsWith("q") ? "p" : "q"}`
+    expect(corrupted).not.toBe(secret)
+
+    const error = await run(
+      Effect.provide(
+        Signer.fromConfig().pipe(Effect.flip),
+        withEnv({ SUI_PRIVATE_KEY: corrupted })
+      )
+    )
+    expect(error._tag).toBe("ConfigError")
+
+    const printed = `${error.message}\n${JSON.stringify(error)}\n${String(error)}`
+    // Nothing longer than eight characters of the input may appear anywhere in
+    // what a failure can print. Eight characters of base32 is 40 bits: far too
+    // little to reconstruct a key, and short enough that the shared
+    // `suiprivkey1` prefix does not trip the check on its own.
+    const WINDOW = 9
+    const leaked: Array<string> = []
+    for (let start = 0; start + WINDOW <= corrupted.length; start += 1) {
+      const run = corrupted.slice(start, start + WINDOW)
+      if (printed.includes(run)) leaked.push(run)
+    }
+    expect(leaked).toEqual([])
+    expect(error.message).toContain("Bech32")
+  })
 })
 
 describe("Signer.ephemeral", () => {

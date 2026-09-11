@@ -60,11 +60,24 @@ export const makeMemoryUnsafe = (): JournalService => {
   }
 }
 
+/** The reference itself; {@link Journal} is it with the constructors attached. */
+const JournalRef = Context.Reference<JournalService>("sui-effect/Journal", {
+  defaultValue: makeMemoryUnsafe
+})
+
 /**
  * The submission journal.
  *
  * Being a `Context.Reference`, it is never in an `R`: `Tx.submit` reads it from
  * context and finds the in-memory default unless something provided another.
+ *
+ * **The default is process-wide.** A `Context.Reference`'s default value is
+ * computed once and cached on the reference itself, so every fiber that does
+ * not provide one shares a single `Map` for the life of the process. That is
+ * what makes a one-shot script work with zero wiring, and it is also why a
+ * test that runs `Tx.submit` or `Tx.run` should provide
+ * {@link Journal.layerMemory}: without it, entries from one test are visible to
+ * the next, and `listUnresolved` returns other tests' submissions.
  *
  * @example
  * ```ts
@@ -77,10 +90,6 @@ export const makeMemoryUnsafe = (): JournalService => {
  * })
  * ```
  */
-const JournalRef = Context.Reference<JournalService>("sui-effect/Journal", {
-  defaultValue: makeMemoryUnsafe
-})
-
 export const Journal = Object.assign(JournalRef, {
   /** A fresh in-memory journal, for a test or a process that wants its own. */
   layerMemory: Layer.sync(JournalRef, makeMemoryUnsafe),

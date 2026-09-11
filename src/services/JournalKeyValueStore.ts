@@ -11,7 +11,7 @@
  *
  * @since 0.1.0
  */
-import { Effect, Layer, Option, Schema } from "effect"
+import { Effect, Layer, Option, Schema, Semaphore } from "effect"
 import { KeyValueStore } from "effect/unstable/persistence"
 import { JournalError } from "../domain/errors.ts"
 import { isUnresolved, JournalEntry } from "../domain/journal-entry.ts"
@@ -50,9 +50,18 @@ const journalError = (cause: unknown): JournalError => new JournalError({ cause 
  *
  * The store has no key enumeration, so the journal keeps its own index: one
  * key holding the digests of the entries that are still unresolved, rewritten
- * whenever an entry is put. A terminal entry (`Executed`, `Failed`) drops its
- * digest from the index and keeps the entry itself, so a later `get` still
- * finds the answer.
+ * whenever an entry is put. A terminal entry (`Executed`, `Failed`,
+ * `NotApplied`) drops its digest from the index and keeps the entry itself, so
+ * a later `get` still finds the answer.
+ *
+ * `put` is serialized by a semaphore of one permit held across **both** writes,
+ * because the index write is a read-modify-write over a store that offers no
+ * compare-and-set: two concurrent `Tx.run`s from different senders would
+ * otherwise each read the same index, each append their own digest, and the
+ * second write would drop the first. The index is written **before** the entry,
+ * so a crash between the two leaves a digest whose entry is missing —
+ * `listUnresolved` skips it and the next `put` rewrites it — rather than an
+ * entry no index points at, which nothing would ever reconcile.
  *
  * Every member fails with `JournalError` and nothing else.
  */
@@ -83,14 +92,21 @@ export const make = (
     return Option.some(entry)
   })
 
+  // One permit, held across the index read-modify-write and the entry write.
+  const writes = Semaphore.makeUnsafe(1)
+
   return {
     put: Effect.fn("Journal.put")(function*(entry: JournalEntry) {
-      const json = yield* encodeEntry(entry).pipe(Effect.mapError(journalError))
-      yield* kv.set(`${ENTRY}${entry.digest}`, json).pipe(Effect.mapError(journalError))
-      const index = yield* readIndex
-      const without = index.filter((digest) => digest !== entry.digest)
-      const next = isUnresolved(entry) ? [...without, entry.digest] : without
-      if (next.length !== index.length || isUnresolved(entry)) yield* writeIndex(next)
+      yield* Semaphore.withPermits(writes, 1)(
+        Effect.gen(function*() {
+          const json = yield* encodeEntry(entry).pipe(Effect.mapError(journalError))
+          const index = yield* readIndex
+          const without = index.filter((digest) => digest !== entry.digest)
+          const next = isUnresolved(entry) ? [...without, entry.digest] : without
+          if (next.length !== index.length || isUnresolved(entry)) yield* writeIndex(next)
+          yield* kv.set(`${ENTRY}${entry.digest}`, json).pipe(Effect.mapError(journalError))
+        })
+      )
     }),
     get,
     listUnresolved: Effect.gen(function*() {

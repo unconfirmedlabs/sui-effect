@@ -9,6 +9,7 @@ import { Result, Schema } from "effect"
 import {
   Digest,
   ExecutionReason,
+  NotAppliedEvidence,
   ObjectId,
   SignedTransaction,
   TransactionEffects,
@@ -93,10 +94,17 @@ export class SubmissionUnknown extends Schema.TaggedError<SubmissionUnknown>()(
   { digest: Digest, signed: Schema.optional(SignedTransaction), cause: Schema.Defect() }
 ) {}
 
-/** The transaction provably cannot have been applied, and never will be. */
+/**
+ * The transaction provably cannot have been applied, and never will be.
+ *
+ * `evidence` is why. `"inputConsumed"` is only ever produced when the node
+ * named a **different** transaction as the consuming one: an owned input that
+ * merely moved on, with no readable `previousTransaction`, is
+ * `SubmissionUnknown`, not this.
+ */
 export class NotApplied extends Schema.TaggedError<NotApplied>()("NotApplied", {
   digest: Digest,
-  evidence: Schema.Literals(["expired", "inputConsumed"])
+  evidence: NotAppliedEvidence
 }) {}
 
 /** A signer refused or failed to produce a signature. */
@@ -189,9 +197,42 @@ const hasOutcome = (error: unknown): error is HasOutcome => isHasOutcome(error)
 const isRetryable = (error: SuiError): boolean =>
   error._tag === "TransportError" ? error.retryable : false
 
+/** Every tag the taxonomy owns, so a foreign tag can be told from one of ours. */
+const TAXONOMY_TAGS: ReadonlySet<string> = new Set([
+  "TransportError",
+  "ObjectNotFound",
+  "ObjectDeleted",
+  "ObjectUnavailable",
+  "TransactionNotFound",
+  "NetworkMismatch",
+  "DecodeError",
+  "SimulationFailed",
+  "ExecutionFailed",
+  "SubmissionUnknown",
+  "NotApplied",
+  "SigningError",
+  "BuildError",
+  "PolicyDenied",
+  "JournalError",
+  "UnexpectedEffects"
+])
+
+/**
+ * What a failure says about the transaction it came from.
+ *
+ * An error that declares its own `outcome` is honoured first, which is how an
+ * extension puts its failures on the same axis. Otherwise a tag the taxonomy
+ * owns gets the taxonomy's answer, and **anything else is `"unknown"`**: a tag
+ * this library has never heard of says nothing about whether a transaction
+ * applied, and answering `"not_applied"` for it would tell a retry idiom to
+ * send again on no evidence at all. `Script.exitCode` agrees by exiting 1 for
+ * an unclassified error rather than 3.
+ */
 const outcome = (error: SuiError | HasOutcome): Outcome => {
   if (hasOutcome(error)) return error.outcome
-  switch ((error as SuiError)._tag) {
+  const tag = (error as { readonly _tag?: unknown })._tag
+  if (typeof tag !== "string" || !TAXONOMY_TAGS.has(tag)) return "unknown"
+  switch (tag) {
     case "ExecutionFailed":
       return "applied"
     case "SubmissionUnknown":
@@ -235,12 +276,32 @@ const describeReason = (reason: ExecutionReason): string =>
     Unknown: () => "Unknown"
   })
 
+/**
+ * The one line of a `cause` worth printing next to a tag: an `Error`'s message,
+ * a tagged error's own `describe` line, a string as itself. `undefined` when
+ * there is nothing readable, so `describe` prints nothing rather than
+ * `[object Object]`.
+ */
+const causeLine = (cause: unknown): string | undefined => {
+  if (cause === undefined || cause === null) return undefined
+  if (typeof cause === "string") return cause.length === 0 ? undefined : cause
+  if (typeof cause !== "object") return undefined
+  const message = (cause as { readonly message?: unknown }).message
+  if (typeof message === "string" && message.length > 0) return message
+  const tag = (cause as { readonly _tag?: unknown })._tag
+  if (typeof tag === "string") return tag
+  if (cause instanceof Error && cause.name.length > 0) return cause.name
+  return undefined
+}
+
 const describe = (error: SuiError): string => {
   switch (error._tag) {
-    case "TransportError":
+    case "TransportError": {
+      const cause = causeLine(error.cause)
       return `TransportError ${error.method}${error.status === undefined ? "" : ` ${error.status}`}${
         error.retryable ? " (retryable)" : ""
-      }`
+      }${cause === undefined ? "" : `: ${cause}`}`
+    }
     case "ObjectNotFound":
     case "ObjectDeleted":
     case "ObjectUnavailable":
@@ -259,8 +320,10 @@ const describe = (error: SuiError): string => {
       return `ExecutionFailed ${describeReason(error.reason)}${
         error.command === undefined ? "" : ` in command ${error.command}`
       }`
-    case "SubmissionUnknown":
-      return `SubmissionUnknown ${error.digest}`
+    case "SubmissionUnknown": {
+      const cause = causeLine(error.cause)
+      return `SubmissionUnknown ${error.digest}${cause === undefined ? "" : `: ${cause}`}`
+    }
     case "NotApplied":
       return `NotApplied ${error.digest} (${error.evidence})`
     case "SigningError":

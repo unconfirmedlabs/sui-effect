@@ -3,9 +3,10 @@ import { DateTime, Effect, Layer, Option, Schema } from "effect"
 import { TestSchema } from "effect/testing"
 import { KeyValueStore } from "effect/unstable/persistence"
 import { ExecutionReason } from "../src/domain/errors.ts"
-import { JournalEntry } from "../src/domain/journal-entry.ts"
+import { isUnresolved, JournalEntry } from "../src/domain/journal-entry.ts"
 import { Digest, Signature, SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
+import { fakeDigest } from "../src/services/SuiCoreFake.ts"
 import { layerKeyValueStore, make } from "../src/services/JournalKeyValueStore.ts"
 
 const DIGEST = Digest.make("7YcE7X6LmUcbqHcRYMRT8vBTxtnCbfGJkH6yZPFpTFwn")
@@ -52,6 +53,13 @@ const failedEntry = JournalEntry.cases.Failed.make({
   at: AT
 })
 
+const notAppliedEntry = JournalEntry.cases.NotApplied.make({
+  _tag: "NotApplied",
+  digest: DIGEST,
+  evidence: "inputConsumed",
+  at: AT
+})
+
 const unknownEntry = JournalEntry.cases.Unknown.make({
   _tag: "Unknown",
   digest: DIGEST,
@@ -66,7 +74,8 @@ describe("JournalEntry", () => {
     ["Signed", signedEntry],
     ["Executed", executedEntry],
     ["Failed", failedEntry],
-    ["Unknown", unknownEntry]
+    ["Unknown", unknownEntry],
+    ["NotApplied", notAppliedEntry]
   ] as const
 
   for (const [name, entry] of entries) {
@@ -83,6 +92,14 @@ describe("JournalEntry", () => {
   test("Signed and Unknown are the unresolved tags", () => {
     expect(JournalEntry.isAnyOf(["Signed", "Unknown"])(signedEntry)).toBe(true)
     expect(JournalEntry.isAnyOf(["Signed", "Unknown"])(executedEntry)).toBe(false)
+  })
+
+  test("NotApplied is terminal", () => {
+    // It is a variant of its own precisely so it can be terminal: recording a
+    // proven-dead submission as `Unknown` would leave it in the unresolved
+    // index forever, and `onUnresolved: "fail"` would refuse to build over it.
+    expect(isUnresolved(notAppliedEntry)).toBe(false)
+    expect(isUnresolved(unknownEntry)).toBe(true)
   })
 })
 
@@ -185,6 +202,70 @@ describe("the KeyValueStore journal", () => {
       )
     )
     expect(ignored).toHaveLength(1)
+  })
+
+  test("a NotApplied entry resolves the digest and leaves the index", async () => {
+    const result = await withStore(
+      Effect.gen(function*() {
+        const store = yield* KeyValueStore.KeyValueStore
+        const journal = make(store)
+        yield* journal.put(signedEntry)
+        const before = yield* journal.listUnresolved
+        yield* journal.put(notAppliedEntry)
+        return {
+          before,
+          after: yield* journal.listUnresolved,
+          entry: yield* journal.get(DIGEST)
+        }
+      })
+    )
+    expect(result.before).toHaveLength(1)
+    expect(result.after).toHaveLength(0)
+    // The answer is still readable; only the "still waiting" index drops it.
+    expect(Option.isSome(result.entry)).toBe(true)
+    if (Option.isSome(result.entry)) expect(result.entry.value._tag).toBe("NotApplied")
+  })
+
+  /**
+   * A store whose reads and writes yield, the way any real one does.
+   *
+   * The in-memory store never suspends, so on it a read-modify-write is
+   * accidentally atomic and the bug this test is about cannot happen. A file,
+   * a socket or a database can always interleave, so the journal has to be
+   * correct without that accident.
+   */
+  const yieldingStore = Layer.effect(
+    KeyValueStore.KeyValueStore,
+    Effect.gen(function*() {
+      const kv = yield* KeyValueStore.KeyValueStore
+      return KeyValueStore.make({
+        ...kv,
+        get: (key) => Effect.flatMap(Effect.yieldNow, () => kv.get(key)),
+        set: (key, value) => Effect.flatMap(Effect.yieldNow, () => kv.set(key, value))
+      })
+    })
+  ).pipe(Layer.provide(KeyValueStore.layerMemory))
+
+  test("four concurrent puts all survive", async () => {
+    // `put` is a read-modify-write over a store with no compare-and-set. Two
+    // `Tx.run`s from different senders overlap all the time, and without a
+    // semaphore held across both writes each one reads the same index, appends
+    // its own digest and overwrites the others: four puts, one entry.
+    const digests = [1, 2, 3, 4].map((seed) => Digest.make(fakeDigest(seed)))
+
+    const unresolved = await Effect.runPromise(
+      Effect.gen(function*() {
+        const store = yield* KeyValueStore.KeyValueStore
+        const journal = make(store)
+        yield* Effect.forEach(
+          digests,
+          (digest) => journal.put({ ...signedEntry, digest, signed: { ...signed, digest } }),
+          { concurrency: "unbounded" }
+        )
+        return yield* journal.listUnresolved
+      }).pipe(Effect.provide(yieldingStore, { local: true }))
+    )
+    expect(unresolved.map((entry) => entry.digest).sort()).toEqual([...digests].sort())
   })
 
   test("building the layer makes no network calls: it only reads the index", async () => {

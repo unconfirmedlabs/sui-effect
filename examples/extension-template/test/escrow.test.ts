@@ -186,23 +186,27 @@ describe("Escrow", () => {
 })
 
 describe("Escrow under the two clocks", () => {
-  test("the chain clock bounds the transaction the extension submits", async () => {
-    const maxTimestamp = await provide(
+  test("the chain's epoch bounds the transaction the extension submits", async () => {
+    const expiration = await provide(
       Effect.gen(function*() {
         const escrow = yield* Escrow
         yield* SuiTest.setClock(1_000_000_000_000n)
         yield* escrow.claimFor(ESCROW_ID, { signer })
         const sent = yield* SuiTest.calls("executeTransaction")
         const options = sent[0]?.options as { readonly transaction: Uint8Array }
-        const expiration = TransactionDataBuilder.fromBytes(options.transaction).expiration
-        return expiration?.$kind === "ValidDuring"
-          ? expiration.ValidDuring.maxTimestamp
-          : undefined
+        return TransactionDataBuilder.fromBytes(options.transaction).expiration
       })
     )
-    // `SubmitConfig.validFor` is two minutes by default, measured from the
-    // chain's clock rather than the process's.
-    expect(String(maxTimestamp)).toBe("1000000120000")
+    // Every transaction an extension submits through `Tx` is bounded to the
+    // current epoch and the next, and carries the chain identifier, with no
+    // wiring in the extension at all. The bound is epochs rather than a wall
+    // clock because no Sui network accepts a timestamp expiration yet.
+    expect(expiration?.$kind).toBe("ValidDuring")
+    if (expiration?.$kind === "ValidDuring") {
+      expect(String(expiration.ValidDuring.minEpoch)).toBe("100")
+      expect(String(expiration.ValidDuring.maxEpoch)).toBe("101")
+      expect(expiration.ValidDuring.maxTimestamp).toBeNull()
+    }
   })
 
   test("a retryable transport failure re-sends the identical bytes", async () => {

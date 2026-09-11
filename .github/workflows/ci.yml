@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - name: LLMS.md and extension guide are current
+        run: |
+          bun run llms
+          bun run docs:extensions
+          git diff --exit-code -- LLMS.md docs/extensions.md
+
+  # The peer range in package.json is exactly the set of rcs this job proves.
+  effect-rc-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        effect: ["4.0.0-rc.112", "4.0.0-rc.113"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun add -d effect@${{ matrix.effect }} @effect/platform-bun@${{ matrix.effect }} || bun add -d effect@${{ matrix.effect }}
+      - run: bun run typecheck && bun test test/
+
+  isolated-consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run build && npm pack
+      - name: Install the tarball into a fresh consumer and import every subpath
+        run: |
+          mkdir /tmp/consumer && cd /tmp/consumer
+          bun init -y >/dev/null
+          bun add ../../$GITHUB_WORKSPACE/sui-effect-*.tgz effect@4.0.0-rc.112 @mysten/sui@2.30.0 @mysten/bcs
+          cat > check.ts <<'TS'
+          import "sui-effect"; import "sui-effect/tx"; import "sui-effect/journal"
+          import "sui-effect/extension"; import "sui-effect/script"; import "sui-effect/testing"
+          TS
+          bunx tsc --noEmit --strict --moduleResolution bundler --module esnext --target esnext --skipLibCheck check.ts

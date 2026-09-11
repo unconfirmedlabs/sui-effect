@@ -395,6 +395,49 @@ describe("error classes", () => {
     expect(SuiError.outcome(new Denied())).toBe("unknown")
   })
 
+  test("outcome is unknown for a tag that is neither ours nor declares an outcome", () => {
+    // "not_applied" would be a claim: it tells the documented retry idiom that
+    // nothing happened and the intent is safe to send again. Nothing about an
+    // unrecognised tag supports that claim, so the answer is that we do not
+    // know. `Script.exitCode` disagrees on purpose and exits 1, because exit 3
+    // would claim the opposite — that there is a digest to reconcile.
+    class Foreign extends Schema.TaggedError<Foreign>()("some-sdk/Foreign", {}) {}
+    expect(SuiError.outcome(new Foreign() as never)).toBe("unknown")
+    expect(SuiError.outcome({ _tag: "WhoKnows" } as never)).toBe("unknown")
+    expect(SuiError.outcome({} as never)).toBe("unknown")
+    // And a declared outcome still wins over the tag rule.
+    expect(SuiError.outcome({ _tag: "Foreign", outcome: "applied" } as never)).toBe("applied")
+  })
+
+  test("describe prints the cause of a TransportError and a SubmissionUnknown", () => {
+    // Without it, every transport failure in a log reads `TransportError
+    // getObject UNAVAILABLE` whatever went wrong, and every unknown submission
+    // is a bare digest with no hint of why it is unknown.
+    expect(
+      SuiError.describe(
+        new TransportError({
+          method: "executeTransaction",
+          retryable: false,
+          status: "INVALID_ARGUMENT",
+          cause: new Error("signature is not valid for sender")
+        })
+      )
+    ).toBe(
+      "TransportError executeTransaction INVALID_ARGUMENT: signature is not valid for sender"
+    )
+    const f = built()
+    expect(
+      SuiError.describe(
+        new SubmissionUnknown({ digest: f.digest, cause: "the node timed out twice" })
+      )
+    ).toBe(`SubmissionUnknown ${f.digest}: the node timed out twice`)
+    // A cause with nothing readable in it adds nothing rather than printing
+    // `[object Object]`.
+    expect(
+      SuiError.describe(new SubmissionUnknown({ digest: f.digest, cause: undefined }))
+    ).toBe(`SubmissionUnknown ${f.digest}`)
+  })
+
   test("isRetryable is true only for a retryable TransportError", () => {
     expect(
       SuiError.isRetryable(new TransportError({ method: "getObject", retryable: true, cause: "x" }))

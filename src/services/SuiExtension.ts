@@ -43,9 +43,16 @@ export type PromiseFace<S> = {
 }
 
 /** What `fromService` needs to know beyond the service key itself. */
-export interface SuiExtensionOptions<Self, E> {
-  /** The property the extension takes on the client: `client.<name>`. */
-  readonly name: string
+export interface SuiExtensionOptions<Self, E, Name extends string = string> {
+  /**
+   * The property the extension takes on the client: `client.<name>`.
+   *
+   * It is inferred as a string **literal**, which is what makes
+   * `client.escrow` a property rather than an index signature. Widening it to
+   * `string` is why the registered member used to arrive as `T | undefined`
+   * under `noUncheckedIndexedAccess`.
+   */
+  readonly name: Name
   /**
    * The extension's layer. It may require `Sui` and `SuiCore`, which this
    * module builds over the client `$extend` was called on, and nothing else.
@@ -96,23 +103,39 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  * `SuiCore.layerFromClient(client)`, `Sui.layerNoDeps` and the extension's own
  * layer is built on the first call and shared by every call after it. A
  * rejection carries the original tagged error instance, so a Promise consumer
- * can still switch on `_tag`. `dispose()` releases everything the layer
- * acquired.
+ * can still switch on `_tag`.
  *
  * Until the runtime has been built once, a member that is a plain value cannot
  * be read as a value — nothing knows what it is yet — and comes back as a
  * callable, iterable placeholder that resolves on use. After the first
  * `await`, every member is the real thing.
  *
+ * `name` is generic in a string literal, so `client.escrow` is a property of
+ * the extended client's type and not an index lookup: no cast, and no
+ * `| undefined` under `noUncheckedIndexedAccess`.
+ *
+ * Two lifetimes worth knowing:
+ *
+ * - **`dispose()` is not final.** It releases everything the layer acquired and
+ *   forgets the runtime; the next call builds a fresh one. That is what a
+ *   long-lived page wants (a disposed extension is usable again after a
+ *   reconnect) and it does mean a `dispose()` that races an in-flight call can
+ *   leave the caller's Promise rejected while a new runtime starts behind it.
+ *   Dispose when the consumer is done, not between calls.
+ * - **Each `register` is independent.** Registering the same extension on two
+ *   clients — or twice on one — gives two runtimes, two layer builds and two
+ *   copies of whatever the layer holds (a cache, a connection). Register once
+ *   per client and keep the extended client.
+ *
  * Never fails; the layer's own failures surface as rejections of the first
  * call that needs it.
  */
-export const fromService = <Self, Shape, E>(
+export const fromService = <Self, Shape, E, const Name extends string>(
   service: Context.Key<Self, Shape>,
-  options: SuiExtensionOptions<Self, E>
+  options: SuiExtensionOptions<Self, E, Name>
 ): SuiClientRegistration<
   ClientWithCoreApi,
-  string,
+  Name,
   PromiseFace<Shape> & { readonly dispose: () => Promise<void> }
 > => ({
   name: options.name,

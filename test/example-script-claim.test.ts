@@ -5,6 +5,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { ConfigProvider, Effect, Layer } from "effect"
 import { program } from "../examples/script-claim.ts"
 import { Script } from "../src/script.ts"
+import { Journal } from "../src/services/Journal.ts"
 import { FakeOutcome } from "../src/services/SuiCoreFake.ts"
 import { layerTest } from "../src/testing.ts"
 
@@ -62,12 +63,20 @@ describe("examples/script-claim.ts", () => {
   test("claims the escrow against the fake and prints the receipt id", async () => {
     const lines: Array<string> = []
     const codes: Array<number> = []
-    const code = await Script.run(program.pipe(Effect.provide(env)), {
-      layer: Script.layerNoDeps.pipe(Layer.provideMerge(layerTest(script)), Layer.provide(env)),
-      exit: (value) => codes.push(value),
-      stderr: (line) => lines.push(line),
-      signals: { on: () => {} }
-    })
+    const code = await Script.run(
+      // The default journal is process-wide, so a test that submits provides
+      // its own and its entries cannot be seen by the next one.
+      program.pipe(Effect.provide(Layer.merge(env, Journal.layerMemory))),
+      {
+      layer: Script.layerNoDeps.pipe(
+        Layer.provideMerge(layerTest(script)),
+        Layer.provide(env)
+      ),
+        exit: (value) => codes.push(value),
+        stderr: (line) => lines.push(line),
+        signals: { on: () => {} }
+      }
+    )
     expect(lines).toEqual([])
     expect(code).toBe(0)
     expect(codes).toEqual([0])
@@ -81,15 +90,18 @@ describe("examples/script-claim.ts", () => {
         SUI_PRIVATE_KEY: keypair.getSecretKey()
       })
     )
-    const code = await Script.run(program.pipe(Effect.provide(withoutEscrow)), {
+    const code = await Script.run(
+      program.pipe(Effect.provide(Layer.merge(withoutEscrow, Journal.layerMemory))),
+      {
       layer: Script.layerNoDeps.pipe(
         Layer.provideMerge(layerTest(script)),
         Layer.provide(withoutEscrow)
       ),
-      exit: () => {},
-      stderr: (line) => lines.push(line),
-      signals: { on: () => {} }
-    })
+        exit: () => {},
+        stderr: (line) => lines.push(line),
+        signals: { on: () => {} }
+      }
+    )
     expect(code).toBe(2)
   })
 })

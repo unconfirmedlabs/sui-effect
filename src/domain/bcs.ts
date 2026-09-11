@@ -120,8 +120,19 @@ export const typeMatches = (expected: string, actual: string): boolean =>
   normalizeSafe(expected) === normalizeSafe(actual)
 
 /**
- * Decodes object content with a codec, turning any schema failure into a
+ * Decodes BCS `content` bytes with a codec, turning any schema failure into a
  * `DecodeError` that names the object and the type that was expected.
+ *
+ * This is what `Sui.getObject(id, { schema })` does after it has checked the
+ * object's type tag, exposed as `SuiSchema.decode` for the places that already
+ * have bytes: a dynamic field's value, an event payload, a `Stream` of
+ * envelopes an extension decodes itself. Without it every caller reinvents the
+ * same `Schema.decodeUnknownEffect(...).pipe(Effect.mapError(...))`, and the
+ * `DecodeError` it produces is worse than this one.
+ *
+ * `expectedType` defaults to the Move type the codec was built with, so passing
+ * it is only needed for a codec that carries none. `objectId` is recorded on
+ * the error so an operator knows which object did not decode.
  *
  * Fails with: `DecodeError`.
  */

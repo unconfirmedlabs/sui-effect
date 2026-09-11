@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
-import { Cause, ConfigProvider, Console, Effect, Exit, Layer } from "effect"
+import { Cause, ConfigProvider, Console, DateTime, Effect, Exit, Layer, Schema } from "effect"
 import {
   BuildError,
   DecodeError,
@@ -19,8 +19,13 @@ import {
   TransportError,
   UnexpectedEffects
 } from "../src/domain/errors.ts"
+import { SuiError } from "../src/domain/errors.ts"
+import { JournalEntry } from "../src/domain/journal-entry.ts"
+import { Journal } from "../src/services/Journal.ts"
+import { fakeDigest } from "../src/services/SuiCoreFake.ts"
 import { Digest, ExecutionReason, Mist, Signature, SuiAddress } from "../src/domain/schemas.ts"
-import { exitCode, readNetwork, Script } from "../src/services/Script.ts"
+import { exitCode, readNetwork, Script, ScriptReadOnly } from "../src/services/Script.ts"
+import { Signer } from "../src/services/Signer.ts"
 import { Sui } from "../src/services/Sui.ts"
 import { SuiCore } from "../src/services/SuiCore.ts"
 import { layerTest } from "../src/testing.ts"
@@ -148,6 +153,25 @@ describe("Script.exitCode", () => {
   test("an error with no tag at all is a defect", () => {
     expect(exitCode(fail("a string"))).toBe(1)
   })
+
+  test("1, not 3, for a tag this library has never heard of", () => {
+    // `SuiError.outcome` answers "unknown" for the same value, and the two are
+    // meant to disagree: exit 3 tells a wrapper there is a digest to
+    // reconcile, and an unrecognised error is not evidence that anything was
+    // ever sent. Extensions are told to declare `outcome` for exactly this.
+    class Foreign {
+      readonly _tag = "some-sdk/Foreign"
+    }
+    expect(exitCode(fail(new Foreign()))).toBe(1)
+    expect(SuiError.outcome(new Foreign() as never)).toBe("unknown")
+  })
+
+  test("2 for a SchemaError, which is a person's input not fitting a schema", async () => {
+    const error = await Effect.runPromise(
+      Schema.decodeUnknownEffect(Schema.Struct({ id: Schema.String }))({ id: 7 }).pipe(Effect.flip)
+    )
+    expect(exitCode(fail(error))).toBe(2)
+  })
 })
 
 const keypair = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(2))
@@ -203,14 +227,78 @@ describe("Script.layer", () => {
     expect(allowed).toBe("mainnet")
   })
 
-  test("a read-only script has no signer in its type", async () => {
-    const network = await Effect.runPromise(
-      Effect.map(Sui, (sui) => sui.network).pipe(
-        Effect.provide(layerTest({ chainId: CHAIN_ID }), { local: true })
+  test("ScriptReadOnly is the same preset with no signer on it", async () => {
+    const readOnly = await Effect.runPromise(
+      Effect.provide(
+        ScriptReadOnly,
+        Script.layerReadOnlyNoDeps.pipe(
+          Layer.provideMerge(layerTest({ chainId: CHAIN_ID })),
+          // No `SUI_PRIVATE_KEY` at all: a read-only script must build without
+          // a credential in the environment.
+          Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord({ SUI_NETWORK: "localnet" })))
+        ),
+        { local: true }
       )
     )
-    expect(network).toBe("localnet")
+    expect(readOnly.network).toBe("localnet")
+    expect(readOnly.sui.chainId).toBe(CHAIN_ID)
+    // The service shape has no `signer`: a script written against `Script`
+    // cannot silently build over a layer that cannot sign.
+    expect("signer" in readOnly).toBe(false)
   })
+
+  test("layerWithSigner uses the credential it was handed, not the environment", async () => {
+    const handed = Signer.fromKeypair(Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(6)))
+    const script = await Effect.runPromise(
+      Effect.provide(
+        Script,
+        Script.layerWithSigner(handed).pipe(
+          Layer.provideMerge(layerTest({ chainId: CHAIN_ID })),
+          Layer.provide(
+            ConfigProvider.layer(
+              ConfigProvider.fromEnvRecord({
+                SUI_NETWORK: "localnet",
+                // Deliberately a different key: it must be ignored.
+                SUI_PRIVATE_KEY: keypair.getSecretKey()
+              })
+            )
+          )
+        ),
+        { local: true }
+      )
+    )
+    expect(script.signer.address).toBe(handed.address)
+    expect(script.signer.address).not.toBe(SuiAddress.make(keypair.toSuiAddress()))
+  })
+
+  test("the mainnet gate is checked before a client is built", async () => {
+    // `Script.layer` and `Script.layerReadOnly` build a real gRPC client and
+    // ask it for the chain identifier. Reading the gate inside that layer would
+    // check it after the connection it exists to prevent, so it is read first,
+    // through `Layer.unwrap`. This test would have to reach the network if it
+    // were not.
+    const mainnet = ConfigProvider.layer(
+      ConfigProvider.fromEnvRecord({
+        SUI_NETWORK: "mainnet",
+        SUI_PRIVATE_KEY: keypair.getSecretKey()
+      })
+    )
+    const signing = await Effect.runPromiseExit(
+      Effect.asVoid(Script).pipe(
+        Effect.provide(Script.layer, { local: true }),
+        Effect.provide(mainnet)
+      )
+    )
+    expect(exitCode(signing)).toBe(2)
+
+    const reading = await Effect.runPromiseExit(
+      Effect.asVoid(ScriptReadOnly).pipe(
+        Effect.provide(Script.layerReadOnly, { local: true }),
+        Effect.provide(mainnet)
+      )
+    )
+    expect(exitCode(reading)).toBe(2)
+  }, 5_000)
 })
 
 describe("Script.run", () => {
@@ -268,5 +356,102 @@ describe("Script.run", () => {
     const result = await runScript(Effect.die(new Error("boom")))
     expect(result.code).toBe(1)
     expect(result.lines.join("\n")).toContain("boom")
+  })
+
+  test("Effect.log lands on stderr and stdout stays clean", async () => {
+    // A script's stdout is its answer, and the default Effect logger writes to
+    // `console.log`. One `Effect.logInfo` inside a library an extension
+    // depends on would otherwise corrupt the output of every script on the
+    // platform.
+    const stdout: Array<unknown> = []
+    const original = console.log
+    console.log = (...args: ReadonlyArray<unknown>) => stdout.push(args.join(" "))
+    let result
+    try {
+      result = await runScript(
+        Effect.gen(function*() {
+          yield* Effect.log("about to claim")
+          yield* Effect.logWarning("the gas price moved")
+          yield* Console.log("the-answer")
+        })
+      )
+    } finally {
+      console.log = original
+    }
+    expect(result.code).toBe(0)
+    expect(stdout).toEqual(["the-answer"])
+    expect(result.lines.join("\n")).toContain("about to claim")
+    expect(result.lines.join("\n")).toContain("the gas price moved")
+  })
+
+  test("an injected signal interrupts the script, runs finalizers and exits 130", async () => {
+    const handlers: Array<() => void> = []
+    const released: Array<string> = []
+    const lines: Array<string> = []
+    const codes: Array<number> = []
+    const layer = Script.layerNoDeps.pipe(
+      Layer.provideMerge(layerTest({ chainId: CHAIN_ID })),
+      Layer.provide(env())
+    )
+    const finished = Script.run(
+      Effect.never.pipe(
+        Effect.onExit(() => Effect.sync(() => released.push("finalizer"))),
+        Effect.ensuring(Effect.sync(() => released.push("ensuring")))
+      ),
+      {
+        layer,
+        exit: (code) => codes.push(code),
+        stderr: (line) => lines.push(line),
+        signals: {
+          on: (_name, handler) => handlers.push(handler),
+          off: () => undefined
+        }
+      }
+    )
+    // The script is parked on `Effect.never`; only the signal can end it.
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(handlers).toHaveLength(2)
+    handlers[0]!()
+    // A second SIGINT is ignored on purpose: the point of the first is to let
+    // the finalizers finish.
+    handlers[0]!()
+    const code = await finished
+    expect(code).toBe(130)
+    expect(codes).toEqual([130])
+    expect(released).toEqual(["finalizer", "ensuring"])
+    expect(lines).toContain("interrupted")
+  })
+
+  test("a defect prints what the default journal still holds unresolved", async () => {
+    // A script killed between signing and the answer otherwise exits with no
+    // digest and no bytes, and nobody can account for the transaction. The
+    // default journal is process-wide, which is what makes it readable from
+    // outside the fiber that wrote to it.
+    const digest = Digest.make(fakeDigest(31))
+    await Effect.runPromise(
+      Effect.flatMap(Journal, (journal) =>
+        journal.put(
+          JournalEntry.cases.Signed.make({
+            _tag: "Signed",
+            digest,
+            signed: { ...signed, digest },
+            signedAt: DateTime.makeUnsafe(0)
+          })
+        ))
+    )
+    const result = await runScript(Effect.die(new Error("killed mid-submit")))
+    expect(result.code).toBe(1)
+    const printed = result.lines.join("\n")
+    expect(printed).toContain("killed mid-submit")
+    expect(printed).toContain(`unresolved ${digest} (Signed)`)
+    expect(printed).toContain("bytes: ")
+
+    // Clean up after ourselves: the default journal outlives this test.
+    await Effect.runPromise(
+      Effect.flatMap(Journal, (journal) =>
+        journal.put(
+          JournalEntry.cases.Executed.make({ _tag: "Executed", digest, at: DateTime.makeUnsafe(0) })
+        ))
+    )
   })
 })

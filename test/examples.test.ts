@@ -15,6 +15,7 @@ import { TestConsole } from "effect/testing"
 import { Escrow, program as consumerProgram, readWithPromises } from "../examples/extension-consumer.ts"
 import { program as readProgram } from "../examples/read-escrow.ts"
 import { Script } from "../src/script.ts"
+import { Journal } from "../src/services/Journal.ts"
 import { FakeOutcome, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
 import { layerTest } from "../src/testing.ts"
 
@@ -103,12 +104,20 @@ describe("examples/extension-consumer.ts", () => {
 
   test("the Effect consumer claims through the extension inside a script", async () => {
     const lines: Array<string> = []
-    const code = await Script.run(consumerProgram.pipe(Effect.provide(Layer.mergeAll(Escrow.layer, env))), {
-      layer: Script.layerNoDeps.pipe(Layer.provideMerge(layerTest(script)), Layer.provide(env)),
-      exit: () => {},
-      stderr: (line) => lines.push(line),
-      signals: { on: () => {} }
-    })
+    const code = await Script.run(
+      // The default journal is process-wide, so a test that submits provides
+      // its own and its entries cannot be seen by the next one.
+      consumerProgram.pipe(Effect.provide(Layer.mergeAll(Escrow.layer, env, Journal.layerMemory))),
+      {
+        layer: Script.layerNoDeps.pipe(
+          Layer.provideMerge(layerTest(script)),
+          Layer.provide(env)
+        ),
+        exit: () => {},
+        stderr: (line) => lines.push(line),
+        signals: { on: () => {} }
+      }
+    )
     expect(lines).toEqual([])
     expect(code).toBe(0)
   })

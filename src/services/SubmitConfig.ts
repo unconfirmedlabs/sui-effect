@@ -18,16 +18,29 @@ export interface SubmitConfigService {
   /**
    * The expiration `Tx.build` sets when the recipe set none.
    *
-   * `"validDuring"` is a wall-clock bound plus the chain identifier and a
-   * random nonce: it is the only one that both bounds the transaction in time
-   * and stops bytes signed for one chain from landing on another.
-   * `"epoch"` costs one `getCurrentSystemState` read. `"none"` leaves the
-   * transaction valid forever, which makes `NotApplied { evidence: "expired" }`
-   * unreachable.
+   * `"validDuring"` bounds the transaction to the current epoch and the next,
+   * and names the chain: it is the only one that both satisfies the validator
+   * rule (a transaction must have address-owned inputs *or* an expiration of at
+   * most two epochs) and stops bytes signed for one chain from landing on
+   * another. It costs one `getCurrentSystemState` read per build.
+   * `"epoch"` costs the same read and carries no chain guard. `"none"` leaves
+   * the transaction valid forever, which makes
+   * `NotApplied { evidence: "expired" }` unreachable.
    */
   readonly expiration: ExpirationPolicy
-  /** How long a `"validDuring"` transaction stays valid after it is built. */
-  readonly validFor: Duration.Duration
+  /**
+   * An **additional** wall-clock bound on a `"validDuring"` expiration, as
+   * `maxTimestamp`.
+   *
+   * Unset by default, because no Sui network accepts one yet: a devnet node on
+   * protocol 100 refuses any transaction carrying a timestamp bound with
+   * `Feature is not supported: Timestamp-based transaction expiration is not
+   * yet supported`, whether or not epochs are set alongside it. Setting this
+   * produces bytes the current protocol rejects at build time; it is here so
+   * that a network which does support them needs no new API, and so that
+   * `Tx.reconcile`'s wall-clock expiry rule has something to read.
+   */
+  readonly validFor?: Duration.Duration
   /**
    * The largest gas budget `Tx.build` will accept. The budget itself is chosen
    * by the node's simulation during build; this is the ceiling above which
@@ -60,6 +73,10 @@ export interface SubmitConfigService {
    * How far `chainTime` must pass a transaction's recorded `maxTimestamp`
    * before `Tx.reconcile` is willing to call it `NotApplied`. It covers the
    * skew between the node's clock, the Clock object and the validators.
+   *
+   * It applies to the wall-clock rule only. The epoch rule needs no margin:
+   * an epoch is a consensus fact, not a reading of a clock, so once the
+   * current epoch is past a transaction's `maxEpoch` it is simply over.
    */
   readonly expiryMargin: Duration.Duration
 }
@@ -67,7 +84,6 @@ export interface SubmitConfigService {
 /** The spec's defaults, in force whenever nothing overrides them. */
 export const defaults: SubmitConfigService = {
   expiration: "validDuring",
-  validFor: Duration.minutes(2),
   // The protocol's own maximum gas budget (50 SUI). Lower it to cap spend.
   maxGasBudget: 50_000_000_000n as Mist,
   lockSender: true,

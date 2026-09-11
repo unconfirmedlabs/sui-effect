@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { bcs as suiBcs } from "@mysten/sui/bcs"
+import { normalizeStructTag } from "@mysten/sui/utils"
 import { Effect, Result, Schema, SchemaTransformation } from "effect"
 import { bcs, decodeContent, expectedTypeOf, typeMatches } from "../src/domain/bcs.ts"
 import { makeSuiObject, ObjectEnvelope, ObjectId, StructTag } from "../src/domain/schemas.ts"
+import * as SuiSchema from "../src/domain/sui-schema.ts"
 
 const SUI = "0x2::sui::SUI"
 const COIN_TYPE = `0x2::coin::Coin<${SUI}>`
@@ -113,6 +115,38 @@ describe("SuiSchema.bcs", () => {
     expect(expectedTypeOf(Schema.Uint8Array as unknown as Schema.Codec<Uint8Array, Uint8Array>)).toBe(
       undefined
     )
+  })
+})
+
+describe("SuiSchema.decode", () => {
+  test("is the same decode getObject does, for bytes a caller already has", async () => {
+    const decoded = await Effect.runPromise(SuiSchema.decode(CoinCodec, content))
+    expect(decoded.balance).toBe("123456789")
+  })
+
+  test("a failure is a DecodeError naming the object and the type", async () => {
+    const error = await Effect.runPromise(
+      SuiSchema.decode(CoinCodec, new Uint8Array([1, 2, 3]), {
+        objectId: ObjectId.make(OBJECT_ID)
+      }).pipe(Effect.flip)
+    )
+    expect(error._tag).toBe("DecodeError")
+    expect(error.objectId).toBe(ObjectId.make(OBJECT_ID))
+    // The expected type comes off the codec, so a caller does not repeat it.
+    expect(error.expectedType).toBe(normalizeStructTag(COIN_TYPE))
+  })
+
+  test("an explicit expectedType overrides the codec's", async () => {
+    const error = await Effect.runPromise(
+      SuiSchema.decode(CoinCodec, new Uint8Array([9]), { expectedType: "0x9::a::B" }).pipe(
+        Effect.flip
+      )
+    )
+    expect(error.expectedType).toBe("0x9::a::B")
+  })
+
+  test("it is the very function Sui decodes object content with", () => {
+    expect(SuiSchema.decode).toBe(decodeContent)
   })
 })
 

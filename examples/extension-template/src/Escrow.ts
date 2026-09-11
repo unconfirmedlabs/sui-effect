@@ -16,8 +16,17 @@ import {
   Schema,
   Stream
 } from "effect"
-import type { ChangedRef, DecodeError, Recipe, SuiObject } from "sui-effect"
-import { Digest, ObjectId, StructTag, Sui, SuiAddress, TransportError } from "sui-effect"
+import type { ChangedRef, Recipe, SuiObject, UnexpectedEffects } from "sui-effect"
+import {
+  DecodeError,
+  Digest,
+  ObjectId,
+  StructTag,
+  Sui,
+  SuiAddress,
+  SuiSchema,
+  TransportError
+} from "sui-effect"
 import type { RunError, Signer } from "sui-effect/tx"
 import { Tx } from "sui-effect/tx"
 import { EscrowNotFound, EscrowSettlementUnknown } from "./errors.ts"
@@ -44,6 +53,7 @@ export type ClaimForError =
   | EscrowNotFound
   | EscrowSettlementUnknown
   | DecodeError
+  | UnexpectedEffects
   | RunError
 
 /**
@@ -58,9 +68,10 @@ export interface EscrowService {
   /**
    * The address the package collects fees at, read through the upstream SDK.
    *
-   * Fails with: `TransportError`.
+   * Fails with: `DecodeError` (the upstream answer was not an address),
+   * `TransportError`.
    */
-  readonly feeCollector: Effect.Effect<SuiAddress, TransportError>
+  readonly feeCollector: Effect.Effect<SuiAddress, DecodeError | TransportError>
   /**
    * Reads one escrow object and decodes its content.
    *
@@ -89,7 +100,8 @@ export interface EscrowService {
    *
    * Fails with: `EscrowNotFound`, `DecodeError`, `TransportError`,
    * `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`,
-   * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, and
+   * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`,
+   * `UnexpectedEffects` (the claim applied but produced no receipt), and
    * `EscrowSettlementUnknown` when the claim is on chain but the operator never
    * confirmed it.
    */
@@ -134,7 +146,6 @@ const SettlementStatus = Schema.Struct({
 })
 
 const decodeSettlement = Schema.decodeUnknownEffect(SettlementStatus)
-const decodeFields = Schema.decodeUnknownEffect(EscrowContent)
 const decodeAddress = Schema.decodeUnknownEffect(SuiAddress)
 
 const transport = (method: string) => (cause: unknown): TransportError =>
@@ -160,9 +171,15 @@ const make = (
           (error) => Effect.fail(transport("escrow.feeCollector")(error))
         ),
         // Upstream answered with `unknown`; it becomes a sui-effect schema
-        // before anything else in this package sees it.
+        // before anything else in this package sees it. A value that does not
+        // decode is a `DecodeError` and stays one: it says which boundary was
+        // wrong, where `TransportError` would claim the node was unreachable.
         Effect.flatMap((raw) =>
-          decodeAddress(raw).pipe(Effect.mapError(transport("escrow.feeCollector")))
+          decodeAddress(raw).pipe(
+            Effect.mapError((issue) =>
+              new DecodeError({ expectedType: "SuiAddress", issue: issue.message })
+            )
+          )
         ),
         Effect.withSpan("Escrow.feeCollector")
       )
@@ -212,9 +229,11 @@ const make = (
     ) {
       const escrow = yield* get(id)
       const executed = yield* Tx.run(claim(escrow), { signer: opts.signer })
-      const receipt = yield* executed.expectCreated(RECEIPT_TYPE).pipe(
-        Effect.mapError((error) => transport("escrow.claimFor")(error))
-      )
+      // The transaction applied and gas was charged; what is missing is the
+      // receipt. That is what `UnexpectedEffects` means, and `outcome` puts it
+      // on "applied". Mapping it to `TransportError` would tell a wrapper the
+      // opposite — nothing happened, retry — about a claim that ran.
+      const receipt = yield* executed.expectCreated(RECEIPT_TYPE)
       yield* notify(id, executed.digest)
       return receipt
     // `Tx.*` requires `Sui`, and the layer has one: providing it here is what
@@ -225,10 +244,15 @@ const make = (
     const stream = (owner: SuiAddress) =>
       sui.streamOwnedObjects(owner, { type: escrowType }).pipe(
         Stream.mapEffect((object) =>
-          decodeFields(object.content).pipe(
-            Effect.map((content): EscrowObject => ({ ...object, content })),
-            Effect.mapError((issue) => transport("escrow.owned.stream")(issue))
-          )
+          // `SuiSchema.decode` is the same decode `sui.getObject({ schema })`
+          // does, for the places that already have bytes. Bytes that do not
+          // decode are a `DecodeError` naming the object and the type — not a
+          // transport failure, which is what a node that could not be reached
+          // is.
+          SuiSchema.decode(EscrowContent, object.content, {
+            objectId: object.id,
+            expectedType: escrowType
+          }).pipe(Effect.map((content): EscrowObject => ({ ...object, content })))
         )
       )
 

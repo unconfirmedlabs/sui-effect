@@ -36,8 +36,12 @@ the work plan. Where this file and the spec disagree, fix this file.
 - Every SDK call forwards the Effect's `AbortSignal` into the SDK's `signal`
   option, so `Effect.timeout` and interruption cancel the request.
 - Tests run on `bun test` with `effect/testing` (`TestClock`, `TestSchema`).
-  Tests provide their own layers and never touch the network. Localnet tests sit
-  behind `SUI_LOCALNET=1`.
+  Tests provide their own layers and never touch the network, with one gated
+  exception: `test/live.devnet.test.ts` runs against devnet behind `SUI_LIVE=1`
+  and is the only proof that a default-built transaction is accepted by a real
+  validator. Localnet tests sit behind `SUI_LOCALNET=1`. A test that runs
+  `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default
+  journal is process-wide.
 - Done means `bun run check` (typecheck, build, tests, and the extension
   template's own check) is green. `LLMS.md` is generated — `bun run llms` after
   any public signature or example change, and a test fails if it is stale.
@@ -63,7 +67,7 @@ and nothing else.
 |---|---|
 | `Signer` | A credential as a **value**, never a service: `{ address, scheme, signTransaction, signPersonalMessage }`. One process may hold two. Secret material never reaches the value. |
 | `Tx.build/sign/cosign/sponsored/submit/reconcile/run/reconcileAll` | The lifecycle as functions, each with a closed error union, all `R = Sui`. |
-| `SubmitConfig` | A `Context.Reference` holding expiration policy, `validFor`, the gas-budget ceiling, `preflight`, the sender lock, and the resubmit schedule, attempts, timeout and expiry margin. |
+| `SubmitConfig` | A `Context.Reference` holding expiration policy, the optional `validFor` wall-clock bound, the gas-budget ceiling, `preflight`, the sender lock, and the resubmit schedule, attempts, timeout and expiry margin. |
 | `Journal` | A `Context.Reference` with an in-memory default. `sui-effect/journal` swaps in a durable one over `KeyValueStore`; `Tx.reconcileAll()` is the explicit startup call. |
 | `Script` | `{ sui, core, signer, network }` plus `Script.run` and `Script.exitCode`. `ScriptReadOnly` is the signer-less variant, a separate key on purpose. |
 | `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. |
@@ -82,6 +86,13 @@ copyable package every block of that guide is quoted from, and
 bytes (never a rebuild) on a retryable `TransportError` or a timeout, and
 reconciles when the retries run out. A `TransportError` never escapes once bytes
 may have been sent: it becomes `SubmissionUnknown`, which carries them.
+`JournalError` escapes only from the `Signed` write, before anything is sent;
+after the network has answered, a failed journal write is logged and the answer
+stands.
+
+`Tx.build` bounds a transaction to the current epoch and the next and names the
+chain. It sets no `maxTimestamp`: no Sui network accepts a timestamp expiration
+yet (`test/live.devnet.test.ts`, behind `SUI_LIVE=1`, is the proof).
 
 `SuiCore` retries retryable `TransportError`s on reads only
 (`Schedule.min([exponential("250 millis"), spaced("10 seconds")])` jittered, five
@@ -104,13 +115,15 @@ Every failure is one flat tag; there is no error inheritance.
 | `SimulationFailed` | Simulation reported an execution failure. No gas charged. |
 | `ExecutionFailed` | Applied on chain and failed. Gas charged. |
 | `SubmissionUnknown` | Bytes may have been sent; the outcome is unknown. Carries the signed bytes, unless it came from reconciling a bare digest. |
-| `NotApplied` | Provably never applied (`expired` or `inputConsumed`). |
+| `NotApplied` | Provably never applied. `expired`: the epoch window closed. `inputConsumed`: the node named a **different** transaction as the one that consumed a pinned input. An input that merely moved on is not evidence. |
 | `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` / `UnexpectedEffects` | Signing, building, preflight policy, journal, and effects that did not contain what was expected. |
 
 `SuiError.outcome(e)` puts every failure on the axis a wrapper script acts on:
 `"applied"` for `ExecutionFailed`, `"unknown"` for `SubmissionUnknown`,
-`"not_applied"` for everything else. An extension error may declare its own
-`outcome`. `SuiError.isRetryable`, `SuiError.describe` (one actionable line) and
+`"not_applied"` for every other tag in the taxonomy, and `"unknown"` for
+anything that is neither one of those tags nor declares an `outcome`.
+`Script.exitCode` exits 1 for that last case rather than 3. An extension error
+may declare its own `outcome`, and should. `SuiError.isRetryable`, `SuiError.describe` (one actionable line) and
 `SuiError.toJson` round it out.
 
 ## Testing
@@ -118,7 +131,7 @@ Every failure is one flat tag; there is no error inheritance.
 `sui-effect/testing` ships `SuiCoreFake.layer(script)`, `layerTest(script)`
 (the real `Sui` over the fake `SuiCore`), `layerExtensionTest(layer, script)`
 (an extension's own layer over that) and `SuiTest` (`putObject`, `bumpVersion`,
-`deleteObject`, `setClock`, `scriptExecute`, `scriptSimulate`,
+`deleteObject`, `setClock`, `setEpoch`, `scriptExecute`, `scriptSimulate`,
 `scriptGetTransaction`, `calls`), which is the whole harness an extension's
 tests need. The fake serves in-memory objects with
 BCS content, the Clock object `0x6`, and scripted outcomes

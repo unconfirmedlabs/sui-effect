@@ -72,17 +72,25 @@ const putObject = (object: FakeObject): Effect.Effect<void, never, SuiCoreFake> 
   withFake((fake) => fake.setObject(object))
 
 /**
- * Moves an object to its next version, optionally with new content, and
- * answers with the version it now has.
+ * Moves an object to its next version, optionally with new content and with the
+ * digest of the transaction that moved it, and answers with the version it now
+ * has.
  *
- * The direct way to make `Tx.reconcile` see an owned input as consumed, and to
- * stand in for a transaction the test did not run. Dies when the fake has no
- * such object: a test that bumps something that is not there is a broken test,
- * not a failing one.
+ * The direct way to stand in for a transaction the test did not run. Pass
+ * `consumedBy` to say who moved it: `Tx.reconcile` reads that digest back as
+ * `previousTransaction` and it is the difference between the three answers a
+ * bumped input can produce — a **different** digest is `NotApplied
+ * { inputConsumed }`, **the transaction's own** digest means it applied after
+ * all, and **no digest** means the node proved nothing and the outcome is
+ * `SubmissionUnknown`. Omitting it therefore models the last of the three, not
+ * the first.
+ *
+ * Dies when the fake has no such object: a test that bumps something that is
+ * not there is a broken test, not a failing one.
  */
 const bumpVersion = (
   objectId: string,
-  opts?: { readonly content?: Uint8Array }
+  opts?: { readonly content?: Uint8Array; readonly consumedBy?: string }
 ): Effect.Effect<bigint, never, SuiCoreFake> =>
   withFake((fake) =>
     Effect.flatMap(fake.readObject(objectId), (found) => {
@@ -95,7 +103,8 @@ const bumpVersion = (
       return fake.setObject({
         ...found.value,
         version: next,
-        ...(opts?.content === undefined ? {} : { content: opts.content })
+        ...(opts?.content === undefined ? {} : { content: opts.content }),
+        ...(opts?.consumedBy === undefined ? {} : { previousTransaction: opts.consumedBy })
       }).pipe(Effect.as(next))
     })
   )
@@ -111,6 +120,15 @@ const deleteObject = (objectId: string): Effect.Effect<void, never, SuiCoreFake>
  */
 const setClock = (timestampMs: bigint): Effect.Effect<void, never, SuiCoreFake> =>
   withFake((fake) => fake.setClock(timestampMs))
+
+/**
+ * Moves the epoch `getCurrentSystemState` reports, which is what `Tx.build`
+ * bounds a transaction to and what `Tx.reconcile` compares a transaction's
+ * `maxEpoch` against. The direct way to make a transaction provably expired.
+ * Never fails.
+ */
+const setEpoch = (epoch: bigint): Effect.Effect<void, never, SuiCoreFake> =>
+  withFake((fake) => fake.setEpoch(epoch))
 
 /**
  * Replaces the outcomes `executeTransaction` will produce, oldest first; the
@@ -176,6 +194,7 @@ export const SuiTest = {
   bumpVersion,
   deleteObject,
   setClock,
+  setEpoch,
   scriptExecute,
   scriptSimulate,
   scriptGetTransaction,

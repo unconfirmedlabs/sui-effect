@@ -74,16 +74,32 @@ field off any error that declares one, and `Script.exitCode` maps the three to
 exit 5, 3 and 4.
 
 **Declare `outcome` on every error you define.** An extension error that does
-not declare one is *unclassified*: `Script.exitCode` cannot place a tag it has
-never heard of and exits 1, the code that also means "defect". The
-`"not_applied"` default that `SuiError.outcome` applies is for sui-effect's own
+not declare one is *unclassified*, and the two helpers answer differently on
+purpose. `Script.exitCode` exits 1, the code that also means "defect", because
+exit 3 would tell a wrapper there is a digest to reconcile and an unrecognised
+error is not evidence that anything was ever sent. `SuiError.outcome` answers
+`"unknown"`, because a tag it has never heard of is equally not evidence that
+nothing happened — answering `"not_applied"` would tell the documented retry
+idiom to send again. The `"not_applied"` default is for sui-effect's own
 taxonomy, not for yours.
 
 Do not invent an error for something the taxonomy already names. A node that
 could not be reached is a `TransportError`; bytes that did not decode are a
-`DecodeError`; a transaction that aborted on chain is an `ExecutionFailed`. Your
-own errors are for your own domain — policy, protocol state, an operator
-service — and upstream failures are mapped into one or the other.
+`DecodeError`; a transaction that aborted on chain is an `ExecutionFailed`; a
+transaction that applied but did not produce what you expected is an
+`UnexpectedEffects`. Your own errors are for your own domain — policy, protocol
+state, an operator service — and upstream failures are mapped into one or the
+other.
+
+**Never map an error onto one with a different outcome.** This is the mistake
+worth naming: `UnexpectedEffects` says the transaction applied and gas was
+charged, `TransportError` says nothing happened and a retry is safe. Mapping the
+first onto the second tells a wrapper script to run the transaction again, and
+the wrapper will. The same goes the other way: a `DecodeError` is a boundary
+that was wrong, not a node that was unreachable, and dressing it as a
+`TransportError` both loses the type that was expected and makes a declared
+`DecodeError` unreachable. Map an error onto another only when the two say the
+same thing about the chain.
 
 ## 3. Reads through `Sui`, writes through `Tx`
 
@@ -95,6 +111,12 @@ recorded on the codec before it parses a byte, so a wrong object is a
 which failures are translated and which are not: a missing or deleted escrow is
 this package's `EscrowNotFound`, but `ObjectUnavailable` — the node could not
 say what happened to it — is a transport problem and stays one.
+
+Where you already have bytes — a `Stream` of envelopes, a dynamic field's value,
+an event payload — `SuiSchema.decode(codec, bytes, { objectId?, expectedType? })`
+is the same decode `getObject` does, and produces the same `DecodeError` naming
+the object and the type. Use it instead of hand-rolling
+`Schema.decodeUnknownEffect(...).pipe(Effect.mapError(...))`.
 
 **An extension never calls `SuiCore.executeTransaction`.** Writes go through
 `Tx.submit` or `Tx.run`, so that every transaction on the platform gets the
@@ -130,6 +152,12 @@ one programmable transaction and submit once.
 A consumer composes fragments by calling them in order on one transaction:
 
 @@ test/escrow.test.ts :: test("the recipe fragment composes into a consumer's transaction", async () => { :: })
+
+Notice `claimFor`: the receipt comes from `executed.expectCreated(...)` with no
+`mapError` at all. The claim is on chain and gas was charged; only the receipt is
+missing, which is exactly what `UnexpectedEffects` means, and its outcome is
+`"applied"`. Adding it to the member's declared union is the honest fix; mapping
+it to something with outcome `"not_applied"` is not.
 
 An extension submits on the consumer's behalf only when that is its purpose —
 onara's sponsor-and-run, this template's `claimFor` — and when it does, it still
@@ -186,13 +214,16 @@ chain-identifier check. After that:
   still switch on `_tag` and read `outcome`;
 - `dispose()` releases everything the layer acquired.
 
-Two things worth telling consumers. Until the first `await` the runtime does not
-exist and neither does the member list, so a plain-value member reads as a
+Three things worth telling consumers. Until the first `await` the runtime does
+not exist and neither does the member list, so a plain-value member reads as a
 callable placeholder rather than as its value; after the first call,
-`client.escrow.packageId` is the string. And under `noUncheckedIndexedAccess`
-the SDK types `$extend`'s result through an indexed access, so the registered
-property arrives as possibly `undefined`; name it once
-(`const api = client.escrow as NonNullable<typeof client.escrow>`) and move on.
+`client.escrow.packageId` is the string. `fromService` is generic in the
+registration name, so `client.escrow` is a property of the extended client's
+type — no cast, and no `| undefined` under `noUncheckedIndexedAccess`. And
+`dispose()` is not final: it releases what the layer acquired and forgets the
+runtime, and the next call builds a fresh one, so dispose when the consumer is
+done rather than between calls. Registering the same extension twice, or on two
+clients, gives two independent runtimes and two layer builds.
 `examples/extension-consumer.ts` in this repository shows both consumers of one
 extension side by side.
 
@@ -297,7 +328,7 @@ conversion is mechanical except where the behaviour deliberately changed.
 | `getOptionalObjectContent` | `sui.getObjectOption` |
 | `getObjectsContent` | `sui.getObjects` — chunked, integrity-checked, a per-item `Result` instead of silently dropping errored ids |
 | `listDynamicFields` | `sui.streamDynamicFields` |
-| `decodeBcs(codec, schema, bytes)` | `SuiSchema.bcs(codec, expectedType)`, composed with a domain class through `Schema.decodeTo`, passed as `sui.getObject(id, { schema })` |
+| `decodeBcs(codec, schema, bytes)` | `SuiSchema.bcs(codec, expectedType)`, composed with a domain class through `Schema.decodeTo`, passed as `sui.getObject(id, { schema })`; for bytes you already have, `SuiSchema.decode(codec, bytes, { objectId?, expectedType? })` |
 | `assertObjectType` | folded into the bridge's tag check |
 | `TxThunk` | `Recipe = (tx) => void` — every existing thunk is already synchronous |
 | `buildTx(...thunks)` | compose recipes: `(tx) => { a(tx); b(tx) }`, then `Tx.build` |

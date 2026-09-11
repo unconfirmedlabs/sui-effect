@@ -496,6 +496,20 @@ export const SignedTransaction = Schema.Struct({
 export type SignedTransaction = typeof SignedTransaction.Type
 
 /**
+ * Why a transaction provably never applied, and never will.
+ *
+ * `"expired"`: `chainTime` has passed the `maxTimestamp` in the bytes by more
+ * than `SubmitConfig.expiryMargin`. `"inputConsumed"`: an owned input the
+ * transaction pinned was consumed by a **different** transaction, whose digest
+ * the node reported as that object's `previousTransaction`.
+ *
+ * Shared by `NotApplied` and by the journal entry that records it, so the two
+ * cannot drift.
+ */
+export const NotAppliedEvidence = Schema.Literals(["expired", "inputConsumed"])
+export type NotAppliedEvidence = typeof NotAppliedEvidence.Type
+
+/**
  * A transaction built into bytes and ready to sign, with the expiration the
  * builder settled on recorded so `Tx.reconcile` can decide, later and without
  * the builder, whether the transaction can still land.
@@ -514,6 +528,35 @@ export type Built = typeof Built.Type
  * milliseconds, or `undefined` when its expiration sets no such bound (`None`,
  * `Epoch`, or a `ValidDuring` with no `maxTimestamp`). Never fails.
  */
+/**
+ * The last epoch in which a transaction can still be applied, or `undefined`
+ * when its expiration sets no such bound (`None`, or a `ValidDuring` with no
+ * `maxEpoch`).
+ *
+ * An `Epoch` expiration is that epoch: the SDK's `Epoch` variant means "valid
+ * until the end of this epoch", so it is its own upper bound.
+ *
+ * This is the bound that matters in practice. Epochs are what the default
+ * expiration carries and what the validator rule is written in, and unlike a
+ * wall clock an epoch is a consensus fact, so `Tx.reconcile` needs no skew
+ * margin to reason about it. Never fails.
+ */
+export const maxEpochOf = (
+  expiration: TransactionExpiration | undefined
+): bigint | undefined => {
+  if (expiration === undefined) return undefined
+  switch (expiration.$kind) {
+    case "Epoch":
+      return expiration.Epoch
+    case "ValidDuring":
+      return expiration.ValidDuring.maxEpoch ?? undefined
+    case "Validity":
+      return expiration.Validity.maxEpoch ?? undefined
+    default:
+      return undefined
+  }
+}
+
 export const maxTimestampMsOf = (
   expiration: TransactionExpiration | undefined
 ): bigint | undefined => {

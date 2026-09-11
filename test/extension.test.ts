@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Context, Effect, Layer, Schema, Stream } from "effect"
+import type { PromiseFace } from "../src/services/SuiExtension.ts"
 import { SuiExtension } from "../src/services/SuiExtension.ts"
 import { Sui } from "../src/services/Sui.ts"
 import { SuiCoreFake } from "../src/services/SuiCoreFake.ts"
@@ -121,5 +122,87 @@ describe("SuiExtension.fromService", () => {
 
   test("the registration has the name $extend will use", () => {
     expect(registration.name).toBe("demo")
+  })
+
+  test("a layer that fails rejects with the original instance, on the first call", async () => {
+    // The runtime is built lazily, so a layer's failure has nowhere to go at
+    // registration time. It surfaces as the rejection of whatever call needed
+    // it — as the very error the layer failed with, not a wrapper.
+    const broken = new EscrowClosed({ id: "the layer" })
+    const failing: Layer.Layer<Demo, EscrowClosed, Sui> = Layer.effect(
+      Demo,
+      Effect.fail(broken)
+    )
+    const fake = Effect.runSync(
+      Effect.provide(SuiCoreFake, SuiCoreFake.layer({ chainId: CHAIN_ID }), { local: true })
+    )
+    const demo = SuiExtension.fromService(Demo, { name: "demo", layer: failing }).register(
+      fake.client
+    )
+    const error = await demo.status().then(() => undefined, (cause: unknown) => cause)
+    expect(error).toBe(broken)
+    expect(error).toBeInstanceOf(EscrowClosed)
+    await demo.dispose()
+  })
+
+  test("the registered property is typed, with no cast and no undefined", () => {
+    const fake = Effect.runSync(
+      Effect.provide(SuiCoreFake, SuiCoreFake.layer({ chainId: CHAIN_ID }), { local: true })
+    )
+    const extended = fake.client.$extend(registration)
+    // `fromService` is generic in a string literal, so this is a property of
+    // the extended client's type rather than an index signature — which is
+    // what `noUncheckedIndexedAccess` used to widen with `undefined`. The
+    // assignment is the assertion: it does not compile otherwise.
+    const api: PromiseFace<Demo["Service"]> & { readonly dispose: () => Promise<void> } =
+      extended.demo
+    expect(typeof api.dispose).toBe("function")
+  })
+
+  test("dispose is not final: the next call builds a fresh runtime", async () => {
+    let built = 0
+    const counted: Layer.Layer<Demo, never, Sui> = Layer.effect(
+      Demo,
+      Effect.gen(function*() {
+        built += 1
+        return yield* Demo.layer.pipe(Layer.build, Effect.map((context) => Context.get(context, Demo)))
+      })
+    )
+    const fake = Effect.runSync(
+      Effect.provide(SuiCoreFake, SuiCoreFake.layer({ chainId: CHAIN_ID }), { local: true })
+    )
+    const demo = SuiExtension.fromService(Demo, { name: "demo", layer: counted }).register(
+      fake.client
+    )
+    expect(await demo.status()).toBe("ready")
+    await demo.dispose()
+    expect(await demo.status()).toBe("ready")
+    expect(built).toBe(2)
+    await demo.dispose()
+  })
+
+  test("registering twice gives two independent runtimes", async () => {
+    let built = 0
+    const counted: Layer.Layer<Demo, never, Sui> = Layer.effect(
+      Demo,
+      Effect.gen(function*() {
+        built += 1
+        return yield* Demo.layer.pipe(Layer.build, Effect.map((context) => Context.get(context, Demo)))
+      })
+    )
+    const fake = Effect.runSync(
+      Effect.provide(SuiCoreFake, SuiCoreFake.layer({ chainId: CHAIN_ID }), { local: true })
+    )
+    const registrationOf = () =>
+      SuiExtension.fromService(Demo, { name: "demo", layer: counted }).register(fake.client)
+    const first = registrationOf()
+    const second = registrationOf()
+    await first.status()
+    await second.status()
+    // Two layer builds, so two copies of whatever the layer holds. Register
+    // once per client and keep the extended client.
+    expect(built).toBe(2)
+    await first.dispose()
+    await second.dispose()
   })
 })

@@ -102,11 +102,27 @@ const keypairOf = (parsed: { scheme: string; secretKey: Uint8Array }): Keypair |
 }
 
 /**
+ * The only text a failure of {@link fromConfig} ever carries.
+ *
+ * It is fixed, and neither the key nor the thrown message is in it. The Bech32
+ * decoder reports a bad checksum as `Invalid checksum in suiprivkey1…` with the
+ * **whole input**, so a one-character typo in a live key would otherwise print
+ * a recoverable secret on stderr the moment `Script.run` describes the failure.
+ * There is nothing a caller can do with the decoder's wording that this
+ * sentence does not already tell them, so it is dropped rather than redacted:
+ * a `cause` on the error would serialize through `SuiError.toJson` too.
+ */
+const KEY_ERROR = "is not a Bech32 Sui private key (scheme or checksum), " +
+  "or names a scheme with no keypair class (MultiSig, ZkLogin, Passkey — use Signer.remote for those)"
+
+/**
  * Reads a Bech32 `suiprivkey1…` secret key from configuration and builds the
  * signer for whichever of the three schemes its flag names.
  *
- * The key is read with `Config.redacted`, so it never reaches a log line, and
- * the decoded bytes never leave this function.
+ * The key is read with `Config.redacted`, and the decoded bytes never leave
+ * this function. Neither does anything derived from them: the failure carries
+ * one fixed sentence and no `cause`, because the decoder's own message quotes
+ * the input it rejected.
  *
  * Fails with: `ConfigError` when the variable is missing, is not a Bech32 Sui
  * private key, or names a scheme that has no keypair class (`MultiSig`,
@@ -122,16 +138,15 @@ export const fromConfig = (
           const parsed = decodeSuiPrivateKey(Redacted.value(redacted))
           const keypair = keypairOf(parsed)
           if (keypair === undefined) {
-            throw new Error(`unsupported key scheme ${parsed.scheme}`)
+            throw new Error("unsupported key scheme")
           }
           return fromKeypair(keypair)
         },
-        catch: (cause) =>
+        // No `cause`: it would carry the decoder's message, and the decoder's
+        // message carries the key.
+        catch: () =>
           new Config.ConfigError(
-            new ConfigProvider.SourceError({
-              message: `${name} is not a usable Bech32 Sui private key: ${String(cause)}`,
-              cause
-            })
+            new ConfigProvider.SourceError({ message: `${name} ${KEY_ERROR}` })
           )
       })
     )
@@ -154,7 +169,15 @@ export const ephemeral: Effect.Effect<Signer> = Effect.sync(() =>
   fromKeypair(new Ed25519Keypair())
 )
 
-/** What {@link remote} needs to know about a credential it does not hold. */
+/**
+ * What {@link remote} needs to know about a credential it does not hold.
+ *
+ * `address` is not optional and is not derived: a remote signer **must report
+ * the address it signs as**. `Tx.sign` and `Tx.cosign` compare it with the
+ * transaction's sender and gas owner and refuse a mismatch, which is the only
+ * thing standing between a misconfigured KMS key and an `INVALID_ARGUMENT`
+ * rejection that `Tx.submit` can only report as `SubmissionUnknown`.
+ */
 export interface RemoteSigner {
   readonly address: SuiAddress
   readonly scheme: SignatureScheme
