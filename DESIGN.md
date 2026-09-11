@@ -55,12 +55,13 @@ A hand-written 1:1 Effect wrap of `ClientWithCoreApi` from `@mysten/sui/client`.
 
 Whether it asserts is decided by one exported table, `KNOWN_CHAIN_IDS`, holding the genesis checkpoint digests observed on the live networks (`mainnet` `4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S`, `testnet` `69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD`); the SDK ships no such table. When the client's network is in the table, a node reporting a different identifier fails the layer with `NetworkMismatch { expected, actual }`. `devnet`, `localnet` and custom networks are regenerated and have no fixed identifier, so nothing is asserted and the observed one is recorded. `layerNoDepsWith({ chainId })` pins any network and overrides the table.
 
-It owns one `Semaphore` per sender address, kept in a `Ref<Map<address, Semaphore>>`: a shared pool with per-key fairness, which is what `PartitionedSemaphore` would have given if v4 shipped one.
+It owns one `Semaphore` per sender address, kept in an `RcMap<address, Semaphore>` with a one minute idle time to live: a shared pool with per-key fairness, which is what `PartitionedSemaphore` would have given if v4 shipped one. Reference counting is what keeps the pool bounded — whoever is inside the lock holds a reference, so a lock cannot be dropped while it is in use, and an idle one is released rather than sitting in a map for the life of the process.
 
 Members and error unions:
 
 ```ts
 network: Network
+core: SuiCore                                                        // the tier below, so every `Tx.*` can declare `R = Sui`
 chainId: string
 chainTime: Effect<DateTimeUtc, TransportError>                       // Clock object 0x6 via the BCS bridge, never cached
 getObject<S>(id: ObjectId, opts?: { schema?: Schema.Codec<S, Uint8Array>; expectedType?: string }):
@@ -94,7 +95,9 @@ Decisions recorded:
 
 A `Schema.Class` built from the execute include set: `digest`, `effects`, `events`, `balanceChanges`, `objectTypes`, `checkpoint?`, `timestampMs?`. Accessors, each returning full refs `{ id, type, version, digest, owner }` so the next transaction can consume them, and each ignoring accumulator writes:
 
-`created(type?)`, `mutated(type?)`, `deleted()`, `packagesPublished()` (`PackageWrite` and `Created`, refs like every other accessor, `type` falling back to the literal `package`), `balanceChange(address, coinType): bigint` and `gasUsedTotal: bigint` (both are signed deltas, so neither is `Mist`, which is non-negative), and `expectCreated(type): Effect<ObjectRef, UnexpectedEffects>` for the one-result case.
+`created(type?)`, `createdWhere(predicate)` (the direct replacement for the substring matching downstream repos hand-roll), `mutated(type?)`, `deleted()`, `packagesPublished()` (`PackageWrite` and `Created`, refs like every other accessor, `type` falling back to the literal `package`), `balanceChange(address, coinType): bigint` and `gasUsedTotal: bigint` (both are signed deltas, so neither is `Mist`, which is non-negative), and `expectCreated(type): Effect<ChangedRef, UnexpectedEffects>` for the one-result case.
+
+Every accessor returns a `ChangedRef { id, type?, version?, digest?, owner? }` rather than a full `ObjectRef`: the effects carry `id` always and the rest only sometimes (a deleted object has no output version, a change missing from the `objectTypes` join has no type), and inventing version `0`, an empty digest or an `Unknown` owner would hand the builder a reference that looks usable and is not. `objectRefOf(ref)` returns a full `ObjectRef` when every field is present and `undefined` otherwise.
 
 ## 5. `Signer` is a value, not a service
 
@@ -120,11 +123,17 @@ Tx.build(input: Recipe | Transaction, opts: { sender: SuiAddress; gasOwner?: Sui
 Tx.sign(built: Built, signer: Signer):     Effect<Signed, SigningError>
 Tx.cosign(signed: Signed, signer: Signer): Effect<Signed, SigningError>
 Tx.sponsored(opts: { sender; gasOwner }): (recipe: Recipe) => Recipe      // setSender, setGasOwner, setGasPayment([])
-Tx.submit(signed: Signed):                 Effect<Executed, ExecutionFailed | SubmissionUnknown | JournalError>
-Tx.reconcile(input: Digest | Unknown):     Effect<Executed, ExecutionFailed | NotApplied | SubmissionUnknown | TransportError>
-Tx.run(recipe: Recipe, opts: { signer: Signer; gasOwner?: SuiAddress }):
-  Effect<Executed, BuildError | SimulationFailed | PolicyDenied | SigningError | ExecutionFailed | SubmissionUnknown | JournalError>
+Tx.submit(signed: Signed):                 Effect<Executed, ExecutionFailed | NotApplied | SubmissionUnknown | JournalError>
+Tx.reconcile(input: Digest | Signed | SubmissionUnknown):
+  Effect<Executed, ExecutionFailed | NotApplied | SubmissionUnknown | TransportError>
+Tx.run(recipe: Recipe | Transaction, opts: { signer: Signer; gasOwner?: SuiAddress }):
+  Effect<Executed, BuildError | SimulationFailed | PolicyDenied | SigningError | ExecutionFailed | NotApplied | SubmissionUnknown | JournalError | TransportError>
+Tx.reconcileAll(): Effect<ReadonlyArray<Executed | ExecutionFailed | NotApplied | SubmissionUnknown>, JournalError | TransportError>
 ```
+
+`submit` and `run` carry `NotApplied` because `submit` runs `reconcile` when its retries are exhausted, and proving that a transaction never applied is one of the three answers `reconcile` can give. `run` carries `TransportError` because `build` does: reads before the bytes exist can fail the ordinary way. Once bytes may have been sent, no `TransportError` escapes.
+
+`reconcile` takes the signed bytes, not only a digest, because the evidence rules need them: given a bare `Digest` there is nothing to reason about and an unknown transaction is always `SubmissionUnknown` (with no `signed` on it, since there is nothing to re-send).
 
 Semantics:
 - **Build already simulates.** On gRPC the SDK resolve plugin calls `simulateTransaction` with checks enabled during `build` and throws `SimulationError` on execution failure. `Tx.build` maps that to `SimulationFailed`, so simulate-before-submit is inherent and costs nothing extra.
@@ -138,17 +147,19 @@ Semantics:
 
 ## 7. `SubmitConfig` (`Context.Reference`, defaults shown)
 
-`expiration: "validDuring" | "epoch" | "none"` (`"validDuring"`), `validFor: Duration` (2 minutes), `maxGasBudget: Mist`, `preflight?: (sim: Simulation) => Effect<void, PolicyDenied>` (none), `lockSender: boolean` (true), `resubmit: Schedule` (jittered exponential, 5 attempts, 30 second cap).
+`expiration: "validDuring" | "epoch" | "none"` (`"validDuring"`), `validFor: Duration` (2 minutes), `maxGasBudget: Mist` (50 SUI, the protocol maximum; `Tx.build` fails with `BuildError` when the budget the node chose is over it), `preflight?: (sim: Simulation) => Effect<void, PolicyDenied>` (none), `lockSender: boolean` (true), `resubmit: Schedule` (jittered exponential, 30 second cap), `resubmitAttempts: number` (5), `executeTimeout: Duration` (60 seconds, after which one `executeTransaction` is treated as a retryable transport failure), `expiryMargin: Duration` (30 seconds of clock skew `Tx.reconcile` allows before calling a transaction expired).
+
+`resubmitAttempts`, `executeTimeout` and `expiryMargin` are separate fields rather than constants because each is a number a test has to be able to drive and an operator has to be able to change: the attempt count is not expressible in a v4 `Schedule` that also has to be jittered, the timeout is what makes `Cause.TimeoutError` reachable at all, and the margin is the difference between "probably gone" and "provably gone".
 
 ## 8. `Journal` (`Context.Reference`, memory default)
 
-Interface: `put(entry)`, `get(digest)`, `listUnresolved`. The memory default keeps `Journal` out of `R` and makes a one-shot script work with zero setup; for scripts, the signed bytes inside `SubmissionUnknown` are the durable record and `describe` prints digest plus base64 bytes.
+Interface: `put(entry)`, `get(digest)`, `listUnresolved`. The memory default keeps `Journal` out of `R` and makes a one-shot script work with zero setup; for scripts, the signed bytes inside `SubmissionUnknown` are the durable record and `describe` prints digest plus base64 bytes. Because a `Context.Reference`'s identifier is `never` in v4 — which is exactly why it stays out of `R` — the layers that provide one are `Layer<never, ...>`; `Journal.layerMemory` is a fresh in-memory journal for a test or a process that wants its own, since the default value is computed once and cached on the reference.
 
-`sui-effect/journal` provides `Journal.layerKeyValueStore({ onUnresolved: "fail" | "ignore" }): Layer<Journal, JournalError, KeyValueStore>`. Layer build does no network work beyond listing entries; an application that wants to reconcile at startup calls `Tx.reconcileAll: Effect<ReadonlyArray<Executed | NotApplied | SubmissionUnknown>, JournalError | TransportError, Sui | Journal>` explicitly. This keeps the layer dependency direction simple and keeps network calls out of layer construction.
+`sui-effect/journal` provides `Journal.layerKeyValueStore({ onUnresolved: "fail" | "ignore" }): Layer<never, JournalError, KeyValueStore>`. `KeyValueStore` has no key enumeration, so the journal keeps its own index under one key: the digests that are still unresolved, rewritten whenever an entry is put. Layer build does no network work beyond listing entries; an application that wants to reconcile at startup calls `Tx.reconcileAll: Effect<ReadonlyArray<Executed | NotApplied | SubmissionUnknown>, JournalError | TransportError, Sui | Journal>` explicitly. This keeps the layer dependency direction simple and keeps network calls out of layer construction.
 
 ## 9. `JournalEntry` (`Schema.TaggedUnion`)
 
-`Signed { digest, bytes, signatures, sender, expiration, signedAt }`, `Executed { digest, checkpoint?, at }`, `Failed { digest, reason, at }`, `Unknown { digest, signed, lastError, attempts }`. This is the only place the lifecycle appears as a union; the program abstraction is the functions in section 6.
+`Signed { digest, signed, signedAt }`, `Executed { digest, checkpoint?, at }`, `Failed { digest, reason, at }`, `Unknown { digest, signed, lastError, attempts, at }`, where `signed` is a `SignedTransaction { digest, bytes, signatures, sender, expiration? }` — one representation of signed bytes, shared with `SubmissionUnknown`, rather than the same five fields spelled out twice. `lastError` is the `SuiError.describe` line, so an entry is JSON with no error schema nested inside it. This is the only place the lifecycle appears as a union; the program abstraction is the functions in section 6.
 
 ## 10. Errors
 
@@ -163,13 +174,13 @@ All `Schema.TaggedError` so they serialize. Flat tags, no inheritance.
 | `DecodeError` | `objectId?`, `expectedType?`, `issue` |
 | `SimulationFailed` | `reason: ExecutionReason`, `message` |
 | `ExecutionFailed` | `digest`, `reason: ExecutionReason`, `command?`, `effects` |
-| `SubmissionUnknown` | `digest`, `signed`, `cause` |
+| `SubmissionUnknown` | `digest`, `signed?`, `cause` (absent only when `Tx.reconcile` was given a bare digest, so there are no bytes to carry) |
 | `NotApplied` | `digest`, `evidence: "expired" \| "inputConsumed"` |
 | `SigningError` | `cause` |
 | `BuildError` | `message`, `cause` |
 | `PolicyDenied` | `rule`, `message` |
 | `JournalError` | `cause` |
-| `UnexpectedEffects` | `digest`, `expected: StructTag`, `found: ObjectId[]` (the ids that did match, so zero and many are told apart) |
+| `UnexpectedEffects` | `digest`, `expected: string`, `found: ObjectId[]` (the ids that did match, so zero and many are told apart; `expected` is the string the caller asked for, because fabricating a valid `StructTag` from an invalid one is worse than repeating it) |
 
 `ExecutionReason` and `Owner` are `Schema.Union([...]).pipe(Schema.toTaggedUnion("$kind"))` rather than `_tag` unions, so the discriminant is the SDK's own `$kind` and our narrowing and the SDK's agree. `ExecutionReason` mirrors `SuiClientTypes.ExecutionError` exactly (`MoveAbort` with `abortCode: bigint`, `location`, `cleverError`; `SizeError`; `CommandArgumentError`; `TypeArgumentError`; `PackageUpgradeError`; `IndexError`; `CoinDenyListError`; `CongestedObjects`; `ObjectIdError`; `Unknown`). Clever-error constant names are decoded automatically; a per-package abort registry is deferred.
 
@@ -177,14 +188,14 @@ All `Schema.TaggedError` so they serialize. Flat tags, no inheritance.
 
 ## 11. Branded schemas and the BCS bridge
 
-`SuiAddress`, `ObjectId`, `Digest`, `StructTag`, `CoinType`, `Mist` (`bigint`) as `Schema.String.pipe(Schema.check(...), Schema.brand(...))` with normalization on decode via `SchemaGetter.transform` (`normalizeSuiAddress`, `normalizeStructTag`). `SuiSchema.bcs(bcsType, expectedType)` turns a `@mysten/bcs` `BcsType<T>` into `Schema.Codec<T, Uint8Array>` that decodes from `content` bytes only (never the transport-varying `json`) and compares the object's type tag with `normalizeStructTag` so generic instantiations match. It must be a `BcsType`, not merely a `{ parse }` codec: the bridge re-serializes what it parsed to reject trailing bytes, which is what stops an `objectBcs` envelope from decoding as the struct it wraps (generated codegen output is a `BcsType`, so this costs nothing in practice). The expected type is stored as a schema annotation and read back by walking the encoding chain, so `SuiSchema.bcs(...).pipe(Schema.decodeTo(DomainClass, ...))` keeps the check; `getObject`, `getObjectOption` and `getObjects` also accept an explicit `expectedType` for codecs built some other way. A `Uint8Array` field that can reach an error or a journal entry (`SignedTransaction.bytes`) uses a base64 codec, so `SuiError.toJson` is JSON.
+`SuiAddress`, `ObjectId`, `Digest`, `StructTag`, `CoinType`, `Signature`, `Mist` (`bigint`) as `Schema.String.pipe(Schema.check(...), Schema.brand(...))` with normalization on decode via `SchemaGetter.transform` (`normalizeSuiAddress`, `normalizeStructTag`). `SuiSchema.bcs(bcsType, expectedType)` turns a `@mysten/bcs` `BcsType<T>` into `Schema.Codec<T, Uint8Array>` that decodes from `content` bytes only (never the transport-varying `json`) and compares the object's type tag with `normalizeStructTag` so generic instantiations match. It must be a `BcsType`, not merely a `{ parse }` codec: the bridge re-serializes what it parsed to reject trailing bytes, which is what stops an `objectBcs` envelope from decoding as the struct it wraps (generated codegen output is a `BcsType`, so this costs nothing in practice). The expected type is stored as a schema annotation and read back by walking the encoding chain, so `SuiSchema.bcs(...).pipe(Schema.decodeTo(DomainClass, ...))` keeps the check; `getObject`, `getObjectOption` and `getObjects` also accept an explicit `expectedType` for codecs built some other way. A `Uint8Array` field that can reach an error or a journal entry (`SignedTransaction.bytes`) uses a base64 codec, so `SuiError.toJson` is JSON.
 
 ## 12. `Script` preset (`sui-effect/script`)
 
-- `Script` is a `Context.Service` `{ sui: Sui, core: SuiCore, signer: Signer, network }`. `Script.layer` reads `SUI_NETWORK` (required, no default; `mainnet` refused unless `SUI_ALLOW_MAINNET=1`), `SUI_RPC_URL` (optional), `SUI_PRIVATE_KEY` (Bech32, `Config.redacted`). `Script.layerReadOnly` omits `signer` from the type.
-- `Script.run(effect)` installs SIGINT/SIGTERM handlers, interrupts the root fiber, waits for finalizers, maps the `Exit` to an exit code and exits. No platform dependency. `Script.exitCode(exit)` is exported for consumers on `BunRuntime.runMain`.
+- `Script` is a `Context.Service` `{ sui: Sui, core: SuiCore, signer: Signer, network }`. `Script.layer` reads `SUI_NETWORK` (required, no default; `mainnet` refused unless `SUI_ALLOW_MAINNET=1`), `SUI_RPC_URL` (optional), `SUI_PRIVATE_KEY` (Bech32, `Config.redacted`), and provides `Sui` and `SuiCore` alongside `Script`, so `Tx.*` works inside a script with no further wiring. `Script.layerReadOnly` provides a separate service, `ScriptReadOnly`, whose shape has no `signer`: one service cannot have two shapes, and a script written against `Script` must not silently build over a layer that cannot sign. `Script.layerNoDeps` and `Script.layerWithSigner(signer)` build over a `Sui` the caller already has, which is how a test runs a script against the fake.
+- `Script.run(effect, options?)` installs SIGINT/SIGTERM handlers, interrupts the root fiber, waits for finalizers, maps the `Exit` to an exit code, exits and returns the code. No platform dependency: `process` is the only global it touches, and `options` can replace `exit`, `stderr`, `signals` and the `layer`, so a test drives the whole path without ending the test process. `Script.exitCode(exit)` is exported for consumers on `BunRuntime.runMain`.
 - stdout carries the script's data only; the logger and `describe` output go to stderr, one line per failure plus `digest:` when present, and for `SubmissionUnknown` the base64 bytes and a reconcile hint.
-- Exit codes: 0 success; 1 defect or unclassified; 2 configuration (`ConfigError`, `NetworkMismatch`, mainnet gate); 3 unknown outcome (`SubmissionUnknown`); 4 not applied (`SimulationFailed`, `BuildError`, `SigningError`, `PolicyDenied`, not-found family, `TransportError` after retries); 5 applied but failed on chain (`ExecutionFailed`); 130 interrupt. The applied / not applied / unknown axis matches what a wrapper script acts on and matches publish's existing exit 3.
+- Exit codes: 0 success; 1 defect or unclassified; 2 configuration (`ConfigError`, `NetworkMismatch`, mainnet gate); 3 unknown outcome (`SubmissionUnknown`); 4 not applied (`SimulationFailed`, `BuildError`, `SigningError`, `PolicyDenied`, `NotApplied`, `DecodeError`, `JournalError`, `UnexpectedEffects`, the not-found family, `TransportError` after retries, and `Cause.TimeoutError`, which sits outside the taxonomy but can only mean a read timed out — `Tx.submit` turns a timed-out submission into `SubmissionUnknown` before it ever reaches here); 5 applied but failed on chain (`ExecutionFailed`); 130 interrupt. The applied / not applied / unknown axis matches what a wrapper script acts on and matches publish's existing exit 3.
 - No `--json` flag at this level; the consumer's CLI owns flags and can use `SuiError.toJson`.
 
 The target shape of an on-demand script:
@@ -254,7 +265,7 @@ const client = new SuiGrpcClient({ network: "testnet", baseUrl }).$extend(onara(
 const status = await client.onara.status()
 ```
 
-`fromService` returns a `SuiClientRegistration` whose `register(client)` builds, lazily on first call, a `ManagedRuntime` over `SuiCore.layerFromClient(client)`, `Sui.layerNoDeps` and the extension layer, and exposes each interface member as a Promise-returning method (or an `AsyncIterable` for Streams). Rejections are the same tagged error instances, so a Promise consumer can still switch on `_tag`. The registration exposes `dispose()` for clean shutdown. One implementation, two faces; the Effect face is the one agents and our own scripts use.
+`fromService` returns a `SuiClientRegistration` whose `register(client)` builds, lazily on first call, a `ManagedRuntime` over `SuiCore.layerFromClient(client)`, `Sui.layerNoDeps` and the extension layer, and exposes each interface member as a Promise-returning method (or an `AsyncIterable` for Streams), mapping nested plain objects of members recursively so a namespaced surface (`client.miso.protocol.*`) works. Because the member list only exists once the layer has been built, and building it is asynchronous, the registration is a proxy: before the first call every member is a callable, async-iterable placeholder that builds the runtime on use, and after it every member is the mapped value, so a non-function member reads as itself. Rejections are the same tagged error instances, so a Promise consumer can still switch on `_tag`. The registration exposes `dispose()` for clean shutdown. One implementation, two faces; the Effect face is the one agents and our own scripts use.
 
 ### 13.3 Third-party packages: we maintain Effect-native variants
 
@@ -273,7 +284,7 @@ Consequences:
 
 ## 14. Testing
 
-- `SuiCoreFake.layer(script)` in `sui-effect/testing`: a `Map` of objects plus scripted outcomes for `getChainIdentifier`, `getReferenceGasPrice`, `getObjects`, `listCoins`, `simulateTransaction`, `executeTransaction`, `getTransaction`, and the Clock object `0x6`. Outcomes include `succeed`, `failWith(reason)`, `transportError(status)`, `notFound()`, `timeoutThen(found)`. It also implements `resolveTransactionPlugin`, so `transaction.build({ client })` resolves gas price, gas budget, gas payment and object inputs from the script with no network, and it keys pending and known transactions by `TransactionDataBuilder.getDigestFromBytes` of the bytes it was given, so journal and reconcile tests are stable. No Move execution, no dynamic fields; localnet covers those.
+- `SuiCoreFake.layer(script)` in `sui-effect/testing`: a `Map` of objects plus scripted outcomes for `getChainIdentifier`, `getReferenceGasPrice`, `getObjects`, `listCoins`, `simulateTransaction`, `executeTransaction`, `getTransaction`, the resolver's budget simulation (`buildSimulate`, which is how a test makes `Tx.build` fail with `SimulationFailed`), and the Clock object `0x6`. Outcomes include `succeed`, `failWith(reason)`, `transportError(status)`, `notFound()`, `timeoutThen(found)`. It also implements `resolveTransactionPlugin`, so `transaction.build({ client })` resolves gas price, gas budget, gas payment and object inputs from the script with no network, and it keys pending and known transactions by `TransactionDataBuilder.getDigestFromBytes` of the bytes it was given, so journal and reconcile tests are stable. No Move execution, no dynamic fields; localnet covers those.
 - `layerTest(script)` in `sui-effect/testing` is `Sui.layerNoDeps` over the fake, so tests exercise the real high tier and the real `Tx.submit` under `TestClock`, under the production chain-id rules.
 - `TestSchema.Asserts` round-trips every error class and every `JournalEntry` variant.
 - The `TransportMethods` completeness type test.

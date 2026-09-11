@@ -17,8 +17,10 @@ the work plan. Where this file and the spec disagree, fix this file.
   `@mysten/sui` can guess sui-effect.
 - Nothing under `src/` imports `@effect/platform-bun` or `bun:*`. `@effect/platform-bun`
   is a devDependency for tests and examples only.
-- No `Effect.runPromise` / `runSync` under `src/`, except inside the documented
-  Promise facade of `SuiExtension.fromService` (phase 1).
+- No `Effect.runPromise` / `runSync` under `src/`, except at the two documented
+  edges: the Promise facade of `SuiExtension.fromService`, and `Script.run`,
+  which is a process entrypoint and whose whole job is to fork the root fiber,
+  await its `Exit` and exit.
 - No `any`. No `unknown` in an error channel. No `console.log` in `src/`.
 - Every public function carries a JSDoc block that **states its error union in
   words** ("Fails with: `ObjectNotFound`, `TransportError`."), so `LLMS.md` can be
@@ -45,8 +47,26 @@ the work plan. Where this file and the spec disagree, fix this file.
 | `SuiCore` | A 1:1 Effect wrap of `ClientWithCoreApi`. One member per `SuiClientTypes.TransportMethods` key plus `getObject`, `getDynamicObjectField`, `waitForTransaction`, `signAndExecuteTransaction` and `use`. `Include` generics preserved. | Reaching a field or method `Sui` does not expose, and inside extension implementations. |
 | `Sui` | The opinionated tier over `SuiCore`: fixed include sets, decoded BCS content, `Option` where absence is normal, chunked and integrity-checked batch reads, `Stream` pagination, one sender lock. | Almost all application and extension code. |
 
-Reads go through `Sui`; writes go through `Tx` (phase 1). An extension never
-calls `SuiCore.executeTransaction` directly.
+Reads go through `Sui`; writes go through `Tx`. An extension never calls
+`SuiCore.executeTransaction` directly. `Sui` exposes the `SuiCore` it was built
+over as `sui.core`, which is what lets every `Tx.*` function declare `R = Sui`
+and nothing else.
+
+## The lifecycle
+
+| Name | What it is |
+|---|---|
+| `Signer` | A credential as a **value**, never a service: `{ address, scheme, signTransaction, signPersonalMessage }`. One process may hold two. Secret material never reaches the value. |
+| `Tx.build/sign/cosign/sponsored/submit/reconcile/run/reconcileAll` | The lifecycle as functions, each with a closed error union, all `R = Sui`. |
+| `SubmitConfig` | A `Context.Reference` holding expiration policy, `validFor`, the gas-budget ceiling, `preflight`, the sender lock, and the resubmit schedule, attempts, timeout and expiry margin. |
+| `Journal` | A `Context.Reference` with an in-memory default. `sui-effect/journal` swaps in a durable one over `KeyValueStore`; `Tx.reconcileAll()` is the explicit startup call. |
+| `Script` | `{ sui, core, signer, network }` plus `Script.run` and `Script.exitCode`. `ScriptReadOnly` is the signer-less variant, a separate key on purpose. |
+| `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. |
+
+`Tx.submit` journals `Signed` before the first execute, re-sends the identical
+bytes (never a rebuild) on a retryable `TransportError` or a timeout, and
+reconciles when the retries run out. A `TransportError` never escapes once bytes
+may have been sent: it becomes `SubmissionUnknown`, which carries them.
 
 `SuiCore` retries retryable `TransportError`s on reads only
 (`Schedule.min([exponential("250 millis"), spaced("10 seconds")])` jittered, five
@@ -68,7 +88,7 @@ Every failure is one flat tag; there is no error inheritance.
 | `DecodeError` | BCS content or a schema boundary did not decode. |
 | `SimulationFailed` | Simulation reported an execution failure. No gas charged. |
 | `ExecutionFailed` | Applied on chain and failed. Gas charged. |
-| `SubmissionUnknown` | Bytes may have been sent; the outcome is unknown. Carries the signed bytes. |
+| `SubmissionUnknown` | Bytes may have been sent; the outcome is unknown. Carries the signed bytes, unless it came from reconciling a bare digest. |
 | `NotApplied` | Provably never applied (`expired` or `inputConsumed`). |
 | `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` / `UnexpectedEffects` | Signing, building, preflight policy, journal, and effects that did not contain what was expected. |
 
@@ -84,7 +104,9 @@ Every failure is one flat tag; there is no error inheritance.
 (the real `Sui` over the fake `SuiCore`). The fake serves in-memory objects with
 BCS content, the Clock object `0x6`, and scripted outcomes
 (`FakeOutcome.succeed`, `failWith`, `transportError`, `notFound`, `timeoutThen`)
-for simulate, execute and `getTransaction`. It records every call so a test can
+for simulate, execute, `getTransaction` and the resolver's budget simulation
+(`buildSimulate`, which is how a test makes `Tx.build` fail with
+`SimulationFailed`). It records every call so a test can
 assert the include set that was sent. It also implements
 `resolveTransactionPlugin` and `listCoins`, so `transaction.build({ client })`
 against the fake's `client` resolves gas and object inputs from the script with

@@ -8,7 +8,7 @@
  * @since 0.1.0
  */
 import type { SuiClientTypes } from "@mysten/sui/client"
-import { Schema, SchemaGetter } from "effect"
+import { Schema, SchemaGetter, SchemaTransformation } from "effect"
 import {
   isValidStructTag,
   isValidSuiAddress,
@@ -410,11 +410,78 @@ export const TransactionEffects = Schema.Struct({
 export type TransactionEffects = typeof TransactionEffects.Type
 
 /**
+ * A serialized signature, as every SDK signer returns it: the base64 of the
+ * flag, signature and public key bytes. Branded so a signature cannot be passed
+ * where a digest or an address is expected.
+ */
+export const Signature = Schema.String.pipe(
+  Schema.check(Schema.isNonEmpty()),
+  Schema.brand("Signature")
+)
+export type Signature = typeof Signature.Type
+
+/**
+ * A `u64` as the SDK's transaction data carries it: a decimal string or, for
+ * small values, a number. Decodes to `bigint` and encodes back to a string.
+ */
+const U64 = Schema.Union([Schema.String, Schema.Number]).pipe(
+  Schema.decodeTo(
+    Schema.BigInt,
+    SchemaTransformation.transform<bigint, string | number>({
+      decode: (value) => BigInt(value),
+      encode: (value) => value.toString()
+    })
+  )
+)
+
+const NullableU64 = Schema.NullOr(U64)
+
+/**
+ * When a transaction stops being valid. Mirrors the SDK's
+ * `TransactionExpiration` enum variant for variant, including its `$kind`
+ * discriminant, so our narrowing and `TransactionDataBuilder`'s agree.
+ *
+ * `ValidDuring` is what `Tx.build` sets by default: its `maxTimestamp` is the
+ * wall-clock bound `Tx.reconcile` reasons about, and its `chain` is a replay
+ * guard, so bytes signed for testnet cannot land on mainnet.
+ */
+export const TransactionExpiration = Schema.Union([
+  Schema.Struct({ $kind: Schema.Literal("None"), None: Schema.Literal(true) }),
+  Schema.Struct({ $kind: Schema.Literal("Epoch"), Epoch: U64 }),
+  Schema.Struct({
+    $kind: Schema.Literal("ValidDuring"),
+    ValidDuring: Schema.Struct({
+      minEpoch: NullableU64,
+      maxEpoch: NullableU64,
+      minTimestamp: NullableU64,
+      maxTimestamp: NullableU64,
+      chain: Schema.String,
+      nonce: Schema.Number
+    })
+  }),
+  Schema.Struct({
+    $kind: Schema.Literal("Validity"),
+    Validity: Schema.Struct({
+      allowedProposers: Schema.NullOr(
+        Schema.Struct({ epoch: U64, proposers: Schema.Array(Schema.Number) })
+      ),
+      minEpoch: NullableU64,
+      maxEpoch: NullableU64,
+      minTimestamp: NullableU64,
+      maxTimestamp: NullableU64,
+      chain: Schema.String,
+      nonce: Schema.Number
+    })
+  })
+]).pipe(Schema.toTaggedUnion("$kind"))
+export type TransactionExpiration = typeof TransactionExpiration.Type
+
+/**
  * The signed bytes of a transaction, kept so an uncertain submission can be
  * reconciled or re-submitted later without rebuilding.
  *
- * Phase 1 extends this with the full expiration union; `maxTimestampMs` is the
- * one field `Tx.reconcile` needs to decide that a transaction can no longer land.
+ * The expiration the transaction was built with rides along, because it is what
+ * `Tx.reconcile` needs to decide that a transaction can no longer land.
  *
  * `bytes` encodes as base64, not as a numeric object, so `SuiError.toJson` of a
  * `SubmissionUnknown` is JSON the operator who has to reconcile it can read.
@@ -422,11 +489,44 @@ export type TransactionEffects = typeof TransactionEffects.Type
 export const SignedTransaction = Schema.Struct({
   digest: Digest,
   bytes: Schema.Uint8ArrayFromBase64,
-  signatures: Schema.Array(Schema.String),
+  signatures: Schema.Array(Signature),
   sender: SuiAddress,
-  maxTimestampMs: Schema.optional(Schema.BigIntFromString)
+  expiration: Schema.optional(TransactionExpiration)
 })
 export type SignedTransaction = typeof SignedTransaction.Type
+
+/**
+ * A transaction built into bytes and ready to sign, with the expiration the
+ * builder settled on recorded so `Tx.reconcile` can decide, later and without
+ * the builder, whether the transaction can still land.
+ */
+export const Built = Schema.Struct({
+  digest: Digest,
+  bytes: Schema.Uint8ArrayFromBase64,
+  sender: SuiAddress,
+  gasOwner: Schema.optional(SuiAddress),
+  expiration: Schema.optional(TransactionExpiration)
+})
+export type Built = typeof Built.Type
+
+/**
+ * The wall-clock bound after which a transaction can no longer be applied, in
+ * milliseconds, or `undefined` when its expiration sets no such bound (`None`,
+ * `Epoch`, or a `ValidDuring` with no `maxTimestamp`). Never fails.
+ */
+export const maxTimestampMsOf = (
+  expiration: TransactionExpiration | undefined
+): bigint | undefined => {
+  if (expiration === undefined) return undefined
+  switch (expiration.$kind) {
+    case "ValidDuring":
+      return expiration.ValidDuring.maxTimestamp ?? undefined
+    case "Validity":
+      return expiration.Validity.maxTimestamp ?? undefined
+    default:
+      return undefined
+  }
+}
 
 /**
  * The fixed set of object fields sui-effect always requests: `content`, plus

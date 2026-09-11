@@ -9,7 +9,7 @@ The spec is `DESIGN.md`. This plan turns it into ordered work packages with acce
 - **SDK names are the source of truth.** Read `node_modules/@mysten/sui/docs/llms-index.md`, then `clients/core.md`, `sdk-building.md`, `clients/executing.md`, `transactions/basics.md`, `plugins.md` before touching the corresponding module. Verify signatures in `node_modules/@mysten/sui/dist/**/*.d.mts`.
 - **Repo conventions** (from sibling repos): MIT, `"type": "module"`, `exports` map with `types` and `import`, `files: ["dist", "README.md", "LICENSE"]`, `tsc -p tsconfig.build.json` for `dist/`, `bun test`, `check` script = typecheck + build + test. tsconfig: `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`, `moduleResolution: bundler` (the skill's setting; the SDK ships `.d.mts`, confirm subpath imports resolve), `types: ["bun"]`, `plugins: [{ "name": "@effect/language-service" }]`.
 - **No platform dependency in `src/`.** Nothing under `src/` imports `@effect/platform-bun` or `bun:*`. `Script.run` uses `process` only.
-- **No `Effect.runPromise`/`runSync` inside `src/`** except inside `SuiExtension.fromService`'s Promise facade, which is a documented edge.
+- **No `Effect.runPromise`/`runSync` inside `src/`** except at the two documented edges: `SuiExtension.fromService`'s Promise facade, and `Script.run`, which is a process entrypoint (spec section 12 requires it to fork the root fiber, interrupt it on a signal, await the `Exit` and exit).
 - **Every public function has a JSDoc block that states its error union in words** so `LLMS.md` can be generated from the source.
 - **Done means:** `bun run check` is green (typecheck, build, tests), no `any`, no `unknown` in an error channel, no `console.log` in `src/`, and the acceptance list of the work package is met.
 
@@ -131,3 +131,75 @@ Facts and requirements discovered after Phase 0 that Phase 1 must honour. The ve
 ### Phase 0 verification
 
 `docs/reviews/phase0-verification.md` is the independent reviewer's Phase 0 report. Every MUST and SHOULD in its section G, and every spec amendment it lists, was applied before Phase 1 started; the items it left open are F4 (`Cause.TimeoutError` outside the taxonomy, for `Tx.submit` and `Script.exitCode`), F7's `createdWhere(predicate)`, F8 (sender-lock semaphores are never evicted), E6 (`Executed.refOf` fabricates a version, digest and owner for a change with no `objectTypes` entry) and C4/C5/C6.
+
+## Phase 1 notes (written after WP6 to WP9 landed)
+
+What WP10 (guide, template, harness) and WP11 (`LLMS.md`, README, examples) must
+know, and what a later phase inherits.
+
+### Shapes WP10's guide and template must mirror
+
+- **An extension layer requires `Sui | SuiCore`.** `SuiExtension.fromService`
+  builds `SuiCore.layerFromClient(client)` then `Sui.layerNoDeps` under the
+  extension's own layer, so the template's `layer` may require either tier and
+  nothing else. Requiring `HttpClient` as well (the onara case) means the
+  template has to provide it inside its own layer before handing it to
+  `fromService`.
+- **`Sui` exposes `core`.** `Tx.*` declares `R = Sui` only because `SuiService`
+  now carries the `SuiCore` service it was built over (`sui.core.use(...)` is
+  how `Tx.build` reaches `transaction.build({ client })`, and
+  `sui.core.executeTransaction` is how `Tx.submit` sends). The guide's rule is
+  unchanged — an extension calls `Tx`, never `executeTransaction` — but the
+  reason it *can* now is visible in the type.
+- **The Promise face is a proxy.** Before the first call, a member is a
+  callable, async-iterable placeholder; after it, the mapped value. The guide
+  should say that a Promise consumer reads plain values (`client.x.network`)
+  after its first `await`, and that a `dispose()` is available for shutdown.
+- **`Script.layerReadOnly` provides `ScriptReadOnly`, a second service key.**
+  A script is written against one or the other; they are not interchangeable,
+  which is the point.
+- **`Script.run` takes `{ layer, exit, stderr, signals, signalNames }`.** The
+  template's tests should use `layer: Script.layerNoDeps.pipe(Layer.provideMerge(layerTest(script)), Layer.provide(env))`
+  and an injected `exit`, as `test/example-script-claim.test.ts` does.
+- **The extension harness WP10 owes** is thin: `layerTest(script)` already
+  provides `Sui | SuiCore | SuiCoreFake`, which is everything an extension's
+  layer needs. What is missing is a documented recipe, not code.
+
+### Deviations from DESIGN.md applied in phase 1 (the spec has been amended)
+
+1. `SuiService.core` added (section 3).
+2. `Executed`'s accessors return `ChangedRef` with optional `type`, `version`,
+   `digest` and `owner` instead of a fabricated `ObjectRef`; `objectRefOf(ref)`
+   upgrades one when every field is present; `createdWhere(predicate)` added
+   (section 4). `UnexpectedEffects.expected` is a plain string.
+3. `Tx.submit` and `Tx.run` carry `NotApplied`; `Tx.run` also carries
+   `TransportError`; `Tx.reconcile` takes `Digest | Signed | SubmissionUnknown`
+   (section 6).
+4. `SubmitConfig` gains `resubmitAttempts`, `executeTimeout` and `expiryMargin`
+   (section 7).
+5. `SubmissionUnknown.signed` is optional — a bare-digest reconcile has no bytes
+   (section 10).
+6. `JournalEntry.Signed` nests a `SignedTransaction` rather than repeating its
+   fields, every variant carries `at`, and `lastError` is the `describe` line
+   (section 9).
+7. A `Context.Reference`'s layer is `Layer<never, ...>` in v4, so
+   `Journal.layerKeyValueStore` is typed that way (section 8).
+8. `Signature` is a new branded schema (section 11).
+
+### Still open, and what a later phase inherits
+
+- **`SubmitConfig.expiration: "epoch"`** is implemented through
+  `getCurrentSystemState`, which the fake does not serve, so that branch has no
+  test. Either script it in the fake or cover it on localnet.
+- **`Tx.build` simulating** is only reachable in tests through the fake's new
+  `buildSimulate` script slot; the real path is the transport's own resolver.
+  Localnet is what proves the production path.
+- **The default memory `Journal` is process-wide.** A `Context.Reference`
+  computes its default once and caches it on the reference, so every fiber in a
+  process shares one in-memory journal unless something provides
+  `Journal.layerMemory`. Tests must provide it to stay isolated.
+- **`waitForCheckpoint`, the events stream and the abort registry** are still
+  phase 2, untouched.
+- **Localnet integration tests** (`SUI_LOCALNET=1`) are still unwritten; they
+  are what would prove the resolver's simulate, the gas-budget ceiling and
+  `NotApplied { evidence: "inputConsumed" }` against a real node.

@@ -11,7 +11,6 @@ import {
   ExecutionReason,
   ObjectId,
   SignedTransaction,
-  StructTag,
   TransactionEffects,
   Version
 } from "./schemas.ts"
@@ -91,7 +90,7 @@ export class ExecutionFailed extends Schema.TaggedError<ExecutionFailed>()("Exec
  */
 export class SubmissionUnknown extends Schema.TaggedError<SubmissionUnknown>()(
   "SubmissionUnknown",
-  { digest: Digest, signed: SignedTransaction, cause: Schema.Defect() }
+  { digest: Digest, signed: Schema.optional(SignedTransaction), cause: Schema.Defect() }
 ) {}
 
 /** The transaction provably cannot have been applied, and never will be. */
@@ -125,7 +124,7 @@ export class JournalError extends Schema.TaggedError<JournalError>()("JournalErr
 /** The effects of an applied transaction did not contain what the caller expected. */
 export class UnexpectedEffects extends Schema.TaggedError<UnexpectedEffects>()(
   "UnexpectedEffects",
-  { digest: Digest, expected: StructTag, found: Schema.Array(ObjectId) }
+  { digest: Digest, expected: Schema.String, found: Schema.Array(ObjectId) }
 ) {}
 
 /** Every failure sui-effect can produce. */

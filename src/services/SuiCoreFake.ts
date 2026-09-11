@@ -129,6 +129,14 @@ export interface FakeScript {
   /** How many items a list method returns per page. Defaults to 50. */
   readonly pageSize?: number
   readonly simulate?: ReadonlyArray<FakeOutcome>
+  /**
+   * What the resolve plugin's budget simulation does during
+   * `transaction.build({ client })`. Empty (the default) means the plugin sets
+   * the budget from `gasBudget` without simulating, which is what most tests
+   * want; scripting `failWith` here is how a test makes `Tx.build` fail with
+   * `SimulationFailed` the way a real node's resolver does.
+   */
+  readonly buildSimulate?: ReadonlyArray<FakeOutcome>
   readonly execute?: ReadonlyArray<FakeOutcome>
   readonly getTransaction?: ReadonlyArray<FakeOutcome>
 }
@@ -161,7 +169,7 @@ export interface SuiCoreFakeState {
   readonly setClock: (timestampMs: bigint) => Effect.Effect<void>
   /** Replaces the remaining scripted outcomes of a method. */
   readonly setOutcomes: (
-    method: "simulate" | "execute" | "getTransaction",
+    method: "simulate" | "execute" | "getTransaction" | "buildSimulate",
     outcomes: ReadonlyArray<FakeOutcome>
   ) => Effect.Effect<void>
 }
@@ -172,11 +180,12 @@ interface Mutable {
   clockTimestampMs: bigint
   calls: Array<RecordedCall>
   aborted: number
-  cursors: { simulate: number; execute: number; getTransaction: number }
+  cursors: { simulate: number; execute: number; getTransaction: number; buildSimulate: number }
   scripts: {
     simulate: ReadonlyArray<FakeOutcome>
     execute: ReadonlyArray<FakeOutcome>
     getTransaction: ReadonlyArray<FakeOutcome>
+    buildSimulate: ReadonlyArray<FakeOutcome>
   }
   pendingDigests: Map<string, boolean>
   knownTransactions: Map<string, SettledTransaction>
@@ -366,11 +375,12 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
       clockTimestampMs: script.clockTimestampMs ?? 1_700_000_000_000n,
       calls: [],
       aborted: 0,
-      cursors: { simulate: 0, execute: 0, getTransaction: 0 },
+      cursors: { simulate: 0, execute: 0, getTransaction: 0, buildSimulate: 0 },
       scripts: {
         simulate: script.simulate ?? [],
         execute: script.execute ?? [],
-        getTransaction: script.getTransaction ?? []
+        getTransaction: script.getTransaction ?? [],
+        buildSimulate: script.buildSimulate ?? []
       },
       pendingDigests: new Map(),
       knownTransactions: new Map()
@@ -385,7 +395,9 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     state.calls.push({ method, options })
   }
 
-  const next = (key: "simulate" | "execute" | "getTransaction"): FakeOutcome | undefined => {
+  const next = (
+    key: "simulate" | "execute" | "getTransaction" | "buildSimulate"
+  ): FakeOutcome | undefined => {
     const outcomes = state.scripts[key]
     if (outcomes.length === 0) return undefined
     const index = Math.min(state.cursors[key], outcomes.length - 1)
@@ -580,7 +592,16 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
    * It does not run Move, so it cannot resolve an `UnresolvedPure` whose type
    * only the function signature knows: use `tx.pure.u64(...)` and friends.
    */
-  const resolvePlugin: TransactionPlugin = async (transactionData, options, next) => {
+  const resolvePlugin: TransactionPlugin = async (transactionData, options, proceed) => {
+    // A real transport's resolver simulates to choose the gas budget, which is
+    // why `Tx.build` can fail with `SimulationFailed`. The fake does it only
+    // when a test scripted it.
+    const budgetOutcome = state.scripts.buildSimulate.length === 0
+      ? undefined
+      : next("buildSimulate")
+    if (budgetOutcome !== undefined) {
+      await applyOutcome(budgetOutcome, "simulate", fakeDigest(state.calls.length + 200))
+    }
     if (!options.onlyTransactionKind) {
       if (!transactionData.gasData.price) {
         transactionData.gasData.price = String(script.referenceGasPrice ?? 1000n)
@@ -622,7 +643,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         digest: coin.digest
       }))
     }
-    await next()
+    await proceed()
   }
 
   /** The digest of the bytes that were handed to us, as the network derives it. */

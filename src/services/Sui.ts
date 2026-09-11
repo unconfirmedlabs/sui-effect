@@ -19,7 +19,7 @@ import {
   Effect,
   Layer,
   Option,
-  Ref,
+  RcMap,
   Result,
   Schema,
   Semaphore,
@@ -104,6 +104,18 @@ const boundaryError = (method: string) => (issue: { readonly message: string }):
 export interface SuiService {
   /** The network the underlying client was built for. */
   readonly network: SuiClientTypes.Network
+
+  /**
+   * The mechanical tier this `Sui` was built over.
+   *
+   * `Sui` is the tier application code reads through, but writing a
+   * transaction needs `executeTransaction` and the SDK client object behind
+   * `use`, neither of which belongs on the opinionated tier. Exposing the core
+   * here is what lets every `Tx.*` function declare `R = Sui` and nothing
+   * else. Reach for it directly only for a field or method `Sui` does not
+   * expose.
+   */
+  readonly core: SuiCore["Service"]
 
   /** The genesis checkpoint digest of the chain, read once at layer build. */
   readonly chainId: string
@@ -252,6 +264,9 @@ export interface SuiService {
   ) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 }
 
+/** How long an unused sender lock is kept before it is released. */
+const SENDER_LOCK_TTL = "1 minute"
+
 const CHUNK = 50
 
 /** Options every object read accepts. */
@@ -275,7 +290,7 @@ const keyOf = (id: string): string => {
 const makeSui = (
   core: SuiCore["Service"],
   chainId: string,
-  locks: Ref.Ref<ReadonlyMap<string, Semaphore.Semaphore>>
+  locks: RcMap.RcMap<string, Semaphore.Semaphore>
 ): SuiService => {
   const envelopeOf = (object: SuiClientTypes.Object<typeof OBJECT_INCLUDE>) =>
     decodeEnvelope(object).pipe(Effect.mapError(boundaryError("getObject")))
@@ -591,15 +606,19 @@ const makeSui = (
     Effect.fn("Sui.withSenderLock")(function*<A, E, R>(
       effect: Effect.Effect<A, E, R>
     ): Effect.fn.Return<A, E, R> {
-      const semaphore = yield* Ref.modify(locks, (current) => {
-        const existing = current.get(address)
-        if (existing !== undefined) return [existing, current] as const
-        const created = Semaphore.makeUnsafe(1)
-        const next = new Map(current)
-        next.set(address, created)
-        return [created, next as ReadonlyMap<string, Semaphore.Semaphore>] as const
-      })
-      return yield* Semaphore.withPermits(semaphore, 1)(effect)
+      // The semaphore is reference counted: whoever is inside the lock holds a
+      // reference, so a sender's semaphore cannot be dropped while it is in
+      // use, and an idle one is released a minute after the last holder leaves
+      // rather than sitting in the map for the life of the process. A service
+      // that sponsors thousands of addresses therefore holds entries for the
+      // senders it is actually working for, not for every sender it has ever
+      // seen.
+      return yield* Effect.scoped(
+        Effect.flatMap(
+          RcMap.get(locks, address),
+          (semaphore) => Semaphore.withPermits(semaphore, 1)(effect)
+        )
+      )
     })
 
   const chainTime = core
@@ -633,6 +652,7 @@ const makeSui = (
 
   return {
     network: core.network,
+    core,
     chainId,
     chainTime,
     getObject: getObject as SuiService["getObject"],
@@ -703,7 +723,10 @@ export class Sui extends Context.Service<Sui, SuiService>()("sui-effect/Sui") {
         if (expected !== undefined && expected !== chainIdentifier) {
           return yield* new NetworkMismatch({ expected, actual: chainIdentifier })
         }
-        const locks = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map())
+        const locks = yield* RcMap.make({
+          lookup: (_address: string) => Effect.succeed(Semaphore.makeUnsafe(1)),
+          idleTimeToLive: SENDER_LOCK_TTL
+        })
         return makeSui(core, chainIdentifier, locks)
       })
     )

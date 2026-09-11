@@ -9,6 +9,7 @@
 import { Layer } from "effect"
 import type { NetworkMismatch, TransportError } from "./domain/errors.ts"
 import { Sui } from "./services/Sui.ts"
+import type { SuiCore } from "./services/SuiCore.ts"
 import type { FakeScript } from "./services/SuiCoreFake.ts"
 import { SuiCoreFake } from "./services/SuiCoreFake.ts"
 
@@ -30,5 +31,5 @@ export * from "./services/SuiCoreFake.ts"
  */
 export const layerTest = (
   script: FakeScript = {}
-): Layer.Layer<Sui | SuiCoreFake, NetworkMismatch | TransportError> =>
+): Layer.Layer<Sui | SuiCore | SuiCoreFake, NetworkMismatch | TransportError> =>
   Sui.layerNoDeps.pipe(Layer.provideMerge(SuiCoreFake.layer(script)))

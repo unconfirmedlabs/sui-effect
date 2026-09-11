@@ -136,7 +136,7 @@ describe("Executed", () => {
     expect(created.map((ref) => ref.id)).toEqual([RECEIPT as never])
     expect(created[0]?.type).toBe("0x0000000000000000000000000000000000000000000000000000000000000002::escrow::Receipt" as never)
     expect(created[0]?.version).toBe(9n as never)
-    expect(created[0]?.owner.$kind).toBe("AddressOwner")
+    expect(created[0]?.owner?.$kind).toBe("AddressOwner")
   })
 
   test("created filters by type after normalization", () => {

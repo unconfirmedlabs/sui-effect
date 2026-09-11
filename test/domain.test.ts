@@ -29,6 +29,7 @@ import {
   ObjectId,
   ObjectType,
   Owner,
+  Signature,
   StructTag,
   SuiAddress,
   TransactionEffects,
@@ -235,7 +236,7 @@ describe("error classes", () => {
         signed: {
           digest: f.digest,
           bytes: new Uint8Array([1, 2, 3]),
-          signatures: ["sig"],
+          signatures: [Signature.make("sig")],
           sender: f.address
         },
         cause: "timeout"
@@ -292,9 +293,8 @@ describe("error classes", () => {
           signed: {
             digest: f.digest,
             bytes: new Uint8Array([1, 2, 3]),
-            signatures: ["sig"],
-            sender: f.address,
-            maxTimestampMs: 99n
+            signatures: [Signature.make("sig")],
+            sender: f.address
           },
           cause: "timeout"
         })
@@ -335,7 +335,7 @@ describe("error classes", () => {
       signed: {
         digest: f.digest,
         bytes: new Uint8Array([0, 1, 2, 253, 254, 255]),
-        signatures: ["sig"],
+        signatures: [Signature.make("sig")],
         sender: f.address
       },
       cause: "timeout"
@@ -347,7 +347,7 @@ describe("error classes", () => {
     const decoded = decode(SubmissionUnknown, json)
     expect(Result.isSuccess(decoded)).toBe(true)
     if (Result.isSuccess(decoded)) {
-      expect(Array.from(decoded.success.signed.bytes)).toEqual([0, 1, 2, 253, 254, 255])
+      expect(Array.from(decoded.success.signed!.bytes)).toEqual([0, 1, 2, 253, 254, 255])
     }
   })
 

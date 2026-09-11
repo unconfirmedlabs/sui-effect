@@ -2,10 +2,12 @@
  * `Executed`: a transaction that reached the chain, with accessors that answer
  * the questions the next transaction needs answered.
  *
- * Every accessor returns full `ObjectRef`s, so a created object can be fed
- * straight back into the builder, and every accessor ignores accumulator writes
+ * Every accessor returns {@link ChangedRef}s — the object's id plus whatever
+ * else the effects actually carried — and ignores accumulator writes
  * (`outputState: "AccumulatorWriteV1"`), which are balance bookkeeping rather
- * than objects.
+ * than objects. Use {@link objectRefOf} to turn one into the full `ObjectRef`
+ * the transaction builder wants, which succeeds exactly when the node reported
+ * every field it needs.
  *
  * @since 0.1.0
  */
@@ -23,17 +25,42 @@ import {
   ObjectRef,
   ObjectType,
   Owner,
-  StructTag,
   SuiAddress,
   TransactionEffects,
   Version
 } from "./schemas.ts"
 import { typeMatches } from "./bcs.ts"
 
-const UNKNOWN_OWNER = Owner.cases.Unknown.make({ $kind: "Unknown" })
-
 const isAccumulatorWrite = (change: ChangedObject): boolean =>
   change.outputState === "AccumulatorWriteV1"
+
+/**
+ * What the effects say about one object a transaction touched.
+ *
+ * `id` is always there. Everything else is present only when the node reported
+ * it: `type` comes from the `objectTypes` join, and the version, digest and
+ * owner from the side of the change being read (a deleted object has no output
+ * version, and a created one has no input version). Nothing is defaulted, so a
+ * caller that needs a full `ObjectRef` for the builder can see what is missing
+ * rather than being handed a fabricated version 0.
+ */
+export interface ChangedRef {
+  readonly id: ObjectId
+  readonly type?: ObjectType
+  readonly version?: Version
+  readonly digest?: string
+  readonly owner?: Owner
+}
+
+/**
+ * The full builder reference of a changed object, when the effects carried
+ * every field the builder needs. Never fails.
+ */
+export const objectRefOf = (ref: ChangedRef): ObjectRef | undefined =>
+  ref.type === undefined || ref.version === undefined || ref.digest === undefined ||
+    ref.owner === undefined
+    ? undefined
+    : { id: ref.id, type: ref.type, version: ref.version, digest: ref.digest, owner: ref.owner }
 
 /**
  * A transaction the network executed, built from the fixed execute include set:
@@ -60,59 +87,84 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
     return decoded._tag === "Some" ? decoded.value : undefined
   }
 
-  private refOf(change: ChangedObject, side: "input" | "output"): ObjectRef | undefined {
-    const type = this.typeOf(change.objectId)
-    if (type === undefined) return undefined
+  /**
+   * Everything the effects actually say about one changed object. Nothing is
+   * invented: a field the node did not report stays `undefined`, so a caller
+   * that needs a full builder reference can tell the difference between
+   * "version 0" and "the node did not say".
+   */
+  private refOf(change: ChangedObject, side: "input" | "output"): ChangedRef {
     const version = side === "output" ? change.outputVersion : change.inputVersion
     const digest = side === "output" ? change.outputDigest : change.inputDigest
     const owner = side === "output" ? change.outputOwner : change.inputOwner
+    const type = this.typeOf(change.objectId)
     return {
       id: change.objectId,
-      type,
-      version: version ?? (0n as Version),
-      digest: digest ?? "",
-      owner: owner ?? UNKNOWN_OWNER
+      ...(type === undefined ? {} : { type }),
+      ...(version === null ? {} : { version }),
+      ...(digest === null ? {} : { digest }),
+      ...(owner === null ? {} : { owner })
     }
   }
 
   private select(
     predicate: (change: ChangedObject) => boolean,
     side: "input" | "output",
-    type?: string
-  ): ReadonlyArray<ObjectRef> {
-    const refs: Array<ObjectRef> = []
+    filter?: (ref: ChangedRef) => boolean
+  ): ReadonlyArray<ChangedRef> {
+    const refs: Array<ChangedRef> = []
     for (const change of this.effects.changedObjects) {
       if (isAccumulatorWrite(change)) continue
       if (!predicate(change)) continue
       const ref = this.refOf(change, side)
-      if (ref === undefined) continue
-      if (type !== undefined && !typeMatches(type, ref.type)) continue
+      if (filter !== undefined && !filter(ref)) continue
       refs.push(ref)
     }
     return refs
+  }
+
+  private static byType(type?: string): ((ref: ChangedRef) => boolean) | undefined {
+    if (type === undefined) return undefined
+    return (ref) => ref.type !== undefined && typeMatches(type, ref.type)
   }
 
   /**
    * Objects this transaction created, optionally filtered by Move type
    * (compared with `normalizeStructTag`). Never fails.
    */
-  created(type?: string): ReadonlyArray<ObjectRef> {
+  created(type?: string): ReadonlyArray<ChangedRef> {
     return this.select(
       (change) => change.idOperation === "Created" && change.outputState === "ObjectWrite",
       "output",
-      type
+      Executed.byType(type)
+    )
+  }
+
+  /**
+   * Objects this transaction created whose reference satisfies a predicate.
+   *
+   * The direct replacement for the substring matching every repo hand-rolls
+   * (`createdByType("::Receipt")`), without making substring matching the
+   * default: `created(type)` still compares normalized struct tags.
+   * Never fails.
+   */
+  createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef> {
+    return this.select(
+      (change) => change.idOperation === "Created" && change.outputState === "ObjectWrite",
+      "output",
+      predicate
     )
   }
 
   /** Objects this transaction mutated in place, optionally filtered by type. Never fails. */
-  mutated(type?: string): ReadonlyArray<ObjectRef> {
+  mutated(type?: string): ReadonlyArray<ChangedRef> {
     return this.select(
       (change) =>
         change.idOperation === "None" &&
         change.outputState === "ObjectWrite" &&
         change.inputState === "Exists",
       "output",
-      type
+      Executed.byType(type)
     )
   }
 
@@ -120,7 +172,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * Objects this transaction deleted or wrapped. The refs carry the versions the
    * objects had going in, since they have no output version. Never fails.
    */
-  deleted(): ReadonlyArray<ObjectRef> {
+  deleted(): ReadonlyArray<ChangedRef> {
     return this.select((change) => change.idOperation === "Deleted", "input")
   }
 
@@ -131,19 +183,15 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * `objectTypes` join has no entry, so a publish is never silently dropped.
    * Never fails.
    */
-  packagesPublished(): ReadonlyArray<ObjectRef> {
-    const refs: Array<ObjectRef> = []
+  packagesPublished(): ReadonlyArray<ChangedRef> {
+    const refs: Array<ChangedRef> = []
     for (const change of this.effects.changedObjects) {
       if (change.outputState !== "PackageWrite" || change.idOperation !== "Created") continue
-      refs.push(
-        this.refOf(change, "output") ?? {
-          id: change.objectId,
-          type: "package",
-          version: change.outputVersion ?? (0n as Version),
-          digest: change.outputDigest ?? "",
-          owner: change.outputOwner ?? UNKNOWN_OWNER
-        }
-      )
+      const ref = this.refOf(change, "output")
+      // gRPC reports the literal `package` as a published package's type, and
+      // some nodes omit it from `objectTypes` entirely; a `PackageWrite` is a
+      // package either way.
+      refs.push(ref.type === undefined ? { ...ref, type: "package" } : ref)
     }
     return refs
   }
@@ -171,15 +219,14 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * Fails with: `UnexpectedEffects` when the transaction created no object of
    * that type, or more than one.
    */
-  expectCreated(type: string): Effect.Effect<ObjectRef, UnexpectedEffects> {
+  expectCreated(type: string): Effect.Effect<ChangedRef, UnexpectedEffects> {
     const created = this.created(type)
     const only = created[0]
     if (created.length === 1 && only !== undefined) return Effect.succeed(only)
-    const expected = Schema.decodeUnknownOption(StructTag)(type)
     return Effect.fail(
       new UnexpectedEffects({
         digest: this.digest,
-        expected: expected._tag === "Some" ? expected.value : StructTag.make("0x2::sui::SUI"),
+        expected: type,
         found: created.map((ref) => ref.id)
       })
     )

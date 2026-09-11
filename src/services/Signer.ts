@@ -1,0 +1,199 @@
+/**
+ * `Signer`: a credential as a value, never a service.
+ *
+ * One process may legitimately hold two credentials at once (a sponsor signs
+ * as itself and verifies the sender's signature), and `R = Signer` cannot say
+ * which one a function meant. So a signer is always an explicit parameter, and
+ * nothing here ever exposes secret material: a `Signer` is an address, a
+ * scheme, and two functions that return signatures.
+ *
+ * @since 0.1.0
+ */
+import type { Keypair } from "@mysten/sui/cryptography"
+import { decodeSuiPrivateKey } from "@mysten/sui/cryptography"
+import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
+import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
+import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
+import { Config, ConfigProvider, Effect, Redacted, Schema } from "effect"
+import { SigningError } from "../domain/errors.ts"
+import { Signature, SuiAddress } from "../domain/schemas.ts"
+
+/** The signature schemes a {@link Signer} built by this module can carry. */
+export type SignatureScheme = "ED25519" | "Secp256k1" | "Secp256r1" | "MultiSig" | "ZkLogin" | "Passkey"
+
+/**
+ * A credential: who it signs as, how, and the two things it can sign.
+ *
+ * Both members fail with `SigningError` and nothing else: a signer that has to
+ * reach a KMS or a wallet wraps its own transport failure in the `cause`, so a
+ * caller's error union does not grow a branch per credential kind.
+ */
+export interface Signer {
+  /** The Sui address this signer signs as. */
+  readonly address: SuiAddress
+  /** The signature scheme of the credential. */
+  readonly scheme: SignatureScheme
+  /**
+   * Signs transaction bytes with the `TransactionData` intent.
+   *
+   * Fails with: `SigningError`.
+   */
+  readonly signTransaction: (bytes: Uint8Array) => Effect.Effect<Signature, SigningError>
+  /**
+   * Signs a personal message with the `PersonalMessage` intent.
+   *
+   * Fails with: `SigningError`.
+   */
+  readonly signPersonalMessage: (bytes: Uint8Array) => Effect.Effect<Signature, SigningError>
+}
+
+const decodeSignature = Schema.decodeUnknownEffect(Signature)
+
+const signatureOf = (signature: string): Effect.Effect<Signature, SigningError> =>
+  decodeSignature(signature).pipe(
+    Effect.mapError((issue) => new SigningError({ cause: `the signer returned a signature this version cannot read: ${issue.message}` }))
+  )
+
+/**
+ * Wraps an SDK `Keypair` (or anything with the same `toSuiAddress`,
+ * `getKeyScheme`, `signTransaction` and `signPersonalMessage` surface).
+ *
+ * The keypair holds the secret; the `Signer` it returns does not expose it.
+ * Never fails: a bad address or signature surfaces as a `SigningError` from the
+ * member that produced it, not from construction.
+ */
+export const fromKeypair = (keypair: Keypair): Signer => {
+  const address = keypair.toSuiAddress()
+  return {
+    // `toSuiAddress` returns the normalized form the SDK derived from the
+    // public key, so this never throws; the members still decode what the
+    // keypair hands back.
+    address: SuiAddress.make(address),
+    scheme: keypair.getKeyScheme(),
+    signTransaction: Effect.fn("Signer.signTransaction")(function*(bytes: Uint8Array) {
+      const result = yield* Effect.tryPromise({
+        try: () => keypair.signTransaction(bytes),
+        catch: (cause) => new SigningError({ cause })
+      })
+      return yield* signatureOf(result.signature)
+    }),
+    signPersonalMessage: Effect.fn("Signer.signPersonalMessage")(function*(bytes: Uint8Array) {
+      const result = yield* Effect.tryPromise({
+        try: () => keypair.signPersonalMessage(bytes),
+        catch: (cause) => new SigningError({ cause })
+      })
+      return yield* signatureOf(result.signature)
+    })
+  }
+}
+
+/** Builds the keypair class the scheme flag of a Bech32 secret key names. */
+const keypairOf = (parsed: { scheme: string; secretKey: Uint8Array }): Keypair | undefined => {
+  switch (parsed.scheme) {
+    case "ED25519":
+      return Ed25519Keypair.fromSecretKey(parsed.secretKey)
+    case "Secp256k1":
+      return Secp256k1Keypair.fromSecretKey(parsed.secretKey)
+    case "Secp256r1":
+      return Secp256r1Keypair.fromSecretKey(parsed.secretKey)
+    default:
+      return undefined
+  }
+}
+
+/**
+ * Reads a Bech32 `suiprivkey1…` secret key from configuration and builds the
+ * signer for whichever of the three schemes its flag names.
+ *
+ * The key is read with `Config.redacted`, so it never reaches a log line, and
+ * the decoded bytes never leave this function.
+ *
+ * Fails with: `ConfigError` when the variable is missing, is not a Bech32 Sui
+ * private key, or names a scheme that has no keypair class (`MultiSig`,
+ * `ZkLogin`, `Passkey` — use {@link remote} for those).
+ */
+export const fromConfig = (
+  name = "SUI_PRIVATE_KEY"
+): Effect.Effect<Signer, Config.ConfigError> =>
+  Config.redacted(name).pipe(
+    Effect.flatMap((redacted) =>
+      Effect.try({
+        try: () => {
+          const parsed = decodeSuiPrivateKey(Redacted.value(redacted))
+          const keypair = keypairOf(parsed)
+          if (keypair === undefined) {
+            throw new Error(`unsupported key scheme ${parsed.scheme}`)
+          }
+          return fromKeypair(keypair)
+        },
+        catch: (cause) =>
+          new Config.ConfigError(
+            new ConfigProvider.SourceError({
+              message: `${name} is not a usable Bech32 Sui private key: ${String(cause)}`,
+              cause
+            })
+          )
+      })
+    )
+  )
+
+/**
+ * A fresh Ed25519 credential that exists only for this process. For tests,
+ * localnet and throwaway addresses.
+ *
+ * This is the one place sui-effect does not take randomness from Effect's
+ * `Random`: key generation must come from a cryptographically secure source,
+ * and `Random` is a seeded, test-controllable PRNG whose whole purpose is to be
+ * reproducible. `new Ed25519Keypair()` uses the SDK's CSPRNG (`@noble/curves`
+ * over `crypto.getRandomValues`). A `TestClock`-style deterministic key would
+ * be a security bug, not a convenience.
+ *
+ * Never fails.
+ */
+export const ephemeral: Effect.Effect<Signer> = Effect.sync(() =>
+  fromKeypair(new Ed25519Keypair())
+)
+
+/** What {@link remote} needs to know about a credential it does not hold. */
+export interface RemoteSigner {
+  readonly address: SuiAddress
+  readonly scheme: SignatureScheme
+  readonly signTransaction: (bytes: Uint8Array) => Effect.Effect<string, SigningError>
+  readonly signPersonalMessage?: (bytes: Uint8Array) => Effect.Effect<string, SigningError>
+}
+
+/**
+ * Builds a signer around something that signs elsewhere: a KMS, a wallet, a
+ * hardware device, another process.
+ *
+ * The returned signer decodes whatever the remote produced, so a malformed
+ * signature is a `SigningError` rather than a surprise at execution. When
+ * `signPersonalMessage` is not given, asking for one fails with `SigningError`
+ * instead of pretending. Never fails.
+ */
+export const remote = (signer: RemoteSigner): Signer => ({
+  address: signer.address,
+  scheme: signer.scheme,
+  signTransaction: Effect.fn("Signer.remote.signTransaction")(function*(bytes: Uint8Array) {
+    return yield* signatureOf(yield* signer.signTransaction(bytes))
+  }),
+  signPersonalMessage: Effect.fn("Signer.remote.signPersonalMessage")(function*(bytes: Uint8Array) {
+    const sign = signer.signPersonalMessage
+    if (sign === undefined) {
+      return yield* new SigningError({ cause: "this remote signer cannot sign personal messages" })
+    }
+    return yield* signatureOf(yield* sign(bytes))
+  })
+})
+
+/**
+ * The constructors, namespaced the way the spec spells them:
+ * `Signer.fromKeypair`, `Signer.fromConfig`, `Signer.ephemeral`,
+ * `Signer.remote`. The type `Signer` is the interface above.
+ */
+export const Signer = {
+  fromKeypair,
+  fromConfig,
+  ephemeral,
+  remote
+} as const

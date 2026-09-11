@@ -39,6 +39,7 @@ export {
 export {
   Balance,
   BalanceChange,
+  Built,
   ChangedObject,
   CleverError,
   CoinType,
@@ -54,6 +55,7 @@ export {
   KNOWN_CHAIN_IDS,
   KnownNetwork,
   Mist,
+  maxTimestampMsOf,
   MoveLocation,
   Network,
   ObjectEnvelope,
@@ -61,18 +63,20 @@ export {
   ObjectRef,
   ObjectType,
   Owner,
+  Signature,
   SignedTransaction,
   Simulation,
   StructTag,
   SuiAddress,
   type SuiObject,
   TransactionEffects,
+  TransactionExpiration,
   UnchangedConsensusObject,
   Version
 } from "./domain/schemas.ts"
 
 /** A transaction that reached the chain, with accessors over its effects. */
-export { Executed } from "./domain/executed.ts"
+export { type ChangedRef, Executed, objectRefOf } from "./domain/executed.ts"
 
 /** The opinionated tier. */
 export {

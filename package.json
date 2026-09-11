@@ -9,6 +9,22 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./tx": {
+      "types": "./dist/tx.d.ts",
+      "import": "./dist/tx.js"
+    },
+    "./journal": {
+      "types": "./dist/journal.d.ts",
+      "import": "./dist/journal.js"
+    },
+    "./extension": {
+      "types": "./dist/extension.d.ts",
+      "import": "./dist/extension.js"
+    },
+    "./script": {
+      "types": "./dist/script.d.ts",
+      "import": "./dist/script.js"
+    },
     "./testing": {
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js"
