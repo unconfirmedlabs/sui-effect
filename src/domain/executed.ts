@@ -21,6 +21,7 @@ import {
   executionReasonOf,
   ObjectId,
   ObjectRef,
+  ObjectType,
   Owner,
   StructTag,
   SuiAddress,
@@ -47,11 +48,15 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   checkpoint: Schema.NullOr(Schema.BigIntFromString),
   timestampMs: Schema.NullOr(Schema.Number)
 }) {
-  /** The type of a changed object, from the `objectTypes` join. */
-  private typeOf(objectId: ObjectId): StructTag | undefined {
+  /**
+   * The type of a changed object, from the `objectTypes` join. A published
+   * package reports the literal `package` rather than a struct tag, so the
+   * decode goes through {@link ObjectType}.
+   */
+  private typeOf(objectId: ObjectId): ObjectType | undefined {
     const type = this.objectTypes[objectId]
     if (type === undefined) return undefined
-    const decoded = Schema.decodeUnknownOption(StructTag)(type)
+    const decoded = Schema.decodeUnknownOption(ObjectType)(type)
     return decoded._tag === "Some" ? decoded.value : undefined
   }
 
@@ -119,15 +124,28 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
     return this.select((change) => change.idOperation === "Deleted", "input")
   }
 
-  /** Packages this transaction published (`PackageWrite` plus `Created`). Never fails. */
-  packagesPublished(): ReadonlyArray<ObjectId> {
-    const ids: Array<ObjectId> = []
+  /**
+   * Packages this transaction published (`PackageWrite` plus `Created`), as
+   * full refs like every other accessor. A package's `type` is the literal
+   * `package` when the node reports one, and the ref falls back to it when the
+   * `objectTypes` join has no entry, so a publish is never silently dropped.
+   * Never fails.
+   */
+  packagesPublished(): ReadonlyArray<ObjectRef> {
+    const refs: Array<ObjectRef> = []
     for (const change of this.effects.changedObjects) {
-      if (change.outputState === "PackageWrite" && change.idOperation === "Created") {
-        ids.push(change.objectId)
-      }
+      if (change.outputState !== "PackageWrite" || change.idOperation !== "Created") continue
+      refs.push(
+        this.refOf(change, "output") ?? {
+          id: change.objectId,
+          type: "package",
+          version: change.outputVersion ?? (0n as Version),
+          digest: change.outputDigest ?? "",
+          owner: change.outputOwner ?? UNKNOWN_OWNER
+        }
+      )
     }
-    return ids
+    return refs
   }
 
   /** The net balance change for one address and coin type, in MIST. Never fails. */
@@ -186,10 +204,10 @@ const decodeExecuted = Schema.decodeUnknownEffect(Executed)
  * and `DecodeError` when the response does not carry the include set that was
  * asked for.
  */
-export const fromTransactionResult = (
-  result: SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
-): Effect.Effect<Executed, ExecutionFailed | DecodeError> =>
-  Effect.gen(function*() {
+export const fromTransactionResult = Effect.fn("Executed.fromTransactionResult")(
+  function*(
+    result: SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
+  ): Effect.fn.Return<Executed, ExecutionFailed | DecodeError> {
     const transaction = result.$kind === "Transaction" ? result.Transaction : result.FailedTransaction
     const encoded = {
       digest: transaction.digest,
@@ -214,4 +232,5 @@ export const fromTransactionResult = (
       })
     }
     return executed
-  })
+  }
+)

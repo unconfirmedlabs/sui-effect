@@ -117,3 +117,17 @@ Phase 1 exit: `bun run check` green; the onara rewrite is a separate repo task a
 ## Verification protocol
 
 After each phase an independent reviewer (Fable) reads `DESIGN.md`, this plan, and the code, and reports: spec deviations, skill-invariant violations, v3 Effect names, SDK misuse (checked against `dist/*.d.mts`), untested acceptance criteria, and anything that would mislead an agent reading the code. Findings are fixed before the next phase starts.
+
+## Phase 1 addendum (written after Phase 0 landed)
+
+Facts and requirements discovered after Phase 0 that Phase 1 must honour. The verifier's Phase 0 findings are appended below this section when available.
+
+- **Chain identifiers.** Done in the Phase 0 fix pass: `KNOWN_CHAIN_IDS` in `src/domain/schemas.ts`, asserted by default from `core.network`, overridable with `layerNoDepsWith({ chainId })`.
+- **Predecessor compatibility.** `docs/research/misofm-effect.md` lists six requirements: the BCS bridge accepts any `{ parse(bytes) }` codec; `Executed.created(type)` matches normalized tags and `createdWhere(predicate)` exists; `balanceChange` and gas use `bigint`; `getObjects` per-item `Result` is deliberate; `Tx.run` replaces sign-and-execute plus wait; `SuiExtension.fromService` handles nested service objects.
+- **Fake gaps for Tx.** Done in the Phase 0 fix pass: the fake implements `resolveTransactionPlugin` (gas price, gas budget, gas payment from scripted coins, object inputs from the object map) and `listCoins`, and keys pending and known transactions by `TransactionDataBuilder.getDigestFromBytes`. `SuiCoreFake`'s handle exposes `client` for `transaction.build({ client })`.
+- **Expiration schema.** `SignedTransaction` carries only `maxTimestampMs`; add the full `TransactionExpiration` union (`None | Epoch | ValidDuring | Validity`) to schemas.ts and use it on `Built`, `Signed` and `JournalEntry.Signed`.
+- **Extension registry shape in the wild.** `@misofm/platform`'s registration constructs a class with dozens of methods and nested namespaces (`client.miso.protocol`, `client.miso.party`). `fromService` must map nested plain objects of Effect members recursively, and Streams to AsyncIterables.
+
+### Phase 0 verification
+
+`docs/reviews/phase0-verification.md` is the independent reviewer's Phase 0 report. Every MUST and SHOULD in its section G, and every spec amendment it lists, was applied before Phase 1 started; the items it left open are F4 (`Cause.TimeoutError` outside the taxonomy, for `Tx.submit` and `Script.exitCode`), F7's `createdWhere(predicate)`, F8 (sender-lock semaphores are never evicted), E6 (`Executed.refOf` fabricates a version, digest and owner for a change with no `objectTypes` entry) and C4/C5/C6.

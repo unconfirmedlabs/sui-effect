@@ -23,7 +23,9 @@ Three audiences, each with a stated entry point:
 | `sui-effect/journal` | durable `Journal` layer over `KeyValueStore` (`effect/unstable/persistence`) |
 | `sui-effect/extension` | `SuiExtension.fromService` (Effect service to `$extend` registration), authoring conventions and helpers |
 | `sui-effect/script` | `Script` service, `Script.run`, exit-code mapping |
-| `sui-effect/testing` | `SuiCore.layerFake`, fixtures, schema round-trip helpers, extension test harness |
+| `sui-effect/testing` | `SuiCoreFake.layer(script)`, `layerTest(script)` (the real `Sui` over the fake), fixtures, schema round-trip helpers, extension test harness |
+
+Everything the package uses to implement itself and everything the tests reach for lives in `src/internal.ts` (`mapSdkError`, `DefectMarker`, `makeFromClient`, `readSchedule`, the include sets, `fromTransactionResult`, `makeSuiObject`, `executionReasonOf`, `digestOf`, `SuiErrorSchema`, and the BCS bridge's `decodeContent` / `typeMatches` / `expectedTypeOf`). It is deliberately absent from the package `exports` map, so `src/index.ts` is exactly the public API.
 
 Peer dependencies: `effect >=4.0.0-rc.112 <4.1` with a CI matrix of tested rcs documented in the README; `@mysten/sui ^2.28` (first version whose BCS and gRPC support round-trips `ValidDuring` and `Validity` expirations). The core module imports only stable `effect/*`; `effect/unstable/*` appears only behind `sui-effect/journal`. No platform package dependency anywhere; tests and examples use `@effect/platform-bun`.
 
@@ -36,20 +38,24 @@ A hand-written 1:1 Effect wrap of `ClientWithCoreApi` from `@mysten/sui/client`.
 - Every key of `SuiClientTypes.TransportMethods` is present, none optional on our side. A type-level test asserts `Exclude<keyof TransportMethods, keyof SuiCore["Service"]>` is `never`.
 - `Include` generics are preserved exactly as the SDK declares them.
 - Every call forwards the AbortSignal from `Effect.tryPromise((signal) => ...)` into `CoreClientMethodOptions.signal`, so `Effect.timeout` and interruption cancel the request.
-- Every method is `Effect.fn("SuiCore.<method>")` so it has a span.
+- Every method is `Effect.fn("SuiCore.<method>")` so it has a span and the `Include` generic still flows. The same holds on `Sui`, with one exception: `getObject`, `getObjectOption` and `getObjects` declare overloads so that passing a `schema` narrows the result type, and `Effect.fn` cannot express an overload set. Their implementations are still `Effect.fn`; only the declared type is written out by hand.
 - One `mapSdkError` function turns SDK failures into the taxonomy in section 10; per-method unions are derived from it:
   - `getObject`: `ObjectNotFound | ObjectDeleted | ObjectUnavailable | TransportError`
   - `getObjects`: `TransportError` (per-item errors are in the result array)
   - `getTransaction`, `waitForTransaction`: `TransactionNotFound | TransportError`
   - `simulateTransaction`: `SimulationFailed | TransportError`
   - everything else: `TransportError`
-- Read methods retry `TransportError` where `retryable` is true (gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, HTTP 5xx and 429) on `Schedule.min([exponential("250 millis"), spaced("10 seconds")]).pipe(Schedule.jittered)` capped at 5 attempts. `executeTransaction` is never retried at this tier.
+- Read methods retry `TransportError` where `retryable` is true on `Schedule.min([exponential("250 millis"), spaced("10 seconds")]).pipe(Schedule.jittered)` capped at 5 attempts. `executeTransaction` is never retried at this tier. The retryable set is exactly: gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `INTERNAL` and `UNKNOWN`; HTTP 5xx and 429; and timeouts. `INTERNAL` and `UNKNOWN` are in the set because they are how the transport reports that the request never reached a node at all: `@protobuf-ts/grpcweb-transport` turns a rejected `fetch` (connection refused, DNS failure) into `INTERNAL`, and its grpc-web format maps HTTP 500 to `UNKNOWN`. Without them a read against a node that is merely down or restarting is never retried. Every other status is an answer from the node and is not retried.
 - `use(f: (client: ClientWithCoreApi, signal: AbortSignal) => Promise<A>): Effect<A, SuiError>` is the low-level hatch for one-off calls into the SDK client object. It runs the same `mapSdkError`. There is no `raw` property. Third-party `$extend` packages are not used directly from application code; each gets an Effect-native extension we maintain (section 13.3), and `use` is how that extension's implementation reaches the upstream package when it needs the client object.
-- Layers: `layerGrpc({ network, baseUrl, timeout?, mvr? })`, `layerFromClient(client)`, `layerConfig` (`SUI_NETWORK` required with no default, `SUI_RPC_URL` optional with a built-in default gRPC URL table because the SDK ships none), `layerFake(script)` in `sui-effect/testing`.
+- Layers: `layerGrpc({ network, baseUrl, timeout?, mvr? })`, `layerFromClient(client)`, `layerConfig` (`SUI_NETWORK` required with no default, `SUI_RPC_URL` optional with a built-in default gRPC URL table because the SDK ships none), and `SuiCoreFake.layer(script)` in `sui-effect/testing`, which provides both `SuiCore` and a `SuiCoreFake` handle a test drives it with.
 
 ## 3. `Sui`: the opinionated tier
 
-`layerNoDeps: Layer<Sui, NetworkMismatch | TransportError, SuiCore>`; `layer = layerNoDeps` over `SuiCore.layerGrpc`; `layerTest = layerNoDeps` over `SuiCore.layerFake`. At build it calls `getChainIdentifier` once and fails with `NetworkMismatch { expected, actual }` if it disagrees with `network`. It owns a `PartitionedSemaphore` keyed by sender address.
+`layerNoDeps: Layer<Sui, NetworkMismatch | TransportError, SuiCore>`; `layer = layerNoDeps` over `SuiCore.layerGrpc`; `layerTest = layerNoDeps` over `SuiCoreFake.layer`. At build it calls `getChainIdentifier` once and records the answer on `Sui.chainId`.
+
+Whether it asserts is decided by one exported table, `KNOWN_CHAIN_IDS`, holding the genesis checkpoint digests observed on the live networks (`mainnet` `4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S`, `testnet` `69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD`); the SDK ships no such table. When the client's network is in the table, a node reporting a different identifier fails the layer with `NetworkMismatch { expected, actual }`. `devnet`, `localnet` and custom networks are regenerated and have no fixed identifier, so nothing is asserted and the observed one is recorded. `layerNoDepsWith({ chainId })` pins any network and overrides the table.
+
+It owns one `Semaphore` per sender address, kept in a `Ref<Map<address, Semaphore>>`: a shared pool with per-key fairness, which is what `PartitionedSemaphore` would have given if v4 shipped one.
 
 Members and error unions:
 
@@ -57,14 +63,17 @@ Members and error unions:
 network: Network
 chainId: string
 chainTime: Effect<DateTimeUtc, TransportError>                       // Clock object 0x6 via the BCS bridge, never cached
-getObject<S>(id: ObjectId, opts?: { schema?: Schema.Codec<S, Uint8Array> }):
+getObject<S>(id: ObjectId, opts?: { schema?: Schema.Codec<S, Uint8Array>; expectedType?: string }):
   Effect<SuiObject<S>, ObjectNotFound | ObjectDeleted | ObjectUnavailable | DecodeError | TransportError>
 getObjectOption<S>(id, opts?):                                        // not found and deleted become None
   Effect<Option<SuiObject<S>>, ObjectUnavailable | DecodeError | TransportError>
-getObjects<S>(ids, opts?):                                            // chunked by 50, response integrity checked
+getObjects<S>(ids, opts?):                                            // ids normalized and deduped, chunked by 50, response integrity checked
   Effect<ReadonlyArray<Result<SuiObject<S>, ObjectNotFound | ObjectDeleted | ObjectUnavailable | DecodeError>>, TransportError>
 getBalance(owner: SuiAddress, coinType?: CoinType): Effect<Balance, TransportError>
 getDynamicFieldOption(parent: ObjectId, name: DynamicFieldName): Effect<Option<DynamicField>, TransportError>
+  // the base client rethrows ObjectError from getDynamicField (client/core.mjs:48), so SuiCore.getDynamicField and
+  // getDynamicObjectField declare the object-error union; Sui folds not-found and deleted into None and the rest
+  // into TransportError
 getTransaction(digest: Digest): Effect<Executed, ExecutionFailed | TransactionNotFound | TransportError>
 simulate(input: Recipe | Transaction | Uint8Array): Effect<Simulation, SimulationFailed | BuildError | TransportError>
 view<S>(recipe: Recipe, schema: Schema.Codec<S, Uint8Array>, opts?: { command?: number; result?: number }):
@@ -79,13 +88,13 @@ Fixed include sets: objects always `content + owner + type + version + digest`; 
 Decisions recorded:
 - `getTransaction` on a historical transaction whose status is failed fails with `ExecutionFailed`, the same as `Tx.submit` and `Tx.reconcile`, so there is exactly one representation of an on-chain failure.
 - `view` decodes return value `result` (default 0) of command `command` (default the last command) from `simulate` with `commandResults`, and `checksEnabled: false` so non-entry functions can be inspected.
-- `SuiObject<S>` carries `id`, `version`, `digest`, `type`, `owner` as a tagged union, `content: S`, and `ref: ObjectRef` for feeding the builder.
+- `SuiObject<S>` carries `id`, `version`, `digest`, `type`, `owner` as a tagged union, `content: S`, and `ref: ObjectRef` for feeding the builder. `type` is `ObjectType`, a union of `StructTag` and the literal `package`: gRPC reports `package` for a Move package object, and a package is a readable object like any other. `Simulation.objectTypes` and `Executed.objectTypes` are plain strings for the same reason.
 
 ## 4. `Executed`
 
 A `Schema.Class` built from the execute include set: `digest`, `effects`, `events`, `balanceChanges`, `objectTypes`, `checkpoint?`, `timestampMs?`. Accessors, each returning full refs `{ id, type, version, digest, owner }` so the next transaction can consume them, and each ignoring accumulator writes:
 
-`created(type?)`, `mutated(type?)`, `deleted()`, `packagesPublished()` (`PackageWrite` and `Created`), `balanceChange(address, coinType)`, `gasUsedTotal`, and `expectCreated(type): Effect<ObjectRef, UnexpectedEffects>` for the one-result case.
+`created(type?)`, `mutated(type?)`, `deleted()`, `packagesPublished()` (`PackageWrite` and `Created`, refs like every other accessor, `type` falling back to the literal `package`), `balanceChange(address, coinType): bigint` and `gasUsedTotal: bigint` (both are signed deltas, so neither is `Mist`, which is non-negative), and `expectCreated(type): Effect<ObjectRef, UnexpectedEffects>` for the one-result case.
 
 ## 5. `Signer` is a value, not a service
 
@@ -160,15 +169,15 @@ All `Schema.TaggedError` so they serialize. Flat tags, no inheritance.
 | `BuildError` | `message`, `cause` |
 | `PolicyDenied` | `rule`, `message` |
 | `JournalError` | `cause` |
-| `UnexpectedEffects` | `digest`, `expected`, `found` |
+| `UnexpectedEffects` | `digest`, `expected: StructTag`, `found: ObjectId[]` (the ids that did match, so zero and many are told apart) |
 
-`ExecutionReason` is a `Schema.TaggedUnion` mirroring `SuiClientTypes.ExecutionError` exactly (`MoveAbort` with `abortCode: bigint`, `location`, `cleverError`; `SizeError`; `CommandArgumentError`; `TypeArgumentError`; `PackageUpgradeError`; `IndexError`; `CoinDenyListError`; `CongestedObjects`; `ObjectIdError`; `Unknown`). Clever-error constant names are decoded automatically; a per-package abort registry is deferred.
+`ExecutionReason` and `Owner` are `Schema.Union([...]).pipe(Schema.toTaggedUnion("$kind"))` rather than `_tag` unions, so the discriminant is the SDK's own `$kind` and our narrowing and the SDK's agree. `ExecutionReason` mirrors `SuiClientTypes.ExecutionError` exactly (`MoveAbort` with `abortCode: bigint`, `location`, `cleverError`; `SizeError`; `CommandArgumentError`; `TypeArgumentError`; `PackageUpgradeError`; `IndexError`; `CoinDenyListError`; `CongestedObjects`; `ObjectIdError`; `Unknown`). Clever-error constant names are decoded automatically; a per-package abort registry is deferred.
 
 `SuiError` is the union plus four helpers every repo hand-rolls today: `isRetryable(e)`, `outcome(e): "applied" | "not_applied" | "unknown"` (`applied` for `ExecutionFailed`, `unknown` for `SubmissionUnknown`, `not_applied` for everything else), `describe(e): string` (one actionable line, for example `ExecutionFailed MoveAbort 0x..::escrow::claim code 3 (EAlreadyClaimed) in command 1`), and `toJson(e)`.
 
 ## 11. Branded schemas and the BCS bridge
 
-`SuiAddress`, `ObjectId`, `Digest`, `StructTag`, `CoinType`, `Mist` (`bigint`) as `Schema.String.pipe(Schema.check(...), Schema.brand(...))` with normalization on decode via `SchemaGetter.transform` (`normalizeSuiAddress`, `normalizeStructTag`). `SuiSchema.bcs(bcsType, expectedType)` turns a `@mysten/bcs` `BcsType<T>` into `Schema.Codec<T, Uint8Array>` that decodes from `content` bytes only (never the transport-varying `json`) and compares the object's type tag with `normalizeStructTag` so generic instantiations match.
+`SuiAddress`, `ObjectId`, `Digest`, `StructTag`, `CoinType`, `Mist` (`bigint`) as `Schema.String.pipe(Schema.check(...), Schema.brand(...))` with normalization on decode via `SchemaGetter.transform` (`normalizeSuiAddress`, `normalizeStructTag`). `SuiSchema.bcs(bcsType, expectedType)` turns a `@mysten/bcs` `BcsType<T>` into `Schema.Codec<T, Uint8Array>` that decodes from `content` bytes only (never the transport-varying `json`) and compares the object's type tag with `normalizeStructTag` so generic instantiations match. It must be a `BcsType`, not merely a `{ parse }` codec: the bridge re-serializes what it parsed to reject trailing bytes, which is what stops an `objectBcs` envelope from decoding as the struct it wraps (generated codegen output is a `BcsType`, so this costs nothing in practice). The expected type is stored as a schema annotation and read back by walking the encoding chain, so `SuiSchema.bcs(...).pipe(Schema.decodeTo(DomainClass, ...))` keeps the check; `getObject`, `getObjectOption` and `getObjects` also accept an explicit `expectedType` for codecs built some other way. A `Uint8Array` field that can reach an error or a journal entry (`SignedTransaction.bytes`) uses a base64 codec, so `SuiError.toJson` is JSON.
 
 ## 12. `Script` preset (`sui-effect/script`)
 
@@ -188,7 +197,7 @@ import { Script } from "sui-effect/script"
 import { bcs } from "@mysten/sui/bcs"
 
 const PKG = "0x…"
-const Escrow = SuiSchema.bcs(bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64 }), `${PKG}::escrow::Escrow`)
+const Escrow = SuiSchema.bcs(bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() }), `${PKG}::escrow::Escrow`)
 
 Script.run(Effect.gen(function*() {
   const { sui, signer } = yield* Script
@@ -264,8 +273,8 @@ Consequences:
 
 ## 14. Testing
 
-- `SuiCore.layerFake(script)`: a `Map` of objects plus scripted outcomes for `getChainIdentifier`, `getReferenceGasPrice`, `getObjects`, `simulateTransaction`, `executeTransaction`, `getTransaction`, and the Clock object `0x6`. Outcomes include `succeed`, `failWith(reason)`, `timeoutThen(found)`. No Move execution, no dynamic fields; localnet covers those.
-- `Sui.layerTest = Sui.layerNoDeps` over the fake, so tests exercise the real high tier and the real `Tx.submit` under `TestClock`.
+- `SuiCoreFake.layer(script)` in `sui-effect/testing`: a `Map` of objects plus scripted outcomes for `getChainIdentifier`, `getReferenceGasPrice`, `getObjects`, `listCoins`, `simulateTransaction`, `executeTransaction`, `getTransaction`, and the Clock object `0x6`. Outcomes include `succeed`, `failWith(reason)`, `transportError(status)`, `notFound()`, `timeoutThen(found)`. It also implements `resolveTransactionPlugin`, so `transaction.build({ client })` resolves gas price, gas budget, gas payment and object inputs from the script with no network, and it keys pending and known transactions by `TransactionDataBuilder.getDigestFromBytes` of the bytes it was given, so journal and reconcile tests are stable. No Move execution, no dynamic fields; localnet covers those.
+- `layerTest(script)` in `sui-effect/testing` is `Sui.layerNoDeps` over the fake, so tests exercise the real high tier and the real `Tx.submit` under `TestClock`, under the production chain-id rules.
 - `TestSchema.Asserts` round-trips every error class and every `JournalEntry` variant.
 - The `TransportMethods` completeness type test.
 - Localnet integration tests behind `SUI_LOCALNET=1`.

@@ -11,7 +11,7 @@
 import { bcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { Transaction } from "@mysten/sui/transactions"
-import { SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
+import { normalizeSuiAddress, SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
 import {
   Config,
   Context,
@@ -29,6 +29,7 @@ import { bcs as bcsCodec, decodeContent, expectedTypeOf, typeMatches } from "../
 import {
   BuildError,
   DecodeError,
+  ExecutionFailed,
   NetworkMismatch,
   ObjectDeleted,
   ObjectNotFound,
@@ -46,6 +47,7 @@ import {
   DynamicFieldEntry,
   DynamicFieldName,
   executionReasonOf,
+  KNOWN_CHAIN_IDS,
   makeSuiObject,
   ObjectEnvelope,
   ObjectId,
@@ -117,18 +119,24 @@ export interface SuiService {
   /**
    * Reads one object, decoding its BCS content with `opts.schema` when given.
    *
+   * The object's type tag is checked before the bytes are parsed: against
+   * `opts.expectedType` when given, otherwise against the type
+   * `SuiSchema.bcs` recorded on the codec. This member and the two below are
+   * written as overloads, not `Effect.fn`, because `Effect.fn` cannot express
+   * an overload set; the implementations are `Effect.fn` and carry the span.
+   *
    * Fails with: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`,
    * `DecodeError`, `TransportError`.
    */
   readonly getObject: {
     <S>(
       id: ObjectId,
-      opts: { readonly schema: Schema.Codec<S, Uint8Array> }
+      opts: { readonly schema: Schema.Codec<S, Uint8Array>; readonly expectedType?: string }
     ): Effect.Effect<SuiObject<S>, GetObjectError>
-    (id: ObjectId, opts?: { readonly schema?: undefined }): Effect.Effect<
-      SuiObject<Uint8Array>,
-      GetObjectError
-    >
+    (
+      id: ObjectId,
+      opts?: { readonly schema?: undefined; readonly expectedType?: string }
+    ): Effect.Effect<SuiObject<Uint8Array>, GetObjectError>
   }
 
   /**
@@ -140,31 +148,36 @@ export interface SuiService {
   readonly getObjectOption: {
     <S>(
       id: ObjectId,
-      opts: { readonly schema: Schema.Codec<S, Uint8Array> }
+      opts: { readonly schema: Schema.Codec<S, Uint8Array>; readonly expectedType?: string }
     ): Effect.Effect<
       Option.Option<SuiObject<S>>,
       ObjectUnavailable | DecodeError | TransportError
     >
-    (id: ObjectId, opts?: { readonly schema?: undefined }): Effect.Effect<
+    (
+      id: ObjectId,
+      opts?: { readonly schema?: undefined; readonly expectedType?: string }
+    ): Effect.Effect<
       Option.Option<SuiObject<Uint8Array>>,
       ObjectUnavailable | DecodeError | TransportError
     >
   }
 
   /**
-   * Reads many objects, chunked by 50, checking that the node answered for each
-   * requested id exactly once. Per-object failures are `Result` values.
+   * Reads many objects, chunked by 50, checking that the node answered for
+   * each requested id exactly once. Ids are normalized and deduplicated before
+   * the request, so asking twice for the same object is legal and returns the
+   * same `Result` twice. Per-object failures are `Result` values.
    *
    * Fails with: `TransportError`.
    */
   readonly getObjects: {
     <S>(
       ids: ReadonlyArray<ObjectId>,
-      opts: { readonly schema: Schema.Codec<S, Uint8Array> }
+      opts: { readonly schema: Schema.Codec<S, Uint8Array>; readonly expectedType?: string }
     ): Effect.Effect<ReadonlyArray<Result.Result<SuiObject<S>, BatchItemError>>, TransportError>
     (
       ids: ReadonlyArray<ObjectId>,
-      opts?: { readonly schema?: undefined }
+      opts?: { readonly schema?: undefined; readonly expectedType?: string }
     ): Effect.Effect<
       ReadonlyArray<Result.Result<SuiObject<Uint8Array>, BatchItemError>>,
       TransportError
@@ -195,10 +208,7 @@ export interface SuiService {
    */
   readonly getTransaction: (
     digest: Digest
-  ) => Effect.Effect<
-    Executed,
-    import("../domain/errors.ts").ExecutionFailed | TransactionNotFound | TransportError
-  >
+  ) => Effect.Effect<Executed, ExecutionFailed | TransactionNotFound | TransportError>
 
   /**
    * Simulates a transaction with the fixed simulate include set.
@@ -244,6 +254,24 @@ export interface SuiService {
 
 const CHUNK = 50
 
+/** Options every object read accepts. */
+interface ReadOptions<S> {
+  readonly schema?: Schema.Codec<S, Uint8Array>
+  /**
+   * The Move type the object must have, overriding the type recorded on the
+   * codec. The escape hatch for a codec that is not a `SuiSchema.bcs` bridge.
+   */
+  readonly expectedType?: string
+}
+
+const keyOf = (id: string): string => {
+  try {
+    return normalizeSuiAddress(id)
+  } catch {
+    return id
+  }
+}
+
 const makeSui = (
   core: SuiCore["Service"],
   chainId: string,
@@ -252,46 +280,49 @@ const makeSui = (
   const envelopeOf = (object: SuiClientTypes.Object<typeof OBJECT_INCLUDE>) =>
     decodeEnvelope(object).pipe(Effect.mapError(boundaryError("getObject")))
 
-  const decodeObject = <S>(
+  const decodeObject = Effect.fn("Sui.decodeObject")(function*<S>(
     object: SuiClientTypes.Object<typeof OBJECT_INCLUDE>,
-    schema?: Schema.Codec<S, Uint8Array>
-  ): Effect.Effect<SuiObject<S | Uint8Array>, DecodeError | TransportError> =>
-    Effect.gen(function*() {
-      const envelope = yield* envelopeOf(object)
-      if (schema === undefined) return makeSuiObject(envelope, object.content)
-      const expected = expectedTypeOf(schema)
-      if (expected !== undefined && !typeMatches(expected, envelope.type)) {
-        return yield* new DecodeError({
-          objectId: envelope.objectId,
-          expectedType: expected,
-          issue: `object ${envelope.objectId} has type ${envelope.type}`
-        })
-      }
-      const content = yield* decodeContent(schema, object.content, {
+    opts?: ReadOptions<S>
+  ): Effect.fn.Return<SuiObject<S | Uint8Array>, DecodeError | TransportError> {
+    const envelope = yield* envelopeOf(object)
+    const schema = opts?.schema
+    if (schema === undefined) return makeSuiObject(envelope, object.content)
+    const expected = opts?.expectedType ?? expectedTypeOf(schema)
+    if (expected !== undefined && !typeMatches(expected, envelope.type)) {
+      return yield* new DecodeError({
         objectId: envelope.objectId,
-        expectedType: envelope.type
+        expectedType: expected,
+        issue: `object ${envelope.objectId} has type ${envelope.type}`
       })
-      return makeSuiObject(envelope, content)
+    }
+    const content = yield* decodeContent(schema, object.content, {
+      objectId: envelope.objectId,
+      expectedType: envelope.type
     })
+    return makeSuiObject(envelope, content)
+  })
 
-  const getObject = <S>(id: ObjectId, opts?: { readonly schema?: Schema.Codec<S, Uint8Array> }) =>
-    core
-      .getObject({ objectId: id, include: OBJECT_INCLUDE })
-      .pipe(
-        Effect.flatMap(({ object }) => decodeObject(object, opts?.schema)),
-        Effect.withSpan("Sui.getObject")
-      )
-
-  const getObjectOption = <S>(
+  const getObject = Effect.fn("Sui.getObject")(function*<S>(
     id: ObjectId,
-    opts?: { readonly schema?: Schema.Codec<S, Uint8Array> }
-  ) =>
-    getObject(id, opts).pipe(
+    opts?: ReadOptions<S>
+  ): Effect.fn.Return<SuiObject<S | Uint8Array>, GetObjectError> {
+    const { object } = yield* core.getObject({ objectId: id, include: OBJECT_INCLUDE })
+    return yield* decodeObject(object, opts)
+  })
+
+  const getObjectOption = Effect.fn("Sui.getObjectOption")(function*<S>(
+    id: ObjectId,
+    opts?: ReadOptions<S>
+  ): Effect.fn.Return<
+    Option.Option<SuiObject<S | Uint8Array>>,
+    ObjectUnavailable | DecodeError | TransportError
+  > {
+    return yield* getObject(id, opts).pipe(
       Effect.map(Option.some),
       Effect.catchTag(["ObjectNotFound", "ObjectDeleted"], () =>
-        Effect.succeed(Option.none<SuiObject<S | Uint8Array>>())),
-      Effect.withSpan("Sui.getObjectOption")
+        Effect.succeed(Option.none<SuiObject<S | Uint8Array>>()))
     )
+  })
 
   const chunk = <A>(items: ReadonlyArray<A>): ReadonlyArray<ReadonlyArray<A>> => {
     const chunks: Array<ReadonlyArray<A>> = []
@@ -301,111 +332,122 @@ const makeSui = (
     return chunks
   }
 
-  const getObjects = <S>(
+  const getObjects = Effect.fn("Sui.getObjects")(function*<S>(
     ids: ReadonlyArray<ObjectId>,
-    opts?: { readonly schema?: Schema.Codec<S, Uint8Array> }
-  ) =>
-    Effect.gen(function*() {
-      const results: Array<Result.Result<SuiObject<S | Uint8Array>, BatchItemError>> = []
-      for (const page of chunk(ids)) {
-        const response = yield* core.getObjects({
-          objectIds: [...page],
-          include: OBJECT_INCLUDE
+    opts?: ReadOptions<S>
+  ): Effect.fn.Return<
+    ReadonlyArray<Result.Result<SuiObject<S | Uint8Array>, BatchItemError>>,
+    TransportError
+  > {
+    type Item = Result.Result<SuiObject<S | Uint8Array>, BatchItemError>
+    const unique: Array<ObjectId> = []
+    const requested = new Set<string>()
+    for (const id of ids) {
+      const key = keyOf(id)
+      if (requested.has(key)) continue
+      requested.add(key)
+      unique.push(id)
+    }
+    const answers = new Map<string, Item>()
+    for (const page of chunk(unique)) {
+      const response = yield* core.getObjects({
+        objectIds: [...page],
+        include: OBJECT_INCLUDE
+      })
+      if (response.objects.length !== page.length) {
+        return yield* new TransportError({
+          method: "getObjects",
+          retryable: false,
+          cause: `asked for ${page.length} objects and the node answered for ${response.objects.length}`
         })
-        if (response.objects.length !== page.length) {
+      }
+      for (let index = 0; index < page.length; index += 1) {
+        const id = page[index] as ObjectId
+        const item = response.objects[index]
+        if (item === undefined) {
           return yield* new TransportError({
             method: "getObjects",
             retryable: false,
-            cause: `asked for ${page.length} objects and the node answered for ${response.objects.length}`
+            cause: `the node returned no entry for ${id}`
           })
         }
-        const seen = new Set<string>()
-        for (let index = 0; index < page.length; index += 1) {
-          const requested = page[index] as ObjectId
-          if (seen.has(requested)) {
-            return yield* new TransportError({
-              method: "getObjects",
-              retryable: false,
-              cause: `duplicate object id ${requested} in the request`
-            })
-          }
-          seen.add(requested)
-          const item = response.objects[index]
-          if (item === undefined) {
-            return yield* new TransportError({
-              method: "getObjects",
-              retryable: false,
-              cause: `the node returned no entry for ${requested}`
-            })
-          }
-          if (item instanceof Error) {
-            const mapped = mapObjectItemError(requested, item)
-            results.push(Result.fail(mapped))
-            continue
-          }
-          if (item.objectId !== requested) {
-            return yield* new TransportError({
-              method: "getObjects",
-              retryable: false,
-              cause: `asked for ${requested} and the node answered for ${item.objectId}`
-            })
-          }
-          const decoded = yield* Effect.result(decodeObject(item, opts?.schema))
-          if (Result.isFailure(decoded)) {
-            if (decoded.failure._tag === "TransportError") return yield* decoded.failure
-            results.push(Result.fail(decoded.failure))
-            continue
-          }
-          results.push(Result.succeed(decoded.success))
+        if (item instanceof Error) {
+          answers.set(keyOf(id), Result.fail(mapObjectItemError(id, item)))
+          continue
         }
+        if (keyOf(item.objectId) !== keyOf(id)) {
+          return yield* new TransportError({
+            method: "getObjects",
+            retryable: false,
+            cause: `asked for ${id} and the node answered for ${item.objectId}`
+          })
+        }
+        const decoded = yield* Effect.result(decodeObject(item, opts))
+        if (Result.isFailure(decoded)) {
+          if (decoded.failure._tag === "TransportError") return yield* decoded.failure
+          answers.set(keyOf(id), Result.fail(decoded.failure))
+          continue
+        }
+        answers.set(keyOf(id), Result.succeed(decoded.success))
       }
-      return results as ReadonlyArray<Result.Result<SuiObject<S | Uint8Array>, BatchItemError>>
-    }).pipe(Effect.withSpan("Sui.getObjects"))
+    }
+    const results: Array<Item> = []
+    for (const id of ids) {
+      const answer = answers.get(keyOf(id))
+      if (answer === undefined) {
+        return yield* new TransportError({
+          method: "getObjects",
+          retryable: false,
+          cause: `the node returned no entry for ${id}`
+        })
+      }
+      results.push(answer)
+    }
+    return results
+  })
 
-  const getBalance = (owner: SuiAddress, coinType?: CoinType) =>
-    core
-      .getBalance({ owner, ...(coinType === undefined ? {} : { coinType }) })
-      .pipe(
-        Effect.flatMap(({ balance }) =>
-          decodeBalance(balance).pipe(Effect.mapError(boundaryError("getBalance")))
-        ),
-        Effect.withSpan("Sui.getBalance")
-      )
+  const getBalance = Effect.fn("Sui.getBalance")(function*(
+    owner: SuiAddress,
+    coinType?: CoinType
+  ): Effect.fn.Return<Balance, TransportError> {
+    const { balance } = yield* core.getBalance({
+      owner,
+      ...(coinType === undefined ? {} : { coinType })
+    })
+    return yield* decodeBalance(balance).pipe(Effect.mapError(boundaryError("getBalance")))
+  })
 
-  const getDynamicFieldOption = (parent: ObjectId, name: DynamicFieldName) =>
-    core
-      .getDynamicField({ parentId: parent, name })
-      .pipe(
-        Effect.flatMap(({ dynamicField }) =>
-          decodeDynamicField(dynamicField).pipe(
-            Effect.mapError(boundaryError("getDynamicField")),
-            Effect.map(Option.some)
-          )
-        ),
-        Effect.catchTag(["ObjectNotFound", "ObjectDeleted"], () =>
-          Effect.succeed(Option.none<DynamicField>())),
-        Effect.catchTag("ObjectUnavailable", (error) =>
-          Effect.fail(
-            new TransportError({
-              method: "getDynamicField",
-              retryable: false,
-              cause: error
-            })
-          )),
-        Effect.withSpan("Sui.getDynamicFieldOption")
-      )
+  const getDynamicFieldOption = Effect.fn("Sui.getDynamicFieldOption")(function*(
+    parent: ObjectId,
+    name: DynamicFieldName
+  ): Effect.fn.Return<Option.Option<DynamicField>, TransportError> {
+    return yield* core.getDynamicField({ parentId: parent, name }).pipe(
+      Effect.flatMap(({ dynamicField }) =>
+        decodeDynamicField(dynamicField).pipe(
+          Effect.mapError(boundaryError("getDynamicField")),
+          Effect.map(Option.some)
+        )
+      ),
+      Effect.catchTag(["ObjectNotFound", "ObjectDeleted"], () =>
+        Effect.succeed(Option.none<DynamicField>())),
+      Effect.catchTag("ObjectUnavailable", (error) =>
+        Effect.fail(
+          new TransportError({ method: "getDynamicField", retryable: false, cause: error })
+        ))
+    )
+  })
 
-  const getTransaction = (digest: Digest) =>
-    core
-      .getTransaction({ digest, include: EXECUTE_INCLUDE })
-      .pipe(
-        Effect.flatMap(fromTransactionResult),
-        Effect.catchTag("DecodeError", (error) =>
-          Effect.fail(
-            new TransportError({ method: "getTransaction", retryable: false, cause: error })
-          )),
-        Effect.withSpan("Sui.getTransaction")
-      )
+  const getTransaction = Effect.fn("Sui.getTransaction")(function*(
+    digest: Digest
+  ): Effect.fn.Return<Executed, ExecutionFailed | TransactionNotFound | TransportError> {
+    return yield* core.getTransaction({ digest, include: EXECUTE_INCLUDE }).pipe(
+      Effect.flatMap(fromTransactionResult),
+      Effect.catchTag("DecodeError", (error) =>
+        Effect.fail(
+          new TransportError({ method: "getTransaction", retryable: false, cause: error })
+        ))
+    )
+  })
 
   const toTransaction = (
     input: Recipe | Transaction | Uint8Array
@@ -422,82 +464,75 @@ const makeSui = (
     })
   }
 
-  const simulateRaw = (
+  const simulateRaw = Effect.fn("Sui.simulateRaw")(function*(
     input: Recipe | Transaction | Uint8Array,
     checksEnabled: boolean
-  ): Effect.Effect<
+  ): Effect.fn.Return<
     SuiClientTypes.SimulateTransactionResult<typeof SIMULATE_INCLUDE>,
     SimulationFailed | BuildError | TransportError
-  > =>
-    toTransaction(input).pipe(
-      Effect.flatMap((transaction) =>
-        core.simulateTransaction({ transaction, include: SIMULATE_INCLUDE, checksEnabled })
-      )
-    )
+  > {
+    const transaction = yield* toTransaction(input)
+    return yield* core.simulateTransaction({
+      transaction,
+      include: SIMULATE_INCLUDE,
+      checksEnabled
+    })
+  })
 
-  const toSimulation = (
+  const toSimulation = Effect.fn("Sui.toSimulation")(function*(
     result: SuiClientTypes.SimulateTransactionResult<typeof SIMULATE_INCLUDE>
-  ): Effect.Effect<Simulation, SimulationFailed | TransportError> =>
-    Effect.gen(function*() {
-      if (result.$kind === "FailedTransaction") {
-        const status = result.FailedTransaction.status
-        if (status.success) {
-          return yield* new TransportError({
-            method: "simulateTransaction",
-            retryable: false,
-            cause: "the node reported a failed transaction whose status says it succeeded"
-          })
-        }
-        return yield* new SimulationFailed({
-          reason: executionReasonOf(status.error),
-          message: status.error.message
+  ): Effect.fn.Return<Simulation, SimulationFailed | TransportError> {
+    if (result.$kind === "FailedTransaction") {
+      const status = result.FailedTransaction.status
+      if (status.success) {
+        return yield* new TransportError({
+          method: "simulateTransaction",
+          retryable: false,
+          cause: "the node reported a failed transaction whose status says it succeeded"
         })
       }
-      const transaction = result.Transaction
-      return yield* decodeSimulation({
-        digest: transaction.digest,
-        effects: transaction.effects,
-        events: transaction.events,
-        balanceChanges: transaction.balanceChanges,
-        objectTypes: transaction.objectTypes,
-        commandResults: result.commandResults
-      }).pipe(Effect.mapError(boundaryError("simulateTransaction")))
-    })
+      return yield* new SimulationFailed({
+        reason: executionReasonOf(status.error),
+        message: status.error.message
+      })
+    }
+    const transaction = result.Transaction
+    return yield* decodeSimulation({
+      digest: transaction.digest,
+      effects: transaction.effects,
+      events: transaction.events,
+      balanceChanges: transaction.balanceChanges,
+      objectTypes: transaction.objectTypes,
+      commandResults: result.commandResults
+    }).pipe(Effect.mapError(boundaryError("simulateTransaction")))
+  })
 
-  const simulate = (input: Recipe | Transaction | Uint8Array) =>
-    simulateRaw(input, true).pipe(
-      Effect.flatMap(toSimulation),
-      Effect.withSpan("Sui.simulate")
-    )
+  const simulate = Effect.fn("Sui.simulate")(function*(
+    input: Recipe | Transaction | Uint8Array
+  ): Effect.fn.Return<Simulation, SimulationFailed | BuildError | TransportError> {
+    return yield* toSimulation(yield* simulateRaw(input, true))
+  })
 
-  const view = <S>(
+  const view = Effect.fn("Sui.view")(function*<S>(
     recipe: Recipe,
     schema: Schema.Codec<S, Uint8Array>,
     opts?: { readonly command?: number; readonly result?: number }
-  ) =>
-    simulateRaw(recipe, false).pipe(
-      Effect.flatMap(toSimulation),
-      Effect.flatMap((simulation) => {
-        const index = opts?.command ?? simulation.commandResults.length - 1
-        const command = simulation.commandResults[index]
-        if (command === undefined) {
-          return Effect.fail(
-            new DecodeError({ issue: `the simulation has no command ${index}` })
-          )
-        }
-        const position = opts?.result ?? 0
-        const value = command.returnValues[position]
-        if (value === undefined) {
-          return Effect.fail(
-            new DecodeError({
-              issue: `command ${index} has no return value ${position}`
-            })
-          )
-        }
-        return decodeContent(schema, value.bcs)
-      }),
-      Effect.withSpan("Sui.view")
-    )
+  ): Effect.fn.Return<S, SimulationFailed | BuildError | DecodeError | TransportError> {
+    const simulation = yield* toSimulation(yield* simulateRaw(recipe, false))
+    const index = opts?.command ?? simulation.commandResults.length - 1
+    const command = simulation.commandResults[index]
+    if (command === undefined) {
+      return yield* new DecodeError({ issue: `the simulation has no command ${index}` })
+    }
+    const position = opts?.result ?? 0
+    const value = command.returnValues[position]
+    if (value === undefined) {
+      return yield* new DecodeError({
+        issue: `command ${index} has no return value ${position}`
+      })
+    }
+    return yield* decodeContent(schema, value.bcs)
+  })
 
   const streamOwnedObjects = (owner: SuiAddress, opts?: { readonly type?: StructTag }) =>
     Stream.paginate(null as string | null, (cursor: string | null) =>
@@ -553,8 +588,9 @@ const makeSui = (
         )).pipe(Stream.withSpan("Sui.streamDynamicFields"))
 
   const withSenderLock = (address: SuiAddress) =>
-  <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-    Effect.gen(function*() {
+    Effect.fn("Sui.withSenderLock")(function*<A, E, R>(
+      effect: Effect.Effect<A, E, R>
+    ): Effect.fn.Return<A, E, R> {
       const semaphore = yield* Ref.modify(locks, (current) => {
         const existing = current.get(address)
         if (existing !== undefined) return [existing, current] as const
@@ -624,7 +660,12 @@ const mapObjectItemError = (id: ObjectId, error: Error): BatchItemError => {
 export interface SuiLayerOptions {
   /**
    * The chain identifier this program expects, as `getChainIdentifier` returns
-   * it. When set, a layer over a node on another chain fails to build.
+   * it. When set, a layer over a node on another chain fails to build, and it
+   * overrides the {@link KNOWN_CHAIN_IDS} entry for the client's network.
+   *
+   * Leave it unset for `mainnet` and `testnet`: their chain identifiers are in
+   * the table and are asserted by default. `devnet`, `localnet` and any custom
+   * network are regenerated, so set this when the program must pin one.
    */
   readonly chainId?: string
 }
@@ -646,7 +687,7 @@ export interface SuiLayerOptions {
 export class Sui extends Context.Service<Sui, SuiService>()("sui-effect/Sui") {
   /**
    * Like {@link layerNoDeps}, but refuses to build when the node reports a
-   * different chain identifier than the one given.
+   * different chain identifier than `options.chainId`, whatever the network.
    *
    * Fails with: `NetworkMismatch`, `TransportError`.
    */
@@ -658,11 +699,9 @@ export class Sui extends Context.Service<Sui, SuiService>()("sui-effect/Sui") {
       Effect.gen(function*() {
         const core = yield* SuiCore
         const { chainIdentifier } = yield* core.getChainIdentifier()
-        if (options.chainId !== undefined && options.chainId !== chainIdentifier) {
-          return yield* new NetworkMismatch({
-            expected: options.chainId,
-            actual: chainIdentifier
-          })
+        const expected = options.chainId ?? KNOWN_CHAIN_IDS[core.network]
+        if (expected !== undefined && expected !== chainIdentifier) {
+          return yield* new NetworkMismatch({ expected, actual: chainIdentifier })
         }
         const locks = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map())
         return makeSui(core, chainIdentifier, locks)
@@ -671,9 +710,16 @@ export class Sui extends Context.Service<Sui, SuiService>()("sui-effect/Sui") {
 
   /**
    * Builds `Sui` over whatever `SuiCore` is provided, reading the chain
-   * identifier once and making no assertion about which chain it is.
+   * identifier once.
    *
-   * Fails with: `TransportError`.
+   * When the client's network is one of the entries in {@link KNOWN_CHAIN_IDS}
+   * (`mainnet`, `testnet`) the identifier the node reports must match it, so a
+   * program pointed at the wrong node fails at layer build rather than reading
+   * the wrong chain. `devnet`, `localnet` and custom networks have no fixed
+   * identifier: the observed one is recorded on `Sui.chainId` and nothing is
+   * asserted unless {@link layerNoDepsWith} is given a `chainId`.
+   *
+   * Fails with: `NetworkMismatch`, `TransportError`.
    */
   static readonly layerNoDeps: Layer.Layer<Sui, NetworkMismatch | TransportError, SuiCore> =
     Sui.layerNoDepsWith({})

@@ -2,11 +2,30 @@ import { describe, expect, test } from "bun:test"
 import { bcs as suiBcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
-import { DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Result, Stream } from "effect"
+import {
+  DateTime,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Result,
+  Schema,
+  SchemaTransformation,
+  Stream
+} from "effect"
 import { TestClock } from "effect/testing"
 import { bcs } from "../src/domain/bcs.ts"
-import { CoinType, ObjectId, StructTag, SuiAddress } from "../src/domain/schemas.ts"
+import {
+  CoinType,
+  KNOWN_CHAIN_IDS,
+  ObjectId,
+  StructTag,
+  SuiAddress
+} from "../src/domain/schemas.ts"
 import { Sui } from "../src/services/Sui.ts"
+import { SuiCore } from "../src/services/SuiCore.ts"
 import { FakeOutcome, fakeDigest, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
 import { layerTest } from "../src/testing.ts"
 
@@ -35,6 +54,18 @@ const baseScript = {
   objects: [escrow("e1", "5"), escrow("e2", "7")]
 }
 
+/**
+ * A `SuiCore` that answers `getObjects` however the test says, so the response
+ * integrity checks can be driven past what the fake is able to produce.
+ */
+const mockCore = (getObjects: () => Effect.Effect<{ objects: ReadonlyArray<unknown> }>) =>
+  Layer.mock(SuiCore, {
+    network: "localnet" as never,
+    mvr: {} as never,
+    getChainIdentifier: () => Effect.succeed({ chainIdentifier: CHAIN_ID }),
+    getObjects: getObjects as never
+  })
+
 const run = <A, E>(
   effect: Effect.Effect<A, E, Sui | SuiCoreFake>,
   layer = layerTest(baseScript)
@@ -55,6 +86,72 @@ describe("layer build", () => {
     )
     expect(result.chainId).toBe(CHAIN_ID)
     expect(result.identifierCalls).toBe(1)
+  })
+
+  test("asserts the known chain id for mainnet and testnet by default", async () => {
+    const good = await Effect.runPromise(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return sui.chainId
+      }).pipe(
+        Effect.provide(layerTest({ ...baseScript, network: "mainnet", chainId: CHAIN_ID }), {
+          local: true
+        })
+      )
+    )
+    expect(good).toBe(KNOWN_CHAIN_IDS["mainnet"]!)
+
+    const error = await Effect.runPromise(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return sui.chainId
+      }).pipe(
+        Effect.provide(
+          layerTest({ ...baseScript, network: "mainnet", chainId: fakeDigest(99) }),
+          { local: true }
+        ),
+        Effect.flip
+      )
+    )
+    expect(error._tag).toBe("NetworkMismatch")
+    if (error._tag === "NetworkMismatch") {
+      expect(error.expected).toBe(KNOWN_CHAIN_IDS["mainnet"]!)
+      expect(error.actual).toBe(fakeDigest(99))
+    }
+  })
+
+  test("records the observed chain id for a network with no fixed one", async () => {
+    const chainId = await Effect.runPromise(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return sui.chainId
+      }).pipe(
+        Effect.provide(
+          layerTest({ ...baseScript, network: "localnet", chainId: fakeDigest(77) }),
+          { local: true }
+        )
+      )
+    )
+    expect(chainId).toBe(fakeDigest(77))
+  })
+
+  test("an explicit chainId overrides the table", async () => {
+    const ok = await Effect.runPromise(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return sui.chainId
+      }).pipe(
+        Effect.provide(
+          Sui.layerNoDepsWith({ chainId: fakeDigest(77) }).pipe(
+            Layer.provide(
+              SuiCoreFake.layer({ ...baseScript, network: "mainnet", chainId: fakeDigest(77) })
+            )
+          ),
+          { local: true }
+        )
+      )
+    )
+    expect(ok).toBe(fakeDigest(77))
   })
 
   test("fails with NetworkMismatch when the node reports another chain", async () => {
@@ -184,16 +281,74 @@ describe("reads", () => {
     expect((batches[2]?.options as { objectIds: Array<string> }).objectIds).toHaveLength(20)
   })
 
-  test("getObjects refuses a request with a duplicate id", async () => {
-    const error = await run(
+  test("getObjects deduplicates the request and answers once per id asked", async () => {
+    const result = await run(
       Effect.gen(function*() {
         const sui = yield* Sui
-        return yield* sui
-          .getObjects([ObjectId.make(PADDED("e1")), ObjectId.make(PADDED("e1"))])
-          .pipe(Effect.flip)
+        const fake = yield* SuiCoreFake
+        const results = yield* sui.getObjects([
+          ObjectId.make(PADDED("e1")),
+          ObjectId.make(PADDED("e2")),
+          ObjectId.make(PADDED("e1"))
+        ], { schema: Escrow })
+        const calls = yield* fake.calls
+        const request = calls.find((call) => call.method === "getObjects")
+        return { results, requested: (request?.options as { objectIds: Array<string> }).objectIds }
       })
     )
+    expect(result.requested).toHaveLength(2)
+    expect(result.results).toHaveLength(3)
+    expect(Result.isSuccess(result.results[0]!)).toBe(true)
+    expect(Result.isSuccess(result.results[2]!)).toBe(true)
+    if (Result.isSuccess(result.results[0]!) && Result.isSuccess(result.results[2]!)) {
+      expect(result.results[2]!.success.content.amount).toBe(
+        result.results[0]!.success.content.amount
+      )
+    }
+  })
+
+  test("getObjects normalizes ids before matching the node's answer", async () => {
+    const results = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        // The short spelling of an id the fake stores padded.
+        return yield* sui.getObjects(["0xe1" as never, PADDED("e2") as never])
+      })
+    )
+    expect(results).toHaveLength(2)
+    expect(Result.isSuccess(results[0]!)).toBe(true)
+    expect(Result.isSuccess(results[1]!)).toBe(true)
+  })
+
+  test("getObjects fails with TransportError when the node answers for another id", async () => {
+    const wrong = mockCore(() =>
+      Effect.succeed({
+        objects: [{ ...escrow("e2", "7"), version: "3", content: new Uint8Array() }]
+      }))
+    const error = await Effect.runPromise(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.getObjects([ObjectId.make(PADDED("e1"))]).pipe(Effect.flip)
+      }).pipe(
+        Effect.provide(Sui.layerNoDeps.pipe(Layer.provide(wrong)), { local: true })
+      )
+    )
     expect(error._tag).toBe("TransportError")
+    expect(String(error.cause)).toContain("answered for")
+  })
+
+  test("getObjects fails with TransportError when the node answers for too few", async () => {
+    const short = mockCore(() => Effect.succeed({ objects: [] }))
+    const error = await Effect.runPromise(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.getObjects([ObjectId.make(PADDED("e1"))]).pipe(Effect.flip)
+      }).pipe(
+        Effect.provide(Sui.layerNoDeps.pipe(Layer.provide(short)), { local: true })
+      )
+    )
+    expect(error._tag).toBe("TransportError")
+    expect(String(error.cause)).toContain("answered for 0")
   })
 
   test("getBalance decodes the balance response", async () => {
@@ -246,6 +401,95 @@ describe("reads", () => {
     expect(reads.clockReads).toBe(2)
   })
 
+  test("a package object is readable: its type is the literal `package`", async () => {
+    const layer = layerTest({
+      ...baseScript,
+      objects: [
+        ...baseScript.objects,
+        {
+          objectId: PADDED("9ac"),
+          type: "package",
+          version: 1n,
+          owner: { $kind: "Immutable" as const, Immutable: true },
+          content: new Uint8Array([1, 2, 3])
+        }
+      ]
+    })
+    const object = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.getObject(ObjectId.make(PADDED("9ac")))
+      }),
+      layer
+    )
+    expect(object.type).toBe("package")
+    expect(object.ref.type).toBe("package")
+    expect(Array.from(object.content)).toEqual([1, 2, 3])
+  })
+
+  test("an explicit expectedType overrides what the codec recorded", async () => {
+    const bare = bcs(EscrowBcs, "0x2::other::Thing")
+    const error = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui
+          .getObject(ObjectId.make(PADDED("e1")), { schema: bare, expectedType: ESCROW_TYPE })
+          .pipe(Effect.result)
+      })
+    )
+    expect(Result.isSuccess(error)).toBe(true)
+
+    const rejected = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui
+          .getObject(ObjectId.make(PADDED("e1")), {
+            schema: Escrow,
+            expectedType: "0x2::other::Thing"
+          })
+          .pipe(Effect.flip)
+      })
+    )
+    expect(rejected._tag).toBe("DecodeError")
+  })
+
+  test("a composed codec keeps the type check the bridge recorded", async () => {
+    class Wallet extends Schema.Class<Wallet>("Wallet")({
+      id: Schema.String,
+      amount: Schema.String
+    }) {}
+    const compose = (codec: typeof Escrow) =>
+      codec.pipe(
+        Schema.decodeTo(
+          Wallet,
+          SchemaTransformation.transform({
+            decode: (value: { id: string; amount: string }) => new Wallet(value),
+            encode: (wallet: Wallet) => ({ id: wallet.id, amount: wallet.amount })
+          })
+        )
+      )
+    const ok = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.getObject(ObjectId.make(PADDED("e1")), { schema: compose(Escrow) })
+      })
+    )
+    expect(ok.content).toBeInstanceOf(Wallet)
+    expect(ok.content.amount).toBe("5")
+
+    const rejected = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui
+          .getObject(ObjectId.make(PADDED("e1")), {
+            schema: compose(bcs(EscrowBcs, "0x2::other::Thing"))
+          })
+          .pipe(Effect.flip)
+      })
+    )
+    expect(rejected._tag).toBe("DecodeError")
+  })
+
   test("getDynamicFieldOption is None when the field is missing", async () => {
     const result = await run(
       Effect.gen(function*() {
@@ -288,6 +532,35 @@ describe("streams", () => {
     )
     expect(result.items).toBe(7)
     expect(result.pages).toBe(3)
+  })
+
+  test("streamOwnedObjects filters by type and asks for the fixed include set", async () => {
+    const objects = [
+      escrow("f1", "1"),
+      { ...escrow("f2", "2"), type: "0x2::escrow::Receipt" },
+      escrow("f3", "3")
+    ]
+    const layer = layerTest({ ...baseScript, objects })
+    const result = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        const fake = yield* SuiCoreFake
+        const items = yield* Stream.runCollect(
+          sui.streamOwnedObjects(SuiAddress.make(ALICE), { type: StructTag.make(ESCROW_TYPE) })
+        )
+        const calls = yield* fake.calls
+        return { items, call: calls.find((call) => call.method === "listOwnedObjects") }
+      }),
+      layer
+    )
+    expect(result.items.map((object) => object.id)).toEqual([
+      PADDED("f1") as never,
+      PADDED("f3") as never
+    ])
+    expect(result.call?.options).toMatchObject({
+      include: { content: true },
+      type: ESCROW_TYPE
+    })
   })
 
   test("streamDynamicFields paginates", async () => {
@@ -345,6 +618,28 @@ describe("simulate and view", () => {
       },
       checksEnabled: true
     })
+  })
+
+  test("simulate decodes a publish, whose object type is the literal `package`", async () => {
+    const layer = layerTest({
+      ...baseScript,
+      simulate: [
+        FakeOutcome.succeed({
+          digest: fakeDigest(51),
+          created: [
+            { objectId: PADDED("9ac"), type: "package", version: 1n, outputState: "PackageWrite" }
+          ]
+        })
+      ]
+    })
+    const simulation = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.simulate(() => {})
+      }),
+      layer
+    )
+    expect(simulation.objectTypes[PADDED("9ac")]).toBe("package")
   })
 
   test("simulate maps an on-chain failure to SimulationFailed", async () => {
@@ -450,6 +745,26 @@ describe("getTransaction", () => {
       layer
     )
     expect(executed.created("0x2::escrow::Receipt")).toHaveLength(1)
+  })
+
+  test("getTransaction asks for the fixed execute include set", async () => {
+    const layer = layerTest({
+      ...baseScript,
+      getTransaction: [FakeOutcome.succeed({ digest: fakeDigest(34) })]
+    })
+    const call = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        const fake = yield* SuiCoreFake
+        yield* sui.getTransaction(fakeDigest(34) as never)
+        const calls = yield* fake.calls
+        return calls.find((entry) => entry.method === "getTransaction")
+      }),
+      layer
+    )
+    expect(call?.options).toMatchObject({
+      include: { effects: true, events: true, balanceChanges: true, objectTypes: true }
+    })
   })
 
   test("a historical failure is an ExecutionFailed, not an Executed", async () => {
@@ -563,8 +878,3 @@ describe("withSenderLock", () => {
   })
 })
 
-describe("type coverage", () => {
-  test("StructTag filters are normalized in streams", () => {
-    expect(StructTag.make(ESCROW_TYPE)).toBe(ESCROW_TYPE as never)
-  })
-})

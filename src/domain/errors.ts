@@ -20,8 +20,12 @@ export { CleverError, ExecutionReason, MoveLocation } from "./schemas.ts"
 
 /**
  * A request did not reach a usable answer. `retryable` is true for the statuses
- * a read may be retried on (`UNAVAILABLE`, `DEADLINE_EXCEEDED`,
- * `RESOURCE_EXHAUSTED`, HTTP 5xx and 429, and timeouts).
+ * a read may be retried on: gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`,
+ * `RESOURCE_EXHAUSTED`, `INTERNAL` and `UNKNOWN`, HTTP 5xx and 429, and
+ * timeouts. `INTERNAL` and `UNKNOWN` are in the set because the grpc-web
+ * transport reports a refused connection or a DNS failure as `INTERNAL` and an
+ * HTTP 500 as `UNKNOWN`, so without them a node that is merely down is never
+ * retried.
  */
 export class TransportError extends Schema.TaggedError<TransportError>()("TransportError", {
   method: Schema.String,
@@ -177,11 +181,11 @@ export interface HasOutcome {
   readonly outcome: Outcome
 }
 
-const hasOutcome = (error: unknown): error is HasOutcome =>
-  typeof error === "object" &&
-  error !== null &&
-  "outcome" in error &&
-  (error.outcome === "applied" || error.outcome === "not_applied" || error.outcome === "unknown")
+const OutcomeSchema = Schema.Literals(["applied", "not_applied", "unknown"])
+
+const isHasOutcome = Schema.is(Schema.Struct({ outcome: OutcomeSchema }))
+
+const hasOutcome = (error: unknown): error is HasOutcome => isHasOutcome(error)
 
 const isRetryable = (error: SuiError): boolean =>
   error._tag === "TransportError" ? error.retryable : false

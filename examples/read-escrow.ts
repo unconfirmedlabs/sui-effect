@@ -3,8 +3,10 @@
  *
  * Run with `SUI_NETWORK=testnet ESCROW_ID=0x… bun examples/read-escrow.ts`.
  * Every failure this program can produce is in the generator's inferred error
- * type: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`, `DecodeError`,
- * `TransportError`, `NetworkMismatch` and `ConfigError`.
+ * type: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`, `DecodeError`
+ * and `TransportError` from the reads, plus `ConfigError` and `NetworkMismatch`
+ * from the layer — the latter when `SUI_NETWORK` is `mainnet` or `testnet` and
+ * `SUI_RPC_URL` points at a node on another chain.
  */
 import { bcs } from "@mysten/sui/bcs"
 import { BunRuntime } from "@effect/platform-bun"

@@ -14,7 +14,15 @@
 import { bcs } from "@mysten/sui/bcs"
 import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
-import { SUI_CLOCK_OBJECT_ID, normalizeSuiAddress, toBase58 } from "@mysten/sui/utils"
+import { Inputs, TransactionDataBuilder } from "@mysten/sui/transactions"
+import type { TransactionPlugin } from "@mysten/sui/transactions"
+import {
+  normalizeStructTag,
+  normalizeSuiAddress,
+  SUI_CLOCK_OBJECT_ID,
+  SUI_TYPE_ARG,
+  toBase58
+} from "@mysten/sui/utils"
 import { Context, Effect, Layer } from "effect"
 import type { SuiCoreService } from "./SuiCore.ts"
 import { DefectMarker, makeFromClient, SuiCore } from "./SuiCore.ts"
@@ -107,6 +115,14 @@ export interface FakeScript {
   /** The timestamp the Clock object `0x6` reports, in milliseconds. */
   readonly clockTimestampMs?: bigint
   readonly objects?: ReadonlyArray<FakeObject>
+  /**
+   * The coins `listCoins` serves and the fake's resolve plugin picks gas
+   * payment from. `type` is the full object type, `0x2::coin::Coin<T>`, the
+   * way the node reports it.
+   */
+  readonly coins?: ReadonlyArray<SuiClientTypes.Coin>
+  /** The gas budget the resolve plugin sets when a transaction has none. */
+  readonly gasBudget?: bigint
   readonly balances?: ReadonlyArray<SuiClientTypes.Balance>
   readonly dynamicFields?: Readonly<Record<string, ReadonlyArray<SuiClientTypes.DynamicFieldEntry>>>
   readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>
@@ -125,6 +141,14 @@ export interface RecordedCall {
 
 /** What a test can do to the fake while it runs. */
 export interface SuiCoreFakeState {
+  /**
+   * The SDK client object the fake implements, for the one place a test needs
+   * it directly: `transaction.build({ client })`. Its
+   * `core.resolveTransactionPlugin()` is the fake's own resolver, so a
+   * transaction resolves against the fake's objects, gas price and coins with
+   * no network.
+   */
+  readonly client: ClientWithCoreApi
   /** Every call the fake has received, oldest first. */
   readonly calls: Effect.Effect<ReadonlyArray<RecordedCall>>
   /** How many calls were aborted by interruption or timeout. */
@@ -155,6 +179,14 @@ interface Mutable {
     getTransaction: ReadonlyArray<FakeOutcome>
   }
   pendingDigests: Map<string, boolean>
+  knownTransactions: Map<string, SettledTransaction>
+}
+
+/** What a settled call produced, kept so `getTransaction` can serve it again. */
+interface SettledTransaction {
+  readonly transaction: SuiClientTypes.Transaction<SuiClientTypes.TransactionInclude>
+  readonly failed: boolean
+  readonly commandResults: ReadonlyArray<SuiClientTypes.CommandResult>
 }
 
 const DEFAULT_GAS: SuiClientTypes.GasCostSummary = {
@@ -340,7 +372,8 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
         execute: script.execute ?? [],
         getTransaction: script.getTransaction ?? []
       },
-      pendingDigests: new Map()
+      pendingDigests: new Map(),
+      knownTransactions: new Map()
     })
   })
 
@@ -402,11 +435,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     outcome: FakeOutcome,
     method: "simulate" | "execute" | "getTransaction",
     digest: string
-  ): Promise<{
-    readonly transaction: SuiClientTypes.Transaction<SuiClientTypes.TransactionInclude>
-    readonly failed: boolean
-    readonly commandResults: ReadonlyArray<SuiClientTypes.CommandResult>
-  }> => {
+  ): Promise<SettledTransaction> => {
     switch (outcome._tag) {
       case "transportError":
         throw rpcError(outcome.status)
@@ -494,12 +523,18 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     return waitForAbort(signal)
   }
 
+  const METHOD_NAMES = {
+    simulate: "simulateTransaction",
+    execute: "executeTransaction",
+    getTransaction: "getTransaction"
+  } as const
+
   const settle = async (
     method: "simulate" | "execute" | "getTransaction",
     digest: string,
     options: unknown
-  ) => {
-    const outcome = next(method) ?? unimplemented(`${method}Transaction`)
+  ): Promise<SettledTransaction> => {
+    const outcome = next(method) ?? unimplemented(METHOD_NAMES[method])
     if (outcome._tag === "timeoutThen") {
       state.pendingDigests.set(digest, outcome.found)
       return pending<never>(method, options)
@@ -507,13 +542,97 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     return applyOutcome(outcome, method, digest)
   }
 
-  const asResult = (result: {
-    readonly transaction: SuiClientTypes.Transaction<SuiClientTypes.TransactionInclude>
-    readonly failed: boolean
-  }) =>
+  const asResult = (result: SettledTransaction) =>
     result.failed
       ? { $kind: "FailedTransaction", FailedTransaction: result.transaction }
       : { $kind: "Transaction", Transaction: result.transaction }
+
+  const coinsOf = (
+    owner: string,
+    coinType?: string
+  ): ReadonlyArray<SuiClientTypes.Coin> => {
+    const address = normalizeSuiAddress(owner)
+    const wanted = normalizeStructTag(`0x2::coin::Coin<${coinType ?? SUI_TYPE_ARG}>`)
+    return (script.coins ?? []).filter((coin) => {
+      if (coin.owner.$kind !== "AddressOwner") return false
+      if (normalizeSuiAddress(coin.owner.AddressOwner) !== address) return false
+      try {
+        return normalizeStructTag(coin.type) === wanted
+      } catch {
+        return false
+      }
+    })
+  }
+
+  /**
+   * The fake's stand-in for the transport's resolve plugin, so
+   * `transaction.build({ client })` works with no network.
+   *
+   * It fills the gas price from the scripted reference gas price, the gas
+   * budget from `script.gasBudget` (default 50 MIST-per-unit times the price),
+   * gas payment from the scripted coins the payer owns when it is unset (an
+   * explicit `[]` is left alone, the way a sponsored transaction wants it), and
+   * resolves every `UnresolvedObject` input from the object map, choosing a
+   * shared, immutable or owned reference from the stored owner. Everything else
+   * — argument normalization, BCS layout, validation — is the SDK's own
+   * `TransactionDataBuilder`.
+   *
+   * It does not run Move, so it cannot resolve an `UnresolvedPure` whose type
+   * only the function signature knows: use `tx.pure.u64(...)` and friends.
+   */
+  const resolvePlugin: TransactionPlugin = async (transactionData, options, next) => {
+    if (!options.onlyTransactionKind) {
+      if (!transactionData.gasData.price) {
+        transactionData.gasData.price = String(script.referenceGasPrice ?? 1000n)
+      }
+      if (!transactionData.gasData.budget) {
+        transactionData.gasData.budget = String(script.gasBudget ?? 50_000_000n)
+      }
+    }
+    transactionData.inputs.forEach((input, index) => {
+      const unresolved = input.UnresolvedObject
+      if (!unresolved) return
+      const id = normalizeSuiAddress(unresolved.objectId)
+      const object = lookup(id)
+      const owner = object.owner ?? addressOwner("0x1")
+      const initialSharedVersion = owner.$kind === "Shared"
+        ? owner.Shared.initialSharedVersion
+        : owner.$kind === "ConsensusAddressOwner"
+        ? owner.ConsensusAddressOwner.startVersion
+        : null
+      const shared = unresolved.initialSharedVersion ?? initialSharedVersion
+      transactionData.inputs[index] = shared
+        ? Inputs.SharedObjectRef({
+          objectId: id,
+          initialSharedVersion: shared,
+          mutable: unresolved.mutable ?? true
+        })
+        : Inputs.ObjectRef({
+          objectId: id,
+          digest: unresolved.digest ?? toSdkObject(object).digest,
+          version: unresolved.version ?? object.version.toString()
+        })
+    })
+    if (!options.onlyTransactionKind && transactionData.gasData.payment == null) {
+      const payer = transactionData.gasData.owner ?? transactionData.sender
+      const coins = payer === null ? [] : coinsOf(payer)
+      transactionData.gasData.payment = coins.map((coin) => ({
+        objectId: coin.objectId,
+        version: coin.version,
+        digest: coin.digest
+      }))
+    }
+    await next()
+  }
+
+  /** The digest of the bytes that were handed to us, as the network derives it. */
+  const digestOfBytes = (bytes: Uint8Array): string => {
+    try {
+      return TransactionDataBuilder.getDigestFromBytes(bytes)
+    } catch {
+      return fakeDigest(state.calls.length + 1)
+    }
+  }
 
   const core = {
     getObject: async (options: SuiClientTypes.GetObjectOptions) => {
@@ -550,7 +669,12 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     listCoins: async (options: SuiClientTypes.ListCoinsOptions) => {
       record("listCoins", options)
-      return unimplemented("listCoins")
+      const result = page(coinsOf(options.owner, options.coinType), options.cursor, options.limit)
+      return {
+        objects: result.items as Array<SuiClientTypes.Coin>,
+        hasNextPage: result.hasNextPage,
+        cursor: result.cursor
+      }
     },
     listDynamicFields: async (options: SuiClientTypes.ListDynamicFieldsOptions) => {
       record("listDynamicFields", options)
@@ -615,14 +739,20 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     getTransaction: async (options: SuiClientTypes.GetTransactionOptions) => {
       record("getTransaction", options)
-      const known = state.pendingDigests.get(options.digest)
-      if (known === false) throw new TransactionError("notFound", options.digest)
+      const pending = state.pendingDigests.get(options.digest)
+      if (pending === false) throw new TransactionError("notFound", options.digest)
+      const known = state.knownTransactions.get(options.digest)
+      if (known !== undefined && state.scripts.getTransaction.length === 0) {
+        return asResult(known)
+      }
       return asResult(await settle("getTransaction", options.digest, options))
     },
     executeTransaction: async (options: SuiClientTypes.ExecuteTransactionOptions) => {
       record("executeTransaction", options)
-      const digest = fakeDigest(state.calls.length + 1)
-      return asResult(await settle("execute", digest, options))
+      const digest = digestOfBytes(options.transaction)
+      const settled = await settle("execute", digest, options)
+      state.knownTransactions.set(digest, settled)
+      return asResult(settled)
     },
     signAndExecuteTransaction: async (
       options: SuiClientTypes.SignAndExecuteTransactionOptions
@@ -635,13 +765,19 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       const digest = "digest" in options && options.digest !== undefined
         ? options.digest
         : fakeDigest(1)
-      const known = state.pendingDigests.get(digest)
-      if (known === false) throw new TransactionError("notFound", digest)
+      const pending = state.pendingDigests.get(digest)
+      if (pending === false) throw new TransactionError("notFound", digest)
+      const known = state.knownTransactions.get(digest)
+      if (known !== undefined && state.scripts.getTransaction.length === 0) {
+        return asResult(known)
+      }
       return asResult(await settle("getTransaction", digest, options))
     },
     simulateTransaction: async (options: SuiClientTypes.SimulateTransactionOptions) => {
       record("simulateTransaction", options)
-      const digest = fakeDigest(state.calls.length + 100)
+      const digest = options.transaction instanceof Uint8Array
+        ? digestOfBytes(options.transaction)
+        : fakeDigest(state.calls.length + 100)
       const result = await settle("simulate", digest, options)
       return { ...asResult(result), commandResults: result.commandResults }
     },
@@ -701,7 +837,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         return unimplemented("mvr.resolve")
       }
     },
-    resolveTransactionPlugin: () => unimplemented("resolveTransactionPlugin")
+    resolveTransactionPlugin: () => resolvePlugin
   }
 
   const client = {
@@ -713,6 +849,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
 
   return {
     core: makeFromClient(client),
+    client,
     calls: Effect.sync(() => [...state.calls]),
     aborted: Effect.sync(() => state.aborted),
     setObject: (object) =>

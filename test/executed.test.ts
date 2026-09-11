@@ -160,8 +160,55 @@ describe("Executed", () => {
     expect(deleted[0]?.version).toBe(8n as never)
   })
 
-  test("packagesPublished returns PackageWrite creations", () => {
-    expect(executed().packagesPublished()).toEqual([PACKAGE as never])
+  test("packagesPublished returns full refs, not bare ids", () => {
+    const published = executed().packagesPublished()
+    expect(published).toHaveLength(1)
+    expect(published[0]?.id).toBe(PACKAGE as never)
+    expect(published[0]?.version).toBe(9n as never)
+    expect(published[0]?.digest).toBe(fakeDigest(2))
+  })
+
+  test("a package whose type is the literal `package` still produces a ref", () => {
+    const raw = result(true)
+    const transaction = raw.$kind === "Transaction" ? raw.Transaction : raw.FailedTransaction
+    const patched = {
+      ...raw,
+      Transaction: {
+        ...transaction,
+        objectTypes: { ...transaction.objectTypes, [PACKAGE]: "package" }
+      }
+    } as unknown as SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
+    const value = Effect.runSync(Effect.result(fromTransactionResult(patched)))
+    expect(Result.isSuccess(value)).toBe(true)
+    if (Result.isSuccess(value)) {
+      const published = value.success.packagesPublished()
+      expect(published).toHaveLength(1)
+      expect(published[0]?.type).toBe("package")
+    }
+  })
+
+  test("expectCreated fails with UnexpectedEffects when many match", async () => {
+    const raw = result(true)
+    const transaction = raw.$kind === "Transaction" ? raw.Transaction : raw.FailedTransaction
+    const second = PADDED("4ecf")
+    const patched = {
+      ...raw,
+      Transaction: {
+        ...transaction,
+        effects: {
+          ...transaction.effects,
+          changedObjects: [...transaction.effects.changedObjects, change({ objectId: second })]
+        },
+        objectTypes: { ...transaction.objectTypes, [second]: "0x2::escrow::Receipt" }
+      }
+    } as unknown as SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
+    const value = Effect.runSync(Effect.result(fromTransactionResult(patched)))
+    if (!Result.isSuccess(value)) throw new Error("fixture did not decode")
+    const error = await Effect.runPromise(
+      value.success.expectCreated("0x2::escrow::Receipt").pipe(Effect.flip)
+    )
+    expect(error._tag).toBe("UnexpectedEffects")
+    expect(error.found).toHaveLength(2)
   })
 
   test("balanceChange sums every delta for an address and coin type", () => {

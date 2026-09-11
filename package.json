@@ -20,6 +20,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "prepare": "effect-language-service patch",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
@@ -44,7 +45,7 @@
   },
   "packageManager": "bun@1.4.2",
   "peerDependencies": {
-    "@mysten/bcs": "^2.1.0",
+    "@mysten/bcs": "^2.1.1",
     "@mysten/sui": "^2.28",
     "effect": ">=4.0.0-rc.112 <4.1"
   },

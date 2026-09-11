@@ -27,6 +27,7 @@ import {
   Digest,
   Mist,
   ObjectId,
+  ObjectType,
   Owner,
   StructTag,
   SuiAddress,
@@ -135,34 +136,59 @@ describe("branded schemas", () => {
 })
 
 describe("schema round trips", () => {
-  const cases: ReadonlyArray<readonly [string, Schema.Codec<unknown, unknown>]> = [
-    ["SuiAddress", SuiAddress as unknown as Schema.Codec<unknown, unknown>],
-    ["ObjectId", ObjectId as unknown as Schema.Codec<unknown, unknown>],
-    ["Digest", Digest as unknown as Schema.Codec<unknown, unknown>],
-    ["StructTag", StructTag as unknown as Schema.Codec<unknown, unknown>],
-    ["CoinType", CoinType as unknown as Schema.Codec<unknown, unknown>],
-    ["Mist", Mist as unknown as Schema.Codec<unknown, unknown>],
-    ["Version", Version as unknown as Schema.Codec<unknown, unknown>],
-    ["Owner", Owner as unknown as Schema.Codec<unknown, unknown>],
-    ["TransactionEffects", TransactionEffects as unknown as Schema.Codec<unknown, unknown>]
+  /**
+   * One encoded fixture per branded schema, the value it decodes to, and what
+   * that value encodes back to. The three differ for the schemas that
+   * normalize: `0x2` decodes to the padded address and encodes back padded.
+   */
+  const roundTrips: ReadonlyArray<
+    readonly [string, Schema.Codec<any, any>, unknown, unknown, unknown]
+  > = [
+    ["SuiAddress", SuiAddress, "0x2", `0x${"0".repeat(63)}2`, `0x${"0".repeat(63)}2`],
+    ["ObjectId", ObjectId, "0x6", `0x${"0".repeat(63)}6`, `0x${"0".repeat(63)}6`],
+    ["Digest", Digest, DIGEST, DIGEST, DIGEST],
+    [
+      "StructTag",
+      StructTag,
+      "0x2::coin::Coin<0x2::sui::SUI>",
+      `0x${"0".repeat(63)}2::coin::Coin<0x${"0".repeat(63)}2::sui::SUI>`,
+      `0x${"0".repeat(63)}2::coin::Coin<0x${"0".repeat(63)}2::sui::SUI>`
+    ],
+    ["CoinType", CoinType, "0x2::sui::SUI", `0x${"0".repeat(63)}2::sui::SUI`, `0x${"0".repeat(63)}2::sui::SUI`],
+    ["Mist", Mist, "42", 42n, "42"],
+    ["Version", Version, "7", 7n, "7"],
+    [
+      "Owner",
+      Owner,
+      { $kind: "Shared", Shared: { initialSharedVersion: "3" } },
+      { $kind: "Shared", Shared: { initialSharedVersion: 3n } },
+      { $kind: "Shared", Shared: { initialSharedVersion: "3" } }
+    ],
+    [
+      "ObjectType (struct tag)",
+      ObjectType,
+      "0x2::escrow::Escrow",
+      `0x${"0".repeat(63)}2::escrow::Escrow`,
+      `0x${"0".repeat(63)}2::escrow::Escrow`
+    ],
+    ["ObjectType (package)", ObjectType, "package", "package", "package"]
   ]
 
-  for (const [name, schema] of cases) {
-    test(`${name} has an asserts harness`, () => {
-      expect(new TestSchema.Asserts(schema)).toBeDefined()
+  for (const [name, schema, encoded, decoded, reencoded] of roundTrips) {
+    test(`${name} decodes and encodes`, async () => {
+      const asserts = new TestSchema.Asserts(schema)
+      await asserts.decoding().succeed(encoded, decoded)
+      await asserts.encoding().succeed(decoded, reencoded)
     })
   }
 
-  test("SuiAddress round trips through decoding and encoding", async () => {
-    const asserts = new TestSchema.Asserts(SuiAddress)
-    await asserts.decoding().succeed("0x2", `0x${"0".repeat(63)}2` as SuiAddress)
-    await asserts.encoding().succeed(`0x${"0".repeat(63)}2` as SuiAddress, `0x${"0".repeat(63)}2`)
-  })
-
-  test("Mist round trips", async () => {
-    const asserts = new TestSchema.Asserts(Mist)
-    await asserts.decoding().succeed("42", 42n as Mist)
-    await asserts.encoding().succeed(42n as Mist, "42")
+  test("TransactionEffects decodes an SDK response and encodes back to it", async () => {
+    const asserts = new TestSchema.Asserts(TransactionEffects)
+    const encoded = effects(true)
+    const decoded = decode(TransactionEffects, encoded)
+    if (!Result.isSuccess(decoded)) throw new Error("fixture did not decode")
+    await asserts.decoding().succeed(encoded, decoded.success)
+    await asserts.encoding().succeed(decoded.success, encoded)
   })
 })
 
@@ -230,6 +256,98 @@ describe("error classes", () => {
       const json = SuiError.toJson(instance)
       expect(json._tag).toBe(instance._tag)
       expect(typeof SuiError.describe(instance)).toBe("string")
+    }
+  })
+
+  test("every error class decodes and encodes through TestSchema.Asserts", async () => {
+    const f = built()
+    const cases: ReadonlyArray<readonly [Schema.Codec<any, any>, unknown]> = [
+      [
+        TransportError,
+        new TransportError({
+          method: "getObject",
+          retryable: true,
+          status: "UNAVAILABLE",
+          cause: "x"
+        })
+      ],
+      [ObjectNotFound, new ObjectNotFound({ objectId: f.objectId })],
+      [ObjectDeleted, new ObjectDeleted({ objectId: f.objectId, version: 7n as never })],
+      [ObjectUnavailable, new ObjectUnavailable({ objectId: f.objectId })],
+      [TransactionNotFound, new TransactionNotFound({ digest: f.digest })],
+      [NetworkMismatch, new NetworkMismatch({ expected: "a", actual: "b" })],
+      [
+        DecodeError,
+        new DecodeError({ objectId: f.objectId, expectedType: "0x2::sui::SUI", issue: "bad" })
+      ],
+      [SimulationFailed, new SimulationFailed({ reason: moveAbort, message: "aborted" })],
+      [
+        ExecutionFailed,
+        new ExecutionFailed({ digest: f.digest, reason: moveAbort, command: 1, effects: f.effects })
+      ],
+      [
+        SubmissionUnknown,
+        new SubmissionUnknown({
+          digest: f.digest,
+          signed: {
+            digest: f.digest,
+            bytes: new Uint8Array([1, 2, 3]),
+            signatures: ["sig"],
+            sender: f.address,
+            maxTimestampMs: 99n
+          },
+          cause: "timeout"
+        })
+      ],
+      [NotApplied, new NotApplied({ digest: f.digest, evidence: "inputConsumed" })],
+      [SigningError, new SigningError({ cause: "no key" })],
+      [BuildError, new BuildError({ message: "no gas", cause: "x" })],
+      [PolicyDenied, new PolicyDenied({ rule: "spend-limit", message: "too much" })],
+      [JournalError, new JournalError({ cause: "disk" })],
+      [
+        UnexpectedEffects,
+        new UnexpectedEffects({
+          digest: f.digest,
+          // `StructTag.make` brands without running the normalizing decode, so
+          // the fixture is spelled the way a decode would produce it.
+          expected: StructTag.make(
+            `0x${"0".repeat(63)}2::coin::Coin<0x${"0".repeat(63)}2::sui::SUI>`
+          ),
+          found: [f.objectId]
+        })
+      ]
+    ]
+    expect(cases).toHaveLength(16)
+    for (const [schema, instance] of cases) {
+      const asserts = new TestSchema.Asserts(schema)
+      const encoded = Schema.encodeUnknownSync(schema)(instance)
+      // JSON-safe: nothing here survives as a typed array or a bigint.
+      expect(() => JSON.stringify(encoded)).not.toThrow()
+      await asserts.encoding().succeed(instance, encoded)
+      await asserts.decoding().succeed(encoded, instance)
+    }
+  })
+
+  test("SubmissionUnknown encodes its signed bytes as base64, and toJson is JSON", () => {
+    const f = built()
+    const error = new SubmissionUnknown({
+      digest: f.digest,
+      signed: {
+        digest: f.digest,
+        bytes: new Uint8Array([0, 1, 2, 253, 254, 255]),
+        signatures: ["sig"],
+        sender: f.address
+      },
+      cause: "timeout"
+    })
+    const json = SuiError.toJson(error)
+    const signed = (json as { signed: { bytes: unknown } }).signed
+    expect(signed.bytes).toBe("AAEC/f7/")
+    expect(JSON.parse(JSON.stringify(json))).toMatchObject({ _tag: "SubmissionUnknown" })
+    const decoded = decode(SubmissionUnknown, json)
+    expect(Result.isSuccess(decoded)).toBe(true)
+    if (Result.isSuccess(decoded)) {
+      expect(Array.from(decoded.success.signed.bytes)).toEqual([0, 1, 2, 253, 254, 255])
     }
   })
 

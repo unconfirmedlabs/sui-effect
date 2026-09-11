@@ -24,6 +24,55 @@ test("SuiCore covers every TransportMethods key", () => {
   expect(assertNever<MissingConveniences>()).toBe(true)
 })
 
+/** True when `A` is assignable to `B`, as a value the test can assert on. */
+const assignable = <_A extends _B, _B>(): true => true
+
+test("Include generics are preserved on every method that takes one", () => {
+  const service = null as unknown as SuiCoreService
+
+  type Objects = Effect.Success<ReturnType<typeof service.getObjects<{ content: true }>>>
+  expect(assignable<Exclude<Objects["objects"][number], Error>["content"], Uint8Array>()).toBe(true)
+  type BareObjects = Effect.Success<ReturnType<typeof service.getObjects>>
+  expect(assignable<Exclude<BareObjects["objects"][number], Error>["content"], undefined>()).toBe(
+    true
+  )
+
+  type Owned = Effect.Success<ReturnType<typeof service.listOwnedObjects<{ content: true }>>>
+  expect(assignable<Owned["objects"][number]["content"], Uint8Array>()).toBe(true)
+  type BareOwned = Effect.Success<ReturnType<typeof service.listOwnedObjects>>
+  expect(assignable<BareOwned["objects"][number]["content"], undefined>()).toBe(true)
+
+  type Transaction = Effect.Success<ReturnType<typeof service.getTransaction<{ events: true }>>>
+  type Events = Extract<Transaction, { $kind: "Transaction" }>["Transaction"]["events"]
+  expect(assignable<Events, ReadonlyArray<SuiClientTypes.Event>>()).toBe(true)
+  type BareTransaction = Effect.Success<ReturnType<typeof service.getTransaction>>
+  type BareEvents = Extract<BareTransaction, { $kind: "Transaction" }>["Transaction"]["events"]
+  expect(assignable<BareEvents, undefined>()).toBe(true)
+
+  type Executed = Effect.Success<ReturnType<typeof service.executeTransaction<{ effects: true }>>>
+  type Effects = Extract<Executed, { $kind: "Transaction" }>["Transaction"]["effects"]
+  expect(assignable<Effects, SuiClientTypes.TransactionEffects>()).toBe(true)
+
+  type Waited = Effect.Success<ReturnType<typeof service.waitForTransaction<{ effects: true }>>>
+  type WaitedEffects = Extract<Waited, { $kind: "Transaction" }>["Transaction"]["effects"]
+  expect(assignable<WaitedEffects, SuiClientTypes.TransactionEffects>()).toBe(true)
+
+  type Simulated = Effect.Success<
+    ReturnType<typeof service.simulateTransaction<{ commandResults: true }>>
+  >
+  expect(assignable<Simulated["commandResults"], ReadonlyArray<SuiClientTypes.CommandResult>>())
+    .toBe(true)
+  type BareSimulated = Effect.Success<ReturnType<typeof service.simulateTransaction>>
+  expect(assignable<BareSimulated["commandResults"], undefined>()).toBe(true)
+
+  type Listed = Effect.Success<ReturnType<typeof service.listTransactions<{ effects: true }>>>
+  type ListedEffects = Extract<
+    Listed["transactions"][number],
+    { $kind: "Transaction" }
+  >["Transaction"]["effects"]
+  expect(assignable<ListedEffects, SuiClientTypes.TransactionEffects>()).toBe(true)
+})
+
 test("Include generics are preserved", () => {
   const service = null as unknown as SuiCoreService
   type ObjectResult = Effect.Success<ReturnType<typeof service.getObject<{ content: true }>>>

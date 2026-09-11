@@ -11,6 +11,8 @@ the work plan. Where this file and the spec disagree, fix this file.
 - **SDK names are the source of truth.** Read
   `node_modules/@mysten/sui/docs/llms-index.md` first, then the version-matched
   page, then confirm the signature in `node_modules/@mysten/sui/dist/**/*.d.mts`.
+- Everything that is not public API lives in `src/internal.ts`, which is not in
+  the `exports` map. `src/index.ts` is exactly the public surface.
 - **Every public name mirrors the SDK name it wraps**, so an agent that knows
   `@mysten/sui` can guess sui-effect.
 - Nothing under `src/` imports `@effect/platform-bun` or `bun:*`. `@effect/platform-bun`
@@ -25,7 +27,10 @@ the work plan. Where this file and the spec disagree, fix this file.
   `layerNoDeps`, `layerConfig`, a test layer). Every error is a
   `Schema.TaggedError`. Schema decodes at every boundary. Time comes from
   `DateTime`/`Clock`, randomness from `Random`, config from `Config`.
-- Every service method has a span named after it.
+- Every service method is `Effect.fn("Service.method")`, which names its span.
+  The only exceptions are `Sui.getObject`, `getObjectOption` and `getObjects`,
+  whose declared types are overload sets `Effect.fn` cannot express; their
+  implementations are still `Effect.fn`.
 - Every SDK call forwards the Effect's `AbortSignal` into the SDK's `signal`
   option, so `Effect.timeout` and interruption cancel the request.
 - Tests run on `bun test` with `effect/testing` (`TestClock`, `TestSchema`).
@@ -45,7 +50,10 @@ calls `SuiCore.executeTransaction` directly.
 
 `SuiCore` retries retryable `TransportError`s on reads only
 (`Schedule.min([exponential("250 millis"), spaced("10 seconds")])` jittered, five
-attempts). `executeTransaction` is never retried at this tier.
+attempts). Retryable means gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`,
+`RESOURCE_EXHAUSTED`, `INTERNAL` or `UNKNOWN`, HTTP 5xx or 429, or a timeout;
+`INTERNAL` and `UNKNOWN` are how grpc-web reports that the request never reached
+a node at all. `executeTransaction` is never retried at this tier.
 
 ## The error taxonomy
 
@@ -77,5 +85,10 @@ Every failure is one flat tag; there is no error inheritance.
 BCS content, the Clock object `0x6`, and scripted outcomes
 (`FakeOutcome.succeed`, `failWith`, `transportError`, `notFound`, `timeoutThen`)
 for simulate, execute and `getTransaction`. It records every call so a test can
-assert the include set that was sent. Any method the script does not cover dies
-with a message naming it: a test never silently passes against a stub.
+assert the include set that was sent. It also implements
+`resolveTransactionPlugin` and `listCoins`, so `transaction.build({ client })`
+against the fake's `client` resolves gas and object inputs from the script with
+no network, and it keys transactions by
+`TransactionDataBuilder.getDigestFromBytes` of the bytes it was handed. Any
+method the script does not cover dies with a message naming it: a test never
+silently passes against a stub.

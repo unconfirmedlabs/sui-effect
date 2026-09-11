@@ -62,13 +62,22 @@ const asDigest = (value: string): Digest => {
 }
 
 /**
- * gRPC status names a read may be retried on, plus HTTP 5xx and 429. Mirrors
- * the spec's list; timeouts map to `DEADLINE_EXCEEDED` with `retryable: true`.
+ * gRPC status names a read may be retried on, plus HTTP 5xx and 429. Timeouts
+ * map to `DEADLINE_EXCEEDED` with `retryable: true`.
+ *
+ * `INTERNAL` and `UNKNOWN` are transport-level failures, not answers from the
+ * node: `@protobuf-ts/grpcweb-transport` turns a rejected `fetch` (connection
+ * refused, DNS failure) into an `RpcError` with code `INTERNAL`, and its
+ * grpc-web format maps HTTP 500 to `UNKNOWN` (503 to `UNAVAILABLE`, 504 to
+ * `DEADLINE_EXCEEDED`, 429 to `RESOURCE_EXHAUSTED`). Without them a read
+ * against a node that is merely down or restarting is never retried.
  */
-const RETRYABLE_GRPC_STATUSES: ReadonlySet<string> = new Set([
+export const RETRYABLE_GRPC_STATUSES: ReadonlySet<string> = new Set([
   "UNAVAILABLE",
   "DEADLINE_EXCEEDED",
-  "RESOURCE_EXHAUSTED"
+  "RESOURCE_EXHAUSTED",
+  "INTERNAL",
+  "UNKNOWN"
 ])
 
 const isRetryableHttpStatus = (status: number): boolean => status === 429 || status >= 500
@@ -125,7 +134,10 @@ const transportError = (method: string, cause: unknown): TransportError => {
  * any thrown value at all) to a `TransportError` whose `retryable` says whether
  * a read may try again.
  *
- * Never fails: it is a total function from a thrown value to an error class.
+ * Total on every value a transport can throw. The one exception is a value
+ * carrying {@link DefectMarker}, which is a bug in the caller or in a test
+ * double rather than a transport failure: that is re-thrown so it surfaces as a
+ * defect instead of being mislabelled a `TransportError`.
  */
 export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
   rethrowDefects(cause)
@@ -202,14 +214,6 @@ const retryReads = <A, E extends { readonly _tag: string }, R>(
     while: (error: E) =>
       error._tag === "TransportError" && (error as unknown as TransportError).retryable
   })
-
-/** How the SDK client is reached; the fake implements the same shape. */
-export interface SuiCoreCall {
-  <A>(
-    method: string,
-    run: (client: ClientWithCoreApi, signal: AbortSignal) => Promise<A>
-  ): Effect.Effect<A, unknown>
-}
 
 type ObjectInclude = SuiClientTypes.ObjectInclude
 type TransactionInclude = SuiClientTypes.TransactionInclude
@@ -474,15 +478,17 @@ const makeGrpcClient = (options: SuiGrpcLayerOptions): ClientWithCoreApi =>
  * and tests can build the same implementation over any `ClientWithCoreApi`.
  */
 export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
+  // Every member below is an `Effect.fn("SuiCore.<method>")`, so the span is
+  // named after the method and `call` does not add one of its own.
   const call = <A, E>(
-    method: string,
+    _method: string,
     run: (core: ClientWithCoreApi["core"], signal: AbortSignal) => Promise<A>,
     onError: (cause: unknown) => E
   ): Effect.Effect<A, E> =>
     Effect.tryPromise({
       try: (signal) => run(client.core, signal),
       catch: onError
-    }).pipe(Effect.withSpan(`SuiCore.${method}`))
+    })
 
   const read = <A, E extends { readonly _tag: string }>(
     method: string,
@@ -492,184 +498,272 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
 
   return {
     network: client.network,
-    getObjects: (options) =>
-      read(
+    getObjects: Effect.fn("SuiCore.getObjects")(function*<Include extends ObjectInclude = {}>(
+      options: SuiClientTypes.GetObjectsOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.GetObjectsResponse<Include>, TransportError> {
+      return yield* read(
         "getObjects",
         (core, signal) => core.getObjects({ ...options, signal }),
         onlyTransportError("getObjects")
-      ),
-    getObject: (options) =>
-      read(
+      )
+    }),
+    getObject: Effect.fn("SuiCore.getObject")(function*<Include extends ObjectInclude = {}>(
+      options: SuiClientTypes.GetObjectOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.GetObjectResponse<Include>, ObjectLookupError> {
+      return yield* read(
         "getObject",
         (core, signal) => core.getObject({ ...options, signal }),
         objectError("getObject")
-      ),
-    listOwnedObjects: (options) =>
-      read(
+      )
+    }),
+    listOwnedObjects: Effect.fn("SuiCore.listOwnedObjects")(function*<Include extends ObjectInclude = {}>(
+      options: SuiClientTypes.ListOwnedObjectsOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.ListOwnedObjectsResponse<Include>, TransportError> {
+      return yield* read(
         "listOwnedObjects",
         (core, signal) => core.listOwnedObjects({ ...options, signal }),
         onlyTransportError("listOwnedObjects")
-      ),
-    listCoins: (options) =>
-      read(
+      )
+    }),
+    listCoins: Effect.fn("SuiCore.listCoins")(function*(
+      options: SuiClientTypes.ListCoinsOptions
+    ): Effect.fn.Return<SuiClientTypes.ListCoinsResponse, TransportError> {
+      return yield* read(
         "listCoins",
         (core, signal) => core.listCoins({ ...options, signal }),
         onlyTransportError("listCoins")
-      ),
-    listDynamicFields: (options) =>
-      read(
+      )
+    }),
+    listDynamicFields: Effect.fn("SuiCore.listDynamicFields")(function*(
+      options: SuiClientTypes.ListDynamicFieldsOptions
+    ): Effect.fn.Return<SuiClientTypes.ListDynamicFieldsResponse, TransportError> {
+      return yield* read(
         "listDynamicFields",
         (core, signal) => core.listDynamicFields({ ...options, signal }),
         onlyTransportError("listDynamicFields")
-      ),
-    getDynamicField: (options) =>
-      read(
+      )
+    }),
+    getDynamicField: Effect.fn("SuiCore.getDynamicField")(function*(
+      options: SuiClientTypes.GetDynamicFieldOptions
+    ): Effect.fn.Return<SuiClientTypes.GetDynamicFieldResponse, ObjectLookupError> {
+      return yield* read(
         "getDynamicField",
         (core, signal) => core.getDynamicField({ ...options, signal }),
         objectError("getDynamicField")
-      ),
-    getDynamicObjectField: (options) =>
-      read(
+      )
+    }),
+    getDynamicObjectField: Effect.fn("SuiCore.getDynamicObjectField")(function*<Include extends ObjectInclude = {}>(
+      options: SuiClientTypes.GetDynamicObjectFieldOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.GetDynamicObjectFieldResponse<Include>, ObjectLookupError> {
+      return yield* read(
         "getDynamicObjectField",
         (core, signal) => core.getDynamicObjectField({ ...options, signal }),
         objectError("getDynamicObjectField")
-      ),
-    getBalance: (options) =>
-      read(
+      )
+    }),
+    getBalance: Effect.fn("SuiCore.getBalance")(function*(
+      options: SuiClientTypes.GetBalanceOptions
+    ): Effect.fn.Return<SuiClientTypes.GetBalanceResponse, TransportError> {
+      return yield* read(
         "getBalance",
         (core, signal) => core.getBalance({ ...options, signal }),
         onlyTransportError("getBalance")
-      ),
-    listBalances: (options) =>
-      read(
+      )
+    }),
+    listBalances: Effect.fn("SuiCore.listBalances")(function*(
+      options: SuiClientTypes.ListBalancesOptions
+    ): Effect.fn.Return<SuiClientTypes.ListBalancesResponse, TransportError> {
+      return yield* read(
         "listBalances",
         (core, signal) => core.listBalances({ ...options, signal }),
         onlyTransportError("listBalances")
-      ),
-    getCoinMetadata: (options) =>
-      read(
+      )
+    }),
+    getCoinMetadata: Effect.fn("SuiCore.getCoinMetadata")(function*(
+      options: SuiClientTypes.GetCoinMetadataOptions
+    ): Effect.fn.Return<SuiClientTypes.GetCoinMetadataResponse, TransportError> {
+      return yield* read(
         "getCoinMetadata",
         (core, signal) => core.getCoinMetadata({ ...options, signal }),
         onlyTransportError("getCoinMetadata")
-      ),
-    getTransaction: (options) =>
-      read(
+      )
+    }),
+    getTransaction: Effect.fn("SuiCore.getTransaction")(function*<Include extends TransactionInclude = {}>(
+      options: SuiClientTypes.GetTransactionOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransactionLookupError> {
+      return yield* read(
         "getTransaction",
         (core, signal) => core.getTransaction({ ...options, signal }),
         transactionError("getTransaction")
-      ),
-    executeTransaction: (options) =>
-      call(
+      )
+    }),
+    executeTransaction: Effect.fn("SuiCore.executeTransaction")(function*<Include extends TransactionInclude = {}>(
+      options: SuiClientTypes.ExecuteTransactionOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransportError> {
+      return yield* call(
         "executeTransaction",
         (core, signal) => core.executeTransaction({ ...options, signal }),
         onlyTransportError("executeTransaction")
-      ),
-    signAndExecuteTransaction: (options) =>
-      call(
+      )
+    }),
+    signAndExecuteTransaction: Effect.fn("SuiCore.signAndExecuteTransaction")(function*<Include extends TransactionInclude = {}>(
+      options: SuiClientTypes.SignAndExecuteTransactionOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransportError> {
+      return yield* call(
         "signAndExecuteTransaction",
         (core, signal) => core.signAndExecuteTransaction({ ...options, signal }),
         onlyTransportError("signAndExecuteTransaction")
-      ),
-    waitForTransaction: (options) =>
-      read(
+      )
+    }),
+    waitForTransaction: Effect.fn("SuiCore.waitForTransaction")(function*<Include extends TransactionInclude = {}>(
+      options: SuiClientTypes.WaitForTransactionOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransactionLookupError> {
+      return yield* read(
         "waitForTransaction",
         (core, signal) => core.waitForTransaction({ ...options, signal }),
         transactionError("waitForTransaction")
-      ),
-    simulateTransaction: (options) =>
-      read(
+      )
+    }),
+    simulateTransaction: Effect.fn("SuiCore.simulateTransaction")(function*<Include extends SimulateInclude = {}>(
+      options: SuiClientTypes.SimulateTransactionOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.SimulateTransactionResult<Include>, SimulationLookupError> {
+      return yield* read(
         "simulateTransaction",
         (core, signal) => core.simulateTransaction({ ...options, signal }),
         simulationError("simulateTransaction")
-      ),
-    listTransactions: (options) =>
-      read(
+      )
+    }),
+    listTransactions: Effect.fn("SuiCore.listTransactions")(function*<Include extends TransactionInclude = {}>(
+      options: SuiClientTypes.ListTransactionsOptions<Include>
+    ): Effect.fn.Return<SuiClientTypes.ListTransactionsResponse<Include>, TransportError> {
+      return yield* read(
         "listTransactions",
         (core, signal) => core.listTransactions({ ...options, signal }),
         onlyTransportError("listTransactions")
-      ),
-    listEvents: (options) =>
-      read(
+      )
+    }),
+    listEvents: Effect.fn("SuiCore.listEvents")(function*(
+      options: SuiClientTypes.ListEventsOptions
+    ): Effect.fn.Return<SuiClientTypes.ListEventsResponse, TransportError> {
+      return yield* read(
         "listEvents",
         (core, signal) => core.listEvents({ ...options, signal }),
         onlyTransportError("listEvents")
-      ),
-    getReferenceGasPrice: (options) =>
-      read(
+      )
+    }),
+    getReferenceGasPrice: Effect.fn("SuiCore.getReferenceGasPrice")(function*(
+      options?: SuiClientTypes.GetReferenceGasPriceOptions
+    ): Effect.fn.Return<SuiClientTypes.GetReferenceGasPriceResponse, TransportError> {
+      return yield* read(
         "getReferenceGasPrice",
         (core, signal) => core.getReferenceGasPrice({ ...options, signal }),
         onlyTransportError("getReferenceGasPrice")
-      ),
-    getCurrentSystemState: (options) =>
-      read(
+      )
+    }),
+    getCurrentSystemState: Effect.fn("SuiCore.getCurrentSystemState")(function*(
+      options?: SuiClientTypes.GetCurrentSystemStateOptions
+    ): Effect.fn.Return<SuiClientTypes.GetCurrentSystemStateResponse, TransportError> {
+      return yield* read(
         "getCurrentSystemState",
         (core, signal) => core.getCurrentSystemState({ ...options, signal }),
         onlyTransportError("getCurrentSystemState")
-      ),
-    getProtocolConfig: (options) =>
-      read(
+      )
+    }),
+    getProtocolConfig: Effect.fn("SuiCore.getProtocolConfig")(function*(
+      options?: SuiClientTypes.GetProtocolConfigOptions
+    ): Effect.fn.Return<SuiClientTypes.GetProtocolConfigResponse, TransportError> {
+      return yield* read(
         "getProtocolConfig",
         (core, signal) => core.getProtocolConfig({ ...options, signal }),
         onlyTransportError("getProtocolConfig")
-      ),
-    getChainIdentifier: (options) =>
-      read(
+      )
+    }),
+    getChainIdentifier: Effect.fn("SuiCore.getChainIdentifier")(function*(
+      options?: SuiClientTypes.GetChainIdentifierOptions
+    ): Effect.fn.Return<SuiClientTypes.GetChainIdentifierResponse, TransportError> {
+      return yield* read(
         "getChainIdentifier",
         (core, signal) => core.getChainIdentifier({ ...options, signal }),
         onlyTransportError("getChainIdentifier")
-      ),
-    getMoveFunction: (options) =>
-      read(
+      )
+    }),
+    getMoveFunction: Effect.fn("SuiCore.getMoveFunction")(function*(
+      options: SuiClientTypes.GetMoveFunctionOptions
+    ): Effect.fn.Return<SuiClientTypes.GetMoveFunctionResponse, TransportError> {
+      return yield* read(
         "getMoveFunction",
         (core, signal) => core.getMoveFunction({ ...options, signal }),
         onlyTransportError("getMoveFunction")
-      ),
-    verifyZkLoginSignature: (options) =>
-      read(
+      )
+    }),
+    verifyZkLoginSignature: Effect.fn("SuiCore.verifyZkLoginSignature")(function*(
+      options: SuiClientTypes.VerifyZkLoginSignatureOptions
+    ): Effect.fn.Return<SuiClientTypes.ZkLoginVerifyResponse, TransportError> {
+      return yield* read(
         "verifyZkLoginSignature",
         (core, signal) => core.verifyZkLoginSignature({ ...options, signal }),
         onlyTransportError("verifyZkLoginSignature")
-      ),
-    resolveNameServiceAddress: (options) =>
-      read(
+      )
+    }),
+    resolveNameServiceAddress: Effect.fn("SuiCore.resolveNameServiceAddress")(function*(
+      options: SuiClientTypes.ResolveNameServiceAddressOptions
+    ): Effect.fn.Return<SuiClientTypes.ResolveNameServiceAddressResponse, TransportError> {
+      return yield* read(
         "resolveNameServiceAddress",
         (core, signal) => core.resolveNameServiceAddress({ ...options, signal }),
         onlyTransportError("resolveNameServiceAddress")
-      ),
-    defaultNameServiceName: (options) =>
-      read(
+      )
+    }),
+    defaultNameServiceName: Effect.fn("SuiCore.defaultNameServiceName")(function*(
+      options: SuiClientTypes.DefaultNameServiceNameOptions
+    ): Effect.fn.Return<SuiClientTypes.DefaultNameServiceNameResponse, TransportError> {
+      return yield* read(
         "defaultNameServiceName",
         (core, signal) => core.defaultNameServiceName({ ...options, signal }),
         onlyTransportError("defaultNameServiceName")
-      ),
+      )
+    }),
     mvr: {
-      resolvePackage: (options) =>
-        read(
+      resolvePackage: Effect.fn("SuiCore.mvr.resolvePackage")(function*(
+        options: SuiClientTypes.MvrResolvePackageOptions
+      ): Effect.fn.Return<SuiClientTypes.MvrResolvePackageResponse, TransportError> {
+        return yield* read(
           "mvr.resolvePackage",
           (core, signal) => core.mvr.resolvePackage({ ...options, signal }),
           onlyTransportError("mvr.resolvePackage")
-        ),
-      resolveType: (options) =>
-        read(
+        )
+      }),
+      resolveType: Effect.fn("SuiCore.mvr.resolveType")(function*(
+        options: SuiClientTypes.MvrResolveTypeOptions
+      ): Effect.fn.Return<SuiClientTypes.MvrResolveTypeResponse, TransportError> {
+        return yield* read(
           "mvr.resolveType",
           (core, signal) => core.mvr.resolveType({ ...options, signal }),
           onlyTransportError("mvr.resolveType")
-        ),
-      resolve: (options) =>
-        read(
+        )
+      }),
+      resolve: Effect.fn("SuiCore.mvr.resolve")(function*(
+        options: SuiClientTypes.MvrResolveOptions
+      ): Effect.fn.Return<SuiClientTypes.MvrResolveResponse, TransportError> {
+        return yield* read(
           "mvr.resolve",
           (core, signal) => core.mvr.resolve({ ...options, signal }),
           onlyTransportError("mvr.resolve")
         )
+      })
     },
-    resolveTransactionPlugin: () =>
-      Effect.sync(() => client.core.resolveTransactionPlugin()).pipe(
-        Effect.withSpan("SuiCore.resolveTransactionPlugin")
-      ),
-    use: (run) =>
-      Effect.tryPromise({
+    resolveTransactionPlugin: Effect.fn("SuiCore.resolveTransactionPlugin")(
+      function*(): Effect.fn.Return<TransactionPlugin> {
+        return yield* Effect.sync(() => client.core.resolveTransactionPlugin())
+      }
+    ),
+    use: Effect.fn("SuiCore.use")(function*<A>(
+      run: (client: ClientWithCoreApi, signal: AbortSignal) => Promise<A>
+    ): Effect.fn.Return<A, SuiCoreError> {
+      return yield* Effect.tryPromise({
         try: (signal) => run(client, signal),
         catch: (cause) => mapSdkError("use", cause)
-      }).pipe(Effect.withSpan("SuiCore.use"))
+      })
+    })
   }
 }

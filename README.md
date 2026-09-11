@@ -37,7 +37,7 @@ import { bcs } from "@mysten/sui/bcs"
 import { ObjectId, Sui, SuiSchema } from "sui-effect"
 
 const Escrow = SuiSchema.bcs(
-  bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64 }),
+  bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() }),
   "0x2::escrow::Escrow"
 )
 

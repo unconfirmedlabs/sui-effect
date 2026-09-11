@@ -4,7 +4,12 @@ import { SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import { TestClock } from "effect/testing"
 import { ConfigProvider } from "effect"
-import { defaultGrpcUrl, mapSdkError, SuiCore } from "../src/services/SuiCore.ts"
+import {
+  defaultGrpcUrl,
+  mapSdkError,
+  RETRYABLE_GRPC_STATUSES,
+  SuiCore
+} from "../src/services/SuiCore.ts"
 import {
   ClockBcs,
   FakeOutcome,
@@ -101,6 +106,34 @@ describe("mapSdkError", () => {
     expect(notFound._tag === "TransportError" && notFound.retryable).toBe(false)
   })
 
+  test("a transport-level gRPC failure is retryable", () => {
+    // `@protobuf-ts/grpcweb-transport` reports a refused connection or a DNS
+    // failure as INTERNAL, and maps HTTP 500 to UNKNOWN. Neither reached a
+    // node, so a read may try again.
+    for (const status of ["INTERNAL", "UNKNOWN"]) {
+      const error = mapSdkError("getObject", Object.assign(new Error(status), { code: status }))
+      expect(error._tag).toBe("TransportError")
+      if (error._tag === "TransportError") {
+        expect(error.retryable).toBe(true)
+        expect(error.status).toBe(status)
+      }
+    }
+    expect([...RETRYABLE_GRPC_STATUSES].sort()).toEqual([
+      "DEADLINE_EXCEEDED",
+      "INTERNAL",
+      "RESOURCE_EXHAUSTED",
+      "UNAVAILABLE",
+      "UNKNOWN"
+    ])
+  })
+
+  test("an answer from the node is not retryable", () => {
+    for (const status of ["NOT_FOUND", "INVALID_ARGUMENT", "PERMISSION_DENIED", "ABORTED"]) {
+      const error = mapSdkError("getObject", Object.assign(new Error(status), { code: status }))
+      expect(error._tag === "TransportError" && error.retryable).toBe(false)
+    }
+  })
+
   test("maps HTTP statuses", () => {
     const server = mapSdkError("getObject", Object.assign(new Error("boom"), { status: 503 }))
     expect(server._tag === "TransportError" && server.retryable).toBe(true)
@@ -137,8 +170,11 @@ describe("layers", () => {
         const core = yield* SuiCore
         return core.network
       }).pipe(
-        Effect.provide(SuiCore.layerConfig),
-        Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord({})))
+        Effect.provide(
+          SuiCore.layerConfig.pipe(
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord({})))
+          )
+        )
       )
     )
     expect(Exit.isFailure(exit)).toBe(true)
@@ -150,9 +186,12 @@ describe("layers", () => {
         const core = yield* SuiCore
         return core.network
       }).pipe(
-        Effect.provide(SuiCore.layerConfig),
         Effect.provide(
-          ConfigProvider.layer(ConfigProvider.fromEnvRecord({ SUI_NETWORK: "testnet" }))
+          SuiCore.layerConfig.pipe(
+            Layer.provide(
+              ConfigProvider.layer(ConfigProvider.fromEnvRecord({ SUI_NETWORK: "testnet" }))
+            )
+          )
         )
       )
     )
@@ -165,9 +204,12 @@ describe("layers", () => {
         const core = yield* SuiCore
         return core.network
       }).pipe(
-        Effect.provide(SuiCore.layerConfig),
         Effect.provide(
-          ConfigProvider.layer(ConfigProvider.fromEnvRecord({ SUI_NETWORK: "staging" }))
+          SuiCore.layerConfig.pipe(
+            Layer.provide(
+              ConfigProvider.layer(ConfigProvider.fromEnvRecord({ SUI_NETWORK: "staging" }))
+            )
+          )
         )
       )
     )

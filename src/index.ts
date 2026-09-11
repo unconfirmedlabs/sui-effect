@@ -6,21 +6,90 @@
  * every failure is a `Schema.TaggedError`, and every boundary decodes through
  * `Schema`.
  *
+ * Everything this module exports is public API. The machinery behind it lives
+ * in `sui-effect/internal`, which is not in the package `exports` map.
+ *
  * @since 0.1.0
  */
-export * from "./domain/errors.ts"
-export * from "./domain/executed.ts"
-export * from "./domain/schemas.ts"
-export { Sui, type Recipe, type SuiService, OBJECT_INCLUDE, SIMULATE_INCLUDE } from "./services/Sui.ts"
+
+/** The closed error taxonomy and its four helpers. */
 export {
-  mapSdkError,
+  BuildError,
+  DecodeError,
+  ExecutionFailed,
+  type HasOutcome,
+  JournalError,
+  NetworkMismatch,
+  NotApplied,
+  ObjectDeleted,
+  ObjectNotFound,
+  ObjectUnavailable,
+  type Outcome,
+  PolicyDenied,
+  SigningError,
+  SimulationFailed,
+  SubmissionUnknown,
+  SuiError,
+  TransactionNotFound,
+  TransportError,
+  UnexpectedEffects
+} from "./domain/errors.ts"
+
+/** Branded schemas and the transport-neutral object model. */
+export {
+  Balance,
+  BalanceChange,
+  ChangedObject,
+  CleverError,
+  CoinType,
+  CommandResult,
+  Digest,
+  DynamicField,
+  DynamicFieldEntry,
+  DynamicFieldName,
+  Event,
+  ExecutionReason,
+  ExecutionStatus,
+  GasCostSummary,
+  KNOWN_CHAIN_IDS,
+  KnownNetwork,
+  Mist,
+  MoveLocation,
+  Network,
+  ObjectEnvelope,
+  ObjectId,
+  ObjectRef,
+  ObjectType,
+  Owner,
+  SignedTransaction,
+  Simulation,
+  StructTag,
+  SuiAddress,
+  type SuiObject,
+  TransactionEffects,
+  UnchangedConsensusObject,
+  Version
+} from "./domain/schemas.ts"
+
+/** A transaction that reached the chain, with accessors over its effects. */
+export { Executed } from "./domain/executed.ts"
+
+/** The opinionated tier. */
+export {
+  type BatchItemError,
+  type GetObjectError,
+  type Recipe,
+  Sui,
+  type SuiLayerOptions,
+  type SuiService
+} from "./services/Sui.ts"
+
+/** The mechanical tier. */
+export {
   defaultGrpcUrl,
-  DefectMarker,
-  makeFromClient,
-  readSchedule,
-  SuiCore,
   type ObjectLookupError,
   type SimulationLookupError,
+  SuiCore,
   type SuiCoreError,
   type SuiCoreService,
   type SuiGrpcLayerOptions,
@@ -31,4 +100,4 @@ export {
  * The BCS bridge, namespaced the way the spec spells it:
  * `SuiSchema.bcs(bcsType, expectedType)`.
  */
-export * as SuiSchema from "./domain/bcs.ts"
+export * as SuiSchema from "./domain/sui-schema.ts"

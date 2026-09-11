@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { bcs as suiBcs } from "@mysten/sui/bcs"
-import { Effect, Result, Schema } from "effect"
+import { Effect, Result, Schema, SchemaTransformation } from "effect"
 import { bcs, decodeContent, expectedTypeOf, typeMatches } from "../src/domain/bcs.ts"
 import { makeSuiObject, ObjectEnvelope, ObjectId, StructTag } from "../src/domain/schemas.ts"
 
@@ -87,6 +87,26 @@ describe("SuiSchema.bcs", () => {
     expect(typeMatches(COIN_TYPE, `${PADDED("2")}::coin::Coin<${PADDED("2")}::sui::SUI>`)).toBe(true)
     expect(typeMatches(COIN_TYPE, "0x2::coin::Coin<0x2::usdc::USDC>")).toBe(false)
     expect(typeMatches(COIN_TYPE, "0x2::escrow::Escrow")).toBe(false)
+  })
+
+  test("the expected type survives composition with decodeTo", () => {
+    class Wallet extends Schema.Class<Wallet>("Wallet")({
+      id: Schema.String,
+      balance: Schema.String
+    }) {}
+    const Composed = CoinCodec.pipe(
+      Schema.decodeTo(
+        Wallet,
+        SchemaTransformation.transform({
+          decode: (value: { id: string; balance: string }) => new Wallet(value),
+          encode: (wallet: Wallet) => ({ id: wallet.id, balance: wallet.balance })
+        })
+      )
+    )
+    expect(expectedTypeOf(Composed)).toBe(expectedTypeOf(CoinCodec))
+    const decoded = Effect.runSync(Schema.decodeUnknownEffect(Composed)(content))
+    expect(decoded).toBeInstanceOf(Wallet)
+    expect(decoded.balance).toBe("123456789")
   })
 
   test("expectedTypeOf is undefined for a codec that is not a BCS bridge", () => {

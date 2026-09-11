@@ -18,14 +18,17 @@ export * from "./services/SuiCoreFake.ts"
  * The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test
  * can script outcomes and inspect what the fake received.
  *
+ * This is `Sui.layerNoDeps`, the production layer, so the chain-id rules are
+ * the production rules: a script whose `network` is `mainnet` or `testnet` must
+ * report that network's identifier, and any other network asserts nothing. A
+ * test that wants the assertion on a custom network builds
+ * `Sui.layerNoDepsWith({ chainId })` over `SuiCoreFake.layer(script)` itself,
+ * rather than having the fake compared against its own script.
+ *
  * Fails with: `NetworkMismatch`, `TransportError` — both only when the script
  * asks for them.
  */
 export const layerTest = (
   script: FakeScript = {}
-): Layer.Layer<Sui | SuiCoreFake, NetworkMismatch | TransportError> => {
-  const fake = SuiCoreFake.layer(script)
-  return Sui.layerNoDepsWith(
-    script.chainId === undefined ? {} : { chainId: script.chainId }
-  ).pipe(Layer.provideMerge(fake))
-}
+): Layer.Layer<Sui | SuiCoreFake, NetworkMismatch | TransportError> =>
+  Sui.layerNoDeps.pipe(Layer.provideMerge(SuiCoreFake.layer(script)))

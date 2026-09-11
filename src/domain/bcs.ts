@@ -10,9 +10,9 @@
  */
 import type { BcsType } from "@mysten/bcs"
 import { normalizeStructTag } from "@mysten/sui/utils"
-import { Effect, Schema, SchemaIssue, SchemaTransformation } from "effect"
+import { Effect, Schema, SchemaAST, SchemaIssue, SchemaTransformation } from "effect"
 import { DecodeError } from "./errors.ts"
-import type { ObjectId, StructTag } from "./schemas.ts"
+import type { ObjectId } from "./schemas.ts"
 
 const SUI_TYPE_ANNOTATION = "sui-effect/suiType"
 
@@ -38,6 +38,9 @@ export const bcs = <T extends Input, Input>(
   expectedType: string
 ): Schema.Codec<T, Uint8Array> => {
   const normalized = normalizeSafe(expectedType)
+  // A BCS layout carries no runtime type to test a decoded value against: the
+  // parse below is the validation, so the target schema accepts whatever the
+  // layout produced.
   const target = Schema.declare((_u: unknown): _u is T => true)
   return Schema.Uint8Array.pipe(
     Schema.decodeTo(
@@ -78,15 +81,36 @@ export const bcs = <T extends Input, Input>(
   ).annotate({ [SUI_TYPE_ANNOTATION]: normalized }) as unknown as Schema.Codec<T, Uint8Array>
 }
 
+const MAX_ENCODING_DEPTH = 32
+
+/**
+ * Walks the encoding chain looking for the annotation {@link bcs} leaves
+ * behind. `SuiSchema.bcs(...).pipe(Schema.decodeTo(DomainClass, ...))` puts a
+ * new node on top and keeps the annotated node as the source side of the
+ * transformation, so the tag survives composition.
+ */
+const findSuiType = (ast: SchemaAST.AST, depth: number): string | undefined => {
+  const annotation = ast.annotations?.[SUI_TYPE_ANNOTATION]
+  if (typeof annotation === "string") return annotation
+  if (depth >= MAX_ENCODING_DEPTH) return undefined
+  const encoding = ast.encoding
+  if (encoding === undefined) return undefined
+  for (const link of encoding) {
+    const found = findSuiType(link.to, depth + 1)
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
 /**
  * The normalized Move type a codec built by {@link bcs} expects, or `undefined`
  * for any other codec. `Sui.getObject` compares it with the object's own type
- * tag before decoding. Never fails.
+ * tag before decoding. Composition preserves it: a codec piped into
+ * `Schema.decodeTo(DomainClass, ...)` still reports the type the bytes came
+ * from. Never fails.
  */
-export const expectedTypeOf = <T>(schema: Schema.Codec<T, Uint8Array>): string | undefined => {
-  const annotation = schema.ast.annotations?.[SUI_TYPE_ANNOTATION]
-  return typeof annotation === "string" ? annotation : undefined
-}
+export const expectedTypeOf = <T, E>(schema: Schema.Codec<T, E>): string | undefined =>
+  findSuiType(schema.ast, 0)
 
 /**
  * Whether an object's type tag satisfies a codec's expected type, comparing
@@ -104,7 +128,7 @@ export const typeMatches = (expected: string, actual: string): boolean =>
 export const decodeContent = <T>(
   schema: Schema.Codec<T, Uint8Array>,
   content: Uint8Array,
-  context?: { readonly objectId?: ObjectId; readonly expectedType?: StructTag }
+  context?: { readonly objectId?: ObjectId; readonly expectedType?: string }
 ): Effect.Effect<T, DecodeError> =>
   Schema.decodeUnknownEffect(schema)(content).pipe(
     Effect.mapError(
@@ -114,7 +138,7 @@ export const decodeContent = <T>(
           ...(context?.expectedType === undefined
             ? expectedTypeOf(schema) === undefined
               ? {}
-              : { expectedType: expectedTypeOf(schema) as string }
+              : { expectedType: expectedTypeOf(schema)! }
             : { expectedType: context.expectedType }),
           issue: error.message
         })

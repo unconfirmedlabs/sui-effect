@@ -105,6 +105,15 @@ export const CoinType = Schema.String.pipe(
 )
 export type CoinType = typeof CoinType.Type
 
+/**
+ * The `type` field of an object envelope. Almost always a struct tag, but gRPC
+ * reports the literal `package` for a Move package object (`grpc/core.mjs`
+ * leaves `objectType` untouched when it has no `::`), and a package is a
+ * readable object like any other.
+ */
+export const ObjectType = Schema.Union([StructTag, Schema.Literal("package")])
+export type ObjectType = typeof ObjectType.Type
+
 /** An amount in MIST. Encoded as the decimal string every SDK response uses. */
 export const Mist = Schema.BigIntFromString.pipe(
   Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n)),
@@ -126,6 +135,18 @@ export type Network = typeof Network.Type
 /** The four networks with a built-in default gRPC endpoint. */
 export const KnownNetwork = Schema.Literals(["mainnet", "testnet", "devnet", "localnet"])
 export type KnownNetwork = typeof KnownNetwork.Type
+
+/**
+ * The genesis checkpoint digest of each public network whose chain identifier
+ * is fixed and known. These are the digests observed on the live networks
+ * (`getChainIdentifier` returns the genesis checkpoint digest); the SDK ships
+ * no such table. `devnet` and `localnet` are regenerated, so they are absent
+ * and `Sui.layerNoDeps` records whatever the node reports instead of asserting.
+ */
+export const KNOWN_CHAIN_IDS: Readonly<Record<string, string>> = {
+  mainnet: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
+  testnet: "69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD"
+}
 
 /**
  * An object owner. Mirrors `SuiClientTypes.ObjectOwner` exactly, including its
@@ -153,7 +174,7 @@ export type Owner = typeof Owner.Type
  */
 export const ObjectRef = Schema.Struct({
   id: ObjectId,
-  type: StructTag,
+  type: ObjectType,
   version: Version,
   digest: Schema.String,
   owner: Owner
@@ -394,10 +415,13 @@ export type TransactionEffects = typeof TransactionEffects.Type
  *
  * Phase 1 extends this with the full expiration union; `maxTimestampMs` is the
  * one field `Tx.reconcile` needs to decide that a transaction can no longer land.
+ *
+ * `bytes` encodes as base64, not as a numeric object, so `SuiError.toJson` of a
+ * `SubmissionUnknown` is JSON the operator who has to reconcile it can read.
  */
 export const SignedTransaction = Schema.Struct({
   digest: Digest,
-  bytes: Schema.Uint8Array,
+  bytes: Schema.Uint8ArrayFromBase64,
   signatures: Schema.Array(Schema.String),
   sender: SuiAddress,
   maxTimestampMs: Schema.optional(Schema.BigIntFromString)
@@ -413,7 +437,7 @@ export const ObjectEnvelope = Schema.Struct({
   version: Version,
   digest: Schema.String,
   owner: Owner,
-  type: StructTag
+  type: ObjectType
 })
 export type ObjectEnvelope = typeof ObjectEnvelope.Type
 
@@ -425,7 +449,7 @@ export interface SuiObject<S> {
   readonly id: ObjectId
   readonly version: Version
   readonly digest: string
-  readonly type: StructTag
+  readonly type: ObjectType
   readonly owner: Owner
   readonly content: S
   readonly ref: ObjectRef
@@ -464,7 +488,7 @@ export const Simulation = Schema.Struct({
   effects: TransactionEffects,
   events: Schema.Array(Event),
   balanceChanges: Schema.Array(BalanceChange),
-  objectTypes: Schema.Record(Schema.String, StructTag),
+  objectTypes: Schema.Record(Schema.String, Schema.String),
   commandResults: Schema.Array(CommandResult)
 })
 export type Simulation = typeof Simulation.Type
