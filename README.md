@@ -86,20 +86,40 @@ was built over as `sui.core`, which is why every `Tx.*` function needs only
 `Tx` is the lifecycle as functions — `build`, `sign`, `cosign`, `sponsored`,
 `submit`, `reconcile`, `run`, `reconcileAll` — each with a closed error union
 and `R = Sui`. `Tx.run` holds the sender lock from build through submit, builds
-(which already simulates, so a transaction that would abort never gets signed),
+(which always simulates, so a transaction that would abort never gets signed),
 signs, journals the signed bytes before the first execute, re-sends the
 identical bytes — never a rebuild — on a retryable transport failure or a
-timeout, and if it still does not know what happened, reconciles: `Executed`,
-`ExecutionFailed`, `NotApplied { evidence }` when the epoch window has closed or
-an input was provably consumed by a *different* transaction, or
-`SubmissionUnknown` carrying the bytes. An input that merely moved on is not
-evidence — this transaction is the likeliest thing to have moved it — so
-reconcile asks the node which digest consumed it before it says anything. A
-`TransportError` never escapes once bytes may have been sent. `Signer` is a
+timeout, waits for the execution to be visible to reads before it releases the
+lock, and if it still does not know what happened, reconciles: `Executed`,
+`ExecutionFailed`, `NotApplied { evidence }`, or `SubmissionUnknown` carrying
+the bytes. A `TransportError` never escapes once bytes may have been sent —
+from `submit`, and from `reconcile` and `reconcileAll` too. `Signer` is a
 value, not a service, so one process can hold two credentials; `SubmitConfig`
 and `Journal` are `Context.Reference`s with working defaults, so none of this
 needs wiring, and `sui-effect/journal` swaps the memory journal for a durable
 one over `KeyValueStore`.
+
+**`NotApplied` is hard to earn, on purpose.** Saying a transaction never applied
+tells the documented retry idiom to send the caller's intent again, so there are
+exactly two kinds of evidence and both are checked twice over. `"expired"`
+requires the epoch (or timestamp) bound to be observed as passed, then a
+`getTransaction` miss, then — after `SubmitConfig.reconcileRecheck` — both
+again; a single observation is `SubmissionUnknown`, and
+`SubmitConfig.expiryEvidence: "never"` turns the rule off for a deployment
+behind a mixed-node load balancer. `"inputConsumed"` requires the object **at
+the version after** one the bytes pinned to name a *different* transaction: the
+live object's `previousTransaction` names the latest mutation, not the consumer
+of the version in question, and reading it would report `NotApplied` for a
+transaction that applied and was simply overtaken. Before any of this,
+reconcile compares the chain the bytes were built for with `sui.chainId` and
+refuses to reason across chains.
+
+**A sponsored `Tx.run` needs both signatures.** When the gas owner is not the
+sender, pass `sponsor`: `Tx.run(recipe, { signer, gasOwner, sponsor })`. Without
+it the run fails with `SigningError` before anything is built, because one
+signature on sponsored bytes is something a validator rejects outright. Two
+parties that cannot both sign in one process use `build`, `sign`, `cosign` and
+`submit` directly.
 
 When the recipe sets no expiration, `Tx.build` sets one: `ValidDuring` bounded
 to the current epoch and the next, carrying the chain identifier as a replay
@@ -125,13 +145,18 @@ ships inside the published package, so
 `node_modules/sui-effect/examples/extension-template/` is there to copy without
 a checkout.
 
-Three things an extension author should know before reading the guide. A layer
+Four things an extension author should know before reading the guide. A layer
 may require `Sui | SuiCore` and must provide everything else itself, including
 another extension's service — the guide's "composing extensions" section is that
 pattern. A Promise face's **synchronous** members (recipe builders, a package
 id) are real only once the runtime exists, so either `await client.<name>.$ready()`
 once or register with `warm`; calling one before that fails with
-`ExtensionNotReady` rather than returning a Promise the type does not mention.
+`ExtensionNotReady` rather than returning a Promise the type does not mention
+(`Effect` and `Stream` members work cold, as Promises and as async iterables).
+Every registration on one client **shares one `Sui`**, and therefore one
+sender-lock map, so two extensions never select gas for the same address at
+once; `$dispose()` releases that shared base only when the last registration on
+the client is disposed, and it is not final — the next call builds a fresh one.
 And `SuiGraphQL` is sui-effect's tag over the SDK's `SuiGraphQLClient` — one
 client shared by every extension that reads GraphQL; sui-effect wraps no GraphQL
 API of its own.
@@ -156,7 +181,7 @@ no error inheritance to match on.
 | `BuildError` | `message`, `cause` | The transaction could not be built |
 | `PolicyDenied` | `rule`, `message` | A preflight policy refused it before it was signed |
 | `JournalError` | `cause` | The journal could not be read or written. It escapes `Tx.submit` only from the write that happens **before** the first send; after the network has answered, a failed write is logged and the answer stands |
-| `UnexpectedEffects` | `digest`, `expected`, `found` | The effects did not contain what the caller expected |
+| `UnexpectedEffects` | `digest`, `expected`, `found` | The effects did not contain what the caller expected. Outcome `applied` and exit 5: it comes from an `Executed`, so the transaction ran and gas was charged; only the receipt is missing |
 | `GraphQLUnavailable` | `method`, `reason` | The GraphQL endpoint an extension needs is not usable. What `SuiGraphQL.layerUnavailable` rejects every call with |
 | `ExtensionNotReady` | `extension`, `member` | A synchronous member of a Promise face was called before its runtime existed: `await client.<name>.$ready()`, or register with `warm` |
 
@@ -188,10 +213,11 @@ layer that cannot. `Script.run` installs SIGINT and SIGTERM handlers, interrupts
 the root fiber so finalizers run, writes one diagnostic line per failure to
 stderr, and exits. stdout carries only what the script itself printed: the
 logger is bound to stderr for the whole run, so an `Effect.log` anywhere in the
-call tree cannot corrupt the output. On an interrupt or a defect the unresolved
-entries of the default journal are printed too, so a script killed mid-submit
-still leaves the digest and the bytes. A second SIGINT is ignored on purpose —
-the first one is what lets the finalizers that record those bytes finish.
+call tree cannot corrupt the output. On every non-zero exit the unresolved
+entries of the journal the script ran with are printed too, so a script killed
+or failed mid-submit still leaves the digest and the bytes. A second SIGINT is
+ignored on purpose — the first one is what lets the finalizers that record those
+bytes finish.
 
 | Code | Means |
 |---|---|
@@ -200,8 +226,12 @@ the first one is what lets the finalizers that record those bytes finish.
 | 2 | configuration: `ConfigError`, `NetworkMismatch`, `SchemaError`, the mainnet gate |
 | 3 | unknown outcome: reconcile before sending anything else |
 | 4 | nothing applied: safe to retry |
-| 5 | applied and failed on chain: gas was charged, do not retry |
-| 130 | interrupted |
+| 5 | applied on chain: `ExecutionFailed` (gas charged) or `UnexpectedEffects` (it ran; the receipt is missing) |
+| 130 | interrupted, with nothing outstanding in the journal |
+
+A timeout or an interrupt asks the journal: with an unresolved submission in it
+the exit is 3, not 4 or 130, because an `Effect.timeout` wrapped around a
+submission interrupts it from the outside and the bytes may be on the wire.
 
 ## Testing
 

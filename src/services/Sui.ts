@@ -26,7 +26,7 @@ import {
   Semaphore,
   Stream
 } from "effect"
-import { bcs as bcsCodec, decodeContent } from "../domain/bcs.ts"
+import { bcs as bcsCodec, decodeContent, typeMatches } from "../domain/bcs.ts"
 import {
   BuildError,
   DecodeError,
@@ -360,7 +360,22 @@ const makeSui = (
   ): Effect.fn.Return<SuiObject<S | Uint8Array>, DecodeError | TransportError> {
     const envelope = yield* envelopeOf(object)
     const schema = opts?.schema
-    if (schema === undefined) return makeSuiObject(envelope, object.content)
+    if (schema === undefined) {
+      // An explicit `expectedType` is a question about the object, not about
+      // the codec: `getObject(id, { expectedType })` with no schema is how a
+      // caller says "this had better be a `Coin<SUI>`" while keeping the raw
+      // bytes. Returning early without checking it answered a different
+      // question than the one that was asked.
+      const expected = opts?.expectedType
+      if (expected !== undefined && !typeMatches(expected, envelope.type)) {
+        return yield* new DecodeError({
+          objectId: envelope.objectId,
+          expectedType: expected,
+          issue: `object ${envelope.objectId} has type ${envelope.type}`
+        })
+      }
+      return makeSuiObject(envelope, object.content)
+    }
     // One rule for every Move type check in the library: `typeMatches` inside
     // `decodeContent`, which accepts a bare tag as every instantiation of it
     // and compares a parameterized one in full.

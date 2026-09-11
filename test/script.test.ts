@@ -105,17 +105,36 @@ describe("Script.exitCode", () => {
       new TransportError({ method: "getObject", retryable: true, cause: "down" }),
       new DecodeError({ issue: "bad bytes" }),
       new NotApplied({ digest: DIGEST, evidence: "expired" }),
-      new JournalError({ cause: "disk full" }),
-      new UnexpectedEffects({ digest: DIGEST, expected: "0x2::a::B", found: [] })
+      new JournalError({ cause: "disk full" })
     ]
     for (const error of notApplied) expect(exitCode(fail(error))).toBe(4)
   })
 
-  test("4 for a TimeoutError, which is outside the taxonomy", async () => {
+  test("5 for UnexpectedEffects, which can only come from a transaction that applied", () => {
+    // It is built from an `Executed`: the transaction reached the chain and gas
+    // was charged, and only the receipt is missing. Exit 4 told a wrapper the
+    // opposite — nothing happened, safe to retry.
+    expect(
+      exitCode(fail(new UnexpectedEffects({ digest: DIGEST, expected: "0x2::a::B", found: [] })))
+    ).toBe(5)
+  })
+
+  test("4 for a TimeoutError with nothing outstanding in the journal", async () => {
     const exit = await Effect.runPromiseExit(
       Effect.never.pipe(Effect.timeout("1 milli"), Effect.provide(Layer.empty))
     )
     expect(exitCode(exit)).toBe(4)
+  })
+
+  test("3 for a TimeoutError when the journal still holds a submission", async () => {
+    // An `Effect.timeout` wrapped around a whole submission interrupts it from
+    // the outside and never reaches `Tx.submit`'s own mapping, so the bytes may
+    // be on the wire. Exit 4 would say "safe to retry" about a transaction
+    // nobody has an answer for.
+    const exit = await Effect.runPromiseExit(
+      Effect.never.pipe(Effect.timeout("1 milli"), Effect.provide(Layer.empty))
+    )
+    expect(exitCode(exit, { unresolved: 1 })).toBe(3)
   })
 
   test("5 when it applied on chain and failed", () => {

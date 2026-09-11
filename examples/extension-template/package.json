@@ -4,7 +4,6 @@
   "description": "A copyable sui-effect extension package: one service, three layers, a derived Promise face.",
   "license": "MIT",
   "type": "module",
-  "private": true,
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -17,9 +16,11 @@
   ],
   "sideEffects": false,
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "check": "tsc --noEmit && bun test"
+    "check:package": "bun scripts/check-package.ts",
+    "check": "tsc --noEmit && bun test && bun scripts/check-package.ts"
   },
   "peerDependencies": {
     "@mysten/bcs": "^2.1.1",

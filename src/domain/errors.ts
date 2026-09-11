@@ -220,7 +220,16 @@ export class JournalError extends Schema.TaggedError<JournalError>()("JournalErr
   cause: Schema.Defect()
 }) {}
 
-/** The effects of an applied transaction did not contain what the caller expected. */
+/**
+ * The effects of an applied transaction did not contain what the caller
+ * expected.
+ *
+ * Outcome `applied`, and exit 5: this error can only come from an `Executed`,
+ * which means the transaction reached the chain and gas was charged. What is
+ * missing is a receipt, not the transaction. Classifying it `not_applied`
+ * would tell the documented retry idiom to send the caller's intent a second
+ * time for a transaction that already ran.
+ */
 export class UnexpectedEffects extends Schema.TaggedError<UnexpectedEffects>()(
   "UnexpectedEffects",
   { digest: Digest, expected: Schema.String, found: Schema.Array(ObjectId) }
@@ -368,6 +377,9 @@ const outcome = (error: SuiError | HasOutcome): Outcome => {
   if (typeof tag !== "string" || !TAXONOMY_TAGS.has(tag)) return "unknown"
   switch (tag) {
     case "ExecutionFailed":
+    // An `UnexpectedEffects` is built from an `Executed`: the transaction
+    // applied and gas was charged, and only the receipt is missing.
+    case "UnexpectedEffects":
       return "applied"
     case "SubmissionUnknown":
       return "unknown"

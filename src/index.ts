@@ -54,6 +54,7 @@ export {
   ExecutionReason,
   ExecutionStatus,
   GasCostSummary,
+  chainOf,
   KNOWN_CHAIN_IDS,
   KnownNetwork,
   maxEpochOf,
@@ -80,7 +81,13 @@ export {
 } from "./domain/schemas.ts"
 
 /** A transaction that reached the chain, with accessors over its effects. */
-export { type ChangedRef, Executed, objectRefOf } from "./domain/executed.ts"
+export {
+  type ChangedRef,
+  Executed,
+  objectRefOf,
+  type SdkObjectRef,
+  sdkRefOf
+} from "./domain/executed.ts"
 
 /** The opinionated tier. */
 export {
@@ -101,7 +108,8 @@ export {
   type SuiCoreError,
   type SuiCoreService,
   type SuiGrpcLayerOptions,
-  type TransactionLookupError
+  type TransactionLookupError,
+  type VersionedObject
 } from "./services/SuiCore.ts"
 
 /** The SDK's GraphQL client as one shared tag. sui-effect wraps no GraphQL API. */

@@ -17,7 +17,7 @@ contract for building an extension package on top of it.
 ## `sui-effect`
 
 
-78 exported symbols.
+82 exported symbols.
 
 ### `Balance` (const)
 
@@ -104,6 +104,8 @@ declare const Built: Schema.Struct<{
             readonly nonce: Schema.Number;
         }>;
     }>]>>;
+    /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
+    readonly chain: Schema.optional<Schema.String>;
 }>
 // decodes to:
 // {
@@ -142,12 +144,30 @@ declare const Built: Schema.Struct<{
 //             readonly nonce: number;
 //         };
 //     } | undefined;
+//     readonly chain?: string | undefined;
 // }
 ```
 
 A transaction built into bytes and ready to sign, with the expiration the
 builder settled on recorded so `Tx.reconcile` can decide, later and without
 the builder, whether the transaction can still land.
+
+### `chainOf` (const)
+
+```ts
+declare const chainOf: (expiration: TransactionExpiration | undefined) => string | undefined
+```
+
+The chain identifier an expiration names, or `undefined` for the variants
+that name none (`None`, `Epoch`).
+
+This is the first half of the chain-identity guard `Tx.reconcile` applies
+before it asks a node anything: bytes built for one chain must not be
+declared expired by another chain's epoch. The second half is
+`SignedTransaction.chain`, which `Tx.build` records for the variants that
+carry no chain of their own.
+
+**Never fails.**
 
 ### `ChangedObject` (const)
 
@@ -506,9 +526,29 @@ export declare class Executed extends Executed_base {
     mutated(type?: string): ReadonlyArray<ChangedRef>;
     /**
      * Objects this transaction deleted or wrapped. The refs carry the versions the
-     * objects had going in, since they have no output version. Never fails.
+     * objects had going in, since they have no output version.
+     *
+     * Two effect shapes land here, because from a caller's side both mean "this
+     * object is gone from where it was":
+     *
+     * - a **delete**, which the node reports as `idOperation: "Deleted"`;
+     * - a **wrap**, which has no id operation at all (`"None"`) and shows up only
+     *   as an input that existed and an output that does not. {@link wrapped}
+     *   returns just those, for a caller that has to tell the two apart — a
+     *   wrapped object still exists inside its wrapper and can come back.
+     *
+     * Never fails.
      */
     deleted(): ReadonlyArray<ChangedRef>;
+    /**
+     * Objects this transaction wrapped: they went in existing and came out
+     * nonexistent without their id being deleted, which is how the SDK's effects
+     * converter represents wrapping. They are a subset of {@link deleted}.
+     * Never fails.
+     */
+    wrapped(): ReadonlyArray<ChangedRef>;
+    private static isDeleted;
+    private static isWrapped;
     /**
      * Packages this transaction published (`PackageWrite` plus `Created`), as
      * full refs like every other accessor. A package's `type` is the literal
@@ -1436,6 +1476,46 @@ export type Recipe = (tx: Transaction) => void;
 
 A synchronous transaction draft. Reads happen before it, so it stays replayable.
 
+### `SdkObjectRef` (interface)
+
+```ts
+export interface SdkObjectRef {
+    readonly objectId: string;
+    readonly version: string;
+    readonly digest: string;
+}
+```
+
+The SDK's own object reference shape, as `Transaction#objectRef` takes it.
+
+### `sdkRefOf` (const)
+
+```ts
+declare const sdkRefOf: (ref: ChangedRef | ObjectRef) => SdkObjectRef | undefined
+```
+
+The shape `Transaction#objectRef` and `Inputs.ObjectRef` want: `objectId`
+rather than `id`, and a decimal **string** version rather than a `bigint`.
+
+sui-effect's own `ObjectRef` carries the branded `id` and a `bigint`
+`version`, because that is what a domain model wants and what a `Version`
+check can be run on; the SDK builder wants neither. This is the one
+conversion, so nobody writes `{ objectId: ref.id, version: String(ref.version) }`
+by hand and gets the field name wrong.
+
+**Only for an address-owned (or immutable) object.** `tx.objectRef` pins a
+version, which is exactly right for an owned input and exactly wrong for a
+**shared** object: a shared object is passed with `tx.sharedObjectRef({
+objectId, initialSharedVersion, mutable })` (the initial shared version lives
+on `ref.owner.Shared.initialSharedVersion`), and a **receiving** object with
+`tx.receivingRef(...)`, which takes the same three fields this returns.
+Passing a shared object by `objectRef` produces bytes a validator rejects.
+
+`undefined` when the effects did not carry a version or a digest — a deleted
+object has no output version, and nothing can be consumed without both.
+
+**Never fails.**
+
 ### `Signature` (const)
 
 ```ts
@@ -1486,6 +1566,18 @@ declare const SignedTransaction: Schema.Struct<{
             readonly nonce: Schema.Number;
         }>;
     }>]>>;
+    /**
+     * The chain identifier the bytes were built against, recorded by `Tx.build`
+     * so `Tx.reconcile` can refuse to reason about a transaction with a node on
+     * another chain.
+     *
+     * A `ValidDuring` or `Validity` expiration already names its chain, and that
+     * is what is compared when it is there. This field is what an `Epoch` or
+     * `None` expiration — which name no chain at all — leaves behind instead, so
+     * a process-wide journal holding submissions from two networks cannot settle
+     * one of them against the other's epoch.
+     */
+    readonly chain: Schema.optional<Schema.String>;
 }>
 // decodes to:
 // {
@@ -1524,6 +1616,7 @@ declare const SignedTransaction: Schema.Struct<{
 //             readonly nonce: number;
 //         };
 //     } | undefined;
+//     readonly chain?: string | undefined;
 // }
 ```
 
@@ -2018,6 +2111,7 @@ export declare class SubmissionUnknown extends SubmissionUnknown_base {
               readonly nonce: number;
           };
       } | undefined;
+      readonly chain?: string | undefined;
   } | undefined
 }
 ```
@@ -2153,6 +2247,30 @@ export interface SuiCoreService {
     readonly executeTransaction: <Include extends TransactionInclude = {}>(options: SuiClientTypes.ExecuteTransactionOptions<Include>) => Effect.Effect<SuiClientTypes.TransactionResult<Include>, TransportError>;
     /** Signs and submits in one call. Never retried at this tier. Fails with: `TransportError`. */
     readonly signAndExecuteTransaction: <Include extends TransactionInclude = {}>(options: SuiClientTypes.SignAndExecuteTransactionOptions<Include>) => Effect.Effect<SuiClientTypes.TransactionResult<Include>, TransportError>;
+    /**
+     * Reads one object **at a specific version**, for the one question the
+     * live-object read cannot answer: which transaction consumed the version a
+     * set of bytes pinned.
+     *
+     * `previousTransaction` on the *current* object names the latest mutation,
+     * which is not necessarily the consumer of an older version: T can consume
+     * version 3 and U version 4, and the live object then names U. The consumer
+     * of version `v` is named by the object at version `v + 1`.
+     *
+     * The SDK's `GetObjectOptions` carries no version, so this is not a wrap of a
+     * Core method: it reaches the transport's own historical read — the gRPC
+     * `LedgerService.GetObject` with a `version`, or JSON-RPC
+     * `sui_tryGetPastObject` — and answers `Absent` on any transport that has
+     * neither, on a version that was pruned, and on an object that never had it.
+     * `Absent` is never evidence of anything; a caller that needs proof treats it
+     * as "unknown".
+     *
+     * Fails with: `TransportError`.
+     */
+    readonly getObjectAtVersion: (options: {
+        readonly objectId: string;
+        readonly version: string | bigint;
+    }) => Effect.Effect<VersionedObject, TransportError>;
     /** Polls until a digest is visible. Fails with: `TransactionNotFound`, `TransportError`. */
     readonly waitForTransaction: <Include extends TransactionInclude = {}>(options: SuiClientTypes.WaitForTransactionOptions<Include>) => Effect.Effect<SuiClientTypes.TransactionResult<Include>, TransactionLookupError>;
     /** Simulates a transaction. Fails with: `SimulationFailed`, `TransportError`. */
@@ -2976,7 +3094,14 @@ export declare class UnexpectedEffects extends UnexpectedEffects_base {
 }
 ```
 
-The effects of an applied transaction did not contain what the caller expected.
+The effects of an applied transaction did not contain what the caller
+expected.
+
+Outcome `applied`, and exit 5: this error can only come from an `Executed`,
+which means the transaction reached the chain and gas was charged. What is
+missing is a receipt, not the transaction. Classifying it `not_applied`
+would tell the documented retry idiom to send the caller's intent a second
+time for a transaction that already ran.
 
 ### `Version` (const)
 
@@ -2987,10 +3112,28 @@ declare const Version: Schema.brand<Schema.BigIntFromString, "Version">
 
 A Move object version. Encoded as the decimal string the SDK returns.
 
+### `VersionedObject` (type)
+
+```ts
+export type VersionedObject = {
+    readonly _tag: "Found";
+    readonly objectId: string;
+    readonly version: string;
+    readonly previousTransaction: string | undefined;
+} | {
+    readonly _tag: "Absent";
+    readonly reason: string;
+};
+```
+
+What a versioned object read found: the object as it was at that exact
+version, with the digest of the transaction that produced it, or nothing at
+all with a reason a log can print.
+
 ## `sui-effect/tx`
 
 
-35 exported symbols.
+37 exported symbols.
 
 ### `build` (const)
 
@@ -3002,6 +3145,7 @@ declare const build: (input: Transaction | Recipe, opts: {
     readonly digest: Digest;
     readonly sender: SuiAddress;
     readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
     readonly expiration?: {
         readonly $kind: "None";
         readonly None: true;
@@ -3039,10 +3183,18 @@ declare const build: (input: Transaction | Recipe, opts: {
 
 Builds a transaction into signable bytes.
 
-Building already simulates: on gRPC the SDK's resolve plugin simulates with
-checks enabled to choose the gas budget, and an execution failure there
-arrives as `SimulationFailed`. So simulate-before-submit is inherent and
-costs nothing extra.
+**Building always simulates.** On gRPC the SDK's resolve plugin simulates
+with checks enabled to choose the gas budget, and an execution failure there
+arrives as `SimulationFailed`. That costs nothing extra — but the resolver
+returns early for a transaction that was **already fully resolved** (every
+input resolved, gas price, budget and payment set), and then nothing
+simulates at all. `Tx.build` detects that case and runs one explicit
+`simulateTransaction` with checks enabled, so simulate-before-submit holds
+for every transaction: it costs nothing extra when the SDK had to resolve,
+and one call otherwise.
+
+An interrupted build cancels the request it started: the SDK is handed a
+client whose Core calls carry the Effect's `AbortSignal`.
 
 When the recipe set no expiration, `SubmitConfig.expiration` decides one.
 The default, `ValidDuring`, bounds the transaction at `chainTime` plus
@@ -3096,6 +3248,8 @@ declare const Built: Schema.Struct<{
             readonly nonce: Schema.Number;
         }>;
     }>]>>;
+    /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
+    readonly chain: Schema.optional<Schema.String>;
 }>
 // decodes to:
 // {
@@ -3134,12 +3288,30 @@ declare const Built: Schema.Struct<{
 //             readonly nonce: number;
 //         };
 //     } | undefined;
+//     readonly chain?: string | undefined;
 // }
 ```
 
 A transaction built into bytes and ready to sign, with the expiration the
 builder settled on recorded so `Tx.reconcile` can decide, later and without
 the builder, whether the transaction can still land.
+
+### `chainOf` (const)
+
+```ts
+declare const chainOf: (expiration: TransactionExpiration | undefined) => string | undefined
+```
+
+The chain identifier an expiration names, or `undefined` for the variants
+that name none (`None`, `Epoch`).
+
+This is the first half of the chain-identity guard `Tx.reconcile` applies
+before it asks a node anything: bytes built for one chain must not be
+declared expired by another chain's epoch. The second half is
+`SignedTransaction.chain`, which `Tx.build` records for the variants that
+carry no chain of their own.
+
+**Never fails.**
 
 ### `cosign` (const)
 
@@ -3149,6 +3321,7 @@ declare const cosign: (signed: {
     readonly sender: SuiAddress;
     readonly signatures: readonly Signature[];
     readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
     readonly expiration?: {
         readonly $kind: "None";
         readonly None: true;
@@ -3185,6 +3358,7 @@ declare const cosign: (signed: {
     readonly sender: SuiAddress;
     readonly signatures: readonly Signature[];
     readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
     readonly expiration?: {
         readonly $kind: "None";
         readonly None: true;
@@ -3254,6 +3428,34 @@ export type ExpirationPolicy = "validDuring" | "epoch" | "none";
 
 How `Tx.build` sets an expiration when the recipe left one unset.
 
+### `ExpiryEvidencePolicy` (type)
+
+```ts
+export type ExpiryEvidencePolicy = "epochThenMiss" | "never";
+```
+
+Whether `Tx.reconcile` is allowed to conclude that an expiration window
+closed on a transaction the node does not know.
+
+`"epochThenMiss"` is the default and the only rule that produces
+`NotApplied { evidence: "expired" }`: the epoch (or timestamp) bound must be
+observed as passed, then `getTransaction` must miss, then — after
+`SubmitConfig.reconcileRecheck` — both must hold again. A single observation
+proves nothing, because a transaction can execute between the lookup and the
+expiry check, and a node behind a load balancer can serve an epoch from one
+replica and a transaction index from another.
+
+`"never"` disables the rule outright, so an expiration window is never
+evidence and an unknown transaction stays `SubmissionUnknown`. That is the
+setting for a deployment behind a mixed-node load balancer, where even the
+repeated observation can be answered by two different nodes.
+
+**Residual risk, even on `"epochThenMiss"`:** a node whose transaction index
+lags its epoch view can report the new epoch and miss a transaction it has in
+fact executed, twice in a row. The recheck delay makes that unlikely, not
+impossible; a deployment that cannot tolerate it sets `"never"` and settles
+unknown submissions by hand.
+
 ### `fromConfig` (const)
 
 ```ts
@@ -3317,6 +3519,7 @@ declare const isUnresolved: (value: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -3365,6 +3568,7 @@ declare const isUnresolved: (value: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -3488,6 +3692,7 @@ declare const isUnresolved: (value: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -3531,6 +3736,7 @@ declare const isUnresolved: (value: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -3638,6 +3844,7 @@ declare const JournalEntry: Schema.TaggedUnion<{
                     readonly nonce: Schema.Number;
                 }>;
             }>]>>;
+            readonly chain: Schema.optional<Schema.String>;
         }>;
         readonly lastError: Schema.String;
         readonly attempts: Schema.Number;
@@ -3686,6 +3893,7 @@ declare const JournalEntry: Schema.TaggedUnion<{
                     readonly nonce: Schema.Number;
                 }>;
             }>]>>;
+            readonly chain: Schema.optional<Schema.String>;
         }>;
         readonly signedAt: Schema.DateTimeUtcFromMillis;
     }>;
@@ -3812,6 +4020,7 @@ declare const JournalEntry: Schema.TaggedUnion<{
 //                 readonly nonce: number;
 //             };
 //         } | undefined;
+//         readonly chain?: string | undefined;
 //     };
 //     readonly lastError: string;
 //     readonly attempts: number;
@@ -3860,6 +4069,7 @@ declare const JournalEntry: Schema.TaggedUnion<{
 //                 readonly nonce: number;
 //             };
 //         } | undefined;
+//         readonly chain?: string | undefined;
 //     };
 //     readonly signedAt: Utc;
 // } | {
@@ -4025,25 +4235,41 @@ for.
 
 A transaction the node knows is `Executed`, or `ExecutionFailed` when it
 applied and aborted. A transaction the node does not know is only ever
-`NotApplied` on evidence:
+`NotApplied` on evidence, and there are exactly two kinds:
 
-- `"expired"` when the current epoch is past the `maxEpoch` recorded in the
-  signed bytes, or when `chainTime` has passed a recorded `maxTimestamp` by
-  more than `SubmitConfig.expiryMargin`. The epoch rule is the one that
-  fires in practice, because the default expiration is epoch-bounded; it
-  needs no margin, an epoch being a consensus fact rather than a reading of
-  a clock, and costs one `getCurrentSystemState` read;
-- `"inputConsumed"` when an owned input or a gas coin the transaction pinned
-  has moved on **and the node names a different transaction** as the one that
-  moved it, so those exact bytes can never execute again.
+- `"expired"`, under an **ordered and repeated** rule, because a closed
+  expiration window proves only that the bytes cannot execute *later*, not
+  that they did not execute *earlier*, and a transaction can execute between
+  a lookup and an expiry check. So: the window must be observed closed, then
+  `getTransaction` must miss, then — after `SubmitConfig.reconcileRecheck`
+  (two seconds by default, through the `Clock`) — both must hold again. Any
+  other order, or a single observation, is `SubmissionUnknown`. Set
+  `SubmitConfig.expiryEvidence: "never"` to disable the rule entirely, which
+  is what a deployment behind a mixed-node load balancer wants. The residual
+  risk is a node whose transaction index lags its epoch view;
+- `"inputConsumed"` when the object **at the version after** one this
+  transaction pinned names a **different** transaction as the one that
+  produced it, so those exact bytes can never execute again.
 
 An input that merely advanced is not evidence: the transaction being
 reconciled is itself the likeliest thing to have advanced it, and calling
 that `NotApplied` would tell the documented retry idiom to execute the
-caller's intent a second time. When the node names *our* digest the
-transaction applied and `getTransaction` is asked again; when it names
-nothing at all the answer is `SubmissionUnknown`, which carries the bytes so
-a later process, or a person, can settle it.
+caller's intent a second time. When the successor version names *our* digest
+the transaction applied and `getTransaction` is asked again; when the
+successor cannot be read at all the answer is `SubmissionUnknown`, which
+carries the bytes so a later process, or a person, can settle it.
+
+**Chain identity is checked before anything is asked.** Bytes built for one
+chain must never be declared expired by another chain's epoch, which a
+process-wide journal holding two networks' submissions makes easy to do. A
+mismatch is `SubmissionUnknown` naming both chains.
+
+**No `TransportError` escapes.** A recovery read that fails says nothing
+about whether the transaction applied, and `SuiError.outcome` puts
+`TransportError` on `"not_applied"` — which would tell a wrapper to retry a
+submission whose outcome is genuinely unknown. Every read failure here
+becomes `SubmissionUnknown` carrying the digest, the bytes and the cause. The
+tag stays in the signature so the union does not shrink under callers.
 
 Given only a `Digest` there can be no evidence, so an unknown transaction is
 always `SubmissionUnknown`. Pass the `Signed` bytes (or the
@@ -4063,9 +4289,11 @@ long-lived application makes after building a durable `Journal`.
 Nothing here fails per entry: each one settles to an `Executed`, an
 `ExecutionFailed`, a `NotApplied` or a `SubmissionUnknown`, in the order the
 journal listed them, and the journal is updated to match. Every settled entry
-gets the same evidence rules `Tx.reconcile` applies, including the
-`previousTransaction` guard, so a startup never reports a transaction that
-applied as `NotApplied`.
+gets the same evidence rules `Tx.reconcile` applies — the ordered, repeated
+expiry rule, the chain-identity guard and the versioned consumer check — so a
+startup never reports a transaction that applied as `NotApplied`, and a
+recovery read that fails becomes that entry's `SubmissionUnknown` rather than
+escaping as a `TransportError` the taxonomy would call "not applied".
 
 The whole call fails only if the journal itself cannot be **read**: a write
 that fails after an entry has been settled is logged and the answer stands,
@@ -4130,6 +4358,11 @@ rejection that `Tx.submit` can only report as `SubmissionUnknown`.
 declare const run: (recipe: Transaction | Recipe, opts: {
     readonly signer: Signer;
     readonly gasOwner?: SuiAddress;
+    /**
+     * The gas owner's signer, for a sponsored transaction. Required whenever
+     * the bytes name a gas owner that is not the sender.
+     */
+    readonly sponsor?: Signer;
 }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>
 ```
 
@@ -4151,6 +4384,17 @@ When `SubmitConfig.preflight` is set it costs one extra simulate, and is
 where spend limits and target policies refuse a transaction before anything
 is signed.
 
+**A sponsored run needs both signatures.** A transaction whose gas owner is
+not its sender is signed by *both* parties; one signature is bytes a
+validator rejects. So when `opts.gasOwner` differs from the signer's address
+— or when the recipe itself set a different gas owner, which `Tx.sponsored`
+does — `opts.sponsor` is required and co-signs the same bytes. Without it
+`Tx.run` fails with `SigningError` naming the address whose signature is
+missing, before anything is built when the gas owner was given as an option
+and immediately after the build when it came out of the recipe. Use the
+explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
+two parties cannot both sign in one process.
+
 **Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`).**
 
 ### `RunError` (type)
@@ -4169,6 +4413,7 @@ declare const sign: (built: {
     readonly digest: Digest;
     readonly sender: SuiAddress;
     readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
     readonly expiration?: {
         readonly $kind: "None";
         readonly None: true;
@@ -4206,6 +4451,7 @@ declare const sign: (built: {
     readonly sender: SuiAddress;
     readonly signatures: readonly Signature[];
     readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
     readonly expiration?: {
         readonly $kind: "None";
         readonly None: true;
@@ -4435,6 +4681,51 @@ export interface SubmitConfigService {
      * current epoch is past a transaction's `maxEpoch` it is simply over.
      */
     readonly expiryMargin: Duration.Duration;
+    /**
+     * Whether a closed expiration window may be evidence at all, and under which
+     * rule. See {@link ExpiryEvidencePolicy}. Defaults to `"epochThenMiss"`.
+     */
+    readonly expiryEvidence: ExpiryEvidencePolicy;
+    /**
+     * How long `Tx.reconcile` waits between the first observation of a closed
+     * expiration window and the second one it needs before it will answer
+     * `NotApplied { evidence: "expired" }`.
+     *
+     * It is a `Clock` sleep, so a test drives it with `TestClock` and a test that
+     * does not care sets it to zero.
+     */
+    readonly reconcileRecheck: Duration.Duration;
+    /**
+     * Whether `Tx.submit` waits for a successful execution to become visible to
+     * reads before it returns and releases the sender lock. Defaults to `true`.
+     */
+    readonly awaitVisibility: boolean;
+    /**
+     * How long that wait may take. A wait that times out or fails **never**
+     * changes the outcome: the transaction executed, and `Tx.submit` returns the
+     * `Executed` it already has after logging the failure.
+     */
+    readonly visibilityTimeout: Duration.Duration;
+    /**
+     * The nonce `Tx.build` stamps on a default `ValidDuring` expiration, which is
+     * what makes two otherwise identical transactions from one address in one
+     * epoch different bytes with different digests.
+     *
+     * The default draws a `u32` from Effect's `Random`, which is process-local
+     * and does not survive a restart: independent 32-bit draws collide with
+     * probability about 1.16% after ten thousand such transactions. **A collision
+     * is not a second execution.** Identical bytes have one digest and one
+     * journal key, so the second build is the same transaction as the first; the
+     * failure mode is a transaction that cannot be sent again because the first
+     * one already occupied its digest, not a duplicated intent.
+     *
+     * Supply a monotonic allocator when that matters — a counter in the same
+     * store the journal uses, an id service, anything that survives a restart:
+     * `nonce: Effect.map(counter.next, (n) => n % 4_294_967_296)`. The value must
+     * be an integer in `[0, 2^32)`; anything else fails the build with
+     * `BuildError`. A journal-backed allocator is deferred (DESIGN §15).
+     */
+    readonly nonce: Effect.Effect<number>;
 }
 ```
 
@@ -4538,6 +4829,7 @@ declare const Tx: {
         readonly digest: Digest;
         readonly sender: SuiAddress;
         readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -4575,6 +4867,7 @@ declare const Tx: {
         readonly digest: Digest;
         readonly sender: SuiAddress;
         readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -4612,6 +4905,7 @@ declare const Tx: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -4649,6 +4943,7 @@ declare const Tx: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -4685,6 +4980,7 @@ declare const Tx: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -4726,6 +5022,11 @@ declare const Tx: {
     readonly run: (recipe: Transaction | Recipe, opts: {
         readonly signer: Signer;
         readonly gasOwner?: SuiAddress;
+        /**
+         * The gas owner's signer, for a sponsored transaction. Required whenever
+         * the bytes name a gas owner that is not the sender.
+         */
+        readonly sponsor?: Signer;
     }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>;
     readonly reconcileAll: () => Effect.Effect<readonly Reconciled[], TransportError | JournalError, Sui>;
 }
@@ -4849,10 +5150,21 @@ a later `get` still finds the answer.
 because the index write is a read-modify-write over a store that offers no
 compare-and-set: two concurrent `Tx.run`s from different senders would
 otherwise each read the same index, each append their own digest, and the
-second write would drop the first. The index is written **before** the entry,
-so a crash between the two leaves a digest whose entry is missing —
-`listUnresolved` skips it and the next `put` rewrites it — rather than an
-entry no index points at, which nothing would ever reconcile.
+second write would drop the first. The semaphore is keyed by the store prefix
+at module level, so two journals built over one prefix share it.
+
+**The order of the two writes depends on which way a crash between them is
+survivable:**
+
+- an **unresolved** entry (`Signed`, `Unknown`) writes the **index first**, so
+  a crash leaves a digest whose entry is missing — `listUnresolved` skips it —
+  rather than an entry nothing points at;
+- a **terminal** entry (`Executed`, `Failed`, `NotApplied`) writes the
+  **entry first** and only then drops the digest from the index, so a crash
+  leaves the digest still indexed with its terminal answer already stored:
+  `listUnresolved` reads the entry, sees it is resolved, and skips it. Doing
+  it the other way round is how a settled transaction reverted to the stale
+  `Signed` entry that startup recovery could no longer find.
 
 Every member fails with `JournalError` and nothing else.
 
@@ -5058,7 +5370,7 @@ What `fromService` needs to know beyond the service key itself.
 ### `exitCode` (const)
 
 ```ts
-declare const exitCode: <A, E>(exit: Exit.Exit<A, E>) => number
+declare const exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number
 ```
 
 The exit code one failure deserves.
@@ -5067,7 +5379,9 @@ The axis is what a wrapper can act on: did the transaction apply (5, gas was
 charged, do not retry), is the outcome unknown (3, reconcile before doing
 anything else), or did nothing apply (4, safe to retry)? Configuration
 problems are 2 because no amount of retrying fixes them, a defect is 1, and
-an interrupt is 130 the way a shell expects.
+an interrupt is 130 the way a shell expects — unless the journal says there
+is a submission outstanding, in which case it is 3, because a wrapper that
+sees 130 has no reason to go looking for one.
 
 An extension error that declares an `outcome` is honoured, so a downstream
 SDK's own failures land on the same axis. `SchemaError` — what Effect's own
@@ -5116,9 +5430,12 @@ calls cannot land in the script's output. A `SubmissionUnknown` additionally
 prints the base64 of the signed bytes and a line saying to reconcile, because
 those bytes are the durable record a script has.
 
-On an interrupt or a defect it also prints whatever the default journal still
-holds unresolved, which is the only record of bytes that may be on the wire
-when a script is killed between signing and the answer.
+On **every** non-zero exit it also prints whatever the journal the script ran
+with still holds unresolved, which is the only record of bytes that may be on
+the wire when a script is killed — or fails — between signing and the answer.
+That count is also what decides a timeout (3 rather than 4) and an interrupt
+(3 rather than 130): an `Effect.timeout` around a submission interrupts it
+from the outside and never reaches `Tx.submit`'s own mapping.
 
 **A second SIGINT does nothing.** The handler interrupts the root fiber once;
 pressing Ctrl-C again while finalizers run is ignored, because the whole
@@ -5174,7 +5491,7 @@ export declare class Script extends Script_base {
      */
     static readonly layerReadOnlyNoDeps: Layer.Layer<ScriptReadOnly, Config.ConfigError, Sui | SuiCore>;
     /** See {@link exitCode}. */
-    static readonly exitCode: <A, E>(exit: Exit.Exit<A, E>) => number;
+    static readonly exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number;
     /** See {@link run}. */
     static readonly run: <A, E>(effect: Effect.Effect<A, E, Script | Sui | SuiCore>, options?: ScriptRunOptions) => Promise<number>;
 }
@@ -5298,6 +5615,16 @@ export interface FakeChange {
     readonly owner?: SuiClientTypes.ObjectOwner;
     /** `PackageWrite` marks a published package; `AccumulatorWriteV1` an accumulator write. */
     readonly outputState?: SuiClientTypes.ChangedObject["outputState"];
+    /**
+     * The balance this coin has **after** the transaction, in MIST.
+     *
+     * Only meaningful for a `0x2::coin::Coin<...>`: a created coin joins the
+     * fake's coin set with this balance and a mutated one has its balance
+     * rewritten, so a test that splits a coin and then builds again sees the gas
+     * selection the split left behind. Leave it out for anything that is not a
+     * coin.
+     */
+    readonly balance?: bigint;
 }
 ```
 
@@ -5856,7 +6183,14 @@ export {
 export { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
 export { escrow } from "./extension.ts"
 export { Platform, platform, type PlatformOptions, type PlatformService } from "./Platform.ts"
-export { ESCROW_PACKAGE, EscrowContent, RECEIPT_TYPE, Settlement, SettlementContent } from "./schema.ts"
+export {
+  ESCROW_PACKAGE,
+  EscrowContent,
+  escrowType,
+  receiptType,
+  Settlement,
+  SettlementContent
+} from "./schema.ts"
 ```
 
 ### `examples/extension-template/src/schema.ts`
@@ -5874,21 +6208,49 @@ import { bcs } from "@mysten/sui/bcs"
 import { DateTime, Effect, Schema, SchemaIssue, SchemaTransformation } from "effect"
 import { ObjectId, SuiAddress, SuiSchema } from "sui-effect"
 
-/** The package the template's example type lives in. Replace it with yours. */
+/**
+ * The package the template's example type lives in, and the default this
+ * release ships. Replace it with yours.
+ */
 export const ESCROW_PACKAGE = "0x0000000000000000000000000000000000000000000000000000000000000002"
 
-/** `escrow::Escrow`, the object this extension reads. */
-export const EscrowContent = SuiSchema.bcs(
-  bcs.struct("Escrow", {
-    id: bcs.Address,
-    owner: bcs.Address,
-    amount: bcs.u64()
-  }),
-  `${ESCROW_PACKAGE}::escrow::Escrow`
-)
+/** The BCS layout of `escrow::Escrow`, which is the same whatever it was published to. */
+const EscrowBcs = bcs.struct("Escrow", {
+  id: bcs.Address,
+  owner: bcs.Address,
+  amount: bcs.u64()
+})
+
+/** The Move type of an escrow, under a given type origin. */
+export const escrowType = (typeOrigin: string): string =>
+  `${typeOrigin}::escrow::Escrow`
 
 /** The Move type of a claim receipt, which `claimFor` expects to be created. */
-export const RECEIPT_TYPE = `${ESCROW_PACKAGE}::escrow::Receipt`
+export const receiptType = (typeOrigin: string): string =>
+  `${typeOrigin}::escrow::Receipt`
+
+/**
+ * `escrow::Escrow`, the object this extension reads, **as a function of the
+ * package it lives in**.
+ *
+ * A Move type name contains its package id, so a codec built from a hard-coded
+ * constant checks the wrong type the moment a consumer configures a different
+ * package: `getObject(id, { schema })` compares the object's tag before it
+ * parses a byte, and a correctly encoded object under the configured package
+ * fails with `DecodeError`. Every type-shaped constant in an extension takes
+ * the package id the service was built with, and the service passes its own.
+ *
+ * **Which package id.** The one that appears in a type name is the **type
+ * origin**: the package the type was *first* published in. Upgrading a package
+ * gives it a new id for *calls*, and the type origin does not move. So an
+ * extension over an upgraded package carries two ids — `packageId` for
+ * `moveCall` targets, `typeOrigin` for codecs, filters and receipt types — and
+ * they are the same value until the first upgrade. `Escrow.layer` takes both.
+ */
+export const EscrowContent = (typeOrigin: string) => SuiSchema.bcs(
+  EscrowBcs,
+  escrowType(typeOrigin)
+)
 
 /**
  * The Move layout of `escrow::Settlement`, whose fields are `snake_case`
@@ -5953,44 +6315,45 @@ interface SettlementParts {
  * `sui.getObject`, with the same fields: the domain mapping is part of the
  * boundary, not a step after it.
  */
-export const SettlementContent = SuiSchema.bcs(
-  SettlementBcs,
-  `${ESCROW_PACKAGE}::escrow::Settlement`
-).pipe(
-  Schema.decodeTo(
-    Settlement,
-    SchemaTransformation.transformOrFail<SettlementParts, typeof SettlementBcs.$inferType>({
-      decode: (fields, options) =>
-        // `transformOrFail`, not `transform`, because one of these mappings can
-        // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
-        // whose body throws is a **defect**, which is not what a bad byte on the
-        // wire should be; failing with a `SchemaIssue` here is what makes it a
-        // `DecodeError` like any other.
-        Effect.map(
-          Effect.fromOption(
-            DateTime.make(Number(fields.settled_at_ms)),
-            () =>
-              new SchemaIssue.InvalidValue(
-                { message: `settled_at_ms ${fields.settled_at_ms} is not a time` },
-                fields,
-                options
-              )
+export const SettlementContent = (typeOrigin: string) =>
+  SuiSchema.bcs(
+    SettlementBcs,
+    `${typeOrigin}::escrow::Settlement`
+  ).pipe(
+    Schema.decodeTo(
+      Settlement,
+      SchemaTransformation.transformOrFail<SettlementParts, typeof SettlementBcs.$inferType>({
+        decode: (fields, options) =>
+          // `transformOrFail`, not `transform`, because one of these mappings can
+          // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
+          // whose body throws is a **defect**, which is not what a bad byte on the
+          // wire should be; failing with a `SchemaIssue` here is what makes it a
+          // `DecodeError` like any other.
+          Effect.map(
+            Effect.fromOption(
+              DateTime.make(Number(fields.settled_at_ms)),
+              () =>
+                new SchemaIssue.InvalidValue(
+                  { message: `settled_at_ms ${fields.settled_at_ms} is not a time` },
+                  fields,
+                  options
+                )
+            ),
+            (settledAt): SettlementParts => ({
+              escrowId: fields.escrow_id,
+              settledAt,
+              claimedBy: fields.claimed_by
+            })
           ),
-          (settledAt): SettlementParts => ({
-            escrowId: fields.escrow_id,
-            settledAt,
-            claimedBy: fields.claimed_by
+        encode: (settlement) =>
+          Effect.succeed({
+            escrow_id: settlement.escrowId,
+            settled_at_ms: String(DateTime.toEpochMillis(settlement.settledAt)),
+            claimed_by: settlement.claimedBy
           })
-        ),
-      encode: (settlement) =>
-        Effect.succeed({
-          escrow_id: settlement.escrowId,
-          settled_at_ms: String(DateTime.toEpochMillis(settlement.settledAt)),
-          claimed_by: settlement.claimedBy
-        })
-    })
+      })
+    )
   )
-)
 ```
 
 ### `examples/extension-template/src/errors.ts`
@@ -6081,6 +6444,7 @@ import {
   Stream
 } from "effect"
 import type { ChangedRef, Recipe, SuiObject, UnexpectedEffects } from "sui-effect"
+import { normalizeSuiAddress } from "@mysten/sui/utils"
 import {
   DecodeError,
   Digest,
@@ -6094,12 +6458,13 @@ import {
 import type { RunError, Signer } from "sui-effect/tx"
 import { Tx } from "sui-effect/tx"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
-import { EscrowContent, ESCROW_PACKAGE, RECEIPT_TYPE } from "./schema.ts"
+import { escrowType, EscrowContent, ESCROW_PACKAGE, receiptType } from "./schema.ts"
 import type { SettlementApi } from "./upstream.ts"
 import { settlementApi } from "./upstream.ts"
 
 /** The decoded content of an escrow object, inferred from the BCS bridge. */
-export type EscrowFields = typeof EscrowContent extends Schema.Codec<infer T, Uint8Array> ? T
+export type EscrowFields = ReturnType<typeof EscrowContent> extends
+  Schema.Codec<infer T, Uint8Array> ? T
   : never
 
 /** An escrow object: the envelope `Sui` returns plus its decoded content. */
@@ -6127,8 +6492,14 @@ export type ClaimForError =
  * no member takes a signer from the layer: `claimFor` is handed one.
  */
 export interface EscrowService {
-  /** The package this service reads and writes. */
+  /** The package this service calls into. */
   readonly packageId: string
+  /**
+   * The package the types this service decodes were **first** published in,
+   * which is what appears inside every Move type name. It is the same as
+   * `packageId` until the package is upgraded.
+   */
+  readonly typeOrigin: string
   /**
    * The address the package collects fees at, read through the upstream SDK.
    *
@@ -6196,8 +6567,18 @@ export interface EscrowService {
 
 /** What {@link Escrow.layer} needs to know. */
 export interface EscrowOptions {
-  /** The published package id. */
+  /** The published package id, which is what `moveCall` targets name. */
   readonly packageId: string
+  /**
+   * The type origin: the package the Move **types** were first published in,
+   * which is what appears inside `pkg::escrow::Escrow`.
+   *
+   * Defaults to `packageId`, which is right until the package is upgraded —
+   * an upgrade gives the package a new id for calls and leaves every type name
+   * pointing at the original. Set it then, and codecs, owned-object filters and
+   * the receipt type keep checking the type that exists.
+   */
+  readonly typeOrigin?: string
   /** The operator's settlement service. */
   readonly url: string
   /** The extension's own credential — never the consumer's. */
@@ -6216,12 +6597,22 @@ const transport = (method: string) => (cause: unknown): TransportError =>
   new TransportError({ method, retryable: false, cause })
 
 const make = (
-  options: { readonly packageId: string; readonly api: SettlementApi }
+  options: {
+    readonly packageId: string
+    readonly typeOrigin?: string
+    readonly api: SettlementApi
+  }
 ): Effect.Effect<EscrowService, never, Sui> =>
   Effect.gen(function*() {
     const sui = yield* Sui
     const { api, packageId } = options
-    const escrowType = StructTag.make(`${packageId}::escrow::Escrow`)
+    // Every type-shaped value is derived here, from the configured origin, and
+    // never from the module-level constant: configuring a package id has to
+    // move the codecs with it.
+    const typeOrigin = options.typeOrigin ?? packageId
+    const content = EscrowContent(typeOrigin)
+    const receipt = receiptType(typeOrigin)
+    const ownedFilter = StructTag.make(escrowType(typeOrigin))
 
     // `Sui` carries the `SuiCore` it was built over, so an extension reaches
     // the mechanical tier — and through `use`, the SDK client object an
@@ -6249,7 +6640,7 @@ const make = (
       )
 
     const get = Effect.fn("Escrow.get")(function*(id: ObjectId) {
-      return yield* sui.getObject(id, { schema: EscrowContent }).pipe(
+      return yield* sui.getObject(id, { schema: content }).pipe(
         Effect.catchTag(
           ["ObjectNotFound", "ObjectDeleted"],
           () => Effect.fail(new EscrowNotFound({ escrowId: id }))
@@ -6297,23 +6688,23 @@ const make = (
       // receipt. That is what `UnexpectedEffects` means, and `outcome` puts it
       // on "applied". Mapping it to `TransportError` would tell a wrapper the
       // opposite — nothing happened, retry — about a claim that ran.
-      const receipt = yield* executed.expectCreated(RECEIPT_TYPE)
+      const created = yield* executed.expectCreated(receipt)
       yield* notify(id, executed.digest)
-      return receipt
+      return created
     // `Tx.*` requires `Sui`, and the layer has one: providing it here is what
     // keeps every member's requirement channel empty, which is what
     // `SuiExtension.fromService` and every consumer expect.
     }, Effect.provideService(Sui, sui))
 
     const stream = (owner: SuiAddress) =>
-      sui.streamOwnedObjects(owner, { type: escrowType }).pipe(
+      sui.streamOwnedObjects(owner, { type: ownedFilter }).pipe(
         Stream.mapEffect((object) =>
           // `SuiSchema.decode` is the same decode `sui.getObject({ schema })`
           // does, for the places that already have bytes. Bytes that do not
           // decode are a `DecodeError` naming the object and the type — not a
           // transport failure, which is what a node that could not be reached
           // is.
-          SuiSchema.decode(EscrowContent, object.content, {
+          SuiSchema.decode(content, object.content, {
             objectId: object.id,
             // The type the object actually has. Give it and `SuiSchema.decode`
             // runs the same tag check `getObject` does, under the same rule: a
@@ -6326,6 +6717,7 @@ const make = (
 
     return {
       packageId,
+      typeOrigin,
       feeCollector,
       get,
       claim,
@@ -6361,7 +6753,12 @@ export const DEPLOYMENTS: Readonly<Record<string, EscrowDeployment>> = {
 /** The in-memory settlement service `layerTest` runs against. */
 const fakeApi = (settled: boolean): SettlementApi => ({
   notifyClaim: async () => ({ status: settled ? "settled" : "pending" }),
-  resolveFeeCollector: async () => SuiAddress.make("0x1")
+  // `SuiAddress.make` validates, it does not normalize: `"0x1"` is not a
+  // 32-byte address and `make` throws, which the `use` boundary then reports as
+  // a `TransportError` from a fake that never touched a network. Normalize
+  // first — or write the padded form out — whenever a literal address becomes a
+  // branded one.
+  resolveFeeCollector: async () => SuiAddress.make(normalizeSuiAddress("0x1"))
 })
 
 /**
@@ -6383,6 +6780,7 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
       Escrow,
       make({
         packageId: options.packageId,
+        ...(options.typeOrigin === undefined ? {} : { typeOrigin: options.typeOrigin }),
         api: settlementApi({ url: options.url, apiKey: Redacted.value(options.apiKey) })
       })
     )
@@ -6596,7 +6994,11 @@ import { Journal, Signer } from "sui-effect/tx"
 import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "../src/errors.ts"
 import { Platform } from "../src/Platform.ts"
-import { ESCROW_PACKAGE, RECEIPT_TYPE, Settlement, SettlementContent } from "../src/schema.ts"
+import { ESCROW_PACKAGE, receiptType, Settlement, SettlementContent } from "../src/schema.ts"
+
+/** The type constants under the package this test's fixtures use. */
+const RECEIPT_TYPE = receiptType(ESCROW_PACKAGE)
+const SETTLEMENT = SettlementContent(ESCROW_PACKAGE)
 
 const padded = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
 const ESCROW_ID = ObjectId.make(padded("e5c0"))
@@ -6833,7 +7235,7 @@ describe("Settlement: a domain class over the BCS bridge", () => {
       settled_at_ms: "1700000000000",
       claimed_by: SENDER
     }).toBytes()
-    const settlement = await Effect.runPromise(SuiSchema.decode(SettlementContent, bytes))
+    const settlement = await Effect.runPromise(SuiSchema.decode(SETTLEMENT, bytes))
     expect(settlement).toBeInstanceOf(Settlement)
     expect(settlement.escrowId).toBe(ESCROW_ID)
     expect(settlement.claimedBy).toBe(SENDER)
@@ -6846,9 +7248,9 @@ describe("Settlement: a domain class over the BCS bridge", () => {
       settled_at_ms: "1700000000000",
       claimed_by: SENDER
     }).toBytes()
-    const settlement = await Effect.runPromise(SuiSchema.decode(SettlementContent, bytes))
+    const settlement = await Effect.runPromise(SuiSchema.decode(SETTLEMENT, bytes))
     const encoded = await Effect.runPromise(
-      Schema.encodeUnknownEffect(SettlementContent)(settlement)
+      Schema.encodeUnknownEffect(SETTLEMENT)(settlement)
     )
     expect(Array.from(encoded)).toEqual(Array.from(bytes))
   })
@@ -6861,7 +7263,7 @@ describe("Settlement: a domain class over the BCS bridge", () => {
       claimed_by: SENDER
     }).toBytes()
     const error = await Effect.runPromise(
-      Effect.flip(SuiSchema.decode(SettlementContent, bytes, { objectId: ESCROW_ID }))
+      Effect.flip(SuiSchema.decode(SETTLEMENT, bytes, { objectId: ESCROW_ID }))
     )
     expect(error._tag).toBe("DecodeError")
     expect(error.objectId).toBe(ESCROW_ID)
@@ -6934,6 +7336,92 @@ describe("Platform: one extension composed on another", () => {
     expect(claimed[0]?.id).toBe(ObjectId.make(RECEIPT_ID))
   })
 })
+
+/**
+ * Regression tests for the codex audit of 2026-09-11, findings 18 and 23.
+ */
+describe("configuring a package moves the codecs with it", () => {
+  const OTHER_PACKAGE = padded("beef")
+
+  const underOtherPackage = {
+    ...script,
+    objects: [
+      {
+        ...escrowObject("5"),
+        // A correctly encoded escrow, published to the *configured* package.
+        type: `${OTHER_PACKAGE}::escrow::Escrow`
+      }
+    ]
+  }
+
+  const withPackage = <A, E>(
+    effect: Effect.Effect<A, E, Escrow | Sui | SuiCore | SuiCoreFake | TestClock.TestClock>,
+    packageId: string
+  ) =>
+    Effect.runPromise(
+      Effect.provide(
+        effect,
+        Layer.mergeAll(
+          layerExtensionTest(
+            Escrow.layer({
+              packageId,
+              url: "https://settlement.example",
+              apiKey: Redacted.make("key")
+            }),
+            underOtherPackage
+          ),
+          TestClock.layer(),
+          Journal.layerMemory
+        ),
+        { local: true }
+      )
+    )
+
+  test("a valid object under the configured package decodes", async () => {
+    // Before the fix the codec and the receipt type came from the module-level
+    // constant, so configuring a package id made every read fail with
+    // `DecodeError` and every claim report a missing receipt.
+    const escrow = await withPackage(
+      Effect.flatMap(Escrow, (service) => service.get(ESCROW_ID)),
+      OTHER_PACKAGE
+    )
+    expect(escrow.content.amount).toBe("5")
+    expect(String(escrow.type)).toBe(`${OTHER_PACKAGE}::escrow::Escrow`)
+  })
+
+  test("the service reports the type origin it was built with", async () => {
+    const origin = await withPackage(
+      Effect.map(Escrow, (service) => service.typeOrigin),
+      OTHER_PACKAGE
+    )
+    expect(origin).toBe(OTHER_PACKAGE)
+  })
+
+  test("the default package still refuses an object of another package", async () => {
+    const error = await Effect.runPromise(
+      Effect.provide(
+        Effect.flip(Effect.flatMap(Escrow, (service) => service.get(ESCROW_ID))),
+        Layer.mergeAll(
+          layerExtensionTest(Escrow.layerTest(), underOtherPackage),
+          TestClock.layer(),
+          Journal.layerMemory
+        ),
+        { local: true }
+      )
+    )
+    expect(error._tag).toBe("DecodeError")
+  })
+})
+
+describe("the test fee collector", () => {
+  test("resolves to a normalized address instead of failing", async () => {
+    // `SuiAddress.make("0x1")` validates the decoded representation and does
+    // not normalize it, so the abbreviated form threw inside the fake API and
+    // arrived as a `TransportError` from a member that never touched a network.
+    const address = await provide(Effect.flatMap(Escrow, (service) => service.feeCollector))
+    expect(String(address)).toBe(padded("1"))
+  })
+})
 ```
 
 ### `examples/extension-template/package.json`
@@ -6945,7 +7433,6 @@ describe("Platform: one extension composed on another", () => {
   "description": "A copyable sui-effect extension package: one service, three layers, a derived Promise face.",
   "license": "MIT",
   "type": "module",
-  "private": true,
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -6958,9 +7445,11 @@ describe("Platform: one extension composed on another", () => {
   ],
   "sideEffects": false,
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "check": "tsc --noEmit && bun test"
+    "check:package": "bun scripts/check-package.ts",
+    "check": "tsc --noEmit && bun test && bun scripts/check-package.ts"
   },
   "peerDependencies": {
     "@mysten/bcs": "^2.1.1",

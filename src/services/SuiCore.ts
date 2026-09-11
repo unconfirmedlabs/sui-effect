@@ -12,7 +12,7 @@
  */
 import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
-import { SuiGrpcClient } from "@mysten/sui/grpc"
+import { isSuiGrpcClient, SuiGrpcClient } from "@mysten/sui/grpc"
 import type { TransactionPlugin } from "@mysten/sui/transactions"
 import { Config, ConfigProvider, Context, Effect, Layer, Schedule, Schema } from "effect"
 import {
@@ -24,6 +24,7 @@ import {
   TransportError
 } from "../domain/errors.ts"
 
+import { classifyTransportCause } from "../domain/errors.ts"
 import { Digest, executionReasonOf, ExecutionReason, KnownNetwork, ObjectId } from "../domain/schemas.ts"
 
 export { RETRYABLE_GRPC_STATUSES } from "../domain/errors.ts"
@@ -111,6 +112,24 @@ export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
     return new TransactionNotFound({ digest: asDigest(cause.digest) })
   }
   if (cause instanceof SimulationError) {
+    // The SDK's resolve plugin simulates to choose a gas budget and wraps
+    // *whatever went wrong* in a `SimulationError`, transport failures
+    // included: a rejected fetch, a gRPC `UNAVAILABLE`, an HTTP 503. Only a
+    // wrapper carrying an `executionError` describes a transaction that would
+    // abort on chain; the rest are the node being unreachable, and calling
+    // those `SimulationFailed` loses both the status and the retryability a
+    // caller needs.
+    if (cause.executionError === undefined) {
+      const transport = transportCauseOf(cause)
+      if (transport !== undefined) {
+        return new TransportError({
+          method,
+          retryable: transport.retryable,
+          ...(transport.status === undefined ? {} : { status: transport.status }),
+          cause: cause.cause ?? cause
+        })
+      }
+    }
     return new SimulationFailed({
       reason:
         cause.executionError === undefined ? UNKNOWN_REASON : executionReasonOf(cause.executionError),
@@ -118,6 +137,33 @@ export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
     })
   }
   return transportError(method, cause)
+}
+
+/**
+ * The transport failure a `SimulationError` is carrying, if it is carrying one.
+ *
+ * `classifyTransportCause` recognises a gRPC `RpcError` by its `code`, an HTTP
+ * status error by its numeric `status`, and an abort or timeout by its `name`.
+ * A cause it does not recognise — a plain `Error` the resolver threw itself —
+ * is not a transport failure and the wrapper stays `SimulationFailed`. The
+ * chain is walked one level at a time because grpc-web wraps a rejected fetch
+ * once more on its way out. Never fails.
+ */
+const transportCauseOf = (
+  error: { readonly cause?: unknown }
+): { readonly status?: string; readonly retryable: boolean } | undefined => {
+  let current: unknown = error.cause
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    const classified = classifyTransportCause(current)
+    if (classified.status !== undefined) return classified
+    if (current instanceof TypeError) {
+      // A rejected `fetch` is a bare `TypeError` with no status of any kind;
+      // it is still the network, and still worth retrying.
+      return { retryable: true }
+    }
+    current = (current as { readonly cause?: unknown }).cause
+  }
+  return undefined
 }
 
 /** Narrows `mapSdkError` to the union an object lookup declares. */
@@ -173,6 +219,20 @@ const retryReads = <A, E extends { readonly _tag: string }, R>(
 type ObjectInclude = SuiClientTypes.ObjectInclude
 type TransactionInclude = SuiClientTypes.TransactionInclude
 type SimulateInclude = SuiClientTypes.SimulateTransactionInclude
+
+/**
+ * What a versioned object read found: the object as it was at that exact
+ * version, with the digest of the transaction that produced it, or nothing at
+ * all with a reason a log can print.
+ */
+export type VersionedObject =
+  | {
+    readonly _tag: "Found"
+    readonly objectId: string
+    readonly version: string
+    readonly previousTransaction: string | undefined
+  }
+  | { readonly _tag: "Absent"; readonly reason: string }
 
 /**
  * The mechanical tier: one member per `SuiClientTypes.TransportMethods` key,
@@ -246,6 +306,30 @@ export interface SuiCoreService {
   readonly signAndExecuteTransaction: <Include extends TransactionInclude = {}>(
     options: SuiClientTypes.SignAndExecuteTransactionOptions<Include>
   ) => Effect.Effect<SuiClientTypes.TransactionResult<Include>, TransportError>
+
+  /**
+   * Reads one object **at a specific version**, for the one question the
+   * live-object read cannot answer: which transaction consumed the version a
+   * set of bytes pinned.
+   *
+   * `previousTransaction` on the *current* object names the latest mutation,
+   * which is not necessarily the consumer of an older version: T can consume
+   * version 3 and U version 4, and the live object then names U. The consumer
+   * of version `v` is named by the object at version `v + 1`.
+   *
+   * The SDK's `GetObjectOptions` carries no version, so this is not a wrap of a
+   * Core method: it reaches the transport's own historical read — the gRPC
+   * `LedgerService.GetObject` with a `version`, or JSON-RPC
+   * `sui_tryGetPastObject` — and answers `Absent` on any transport that has
+   * neither, on a version that was pruned, and on an object that never had it.
+   * `Absent` is never evidence of anything; a caller that needs proof treats it
+   * as "unknown".
+   *
+   * Fails with: `TransportError`.
+   */
+  readonly getObjectAtVersion: (
+    options: { readonly objectId: string; readonly version: string | bigint }
+  ) => Effect.Effect<VersionedObject, TransportError>
 
   /** Polls until a digest is visible. Fails with: `TransactionNotFound`, `TransportError`. */
   readonly waitForTransaction: <Include extends TransactionInclude = {}>(
@@ -429,6 +513,97 @@ const makeGrpcClient = (options: SuiGrpcLayerOptions): ClientWithCoreApi =>
   })
 
 /**
+ * The JSON-RPC shape of a historical object read, duck-typed rather than
+ * imported: `@mysten/sui/jsonRpc` is a deprecated subpath and pulling it into
+ * this module for one optional call would put the whole JSON-RPC client in
+ * every bundle. A client that has `tryGetPastObject` answers the question; one
+ * that does not, does not.
+ */
+interface PastObjectCapable {
+  readonly tryGetPastObject: (options: {
+    readonly id: string
+    readonly version: number
+    readonly options?: { readonly showPreviousTransaction?: boolean }
+    readonly signal?: AbortSignal
+  }) => Promise<
+    | { readonly status: "VersionFound"; readonly details: { version: string; previousTransaction?: string | null } }
+    | { readonly status: string; readonly details: unknown }
+  >
+}
+
+const hasPastObject = (client: unknown): client is PastObjectCapable =>
+  typeof (client as { readonly tryGetPastObject?: unknown }).tryGetPastObject === "function"
+
+const NOT_FOUND_STATUSES: ReadonlySet<string> = new Set(["NOT_FOUND", "5"])
+
+/**
+ * One historical object read, on whichever transport the client is.
+ *
+ * gRPC's `LedgerService.GetObject` takes a `version` and a read mask; JSON-RPC
+ * has `sui_tryGetPastObject`. Everything else — a hand-written client, a test
+ * double with neither — answers `Absent`, because a transport that cannot read
+ * history must not be allowed to look like a transport that read history and
+ * found nothing.
+ */
+const readObjectAtVersion = async (
+  client: ClientWithCoreApi,
+  objectId: string,
+  version: bigint,
+  signal: AbortSignal
+): Promise<VersionedObject> => {
+  if (isSuiGrpcClient(client)) {
+    try {
+      const { response } = await client.ledgerService.getObject(
+        {
+          objectId,
+          version,
+          readMask: { paths: ["object_id", "version", "previous_transaction"] }
+        },
+        { abort: signal }
+      )
+      const object = response.object
+      if (object === undefined || object.version === undefined) {
+        return { _tag: "Absent", reason: `the node served no object ${objectId} at version ${version}` }
+      }
+      return {
+        _tag: "Found",
+        objectId,
+        version: object.version.toString(),
+        previousTransaction: object.previousTransaction ?? undefined
+      }
+    } catch (cause) {
+      const code = (cause as { readonly code?: unknown }).code
+      if (typeof code === "string" && NOT_FOUND_STATUSES.has(code)) {
+        return { _tag: "Absent", reason: `version ${version} of ${objectId} is not served (pruned or never existed)` }
+      }
+      throw cause
+    }
+  }
+  if (hasPastObject(client)) {
+    const read = await client.tryGetPastObject({
+      id: objectId,
+      version: Number(version),
+      options: { showPreviousTransaction: true },
+      signal
+    })
+    if (read.status !== "VersionFound") {
+      return { _tag: "Absent", reason: `sui_tryGetPastObject answered ${read.status} for ${objectId} at version ${version}` }
+    }
+    const details = read.details as { version: string; previousTransaction?: string | null }
+    return {
+      _tag: "Found",
+      objectId,
+      version: String(details.version),
+      previousTransaction: details.previousTransaction ?? undefined
+    }
+  }
+  return {
+    _tag: "Absent",
+    reason: "this transport cannot read an object at a past version"
+  }
+}
+
+/**
  * Wraps a client object into the service. Exported so `SuiExtension.fromService`
  * and tests can build the same implementation over any `ClientWithCoreApi`.
  */
@@ -568,6 +743,17 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         "signAndExecuteTransaction",
         (core, signal) => core.signAndExecuteTransaction({ ...options, signal }),
         onlyTransportError("signAndExecuteTransaction")
+      )
+    }),
+    getObjectAtVersion: Effect.fn("SuiCore.getObjectAtVersion")(function*(
+      options: { readonly objectId: string; readonly version: string | bigint }
+    ): Effect.fn.Return<VersionedObject, TransportError> {
+      return yield* retryReads(
+        Effect.tryPromise({
+          try: (signal) =>
+            readObjectAtVersion(client, options.objectId, BigInt(options.version), signal),
+          catch: onlyTransportError("getObjectAtVersion")
+        })
       )
     }),
     waitForTransaction: Effect.fn("SuiCore.waitForTransaction")(function*<Include extends TransactionInclude = {}>(

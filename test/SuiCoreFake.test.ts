@@ -177,7 +177,7 @@ describe("digests come from the bytes", () => {
         const core = yield* SuiCore
         const fake = yield* SuiCoreFake
         const bytes = yield* bytesOf(fake)
-        const executed = yield* core.executeTransaction({ transaction: bytes, signatures: [] })
+        const executed = yield* core.executeTransaction({ transaction: bytes, signatures: ["c2ln"] })
         const digest = executed.$kind === "Transaction"
           ? executed.Transaction.digest
           : executed.FailedTransaction.digest
@@ -210,7 +210,7 @@ describe("digests come from the bytes", () => {
         const digest = TransactionDataBuilder.getDigestFromBytes(bytes)
         yield* Effect.exit(
           core
-            .executeTransaction({ transaction: bytes, signatures: [] })
+            .executeTransaction({ transaction: bytes, signatures: ["c2ln"] })
             .pipe(Effect.timeout("20 millis"))
         )
         return yield* Effect.exit(core.getTransaction({ digest }))
@@ -230,7 +230,7 @@ describe("digests come from the bytes", () => {
         const digest = TransactionDataBuilder.getDigestFromBytes(bytes)
         yield* Effect.exit(
           core
-            .executeTransaction({ transaction: bytes, signatures: [] })
+            .executeTransaction({ transaction: bytes, signatures: ["c2ln"] })
             .pipe(Effect.timeout("20 millis"))
         )
         return yield* core.getTransaction({ digest }).pipe(Effect.flip)

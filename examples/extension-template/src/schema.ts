@@ -10,21 +10,49 @@ import { bcs } from "@mysten/sui/bcs"
 import { DateTime, Effect, Schema, SchemaIssue, SchemaTransformation } from "effect"
 import { ObjectId, SuiAddress, SuiSchema } from "sui-effect"
 
-/** The package the template's example type lives in. Replace it with yours. */
+/**
+ * The package the template's example type lives in, and the default this
+ * release ships. Replace it with yours.
+ */
 export const ESCROW_PACKAGE = "0x0000000000000000000000000000000000000000000000000000000000000002"
 
-/** `escrow::Escrow`, the object this extension reads. */
-export const EscrowContent = SuiSchema.bcs(
-  bcs.struct("Escrow", {
-    id: bcs.Address,
-    owner: bcs.Address,
-    amount: bcs.u64()
-  }),
-  `${ESCROW_PACKAGE}::escrow::Escrow`
-)
+/** The BCS layout of `escrow::Escrow`, which is the same whatever it was published to. */
+const EscrowBcs = bcs.struct("Escrow", {
+  id: bcs.Address,
+  owner: bcs.Address,
+  amount: bcs.u64()
+})
+
+/** The Move type of an escrow, under a given type origin. */
+export const escrowType = (typeOrigin: string): string =>
+  `${typeOrigin}::escrow::Escrow`
 
 /** The Move type of a claim receipt, which `claimFor` expects to be created. */
-export const RECEIPT_TYPE = `${ESCROW_PACKAGE}::escrow::Receipt`
+export const receiptType = (typeOrigin: string): string =>
+  `${typeOrigin}::escrow::Receipt`
+
+/**
+ * `escrow::Escrow`, the object this extension reads, **as a function of the
+ * package it lives in**.
+ *
+ * A Move type name contains its package id, so a codec built from a hard-coded
+ * constant checks the wrong type the moment a consumer configures a different
+ * package: `getObject(id, { schema })` compares the object's tag before it
+ * parses a byte, and a correctly encoded object under the configured package
+ * fails with `DecodeError`. Every type-shaped constant in an extension takes
+ * the package id the service was built with, and the service passes its own.
+ *
+ * **Which package id.** The one that appears in a type name is the **type
+ * origin**: the package the type was *first* published in. Upgrading a package
+ * gives it a new id for *calls*, and the type origin does not move. So an
+ * extension over an upgraded package carries two ids — `packageId` for
+ * `moveCall` targets, `typeOrigin` for codecs, filters and receipt types — and
+ * they are the same value until the first upgrade. `Escrow.layer` takes both.
+ */
+export const EscrowContent = (typeOrigin: string) => SuiSchema.bcs(
+  EscrowBcs,
+  escrowType(typeOrigin)
+)
 
 /**
  * The Move layout of `escrow::Settlement`, whose fields are `snake_case`
@@ -89,41 +117,42 @@ interface SettlementParts {
  * `sui.getObject`, with the same fields: the domain mapping is part of the
  * boundary, not a step after it.
  */
-export const SettlementContent = SuiSchema.bcs(
-  SettlementBcs,
-  `${ESCROW_PACKAGE}::escrow::Settlement`
-).pipe(
-  Schema.decodeTo(
-    Settlement,
-    SchemaTransformation.transformOrFail<SettlementParts, typeof SettlementBcs.$inferType>({
-      decode: (fields, options) =>
-        // `transformOrFail`, not `transform`, because one of these mappings can
-        // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
-        // whose body throws is a **defect**, which is not what a bad byte on the
-        // wire should be; failing with a `SchemaIssue` here is what makes it a
-        // `DecodeError` like any other.
-        Effect.map(
-          Effect.fromOption(
-            DateTime.make(Number(fields.settled_at_ms)),
-            () =>
-              new SchemaIssue.InvalidValue(
-                { message: `settled_at_ms ${fields.settled_at_ms} is not a time` },
-                fields,
-                options
-              )
+export const SettlementContent = (typeOrigin: string) =>
+  SuiSchema.bcs(
+    SettlementBcs,
+    `${typeOrigin}::escrow::Settlement`
+  ).pipe(
+    Schema.decodeTo(
+      Settlement,
+      SchemaTransformation.transformOrFail<SettlementParts, typeof SettlementBcs.$inferType>({
+        decode: (fields, options) =>
+          // `transformOrFail`, not `transform`, because one of these mappings can
+          // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
+          // whose body throws is a **defect**, which is not what a bad byte on the
+          // wire should be; failing with a `SchemaIssue` here is what makes it a
+          // `DecodeError` like any other.
+          Effect.map(
+            Effect.fromOption(
+              DateTime.make(Number(fields.settled_at_ms)),
+              () =>
+                new SchemaIssue.InvalidValue(
+                  { message: `settled_at_ms ${fields.settled_at_ms} is not a time` },
+                  fields,
+                  options
+                )
+            ),
+            (settledAt): SettlementParts => ({
+              escrowId: fields.escrow_id,
+              settledAt,
+              claimedBy: fields.claimed_by
+            })
           ),
-          (settledAt): SettlementParts => ({
-            escrowId: fields.escrow_id,
-            settledAt,
-            claimedBy: fields.claimed_by
+        encode: (settlement) =>
+          Effect.succeed({
+            escrow_id: settlement.escrowId,
+            settled_at_ms: String(DateTime.toEpochMillis(settlement.settledAt)),
+            claimed_by: settlement.claimedBy
           })
-        ),
-      encode: (settlement) =>
-        Effect.succeed({
-          escrow_id: settlement.escrowId,
-          settled_at_ms: String(DateTime.toEpochMillis(settlement.settledAt)),
-          claimed_by: settlement.claimedBy
-        })
-    })
+      })
+    )
   )
-)

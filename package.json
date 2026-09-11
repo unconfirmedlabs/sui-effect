@@ -45,7 +45,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test test/",
     "test:template": "cd examples/extension-template && bun test",
-    "check:template": "cd examples/extension-template && tsc --noEmit && bun test",
+    "check:template": "cd examples/extension-template && tsc --noEmit && bun test && bun scripts/check-package.ts",
     "llms": "bun scripts/llms.ts",
     "docs:extensions": "bun scripts/extensions.ts",
     "check": "tsc --noEmit && bun run build && bun test test/ && bun run check:template"

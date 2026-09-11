@@ -13,6 +13,7 @@
  *
  * @since 0.1.0
  */
+import type { ClientWithCoreApi } from "@mysten/sui/client"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
 import { normalizeSuiAddress } from "@mysten/sui/utils"
 
@@ -23,7 +24,6 @@ import {
   DateTime,
   Duration,
   Effect,
-  Random,
   Schema
 } from "effect"
 import {
@@ -42,6 +42,7 @@ import { EXECUTE_INCLUDE, Executed, fromTransactionResult } from "../domain/exec
 import { isUnresolved, JournalEntry } from "../domain/journal-entry.ts"
 import {
   Built,
+  chainOf,
   Digest,
   maxEpochOf,
   maxTimestampMsOf,
@@ -50,6 +51,7 @@ import {
   SignedTransaction,
   SuiAddress,
   TransactionExpiration,
+  U32_MAX,
   Version
 } from "../domain/schemas.ts"
 import { Journal } from "./Journal.ts"
@@ -106,7 +108,100 @@ const buildError = (message: string) => (cause: unknown): BuildError =>
   new BuildError({ message, cause })
 
 /** The `u32` nonce a `ValidDuring` expiration carries as its replay guard. */
-const MAX_NONCE = 0xffff_ffff
+const MAX_NONCE = U32_MAX
+
+/**
+ * The SDK client with the Effect's `AbortSignal` injected into every Core call.
+ *
+ * `Transaction#build` takes no signal: `BuildTransactionOptions` has no such
+ * field, and the gRPC resolve plugin simulates with whatever the client hands
+ * it. So an interrupted `Tx.build` used to end — releasing the sender lock —
+ * while the simulate it started stayed in flight. The only cancellation hook
+ * the SDK offers is the `signal` on each Core method, and the resolver reaches
+ * those through `options.client`, so a client whose `core` injects the signal is
+ * how an interrupt reaches the request.
+ *
+ * `resolveTransactionPlugin` is delegated untouched: it is a pure value
+ * constructor, and the plugin it returns receives this same proxy as
+ * `options.client`, so the transport's own reads are signalled too.
+ */
+const abortableClient = (client: ClientWithCoreApi, signal: AbortSignal): ClientWithCoreApi => {
+  const inject = (target: object): object =>
+    new Proxy(target, {
+      get: (receiver, key) => {
+        const value = Reflect.get(receiver, key)
+        if (typeof key !== "string") return value
+        if (key === "resolveTransactionPlugin") {
+          return typeof value === "function"
+            ? (...args: Array<unknown>) =>
+              (value as (...a: Array<unknown>) => unknown).apply(receiver, args)
+            : value
+        }
+        if (typeof value === "function") {
+          return (options?: Record<string, unknown>, ...rest: Array<unknown>) =>
+            (value as (...a: Array<unknown>) => unknown).call(
+              receiver,
+              { ...(options ?? {}), signal: options?.["signal"] ?? signal },
+              ...rest
+            )
+        }
+        if (
+          value !== null && typeof value === "object" &&
+          Object.getPrototypeOf(value) === Object.prototype
+        ) {
+          // `core.mvr` is a plain namespace of methods; it needs the same
+          // treatment and nothing else does.
+          return inject(value as object)
+        }
+        return value
+      }
+    })
+
+  const core = inject(client.core as unknown as object)
+  return new Proxy(client, {
+    get: (receiver, key) => {
+      if (key === "core") return core
+      const value = Reflect.get(receiver, key)
+      // Bound, so a method reached through the proxy still sees the real
+      // instance as `this` — a class with private fields would throw otherwise.
+      return typeof value === "function" ? (value as (...a: Array<unknown>) => unknown).bind(receiver) : value
+    }
+  })
+}
+
+/**
+ * Whether the SDK will have to resolve this transaction, which is the same
+ * question as "will building simulate".
+ *
+ * It mirrors the SDK's own `needsTransactionResolution`, which is not exported:
+ * the resolve plugin returns early — no gas-budget simulation, no plugin call
+ * at all — when every input is resolved and the gas price, budget and payment
+ * are already set. `Tx.build` promises a simulation before any bytes are
+ * signed, so when this says `false` it runs one itself.
+ *
+ * Bytes this version cannot read answer `false`, which costs one simulate and
+ * keeps the guarantee. Never fails.
+ */
+const willResolve = (tx: Transaction): boolean => {
+  try {
+    const data = tx.getData()
+    if (
+      data.inputs.some((input) =>
+        input.UnresolvedObject !== undefined || input.UnresolvedPure !== undefined
+      )
+    ) {
+      return true
+    }
+    const gas = data.gasData
+    if (!gas.price || !gas.budget) return true
+    const payment = gas.payment
+    if (payment === null || payment === undefined) return true
+    if (payment.length === 0 && data.expiration == null) return true
+    return false
+  } catch {
+    return false
+  }
+}
 
 /**
  * The expiration a transaction was built with, read back out of the bytes so
@@ -223,10 +318,18 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
 /**
  * Builds a transaction into signable bytes.
  *
- * Building already simulates: on gRPC the SDK's resolve plugin simulates with
- * checks enabled to choose the gas budget, and an execution failure there
- * arrives as `SimulationFailed`. So simulate-before-submit is inherent and
- * costs nothing extra.
+ * **Building always simulates.** On gRPC the SDK's resolve plugin simulates
+ * with checks enabled to choose the gas budget, and an execution failure there
+ * arrives as `SimulationFailed`. That costs nothing extra — but the resolver
+ * returns early for a transaction that was **already fully resolved** (every
+ * input resolved, gas price, budget and payment set), and then nothing
+ * simulates at all. `Tx.build` detects that case and runs one explicit
+ * `simulateTransaction` with checks enabled, so simulate-before-submit holds
+ * for every transaction: it costs nothing extra when the SDK had to resolve,
+ * and one call otherwise.
+ *
+ * An interrupted build cancels the request it started: the SDK is handed a
+ * client whose Core calls carry the Effect's `AbortSignal`.
  *
  * When the recipe set no expiration, `SubmitConfig.expiration` decides one.
  * The default, `ValidDuring`, bounds the transaction at `chainTime` plus
@@ -269,15 +372,25 @@ export const build = Effect.fn("Tx.build")(function*(
     }
   }
 
-  const bytes = yield* sui.core.use((client) => tx.build({ client })).pipe(
-    Effect.catchTag(
-      ["ObjectNotFound", "ObjectDeleted", "ObjectUnavailable", "TransactionNotFound"],
-      (error) =>
-        Effect.fail(
-          new BuildError({ message: `an input could not be resolved: ${SuiError.describe(error)}`, cause: error })
-        )
+  const resolving = willResolve(tx)
+  const bytes = yield* sui.core
+    .use((client, signal) => tx.build({ client: abortableClient(client, signal) }))
+    .pipe(
+      Effect.catchTag(
+        ["ObjectNotFound", "ObjectDeleted", "ObjectUnavailable", "TransactionNotFound"],
+        (error) =>
+          Effect.fail(
+            new BuildError({ message: `an input could not be resolved: ${SuiError.describe(error)}`, cause: error })
+          )
+      )
     )
-  )
+
+  if (!resolving) {
+    // The SDK resolved nothing, so it simulated nothing. One explicit simulate
+    // with checks enabled keeps the promise `Tx.run` is built on: nothing is
+    // signed that was not first shown to execute.
+    yield* sui.simulate(bytes)
+  }
 
   const budget = gasBudgetOfBytes(bytes)
   if (budget !== undefined && budget > config.maxGasBudget) {
@@ -297,6 +410,10 @@ export const build = Effect.fn("Tx.build")(function*(
     digest,
     bytes,
     sender: opts.sender,
+    // The chain these bytes were built against, so `Tx.reconcile` can refuse to
+    // reason about them with a node on another one — including for the
+    // expiration variants that name no chain themselves.
+    chain: sui.chainId,
     ...(opts.gasOwner === undefined ? {} : { gasOwner: opts.gasOwner }),
     ...(expiration === undefined ? {} : { expiration })
   }
@@ -315,6 +432,26 @@ const epochOf = (epoch: string): Effect.Effect<bigint, TransportError> =>
       })
   })
 
+/**
+ * The nonce for a default `ValidDuring` expiration, from
+ * `SubmitConfig.nonce`, checked to be the `u32` the wire carries.
+ *
+ * A custom allocator that answers something else is a configuration mistake and
+ * fails the build, rather than producing bytes a validator refuses.
+ */
+const nonceOf = (config: SubmitConfigService): Effect.Effect<number, TransportError> =>
+  Effect.flatMap(config.nonce, (nonce) =>
+    Number.isInteger(nonce) && nonce >= 0 && nonce <= MAX_NONCE
+      ? Effect.succeed(nonce)
+      : Effect.fail(
+        new TransportError({
+          method: "SubmitConfig.nonce",
+          retryable: false,
+          status: "INVALID_ARGUMENT",
+          cause: `SubmitConfig.nonce produced ${nonce}, which is not a u32 (0 to ${MAX_NONCE})`
+        })
+      ))
+
 /** The expiration `Tx.build` sets when the recipe set none. */
 const defaultExpiration = Effect.fn("Tx.defaultExpiration")(function*(
   sui: Sui["Service"],
@@ -330,7 +467,7 @@ const defaultExpiration = Effect.fn("Tx.defaultExpiration")(function*(
     case "validDuring": {
       const { systemState } = yield* sui.core.getCurrentSystemState()
       const epoch = yield* epochOf(systemState.epoch)
-      const nonce = yield* Random.nextIntBetween(0, MAX_NONCE)
+      const nonce = yield* nonceOf(config)
       const maxTimestamp = config.validFor === undefined
         ? null
         : (BigInt(DateTime.toEpochMillis(yield* sui.chainTime)) +
@@ -413,7 +550,10 @@ export const sign = Effect.fn("Tx.sign")(function*(
     bytes: built.bytes,
     signatures: [signature],
     sender: built.sender,
-    ...(built.expiration === undefined ? {} : { expiration: built.expiration })
+    ...(built.expiration === undefined ? {} : { expiration: built.expiration }),
+    // Carried forward from the build, so `Tx.reconcile` knows which chain these
+    // bytes belong to even when the expiration names none.
+    ...(built.chain === undefined ? {} : { chain: built.chain })
   }
 })
 
@@ -541,6 +681,44 @@ const unknownEntry = Effect.fn("Tx.unknownEntry")(function*(
 })
 
 /**
+ * Waits for an execution to be visible to reads, before `Tx.submit` returns and
+ * the sender lock is released.
+ *
+ * Execute and indexing are two different things on a Sui node: a transaction
+ * that executed is not necessarily one the next `getObject` or the next build's
+ * input resolution can see. Serializing per sender stops two builds picking the
+ * same gas coin; it does not stop the second build resolving that coin at the
+ * version the first one already spent. `waitForTransaction` is the SDK's own
+ * answer, and holding the lock across it is what makes "the next `Tx.run` from
+ * this sender sees this one" true.
+ *
+ * **It never changes the outcome.** The transaction executed; that is a fact,
+ * and a wait that times out or fails does not unmake it. The failure is logged
+ * with the digest and `Tx.submit` returns the `Executed` it already has. Turn
+ * the wait off with `SubmitConfig.awaitVisibility: false` and bound it with
+ * `SubmitConfig.visibilityTimeout`. Never fails.
+ */
+const awaitVisible = (
+  sui: Sui["Service"],
+  config: SubmitConfigService,
+  digest: Digest
+): Effect.Effect<void> =>
+  config.awaitVisibility === false ? Effect.void : sui.core
+    .waitForTransaction({ digest })
+    .pipe(
+      Effect.timeout(config.visibilityTimeout),
+      Effect.asVoid,
+      Effect.catchCause(() =>
+        Effect.logWarning(
+          "the transaction executed but did not become visible to reads within" +
+            " SubmitConfig.visibilityTimeout; the outcome stands"
+        )
+      ),
+      Effect.annotateLogs({ digest }),
+      Effect.withSpan("Tx.awaitVisible")
+    )
+
+/**
  * Sends signed bytes, and does not stop caring until it knows what happened.
  *
  * Before the first `executeTransaction` it writes a `Signed` journal entry, so
@@ -608,6 +786,7 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
 
   if (result._tag === "Success") {
     yield* journalSettled(yield* executedEntry(result.success))
+    yield* awaitVisible(sui, config, signed.digest)
     return result.success
   }
   const failure = result.failure
@@ -723,23 +902,31 @@ type InputEvidence =
   | { readonly _tag: "NoEvidence" }
   | { readonly _tag: "ConsumedByOther"; readonly objectId: string; readonly by: string }
   | { readonly _tag: "AppliedByUs"; readonly objectId: string }
-  | { readonly _tag: "Unreadable"; readonly objectId: string }
+  | { readonly _tag: "Unreadable"; readonly objectId: string; readonly reason: string }
 
 /**
  * Reads every object the bytes pinned — owned inputs and gas coins alike — and
  * says what their current state proves.
  *
  * A version that has not moved proves nothing and the next reference is tried.
- * A version that has moved (or an object that is gone) is only evidence once
- * the node names the transaction that moved it:
+ * A version that has moved (or an object that is gone) says only *that* it
+ * moved; it does not say **who** moved it, and that is the whole question.
  *
- * - a **different** digest means those exact bytes can never execute again, and
- *   that is the one thing `NotApplied { inputConsumed }` may be built on;
+ * `previousTransaction` on the current object is the wrong answer to it: it
+ * names the **latest** mutation, so a transaction T that consumed version 3 and
+ * a later transaction U that consumed version 4 leave an object that names U,
+ * and reconciling T against it would report `NotApplied` for a transaction that
+ * applied. The consumer of version `v` is named by the object **at version
+ * `v + 1`**, which is what `SuiCore.getObjectAtVersion` reads:
+ *
+ * - a **different** digest there means those exact bytes can never execute
+ *   again, and that is the one thing `NotApplied { inputConsumed }` may be
+ *   built on;
  * - **our own** digest means the transaction applied, whatever the read replica
  *   that answered `getTransaction` thought;
- * - **no readable digest** — a deleted object, a node that does not serve the
- *   field — proves nothing either way, and the honest answer is that the
- *   outcome is unknown.
+ * - **no readable successor** — a pruned version, a transport with no
+ *   historical read, a node that does not serve the field — proves nothing
+ *   either way, and the honest answer is that the outcome is unknown.
  *
  * Fails with: `TransportError`.
  */
@@ -753,13 +940,76 @@ const inputEvidence = Effect.fn("Tx.inputEvidence")(function*(
     if (decoded._tag !== "Some") continue
     const state = yield* inputStateOf(sui, decoded.value)
     if (state._tag === "Present" && state.version <= pinned.version) continue
-    const previous = state._tag === "Present" ? state.previousTransaction : undefined
-    if (previous === undefined) return { _tag: "Unreadable", objectId: decoded.value }
-    if (previous === digest) return { _tag: "AppliedByUs", objectId: decoded.value }
-    return { _tag: "ConsumedByOther", objectId: decoded.value, by: previous }
+    // The pinned version is behind us. Whoever produced the version after it is
+    // the transaction that consumed ours.
+    const successor = yield* sui.core.getObjectAtVersion({
+      objectId: decoded.value,
+      version: (pinned.version + 1n).toString()
+    })
+    if (successor._tag !== "Found") {
+      return { _tag: "Unreadable", objectId: decoded.value, reason: successor.reason }
+    }
+    const by = successor.previousTransaction
+    if (by === undefined) {
+      return {
+        _tag: "Unreadable",
+        objectId: decoded.value,
+        reason: "the node served the next version but named no transaction for it"
+      }
+    }
+    if (by === digest) return { _tag: "AppliedByUs", objectId: decoded.value }
+    return { _tag: "ConsumedByOther", objectId: decoded.value, by }
   }
   return { _tag: "NoEvidence" }
 })
+
+/** The epoch the node currently reports. Fails with: `TransportError`. */
+const currentEpoch = Effect.fn("Tx.currentEpoch")(function*(
+  sui: Sui["Service"]
+): Effect.fn.Return<bigint, TransportError> {
+  const { systemState } = yield* sui.core.getCurrentSystemState()
+  return yield* epochOf(systemState.epoch)
+})
+
+/**
+ * Whether the transaction's expiration window is observably closed **right
+ * now**: the current epoch is past its `maxEpoch`, or `chainTime` is past its
+ * `maxTimestamp` by more than `SubmitConfig.expiryMargin`.
+ *
+ * One observation of this is not evidence of anything (see `reconcile`); it is
+ * the thing that has to hold twice, around a `getTransaction` miss each time.
+ *
+ * Fails with: `TransportError`.
+ */
+const expiryClosed = Effect.fn("Tx.expiryClosed")(function*(
+  sui: Sui["Service"],
+  config: SubmitConfigService,
+  signed: Signed
+): Effect.fn.Return<boolean, TransportError> {
+  const lastEpoch = maxEpochOf(signed.expiration)
+  if (lastEpoch !== undefined) {
+    // Epochs first: they are what the default expiration carries, and unlike a
+    // wall clock an epoch is a consensus fact, so no skew margin is needed.
+    const epoch = yield* currentEpoch(sui)
+    if (epoch > lastEpoch) return true
+  }
+  const bound = maxTimestampMsOf(signed.expiration)
+  if (bound !== undefined) {
+    const now = yield* sui.chainTime
+    const margin = BigInt(Duration.toMillis(config.expiryMargin))
+    if (BigInt(DateTime.toEpochMillis(now)) > bound + margin) return true
+  }
+  return false
+})
+
+/**
+ * The chain these bytes belong to: the one the expiration names, or the one
+ * `Tx.build` recorded for the variants that name none. `undefined` when neither
+ * is available, which is every hand-built `Signed` from before this field
+ * existed.
+ */
+const chainOfSigned = (signed: Signed): string | undefined =>
+  chainOf(signed.expiration) ?? signed.chain
 
 /**
  * Finds out what happened to a transaction that was sent but never answered
@@ -767,25 +1017,41 @@ const inputEvidence = Effect.fn("Tx.inputEvidence")(function*(
  *
  * A transaction the node knows is `Executed`, or `ExecutionFailed` when it
  * applied and aborted. A transaction the node does not know is only ever
- * `NotApplied` on evidence:
+ * `NotApplied` on evidence, and there are exactly two kinds:
  *
- * - `"expired"` when the current epoch is past the `maxEpoch` recorded in the
- *   signed bytes, or when `chainTime` has passed a recorded `maxTimestamp` by
- *   more than `SubmitConfig.expiryMargin`. The epoch rule is the one that
- *   fires in practice, because the default expiration is epoch-bounded; it
- *   needs no margin, an epoch being a consensus fact rather than a reading of
- *   a clock, and costs one `getCurrentSystemState` read;
- * - `"inputConsumed"` when an owned input or a gas coin the transaction pinned
- *   has moved on **and the node names a different transaction** as the one that
- *   moved it, so those exact bytes can never execute again.
+ * - `"expired"`, under an **ordered and repeated** rule, because a closed
+ *   expiration window proves only that the bytes cannot execute *later*, not
+ *   that they did not execute *earlier*, and a transaction can execute between
+ *   a lookup and an expiry check. So: the window must be observed closed, then
+ *   `getTransaction` must miss, then — after `SubmitConfig.reconcileRecheck`
+ *   (two seconds by default, through the `Clock`) — both must hold again. Any
+ *   other order, or a single observation, is `SubmissionUnknown`. Set
+ *   `SubmitConfig.expiryEvidence: "never"` to disable the rule entirely, which
+ *   is what a deployment behind a mixed-node load balancer wants. The residual
+ *   risk is a node whose transaction index lags its epoch view;
+ * - `"inputConsumed"` when the object **at the version after** one this
+ *   transaction pinned names a **different** transaction as the one that
+ *   produced it, so those exact bytes can never execute again.
  *
  * An input that merely advanced is not evidence: the transaction being
  * reconciled is itself the likeliest thing to have advanced it, and calling
  * that `NotApplied` would tell the documented retry idiom to execute the
- * caller's intent a second time. When the node names *our* digest the
- * transaction applied and `getTransaction` is asked again; when it names
- * nothing at all the answer is `SubmissionUnknown`, which carries the bytes so
- * a later process, or a person, can settle it.
+ * caller's intent a second time. When the successor version names *our* digest
+ * the transaction applied and `getTransaction` is asked again; when the
+ * successor cannot be read at all the answer is `SubmissionUnknown`, which
+ * carries the bytes so a later process, or a person, can settle it.
+ *
+ * **Chain identity is checked before anything is asked.** Bytes built for one
+ * chain must never be declared expired by another chain's epoch, which a
+ * process-wide journal holding two networks' submissions makes easy to do. A
+ * mismatch is `SubmissionUnknown` naming both chains.
+ *
+ * **No `TransportError` escapes.** A recovery read that fails says nothing
+ * about whether the transaction applied, and `SuiError.outcome` puts
+ * `TransportError` on `"not_applied"` — which would tell a wrapper to retry a
+ * submission whose outcome is genuinely unknown. Every read failure here
+ * becomes `SubmissionUnknown` carrying the digest, the bytes and the cause. The
+ * tag stays in the signature so the union does not shrink under callers.
  *
  * Given only a `Digest` there can be no evidence, so an unknown transaction is
  * always `SubmissionUnknown`. Pass the `Signed` bytes (or the
@@ -804,11 +1070,28 @@ export const reconcile = Effect.fn("Tx.reconcile")(function*(
   const sui = yield* Sui
   const config = yield* SubmitConfig
   const { digest, signed } = inputOf(input)
+  return yield* recover(sui, config, digest, signed).pipe(
+    Effect.catchTag("TransportError", (error) =>
+      Effect.fail(
+        new SubmissionUnknown({
+          digest,
+          ...(signed === undefined ? {} : { signed }),
+          cause: error
+        })
+      ))
+  )
+})
 
-  const found = yield* Effect.result(sui.getTransaction(digest))
-  if (found._tag === "Success") return found.success
-  if (found.failure._tag !== "TransactionNotFound") return yield* found.failure
-
+/** The body of {@link reconcile}, before its read failures become unknown. */
+const recover = Effect.fn("Tx.recover")(function*(
+  sui: Sui["Service"],
+  config: SubmitConfigService,
+  digest: Digest,
+  signed: Signed | undefined
+): Effect.fn.Return<
+  Executed,
+  ExecutionFailed | NotApplied | SubmissionUnknown | TransportError
+> {
   const unknown = (cause: unknown) =>
     new SubmissionUnknown({
       digest,
@@ -818,27 +1101,46 @@ export const reconcile = Effect.fn("Tx.reconcile")(function*(
       cause
     })
 
+  if (signed !== undefined) {
+    const chain = chainOfSigned(signed)
+    if (chain !== undefined && chain !== sui.chainId) {
+      return yield* unknown(
+        `these bytes were built for chain ${chain} and this Sui is on ${sui.chainId};` +
+          " nothing this node says about them is evidence"
+      )
+    }
+  }
+
+  /** One `getTransaction`, with "the node does not know it" as a value. */
+  const lookup = Effect.fn("Tx.recover.lookup")(function*(): Effect.fn.Return<
+    Executed | undefined,
+    ExecutionFailed | TransportError
+  > {
+    const found = yield* Effect.result(sui.getTransaction(digest))
+    if (found._tag === "Success") return found.success
+    if (found.failure._tag !== "TransactionNotFound") return yield* found.failure
+    return undefined
+  })
+
+  const first = yield* lookup()
+  if (first !== undefined) return first
+
   if (signed === undefined) {
     return yield* unknown("the node does not know this digest and the signed bytes are not available")
   }
 
-  // Epochs first: they are what the default expiration carries, and unlike a
-  // wall clock an epoch is a consensus fact, so no skew margin is needed.
-  const lastEpoch = maxEpochOf(signed.expiration)
-  if (lastEpoch !== undefined) {
-    const { systemState } = yield* sui.core.getCurrentSystemState()
-    const epoch = yield* epochOf(systemState.epoch)
-    if (epoch > lastEpoch) {
-      return yield* new NotApplied({ digest, evidence: "expired" })
-    }
-  }
-
-  const bound = maxTimestampMsOf(signed.expiration)
-  if (bound !== undefined) {
-    const now = yield* sui.chainTime
-    const margin = BigInt(Duration.toMillis(config.expiryMargin))
-    if (BigInt(DateTime.toEpochMillis(now)) > bound + margin) {
-      return yield* new NotApplied({ digest, evidence: "expired" })
+  if (config.expiryEvidence === "epochThenMiss") {
+    // Ordered, and repeated: closed, then missing, then — after a delay —
+    // closed and missing again. Anything else proves nothing.
+    if (yield* expiryClosed(sui, config, signed)) {
+      const second = yield* lookup()
+      if (second !== undefined) return second
+      yield* Effect.sleep(config.reconcileRecheck)
+      if (yield* expiryClosed(sui, config, signed)) {
+        const third = yield* lookup()
+        if (third !== undefined) return third
+        return yield* new NotApplied({ digest, evidence: "expired" })
+      }
     }
   }
 
@@ -847,21 +1149,21 @@ export const reconcile = Effect.fn("Tx.reconcile")(function*(
     case "ConsumedByOther":
       return yield* new NotApplied({ digest, evidence: "inputConsumed" })
     case "AppliedByUs": {
-      // The node named this very transaction as the one that last moved the
-      // input, so it applied; the `getTransaction` above was answered by a
-      // node that had not caught up. Ask once more for the receipt.
-      const again = yield* Effect.result(sui.getTransaction(digest))
-      if (again._tag === "Success") return again.success
-      if (again.failure._tag !== "TransactionNotFound") return yield* again.failure
+      // The version after the one we pinned names this very transaction, so it
+      // applied; the `getTransaction` above was answered by a node that had not
+      // caught up. Ask once more for the receipt.
+      const again = yield* lookup()
+      if (again !== undefined) return again
       return yield* unknown(
-        `object ${evidence.objectId} names this transaction as the one that last mutated it,` +
-          " so it applied, but the node still does not serve it"
+        `the version after the one this transaction pinned on object ${evidence.objectId}` +
+          " names it as the transaction that produced it, so it applied, but the node still" +
+          " does not serve it"
       )
     }
     case "Unreadable":
       return yield* unknown(
-        `object ${evidence.objectId} has moved on or is gone, but the node did not say which` +
-          " transaction consumed it, so nothing is proven"
+        `object ${evidence.objectId} has moved on or is gone, and ${evidence.reason},` +
+          " so nothing is proven"
       )
     case "NoEvidence":
       return yield* unknown(
@@ -869,6 +1171,35 @@ export const reconcile = Effect.fn("Tx.reconcile")(function*(
       )
   }
 })
+
+/**
+ * The signer for an address the bytes require a second signature from, or a
+ * `SigningError` saying which address is missing one.
+ */
+const assertSponsor = (
+  gasOwner: string,
+  sponsor: Signer | undefined
+): Effect.Effect<Signer, SigningError> => {
+  if (sponsor === undefined) {
+    return Effect.fail(
+      new SigningError({
+        cause: `this transaction's gas owner is ${gasOwner}, which is not the sender:` +
+          " a sponsored transaction needs that party's signature too. Pass" +
+          " Tx.run(recipe, { signer, gasOwner, sponsor }), or build, sign, cosign and" +
+          " submit the steps yourself when the two parties cannot both sign here"
+      })
+    )
+  }
+  if (normalizeSuiAddress(sponsor.address) !== normalizeSuiAddress(gasOwner)) {
+    return Effect.fail(
+      new SigningError({
+        cause: `the sponsor signs as ${sponsor.address}, but this transaction's gas owner` +
+          ` is ${gasOwner}`
+      })
+    )
+  }
+  return Effect.succeed(sponsor)
+}
 
 /**
  * Build, preflight, sign and submit, with the sender lock held throughout.
@@ -889,6 +1220,17 @@ export const reconcile = Effect.fn("Tx.reconcile")(function*(
  * where spend limits and target policies refuse a transaction before anything
  * is signed.
  *
+ * **A sponsored run needs both signatures.** A transaction whose gas owner is
+ * not its sender is signed by *both* parties; one signature is bytes a
+ * validator rejects. So when `opts.gasOwner` differs from the signer's address
+ * — or when the recipe itself set a different gas owner, which `Tx.sponsored`
+ * does — `opts.sponsor` is required and co-signs the same bytes. Without it
+ * `Tx.run` fails with `SigningError` naming the address whose signature is
+ * missing, before anything is built when the gas owner was given as an option
+ * and immediately after the build when it came out of the recipe. Use the
+ * explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
+ * two parties cannot both sign in one process.
+ *
  * Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`,
  * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`,
  * `TransportError` (from the build reads; once bytes are sent, transport
@@ -896,7 +1238,15 @@ export const reconcile = Effect.fn("Tx.reconcile")(function*(
  */
 export const run = Effect.fn("Tx.run")(function*(
   recipe: Recipe | Transaction,
-  opts: { readonly signer: Signer; readonly gasOwner?: SuiAddress }
+  opts: {
+    readonly signer: Signer
+    readonly gasOwner?: SuiAddress
+    /**
+     * The gas owner's signer, for a sponsored transaction. Required whenever
+     * the bytes name a gas owner that is not the sender.
+     */
+    readonly sponsor?: Signer
+  }
 ): Effect.fn.Return<
   Executed,
   | BuildError
@@ -917,6 +1267,12 @@ export const run = Effect.fn("Tx.run")(function*(
     ? [sender]
     : [sender, opts.gasOwner].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
 
+  // Before anything is built: a gas owner the caller named, with no signer for
+  // it, can never produce bytes a validator accepts.
+  if (opts.gasOwner !== undefined && normalizeSuiAddress(opts.gasOwner) !== normalizeSuiAddress(sender)) {
+    yield* assertSponsor(opts.gasOwner, opts.sponsor)
+  }
+
   const body = Effect.gen(function*() {
     const built = yield* build(recipe, {
       sender,
@@ -927,7 +1283,15 @@ export const run = Effect.fn("Tx.run")(function*(
       const simulation = yield* sui.simulate(built.bytes)
       yield* preflight(simulation)
     }
-    return yield* submit(yield* sign(built, opts.signer))
+    let signed = yield* sign(built, opts.signer)
+    // Read back out of the bytes, so a recipe that set its own gas owner —
+    // which `Tx.sponsored` does — is covered as well as the option.
+    for (const required of signersOfBytes(built.bytes)) {
+      if (required === normalizeSuiAddress(sender)) continue
+      const sponsor = yield* assertSponsor(required, opts.sponsor)
+      signed = yield* cosign(signed, sponsor)
+    }
+    return yield* submit(signed)
   })
 
   return yield* config.lockSender
@@ -945,9 +1309,11 @@ export const run = Effect.fn("Tx.run")(function*(
  * Nothing here fails per entry: each one settles to an `Executed`, an
  * `ExecutionFailed`, a `NotApplied` or a `SubmissionUnknown`, in the order the
  * journal listed them, and the journal is updated to match. Every settled entry
- * gets the same evidence rules `Tx.reconcile` applies, including the
- * `previousTransaction` guard, so a startup never reports a transaction that
- * applied as `NotApplied`.
+ * gets the same evidence rules `Tx.reconcile` applies — the ordered, repeated
+ * expiry rule, the chain-identity guard and the versioned consumer check — so a
+ * startup never reports a transaction that applied as `NotApplied`, and a
+ * recovery read that fails becomes that entry's `SubmissionUnknown` rather than
+ * escaping as a `TransportError` the taxonomy would call "not applied".
  *
  * The whole call fails only if the journal itself cannot be **read**: a write
  * that fails after an entry has been settled is logged and the answer stands,
@@ -979,7 +1345,21 @@ export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(): Effect.fn.
         settled.push(failure)
         break
       case "TransportError":
-        return yield* failure
+        // A recovery read that failed says nothing about this entry, and
+        // nothing about the next one either: it becomes this entry's
+        // `SubmissionUnknown` and the loop continues, rather than aborting the
+        // whole startup on one unreachable read.
+        yield* journalSettled(
+          yield* unknownEntry(entry.signed, SuiError.describe(failure), attempts)
+        )
+        settled.push(
+          new SubmissionUnknown({
+            digest: entry.digest,
+            signed: entry.signed,
+            cause: failure
+          })
+        )
+        break
       case "NotApplied":
         // Terminal, so the entry leaves the unresolved index: without this a
         // durable journal would hold a proven-dead submission forever and

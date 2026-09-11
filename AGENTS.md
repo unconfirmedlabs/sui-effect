@@ -75,10 +75,10 @@ and nothing else.
 |---|---|
 | `Signer` | A credential as a **value**, never a service: `{ address, scheme, signTransaction, signPersonalMessage }`. One process may hold two. Secret material never reaches the value. |
 | `Tx.build/sign/cosign/sponsored/submit/reconcile/run/reconcileAll` | The lifecycle as functions, each with a closed error union, all `R = Sui`. |
-| `SubmitConfig` | A `Context.Reference` holding expiration policy, the optional `validFor` wall-clock bound, the gas-budget ceiling, `preflight`, the sender lock, and the resubmit schedule, attempts, timeout and expiry margin. |
+| `SubmitConfig` | A `Context.Reference` holding expiration policy, the optional `validFor` wall-clock bound, the gas-budget ceiling, `preflight`, the sender lock, the resubmit schedule, attempts, timeout and expiry margin, plus `expiryEvidence`, `reconcileRecheck`, `awaitVisibility`, `visibilityTimeout` and `nonce`. |
 | `Journal` | A `Context.Reference` with an in-memory default. `sui-effect/journal` swaps in a durable one over `KeyValueStore`; `Tx.reconcileAll()` is the explicit startup call. |
 | `Script` | `{ sui, core, signer, network }` plus `Script.run` and `Script.exitCode`. `ScriptReadOnly` is the signer-less variant, a separate key on purpose. |
-| `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. Options: `sui` (chain pinning), `warm` (build the runtime synchronously in `register`). The face carries `$ready()` and `$dispose()`; a synchronous member called before the runtime exists fails with `ExtensionNotReady`. |
+| `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. Options: `sui` (chain pinning), `warm` (build the runtime synchronously in `register`). The face carries `$ready()` and `$dispose()`; a synchronous member called before the runtime exists fails with `ExtensionNotReady`, while `Effect` and `Stream` members work cold. Every registration on one client shares one base `Sui`/`SuiCore` — one chain-id read and one sender-lock map — reference counted, so `$dispose()` releases it only when the last registration does. |
 | `SuiGraphQL` | A bare tag over the SDK's `SuiGraphQLClient` (`layer`, `layerConfig`, `layerUnavailable`). sui-effect wraps no GraphQL API; the tag exists so extensions share one client. |
 
 ## Extensions
@@ -100,8 +100,22 @@ after the network has answered, a failed journal write is logged and the answer
 stands.
 
 `Tx.build` bounds a transaction to the current epoch and the next and names the
-chain. It sets no `maxTimestamp`: no Sui network accepts a timestamp expiration
-yet (`test/live.devnet.test.ts`, behind `SUI_LIVE=1`, is the proof).
+chain, records `sui.chainId` on `Built`/`Signed`, always simulates (explicitly
+when the SDK had nothing to resolve), and cancels its in-flight request when
+interrupted. It sets no `maxTimestamp`: no Sui network accepts a timestamp
+expiration yet (`test/live.devnet.test.ts`, behind `SUI_LIVE=1`, is the proof).
+`Tx.run` takes `sponsor?: Signer` and requires it whenever the bytes name a gas
+owner that is not the sender. `Tx.submit` waits for visibility before releasing
+the sender lock.
+
+`NotApplied` needs evidence that is checked twice: `"expired"` is
+epoch-or-timestamp closed, then a `getTransaction` miss, then both again after
+`SubmitConfig.reconcileRecheck`; `"inputConsumed"` is the object **at the
+version after** a pinned one naming a different transaction, read with
+`SuiCore.getObjectAtVersion` (the live object's `previousTransaction` names the
+latest mutation and is never evidence). Chain identity is compared before any
+recovery query, and `reconcile`/`reconcileAll` turn every recovery read failure
+into `SubmissionUnknown`.
 
 `SuiCore` retries retryable `TransportError`s on reads only
 (`Schedule.min([exponential("250 millis"), spaced("10 seconds")])` jittered, five
@@ -124,12 +138,12 @@ Every failure is one flat tag; there is no error inheritance.
 | `SimulationFailed` | Simulation reported an execution failure. No gas charged. |
 | `ExecutionFailed` | Applied on chain and failed. Gas charged. |
 | `SubmissionUnknown` | Bytes may have been sent; the outcome is unknown. Carries the signed bytes, unless it came from reconciling a bare digest. |
-| `NotApplied` | Provably never applied. `expired`: the epoch window closed. `inputConsumed`: the node named a **different** transaction as the one that consumed a pinned input. An input that merely moved on is not evidence. |
+| `NotApplied` | Provably never applied. `expired`: the expiry window was observed closed and the transaction missing, twice, `reconcileRecheck` apart. `inputConsumed`: the object at the version **after** a pinned one names a **different** transaction. An input that merely moved on is not evidence. |
 | `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` / `UnexpectedEffects` | Signing, building, preflight policy, journal, and effects that did not contain what was expected. |
 | `GraphQLUnavailable` / `ExtensionNotReady` | No usable GraphQL endpoint; a synchronous Promise-face member used before its runtime existed. Both `not_applied`. |
 
 `SuiError.outcome(e)` puts every failure on the axis a wrapper script acts on:
-`"applied"` for `ExecutionFailed`, `"unknown"` for `SubmissionUnknown`,
+`"applied"` for `ExecutionFailed` and `UnexpectedEffects`, `"unknown"` for `SubmissionUnknown`,
 `"not_applied"` for every other tag in the taxonomy, and `"unknown"` for
 anything that is neither one of those tags nor declares an `outcome`.
 `Script.exitCode` exits 1 for that last case rather than 3. An extension error
@@ -159,3 +173,10 @@ silently passes against a stub. Its `client` implements `$extend`, so a derived
 Promise face is testable the way a consumer writes it; `listOwnedObjects`
 filters through `typeMatches` rather than string equality, and `getDynamicField`
 matches an entry by `name.type` only, not by the `name.bcs` bytes.
+
+The fake enforces the invariants the lifecycle depends on: a known digest
+executes idempotently, gas selection excludes object inputs, the coin set
+evolves (deleted, mutated with `FakeChange.balance`, gas-bumped, created), a
+submission with fewer signatures than the bytes name signers is refused, and a
+version history is served through `tryGetPastObject`, which is what
+`SuiCore.getObjectAtVersion` reads.

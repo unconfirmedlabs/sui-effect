@@ -73,6 +73,16 @@ export interface FakeChange {
   readonly owner?: SuiClientTypes.ObjectOwner
   /** `PackageWrite` marks a published package; `AccumulatorWriteV1` an accumulator write. */
   readonly outputState?: SuiClientTypes.ChangedObject["outputState"]
+  /**
+   * The balance this coin has **after** the transaction, in MIST.
+   *
+   * Only meaningful for a `0x2::coin::Coin<...>`: a created coin joins the
+   * fake's coin set with this balance and a mutated one has its balance
+   * rewritten, so a test that splits a coin and then builds again sees the gas
+   * selection the split left behind. Leave it out for anything that is not a
+   * coin.
+   */
+  readonly balance?: bigint
 }
 
 /** What a scripted success returns. Everything is optional and defaulted. */
@@ -206,6 +216,18 @@ export interface SuiCoreFakeState {
 
 interface Mutable {
   objects: Map<string, FakeObject>
+  /**
+   * Which transaction produced each version of each object, keyed by object id
+   * and then by version.
+   *
+   * This is the fake's transaction history, and it exists because the live
+   * object only ever names its **latest** mutation: identifying the transaction
+   * that consumed a particular version means reading the object *at the version
+   * after it*, which is what `SuiCore.getObjectAtVersion` does and what
+   * `tryGetPastObject` below serves.
+   */
+  history: Map<string, Map<string, string | undefined>>
+  coins: Array<SuiClientTypes.Coin>
   deleted: Set<string>
   clockTimestampMs: bigint
   epoch: bigint
@@ -459,8 +481,15 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
     for (const object of script.objects ?? []) {
       objects.set(normalizeSuiAddress(object.objectId), object)
     }
+    const history = new Map<string, Map<string, string | undefined>>()
+    for (const object of script.objects ?? []) {
+      const id = normalizeSuiAddress(object.objectId)
+      history.set(id, new Map([[object.version.toString(), object.previousTransaction]]))
+    }
     return makeInternal(script, {
       objects,
+      history,
+      coins: [...(script.coins ?? [])],
       deleted: new Set(),
       clockTimestampMs: script.clockTimestampMs ?? 1_700_000_000_000n,
       epoch: script.epoch ?? DEFAULT_EPOCH,
@@ -482,8 +511,102 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   const pageSize = script.pageSize ?? 50
   const chainId = script.chainId ?? "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
 
+  /**
+   * The most recent `AbortSignal` the fake was handed.
+   *
+   * The SDK's `Transaction#build` takes no signal; the only way one reaches a
+   * resolver is through the `client` it was given, one Core call at a time. The
+   * fake's resolve plugin makes a real Core call for the gas price, so this
+   * holds the signal `Tx.build` injected — which is what lets a scripted
+   * `buildSimulate: [FakeOutcome.timeoutThen(...)]` block until the build is
+   * interrupted, and therefore what lets a test prove that an interrupted build
+   * cancels the request it started.
+   */
+  let lastSignal: AbortSignal | undefined
+
   const record = (method: string, options: unknown): void => {
+    const signal = signalOf(options)
+    if (signal !== undefined) lastSignal = signal
     state.calls.push({ method, options })
+  }
+
+  /** Remembers which transaction produced one version of one object. */
+  const remember = (objectId: string, version: bigint, by: string | undefined): void => {
+    const id = normalizeSuiAddress(objectId)
+    const versions = state.history.get(id) ?? new Map<string, string | undefined>()
+    versions.set(version.toString(), by)
+    state.history.set(id, versions)
+  }
+
+  const isCoin = (type: string): boolean => {
+    try {
+      return normalizeStructTag(type).startsWith("0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<")
+    } catch {
+      return false
+    }
+  }
+
+  /** The object ids a set of signed bytes names as gas payment. */
+  const paymentOfBytes = (bytes: Uint8Array): ReadonlyArray<string> => {
+    try {
+      return (TransactionDataBuilder.fromBytes(bytes).gasData.payment ?? []).map((ref) =>
+        normalizeSuiAddress(ref.objectId)
+      )
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * Evolves the fake's coin set the way an execution would: a coin the
+   * transaction deleted is gone, a coin it mutated takes its new version and
+   * balance, a gas coin is bumped because gas is always mutated, and a coin the
+   * transaction created joins the set.
+   *
+   * Without this, gas selection in a second build picks the same coins at the
+   * same versions the first build already spent, and no lifecycle test can tell
+   * a correct selection from a stale one.
+   */
+  const evolveCoins = (execution: FakeExecution, payment: ReadonlyArray<string>): void => {
+    const deleted = new Set(
+      (execution.deleted ?? []).map((change) => normalizeSuiAddress(change.objectId))
+    )
+    const mutated = new Map(
+      (execution.mutated ?? []).map((change) => [normalizeSuiAddress(change.objectId), change])
+    )
+    const next: Array<SuiClientTypes.Coin> = []
+    for (const coin of state.coins) {
+      const id = normalizeSuiAddress(coin.objectId)
+      if (deleted.has(id)) continue
+      const change = mutated.get(id)
+      if (change !== undefined) {
+        next.push({
+          ...coin,
+          version: (change.version ?? BigInt(coin.version) + 1n).toString(),
+          ...(change.balance === undefined ? {} : { balance: change.balance.toString() })
+        })
+        continue
+      }
+      if (payment.includes(id)) {
+        next.push({ ...coin, version: (BigInt(coin.version) + 1n).toString() })
+        continue
+      }
+      next.push(coin)
+    }
+    for (const change of execution.created ?? []) {
+      if (!isCoin(change.type)) continue
+      const id = normalizeSuiAddress(change.objectId)
+      if (next.some((coin) => normalizeSuiAddress(coin.objectId) === id)) continue
+      next.push({
+        objectId: id,
+        version: (change.version ?? 2n).toString(),
+        digest: fakeDigest(13),
+        owner: change.owner ?? addressOwner("0x1"),
+        type: change.type,
+        balance: (change.balance ?? 0n).toString()
+      })
+    }
+    state.coins = next
   }
 
   const next = (
@@ -537,7 +660,8 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   const applyOutcome = async (
     outcome: FakeOutcome,
     method: "simulate" | "execute" | "getTransaction",
-    digest: string
+    digest: string,
+    executingPayment: ReadonlyArray<string> = []
   ): Promise<SettledTransaction> => {
     switch (outcome._tag) {
       case "transportError":
@@ -572,22 +696,30 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
           ]) {
             const id = normalizeSuiAddress(change.objectId)
             const existing = state.objects.get(id)
+            const version = change.version ?? (existing === undefined ? 2n : existing.version + 1n)
             state.objects.set(id, {
               objectId: id,
               type: change.type,
-              version: change.version ?? (existing === undefined ? 2n : existing.version + 1n),
+              version,
               content: existing?.content ?? new Uint8Array(),
               // The executing transaction is now what last mutated it, which is
               // what `Tx.reconcile`'s evidence rules read back.
               previousTransaction: resolved,
               ...(change.owner === undefined ? {} : { owner: change.owner })
             })
+            remember(id, version, resolved)
           }
           for (const change of outcome.value.deleted ?? []) {
             const id = normalizeSuiAddress(change.objectId)
+            const existing = state.objects.get(id)
+            // The version the delete produced is still history: it is what
+            // names this transaction as the one that consumed the version
+            // before it.
+            remember(id, change.version ?? (existing === undefined ? 2n : existing.version + 1n), resolved)
             state.objects.delete(id)
             state.deleted.add(id)
           }
+          evolveCoins(outcome.value, executingPayment)
         }
         return {
           transaction: executionToTransaction(
@@ -638,14 +770,15 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   const settle = async (
     method: "simulate" | "execute" | "getTransaction",
     digest: string,
-    options: unknown
+    options: unknown,
+    executingPayment: ReadonlyArray<string> = []
   ): Promise<SettledTransaction> => {
     const outcome = next(method) ?? unimplemented(METHOD_NAMES[method])
     if (outcome._tag === "timeoutThen") {
       state.pendingDigests.set(digest, outcome.found)
       return pending<never>(method, options)
     }
-    return applyOutcome(outcome, method, digest)
+    return applyOutcome(outcome, method, digest, executingPayment)
   }
 
   const asResult = (result: SettledTransaction) =>
@@ -659,7 +792,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   ): ReadonlyArray<SuiClientTypes.Coin> => {
     const address = normalizeSuiAddress(owner)
     const wanted = normalizeStructTag(`0x2::coin::Coin<${coinType ?? SUI_TYPE_ARG}>`)
-    return (script.coins ?? []).filter((coin) => {
+    return state.coins.filter((coin) => {
       if (coin.owner.$kind !== "AddressOwner") return false
       if (normalizeSuiAddress(coin.owner.AddressOwner) !== address) return false
       try {
@@ -687,6 +820,13 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
    * only the function signature knows: use `tx.pure.u64(...)` and friends.
    */
   const resolvePlugin: TransactionPlugin = async (transactionData, options, proceed) => {
+    // A real resolver reads the reference gas price through the client it was
+    // given, and that is the only place an `AbortSignal` reaches a resolver at
+    // all: `BuildTransactionOptions` has no signal field. Going through the
+    // client rather than reading the script directly is what makes an
+    // interrupted `Tx.build` observable here.
+    const core = options.client?.core ?? client.core
+    const { referenceGasPrice } = await core.getReferenceGasPrice({})
     // A real transport's resolver simulates to choose the gas budget, which is
     // why `Tx.build` can fail with `SimulationFailed`. The fake does it only
     // when a test scripted it.
@@ -694,11 +834,21 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       ? undefined
       : next("buildSimulate")
     if (budgetOutcome !== undefined) {
+      if (budgetOutcome._tag === "timeoutThen") {
+        // Never settles until the build is interrupted, which is exactly what a
+        // resolver's in-flight simulate does.
+        if (lastSignal === undefined) {
+          return unimplemented(
+            "buildSimulate timeoutThen (no AbortSignal reached the resolver; build through Tx.build)"
+          )
+        }
+        await waitForAbort(lastSignal)
+      }
       await applyOutcome(budgetOutcome, "simulate", fakeDigest(state.calls.length + 200))
     }
     if (!options.onlyTransactionKind) {
       if (!transactionData.gasData.price) {
-        transactionData.gasData.price = String(script.referenceGasPrice ?? 1000n)
+        transactionData.gasData.price = String(referenceGasPrice)
       }
       if (!transactionData.gasData.budget) {
         transactionData.gasData.budget = String(script.gasBudget ?? 50_000_000n)
@@ -730,7 +880,17 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     })
     if (!options.onlyTransactionKind && transactionData.gasData.payment == null) {
       const payer = transactionData.gasData.owner ?? transactionData.sender
-      const coins = payer === null ? [] : coinsOf(payer)
+      // A gas coin may not also be an input of the transaction: the SDK
+      // documents the prohibition and a validator enforces it. Resolving the
+      // inputs first and then excluding them is what a real transport does.
+      const inputIds = new Set<string>()
+      for (const input of transactionData.inputs) {
+        const owned = input.Object?.ImmOrOwnedObject ?? input.Object?.Receiving
+        if (owned !== undefined) inputIds.add(normalizeSuiAddress(owned.objectId))
+      }
+      const coins = payer === null
+        ? []
+        : coinsOf(payer).filter((coin) => !inputIds.has(normalizeSuiAddress(coin.objectId)))
       transactionData.gasData.payment = coins.map((coin) => ({
         objectId: coin.objectId,
         version: coin.version,
@@ -738,6 +898,38 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       }))
     }
     await proceed()
+  }
+
+  /**
+   * Refuses a submission that carries fewer signatures than the bytes name
+   * distinct signing addresses.
+   *
+   * A transaction takes a signature from its sender and, when its gas owner is
+   * someone else, from that party too; one signature on sponsored bytes is
+   * something a validator rejects outright. The fake used to accept it, which
+   * is how a whole family of sponsorship and locking tests passed while
+   * describing a transaction that could never land.
+   */
+  const assertSignatures = (bytes: Uint8Array, signatures: ReadonlyArray<string>): void => {
+    let required: ReadonlyArray<string>
+    try {
+      const data = TransactionDataBuilder.fromBytes(bytes)
+      required = [...new Set(
+        [data.sender, data.gasData.owner]
+          .filter((address): address is string => typeof address === "string" && address.length > 0)
+          .map((address) => normalizeSuiAddress(address))
+      )]
+    } catch {
+      return
+    }
+    if (signatures.length < required.length) {
+      const error = new Error(
+        `fake validator: these bytes name ${required.length} signer(s) (${required.join(", ")})` +
+          ` and carry ${signatures.length} signature(s)`
+      )
+      Object.assign(error, { code: "INVALID_ARGUMENT", name: "RpcError" })
+      throw error
+    }
   }
 
   /** The digest of the bytes that were handed to us, as the network derives it. */
@@ -868,7 +1060,17 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     executeTransaction: async (options: SuiClientTypes.ExecuteTransactionOptions) => {
       record("executeTransaction", options)
       const digest = digestOfBytes(options.transaction)
-      const settled = await settle("execute", digest, options)
+      assertSignatures(options.transaction, options.signatures ?? [])
+      const known = state.knownTransactions.get(digest)
+      if (known !== undefined) {
+        // Re-submitting identical bytes is what `Tx.submit` does after a
+        // retryable transport failure, and a validator answers with the
+        // recorded result rather than executing again. Re-applying the scripted
+        // changes here took an object from version 3 to version 5 and made
+        // replay idempotency untestable.
+        return asResult(known)
+      }
+      const settled = await settle("execute", digest, options, paymentOfBytes(options.transaction))
       state.knownTransactions.set(digest, settled)
       return asResult(settled)
     },
@@ -885,10 +1087,11 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         : fakeDigest(1)
       const pending = state.pendingDigests.get(digest)
       if (pending === false) throw new TransactionError("notFound", digest)
+      // A transaction this fake executed is visible: the visibility wait
+      // `Tx.submit` makes after a successful execute must not consume the
+      // `getTransaction` script a reconcile test set up.
       const known = state.knownTransactions.get(digest)
-      if (known !== undefined && state.scripts.getTransaction.length === 0) {
-        return asResult(known)
-      }
+      if (known !== undefined) return asResult(known)
       return asResult(await settle("getTransaction", digest, options))
     },
     simulateTransaction: async (options: SuiClientTypes.SimulateTransactionOptions) => {
@@ -958,10 +1161,43 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     resolveTransactionPlugin: () => resolvePlugin
   }
 
+  /**
+   * The historical object read, in the JSON-RPC `sui_tryGetPastObject` shape.
+   *
+   * `SuiCore.getObjectAtVersion` duck-types this method, so implementing it is
+   * what gives the fake a transaction history and lets `Tx.reconcile` identify
+   * the consumer of a pinned version the way it does against a real node. A
+   * version the fake never recorded answers `VersionNotFound`, which is
+   * evidence of nothing.
+   */
+  const tryGetPastObject = async (options: {
+    readonly id: string
+    readonly version: number
+    readonly options?: { readonly showPreviousTransaction?: boolean }
+    readonly signal?: AbortSignal
+  }) => {
+    record("tryGetPastObject", options)
+    const id = normalizeSuiAddress(options.id)
+    const versions = state.history.get(id)
+    const version = String(options.version)
+    if (versions === undefined || !versions.has(version)) {
+      return { status: "VersionNotFound" as const, details: [id, version] as [string, string] }
+    }
+    return {
+      status: "VersionFound" as const,
+      details: {
+        objectId: id,
+        version,
+        previousTransaction: versions.get(version) ?? null
+      }
+    }
+  }
+
   const client: ClientWithCoreApi = {
     network: script.network ?? "localnet",
     cache: undefined,
     core,
+    tryGetPastObject,
     // The SDK's registration mechanism, implemented so an extension's derived
     // Promise face can be tested exactly the way a consumer writes it:
     // `client.$extend(myExtension())`.
@@ -983,6 +1219,11 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         const id = normalizeSuiAddress(object.objectId)
         state.objects.set(id, object)
         state.deleted.delete(id)
+        // Every version the fake has ever served is history, which is what a
+        // versioned read asks for. `SuiTest.bumpVersion(id, { consumedBy })`
+        // lands here, so "someone else spent this version" is recorded at the
+        // version it produced.
+        remember(id, object.version, object.previousTransaction)
       }),
     deleteObject: (objectId) =>
       Effect.sync(() => {

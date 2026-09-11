@@ -131,7 +131,7 @@ it wraps, and only a real layout can serialize.
 So a codec that maps into your own domain types is a `BcsType` **composed with
 `Schema.decodeTo`**, never a custom `parse`:
 
-@@ src/schema.ts :: export const SettlementContent = SuiSchema.bcs( :: )
+@@ src/schema.ts :: export const SettlementContent = (typeOrigin: string) => :: )
 
 The domain class is an ordinary `Schema.Class`:
 
@@ -161,6 +161,25 @@ option of `getObject` / `getObjectOption` / `getObjects`, `SuiSchema.decode`'s
 `actualType`, the `type` filter of `streamOwnedObjects`, and the fake's filter
 in tests. The object keeps the type it actually has on `SuiObject.type`, so an
 extension that cares which instantiation it read can still look.
+
+### Every type-shaped constant is a function of the package id
+
+A Move type name **contains its package id**. So a codec, an owned-object
+filter or a receipt type built from a module-level constant checks the wrong
+type the moment a consumer configures a different package, and the symptom is
+brutal: a correctly encoded object fails with `DecodeError`, and a claim that
+applied on chain reports a missing receipt. The template derives all of them
+from the id the service was built with:
+
+@@ src/schema.ts :: export const escrowType = (typeOrigin: string): string => :: )
+
+**Which id, though.** The one inside a type name is the **type origin**: the
+package the type was *first* published in. Upgrading a package gives it a new id
+for `moveCall` targets and leaves every type name pointing at the original. So
+an extension over an upgradeable package carries two: `packageId` for calls,
+`typeOrigin` for codecs, filters and expected types. They are the same value
+until the first upgrade, which is why `EscrowOptions.typeOrigin` defaults to
+`packageId`.
 
 ### Bytes you already have
 
@@ -274,6 +293,17 @@ one process may legitimately hold two.
 
 @@ src/Escrow.ts :: export interface EscrowOptions { :: }
 
+**A sponsored write needs two of them.** When the transaction's gas owner is not
+its sender, both parties sign; one signature on such bytes is something a
+validator rejects outright. `Tx.run(recipe, { signer, gasOwner, sponsor })`
+takes the sponsor's `Signer` and co-signs, and refuses with `SigningError` —
+before anything is built — when a gas owner has no sponsor to go with it. The
+same check runs on the addresses read back out of the built bytes, so a recipe
+that set its own gas owner (anything built with `Tx.sponsored`) is caught too.
+An extension whose two parties cannot both sign in one process — the sponsor is
+a remote service, the sender is a wallet — uses the explicit lifecycle instead:
+`Tx.build`, `Tx.sign`, hand the bytes over, `Tx.cosign`, `Tx.submit`.
+
 ## 6. Layers
 
 Following the house convention: `layer(opts)` for the live one, `layerConfig`
@@ -341,9 +371,10 @@ Never maintain a Promise API beside the Effect one; derive it.
 @@ src/extension.ts :: export const escrow = (options: EscrowOptions) => :: SuiExtension.fromService(Escrow, { name: "escrow", layer: Escrow.layer(options) })
 
 `register(client)` does no work until the first call. Then it builds one
-`ManagedRuntime` over `SuiCore.layerFromClient(client)`, `Sui.layerNoDeps` and
-your layer, so the extension and the consumer share one transport and one
-chain-identifier check. After that:
+`ManagedRuntime` over your layer and a **base shared per client** —
+`SuiCore.layerFromClient(client)` plus `Sui.layerNoDeps` — so the extension and
+the consumer share one transport and one chain-identifier check, and so do two
+different extensions on the same client. After that:
 
 - an `Effect` member is a zero-argument method returning a `Promise`;
 - a function returning an `Effect` keeps its arguments and returns a `Promise`;
@@ -362,6 +393,12 @@ Promise-returning and leaves everything else alone: a recipe builder
 `packageId` is still a `string`. But **until the runtime exists there is no
 service object**, so nothing knows what a member is, and a placeholder is not a
 `Recipe` and not a string.
+
+An `Effect` member and a `Stream` member both work cold, because the face
+promises a `Promise` for one and an `AsyncIterable` for the other and a cold
+call can be both at once: what it returns is a thenable *and* an async iterable,
+so `await client.status()` and `for await (const x of client.owned.stream(a))`
+are each right before anything has been awaited.
 
 So a synchronous member used before the runtime exists fails with
 `ExtensionNotReady`, naming itself — a value read as a string throws, a
@@ -408,7 +445,19 @@ must report, which is how an extension whose deployment names a custom network's
 available as `dispose()`) is not final: it releases what the layer acquired and
 forgets the runtime, and the next call builds a fresh one, so dispose when the
 consumer is done rather than between calls. Registering the same extension
-twice, or on two clients, gives two independent runtimes and two layer builds.
+twice, or on two clients, still gives two independent runtimes and two layer
+builds — two copies of whatever *your* layer holds.
+
+**The base is shared, and it matters more than it sounds.** `Sui` owns the
+sender lock: one semaphore per address, which is what stops two `Tx.run`s from
+selecting the same gas coin. When each registration built its own `Sui`, two
+extensions on one client had two lock maps and could do exactly that, and
+"register each extension once" did not help. Now every registration on a client
+(for one base configuration — a different `sui.chainId` is a different base, on
+purpose) shares one `Sui`, one chain-id read and one lock map. It is reference
+counted: the base is built by the first registration that needs it and released
+when the **last** one is disposed, so `$dispose()` on one extension never tears
+the transport out from under another.
 `examples/extension-consumer.ts` in this repository shows both consumers of one
 extension side by side.
 
@@ -560,6 +609,16 @@ Because your errors declare an `outcome`, a script that fails inside your
 extension exits with the code a wrapper can act on — 5 applied, 4 not applied,
 3 unknown — with no handling lines anywhere.
 
+Two of those deserve a second look. `UnexpectedEffects` — what
+`executed.expectCreated(type)` fails with — is **applied**, exit 5: it can only
+come from an `Executed`, so the transaction ran and gas was charged and only the
+receipt is missing; treating it as "safe to retry" would run the caller's intent
+twice. And a `Cause.TimeoutError` from an `Effect.timeout` wrapped *around* a
+submission exits 3, not 4, when the journal still holds an unresolved entry: the
+outer timeout interrupts the submission from outside and the bytes may be on the
+wire. `Script.run` prints those unresolved entries, with their base64 bytes, on
+every non-zero exit.
+
 ## 12. Converting an existing facade
 
 Copying the template is the greenfield path. A 14k-line facade with standalone
@@ -693,8 +752,28 @@ copy even when you have no checkout of this repository.
 
 `examples/extension-template/README.md` has the step by step: rename the
 package, the service identifier and the registration name; drop the `paths`
-block that resolves `sui-effect` inside this repository; replace the package id,
+blocks that resolve `sui-effect` inside this repository; replace the package id,
 the BCS layouts and the Move targets; keep the shape.
+
+### The package has to actually build
+
+`exports` points into `dist`, so something has to put a `dist` there. The
+template ships `tsconfig.build.json` (emit on, `rootDir: src`, declarations and
+maps) and a `build` script, and its `files` list is `dist` plus the README —
+which is exactly the combination that is easy to get wrong and impossible to
+notice, because `tsc --noEmit` and `bun test` both import `src/` and pass for a
+package that ships nothing at all.
+
+So the template's own check does not stop at those two. `bun run check` also
+runs `scripts/check-package.ts`, which builds, packs the tarball, unpacks it
+into a throwaway `node_modules`, and imports the package the way a consumer
+will. Copy that script along with the rest: it is the only step that looks at
+what you are actually publishing.
+
+The template is `version: "0.0.0"` and **not** `private`, because a package
+meant to be copied and published must not carry a flag that silently refuses to
+publish. Set your own name, version and `publishConfig.access` before you run
+`npm publish`.
 
 ### TypeScript
 

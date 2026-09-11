@@ -1,0 +1,26 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    // Inside the sui-effect repository the *build* resolves `sui-effect` to the
+    // library's emitted declarations rather than to its sources: a `.ts` file
+    // outside `rootDir` is a file tsc refuses to emit around, and a published
+    // package must not carry a path back into this repository either way.
+    // Delete this block when you copy the template out; `node_modules` then
+    // resolves it like any other dependency.
+    "paths": {
+      "sui-effect": ["../../dist/index.d.ts"],
+      "sui-effect/tx": ["../../dist/tx.d.ts"],
+      "sui-effect/journal": ["../../dist/journal.d.ts"],
+      "sui-effect/extension": ["../../dist/extension.d.ts"],
+      "sui-effect/script": ["../../dist/script.d.ts"],
+      "sui-effect/testing": ["../../dist/testing.d.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

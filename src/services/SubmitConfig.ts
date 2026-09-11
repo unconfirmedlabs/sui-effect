@@ -5,13 +5,39 @@
  *
  * @since 0.1.0
  */
-import { Context, Duration, Schedule } from "effect"
+import { Context, Duration, Random, Schedule } from "effect"
 import type { Effect } from "effect"
 import type { PolicyDenied } from "../domain/errors.ts"
 import type { Mist, Simulation } from "../domain/schemas.ts"
+import { U32_MAX } from "../domain/schemas.ts"
 
 /** How `Tx.build` sets an expiration when the recipe left one unset. */
 export type ExpirationPolicy = "validDuring" | "epoch" | "none"
+
+/**
+ * Whether `Tx.reconcile` is allowed to conclude that an expiration window
+ * closed on a transaction the node does not know.
+ *
+ * `"epochThenMiss"` is the default and the only rule that produces
+ * `NotApplied { evidence: "expired" }`: the epoch (or timestamp) bound must be
+ * observed as passed, then `getTransaction` must miss, then — after
+ * `SubmitConfig.reconcileRecheck` — both must hold again. A single observation
+ * proves nothing, because a transaction can execute between the lookup and the
+ * expiry check, and a node behind a load balancer can serve an epoch from one
+ * replica and a transaction index from another.
+ *
+ * `"never"` disables the rule outright, so an expiration window is never
+ * evidence and an unknown transaction stays `SubmissionUnknown`. That is the
+ * setting for a deployment behind a mixed-node load balancer, where even the
+ * repeated observation can be answered by two different nodes.
+ *
+ * **Residual risk, even on `"epochThenMiss"`:** a node whose transaction index
+ * lags its epoch view can report the new epoch and miss a transaction it has in
+ * fact executed, twice in a row. The recheck delay makes that unlikely, not
+ * impossible; a deployment that cannot tolerate it sets `"never"` and settles
+ * unknown submissions by hand.
+ */
+export type ExpiryEvidencePolicy = "epochThenMiss" | "never"
 
 /** Every decision `Tx.build`, `Tx.submit` and `Tx.reconcile` read from context. */
 export interface SubmitConfigService {
@@ -79,6 +105,51 @@ export interface SubmitConfigService {
    * current epoch is past a transaction's `maxEpoch` it is simply over.
    */
   readonly expiryMargin: Duration.Duration
+  /**
+   * Whether a closed expiration window may be evidence at all, and under which
+   * rule. See {@link ExpiryEvidencePolicy}. Defaults to `"epochThenMiss"`.
+   */
+  readonly expiryEvidence: ExpiryEvidencePolicy
+  /**
+   * How long `Tx.reconcile` waits between the first observation of a closed
+   * expiration window and the second one it needs before it will answer
+   * `NotApplied { evidence: "expired" }`.
+   *
+   * It is a `Clock` sleep, so a test drives it with `TestClock` and a test that
+   * does not care sets it to zero.
+   */
+  readonly reconcileRecheck: Duration.Duration
+  /**
+   * Whether `Tx.submit` waits for a successful execution to become visible to
+   * reads before it returns and releases the sender lock. Defaults to `true`.
+   */
+  readonly awaitVisibility: boolean
+  /**
+   * How long that wait may take. A wait that times out or fails **never**
+   * changes the outcome: the transaction executed, and `Tx.submit` returns the
+   * `Executed` it already has after logging the failure.
+   */
+  readonly visibilityTimeout: Duration.Duration
+  /**
+   * The nonce `Tx.build` stamps on a default `ValidDuring` expiration, which is
+   * what makes two otherwise identical transactions from one address in one
+   * epoch different bytes with different digests.
+   *
+   * The default draws a `u32` from Effect's `Random`, which is process-local
+   * and does not survive a restart: independent 32-bit draws collide with
+   * probability about 1.16% after ten thousand such transactions. **A collision
+   * is not a second execution.** Identical bytes have one digest and one
+   * journal key, so the second build is the same transaction as the first; the
+   * failure mode is a transaction that cannot be sent again because the first
+   * one already occupied its digest, not a duplicated intent.
+   *
+   * Supply a monotonic allocator when that matters — a counter in the same
+   * store the journal uses, an id service, anything that survives a restart:
+   * `nonce: Effect.map(counter.next, (n) => n % 4_294_967_296)`. The value must
+   * be an integer in `[0, 2^32)`; anything else fails the build with
+   * `BuildError`. A journal-backed allocator is deferred (DESIGN §15).
+   */
+  readonly nonce: Effect.Effect<number>
 }
 
 /** The spec's defaults, in force whenever nothing overrides them. */
@@ -93,7 +164,12 @@ export const defaults: SubmitConfigService = {
   ]).pipe(Schedule.jittered),
   resubmitAttempts: 5,
   executeTimeout: Duration.seconds(60),
-  expiryMargin: Duration.seconds(30)
+  expiryMargin: Duration.seconds(30),
+  expiryEvidence: "epochThenMiss",
+  reconcileRecheck: Duration.seconds(2),
+  awaitVisibility: true,
+  visibilityTimeout: Duration.seconds(15),
+  nonce: Random.nextIntBetween(0, U32_MAX)
 }
 
 /**

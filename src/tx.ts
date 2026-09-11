@@ -25,6 +25,7 @@ export {
 /** The lifecycle settings, with the spec's defaults in force by default. */
 export {
   type ExpirationPolicy,
+  type ExpiryEvidencePolicy,
   SubmitConfig,
   type SubmitConfigService
 } from "./services/SubmitConfig.ts"
@@ -54,8 +55,9 @@ export {
   Tx
 } from "./services/Tx.ts"
 
-/** The expiration union and the bound `Tx.reconcile` reasons about. */
+/** The expiration union and the bounds `Tx.reconcile` reasons about. */
 export {
+  chainOf,
   maxEpochOf,
   maxTimestampMsOf,
   Signature,

@@ -395,3 +395,110 @@ and why. Everything here is additive except where noted.
 
 Deferred, recorded, not done here: `Tx.runEffect` with an effectful recipe, and
 a GraphQL-backed `SuiCore` layer.
+
+## Codex audit fixes (2026-09-11)
+
+Applied from `docs/reviews/codex-astra-audit.md` (gpt-6-astra, reasoning xhigh)
+and the adjudicated fix plan. Findings 1 to 23, one line each. Every finding has
+a regression test reproducing the audit's own scenario against the fake, in
+`test/codex-audit.test.ts` unless noted; DESIGN §§2, 4, 6, 7, 8, 10, 12, 13, 14,
+15 are amended to match.
+
+1. **Expiry is no longer proof on its own.** `NotApplied { evidence: "expired" }`
+   now needs the window observed closed, a `getTransaction` miss, and — after
+   `SubmitConfig.reconcileRecheck` (2s, through the `Clock`) — both again.
+   `SubmitConfig.expiryEvidence: "never"` disables it. Residual risk (a node
+   whose index lags its epoch view) documented in DESIGN §6 and the JSDoc.
+2. **The consumer of a pinned version, not the latest mutation.** Reconcile reads
+   the object **at version `v + 1`** through the new
+   `SuiCore.getObjectAtVersion` (gRPC `LedgerService.GetObject` with a version,
+   JSON-RPC `sui_tryGetPastObject`, `Absent` on anything else) and never uses the
+   live object's `previousTransaction` as evidence.
+3. **`UnexpectedEffects` is `applied`.** `SuiError.outcome` returns `"applied"`
+   and `Script.exitCode` returns 5; the guide's claim and the tests were wrong
+   the other way.
+4. **`Tx.reconcile` and `Tx.reconcileAll` leak no `TransportError`.** Every
+   recovery read failure becomes `SubmissionUnknown { digest, signed?, cause }`;
+   in `reconcileAll` it settles that entry instead of aborting the call. The tag
+   stays in both signatures.
+5. **An outer timeout no longer claims "not applied".** The unconditional
+   `TimeoutError → 4` mapping is gone: `Script.exitCode(exit, { unresolved })`
+   exits 3 for a timeout or an interrupt when the journal still holds a
+   submission. `Script.run` captures the journal **inside** the script runtime
+   and prints unresolved entries on every non-zero exit, typed failures included.
+6. **Chain identity before any recovery query.** `Tx.build` records
+   `sui.chainId` on `Built` and `Signed` (new `chain?` field, for the `Epoch` and
+   `None` variants that name no chain); reconcile compares it and answers
+   `SubmissionUnknown` naming both chains on a mismatch.
+7. **Durable journal write order.** Terminal entries are saved **before** the
+   digest leaves the index (unresolved ones still index first); the `put`
+   semaphore is module-level per store prefix, so two instances in one process
+   share it. Multi-process locking is DEFERRED and documented as a limitation
+   (DESIGN §8, §15).
+8. **One base per client in `SuiExtension.fromService`.** `Sui` + `SuiCore` are
+   memoized per client and per base configuration through a shared
+   `Layer.MemoMap`, so every registration shares one chain-id read and one
+   sender-lock map; Effect reference counts it, so `$dispose()` releases the base
+   only when the last registration does. Extension layers stay per registration.
+9. **`Tx.run({ signer, gasOwner, sponsor })`.** The sponsor co-signs; a gas owner
+   with no sponsor is a `SigningError` before the build, and again from the
+   addresses read out of the built bytes (which catches `Tx.sponsored`). The fake
+   now refuses a submission carrying fewer signatures than the bytes name
+   signers, so the old tests would have failed.
+10. **Visibility before the lock is released.** After a successful execute
+    `Tx.submit` calls `SuiCore.waitForTransaction({ digest })`, bounded by
+    `SubmitConfig.visibilityTimeout` (15s) and switchable with
+    `awaitVisibility`. A failed wait is logged and never changes the outcome.
+11. **The cold Promise face tells the truth.** A cold call returns a value that
+    is a thenable **and** an async iterable, so a `Stream` member is a real
+    `AsyncIterable` before the runtime exists and an `Effect` member is still a
+    Promise; synchronous members keep failing with `ExtensionNotReady` until
+    `$ready()` or `warm`.
+12. **An interrupted build cancels its request.** `Tx.build` hands the SDK a
+    proxy client whose `core` methods inject the Effect's `AbortSignal` and whose
+    `resolveTransactionPlugin` is delegated untouched. The fake's resolver now
+    reads the gas price through that client, which is how a test observes it.
+13. **Resolver transport failures are transport failures.** `mapSdkError` walks a
+    `SimulationError`'s cause chain: a gRPC status, an HTTP status, an abort or a
+    bare `fetch` `TypeError` becomes a `TransportError` with that retryability;
+    only an `executionError` (or no transport cause) stays `SimulationFailed`.
+14. **Building always simulates.** `Tx.build` mirrors the SDK's
+    `needsTransactionResolution` and, for an already-resolved transaction, runs
+    one explicit `simulateTransaction` with checks enabled. DESIGN §6 now says
+    "costs nothing extra when the SDK had to resolve; one call otherwise".
+15. **Fake invariants.** Known-digest execution is idempotent, gas selection
+    excludes object inputs, the coin set evolves (deleted / mutated with the new
+    `FakeChange.balance` / gas-bumped / created), a submission with too few
+    signatures is refused, and a version history is served through
+    `tryGetPastObject` so `getObjectAtVersion` works against the fake.
+16. **`SubmitConfig.nonce: Effect<number>`**, defaulting to a `u32` from
+    `Random`, checked to be in range at build. Collision semantics (the same
+    transaction and journal key, not a second execution) documented; a
+    journal-backed allocator is DEFERRED, recorded in DESIGN §15.
+17. **Checked `u64`.** The expiration transformation fails with a schema issue on
+    a non-numeric string, a non-integer number and anything outside `[0, 2^64)`;
+    the nonce is bounded to `u32`. Malformed persisted data is a `JournalError`,
+    not a defect.
+18. **Template codecs follow the configured package.** `EscrowContent(typeOrigin)`,
+    `escrowType`, `receiptType` and `SettlementContent(typeOrigin)` are functions;
+    `EscrowOptions.typeOrigin` distinguishes an upgraded execution package from
+    the type origin. Tested in `examples/extension-template/test/escrow.test.ts`.
+19. **The template can produce its package.** `tsconfig.build.json`, a `build`
+    script, `private` removed (publishing documented in its README), and
+    `scripts/check-package.ts`, which packs the tarball, unpacks it into a
+    throwaway consumer and imports it. Wired into `bun run check:template`.
+20. **`sdkRefOf(ref)`** returns `{ objectId, version: string, digest }` for
+    `tx.objectRef`; shared and receiving references documented (DESIGN §4).
+21. **`deleted()` includes wrapped objects** (input exists, no output,
+    `idOperation: "None"`), and `wrapped()` returns just those.
+22. **`getObject`'s explicit `expectedType` applies without a schema**, through
+    the same `typeMatches` rule.
+23. **The template's test fee collector** normalizes `0x1` instead of throwing
+    inside `SuiAddress.make`, and the member is tested.
+
+**Public surface added:** `SuiCore.getObjectAtVersion` and `VersionedObject`;
+`sdkRefOf` / `SdkObjectRef`; `Executed#wrapped()`; `chainOf`; `SignedTransaction.chain`
+and `Built.chain`; `SubmitConfig.expiryEvidence`, `reconcileRecheck`,
+`awaitVisibility`, `visibilityTimeout`, `nonce` and the `ExpiryEvidencePolicy`
+type; `Tx.run`'s `sponsor` option; `Script.exitCode`'s `ExitCodeOptions`;
+`FakeChange.balance`. Nothing was removed.

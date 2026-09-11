@@ -17,6 +17,7 @@ import {
   Stream
 } from "effect"
 import type { ChangedRef, Recipe, SuiObject, UnexpectedEffects } from "sui-effect"
+import { normalizeSuiAddress } from "@mysten/sui/utils"
 import {
   DecodeError,
   Digest,
@@ -30,12 +31,13 @@ import {
 import type { RunError, Signer } from "sui-effect/tx"
 import { Tx } from "sui-effect/tx"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
-import { EscrowContent, ESCROW_PACKAGE, RECEIPT_TYPE } from "./schema.ts"
+import { escrowType, EscrowContent, ESCROW_PACKAGE, receiptType } from "./schema.ts"
 import type { SettlementApi } from "./upstream.ts"
 import { settlementApi } from "./upstream.ts"
 
 /** The decoded content of an escrow object, inferred from the BCS bridge. */
-export type EscrowFields = typeof EscrowContent extends Schema.Codec<infer T, Uint8Array> ? T
+export type EscrowFields = ReturnType<typeof EscrowContent> extends
+  Schema.Codec<infer T, Uint8Array> ? T
   : never
 
 /** An escrow object: the envelope `Sui` returns plus its decoded content. */
@@ -63,8 +65,14 @@ export type ClaimForError =
  * no member takes a signer from the layer: `claimFor` is handed one.
  */
 export interface EscrowService {
-  /** The package this service reads and writes. */
+  /** The package this service calls into. */
   readonly packageId: string
+  /**
+   * The package the types this service decodes were **first** published in,
+   * which is what appears inside every Move type name. It is the same as
+   * `packageId` until the package is upgraded.
+   */
+  readonly typeOrigin: string
   /**
    * The address the package collects fees at, read through the upstream SDK.
    *
@@ -132,8 +140,18 @@ export interface EscrowService {
 
 /** What {@link Escrow.layer} needs to know. */
 export interface EscrowOptions {
-  /** The published package id. */
+  /** The published package id, which is what `moveCall` targets name. */
   readonly packageId: string
+  /**
+   * The type origin: the package the Move **types** were first published in,
+   * which is what appears inside `pkg::escrow::Escrow`.
+   *
+   * Defaults to `packageId`, which is right until the package is upgraded —
+   * an upgrade gives the package a new id for calls and leaves every type name
+   * pointing at the original. Set it then, and codecs, owned-object filters and
+   * the receipt type keep checking the type that exists.
+   */
+  readonly typeOrigin?: string
   /** The operator's settlement service. */
   readonly url: string
   /** The extension's own credential — never the consumer's. */
@@ -152,12 +170,22 @@ const transport = (method: string) => (cause: unknown): TransportError =>
   new TransportError({ method, retryable: false, cause })
 
 const make = (
-  options: { readonly packageId: string; readonly api: SettlementApi }
+  options: {
+    readonly packageId: string
+    readonly typeOrigin?: string
+    readonly api: SettlementApi
+  }
 ): Effect.Effect<EscrowService, never, Sui> =>
   Effect.gen(function*() {
     const sui = yield* Sui
     const { api, packageId } = options
-    const escrowType = StructTag.make(`${packageId}::escrow::Escrow`)
+    // Every type-shaped value is derived here, from the configured origin, and
+    // never from the module-level constant: configuring a package id has to
+    // move the codecs with it.
+    const typeOrigin = options.typeOrigin ?? packageId
+    const content = EscrowContent(typeOrigin)
+    const receipt = receiptType(typeOrigin)
+    const ownedFilter = StructTag.make(escrowType(typeOrigin))
 
     // `Sui` carries the `SuiCore` it was built over, so an extension reaches
     // the mechanical tier — and through `use`, the SDK client object an
@@ -185,7 +213,7 @@ const make = (
       )
 
     const get = Effect.fn("Escrow.get")(function*(id: ObjectId) {
-      return yield* sui.getObject(id, { schema: EscrowContent }).pipe(
+      return yield* sui.getObject(id, { schema: content }).pipe(
         Effect.catchTag(
           ["ObjectNotFound", "ObjectDeleted"],
           () => Effect.fail(new EscrowNotFound({ escrowId: id }))
@@ -233,23 +261,23 @@ const make = (
       // receipt. That is what `UnexpectedEffects` means, and `outcome` puts it
       // on "applied". Mapping it to `TransportError` would tell a wrapper the
       // opposite — nothing happened, retry — about a claim that ran.
-      const receipt = yield* executed.expectCreated(RECEIPT_TYPE)
+      const created = yield* executed.expectCreated(receipt)
       yield* notify(id, executed.digest)
-      return receipt
+      return created
     // `Tx.*` requires `Sui`, and the layer has one: providing it here is what
     // keeps every member's requirement channel empty, which is what
     // `SuiExtension.fromService` and every consumer expect.
     }, Effect.provideService(Sui, sui))
 
     const stream = (owner: SuiAddress) =>
-      sui.streamOwnedObjects(owner, { type: escrowType }).pipe(
+      sui.streamOwnedObjects(owner, { type: ownedFilter }).pipe(
         Stream.mapEffect((object) =>
           // `SuiSchema.decode` is the same decode `sui.getObject({ schema })`
           // does, for the places that already have bytes. Bytes that do not
           // decode are a `DecodeError` naming the object and the type — not a
           // transport failure, which is what a node that could not be reached
           // is.
-          SuiSchema.decode(EscrowContent, object.content, {
+          SuiSchema.decode(content, object.content, {
             objectId: object.id,
             // The type the object actually has. Give it and `SuiSchema.decode`
             // runs the same tag check `getObject` does, under the same rule: a
@@ -262,6 +290,7 @@ const make = (
 
     return {
       packageId,
+      typeOrigin,
       feeCollector,
       get,
       claim,
@@ -297,7 +326,12 @@ export const DEPLOYMENTS: Readonly<Record<string, EscrowDeployment>> = {
 /** The in-memory settlement service `layerTest` runs against. */
 const fakeApi = (settled: boolean): SettlementApi => ({
   notifyClaim: async () => ({ status: settled ? "settled" : "pending" }),
-  resolveFeeCollector: async () => SuiAddress.make("0x1")
+  // `SuiAddress.make` validates, it does not normalize: `"0x1"` is not a
+  // 32-byte address and `make` throws, which the `use` boundary then reports as
+  // a `TransportError` from a fake that never touched a network. Normalize
+  // first — or write the padded form out — whenever a literal address becomes a
+  // branded one.
+  resolveFeeCollector: async () => SuiAddress.make(normalizeSuiAddress("0x1"))
 })
 
 /**
@@ -319,6 +353,7 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
       Escrow,
       make({
         packageId: options.packageId,
+        ...(options.typeOrigin === undefined ? {} : { typeOrigin: options.typeOrigin }),
         api: settlementApi({ url: options.url, apiKey: Redacted.value(options.apiKey) })
       })
     )
