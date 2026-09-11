@@ -14,6 +14,9 @@
  * @since 0.1.0
  */
 import type { ClientWithCoreApi } from "@mysten/sui/client"
+import type { SuiGrpcClient } from "@mysten/sui/grpc"
+import { GrpcCoreClient, isSuiGrpcClient } from "@mysten/sui/grpc"
+import type { TransactionPlugin } from "@mysten/sui/transactions"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
 import { normalizeSuiAddress } from "@mysten/sui/utils"
 
@@ -101,6 +104,7 @@ export type Reconciled = Executed | ExecutionFailed | NotApplied | SubmissionUnk
 
 const decodeExpiration = Schema.decodeUnknownOption(TransactionExpiration)
 const decodeDigest = Schema.decodeUnknownEffect(Digest)
+const decodeDigestOption = Schema.decodeUnknownOption(Digest)
 const decodeVersion = Schema.decodeUnknownOption(Version)
 const decodeObjectId = Schema.decodeUnknownOption(ObjectId)
 
@@ -109,6 +113,72 @@ const buildError = (message: string) => (cause: unknown): BuildError =>
 
 /** The `u32` nonce a `ValidDuring` expiration carries as its replay guard. */
 const MAX_NONCE = U32_MAX
+
+/**
+ * The gRPC resolve plugin, re-created over a client whose
+ * `transactionExecutionService.simulateTransaction` carries the Effect's
+ * `AbortSignal`.
+ *
+ * This is the one request `abortableClient`'s `core` proxy cannot reach.
+ * `GrpcCoreClient#resolveTransactionPlugin` closes over the private grpc client
+ * it was constructed with and calls `simulateTransaction(request)` with no
+ * second argument, while every other method on that class passes
+ * `{ abort: options.signal }`. So an interrupted `Tx.build` on a gRPC client
+ * ended — releasing the sender lock — with the resolver's simulate still in
+ * flight.
+ *
+ * Nothing is re-implemented. `GrpcCoreClient` is public
+ * (`@mysten/sui/grpc`), and its constructor takes the grpc client it will use:
+ * handing it a `SuiGrpcClient` whose `transactionExecutionService` adds
+ * `{ abort: signal }` and whose `core` is the already-signalled proxy gives back
+ * the SDK's **own** plugin, line for line, with the signal attached. The cache
+ * is shared through `base`, so nothing is read twice.
+ *
+ * Never fails.
+ */
+const grpcResolvePlugin = (
+  client: SuiGrpcClient,
+  core: object,
+  signal: AbortSignal
+): TransactionPlugin => {
+  const service = client.transactionExecutionService
+  const abortable = new Proxy(service, {
+    get: (receiver, key) => {
+      const value = Reflect.get(receiver, key)
+      if (typeof value !== "function") return value
+      if (key !== "simulateTransaction") {
+        return (...args: Array<unknown>) =>
+          (value as (...a: Array<unknown>) => unknown).apply(receiver, args)
+      }
+      return (input: unknown, options?: Record<string, unknown>) =>
+        (value as (...a: Array<unknown>) => unknown).call(receiver, input, {
+          ...(options ?? {}),
+          // A caller that passed its own signal keeps it; the resolver passes
+          // none, which is the whole bug.
+          abort: options?.["abort"] ?? signal
+        })
+    }
+  })
+  const shadow = new Proxy(client, {
+    get: (receiver, key) => {
+      // `setAddressBalanceTransactionExpirationFromSimulatedEpoch` reads
+      // `client.core.getChainIdentifier()` and `client.core
+      // .getCurrentSystemState()` out of this same object, so it gets the
+      // signalled core too.
+      if (key === "core") return core
+      if (key === "transactionExecutionService") return abortable
+      const value = Reflect.get(receiver, key)
+      return typeof value === "function"
+        ? (value as (...a: Array<unknown>) => unknown).bind(receiver)
+        : value
+    }
+  })
+  return new GrpcCoreClient({
+    client: shadow as SuiGrpcClient,
+    base: client,
+    network: client.network
+  }).resolveTransactionPlugin()
+}
 
 /**
  * The SDK client with the Effect's `AbortSignal` injected into every Core call.
@@ -121,17 +191,23 @@ const MAX_NONCE = U32_MAX
  * those through `options.client`, so a client whose `core` injects the signal is
  * how an interrupt reaches the request.
  *
- * `resolveTransactionPlugin` is delegated untouched: it is a pure value
- * constructor, and the plugin it returns receives this same proxy as
- * `options.client`, so the transport's own reads are signalled too.
+ * `resolveTransactionPlugin` is delegated untouched on every transport but
+ * gRPC, whose plugin simulates through a captured private client that no proxy
+ * of `core` can reach: there it is rebuilt by {@link grpcResolvePlugin}, which
+ * is the same SDK plugin over a client that carries the signal.
  */
 const abortableClient = (client: ClientWithCoreApi, signal: AbortSignal): ClientWithCoreApi => {
+  const grpc = isSuiGrpcClient(client) ? client : undefined
+  let core: object | undefined
   const inject = (target: object): object =>
     new Proxy(target, {
       get: (receiver, key) => {
         const value = Reflect.get(receiver, key)
         if (typeof key !== "string") return value
         if (key === "resolveTransactionPlugin") {
+          if (grpc !== undefined) {
+            return () => grpcResolvePlugin(grpc, core ?? (client.core as unknown as object), signal)
+          }
           return typeof value === "function"
             ? (...args: Array<unknown>) =>
               (value as (...a: Array<unknown>) => unknown).apply(receiver, args)
@@ -157,10 +233,11 @@ const abortableClient = (client: ClientWithCoreApi, signal: AbortSignal): Client
       }
     })
 
-  const core = inject(client.core as unknown as object)
+  core = inject(client.core as unknown as object)
+  const coreProxy = core
   return new Proxy(client, {
     get: (receiver, key) => {
-      if (key === "core") return core
+      if (key === "core") return coreProxy
       const value = Reflect.get(receiver, key)
       // Bound, so a method reached through the proxy still sees the real
       // instance as `this` — a class with private fields would throw otherwise.
@@ -200,6 +277,20 @@ const willResolve = (tx: Transaction): boolean => {
     return false
   } catch {
     return false
+  }
+}
+
+/**
+ * The object inputs the transaction has not resolved yet, which are exactly
+ * the ones the resolver is about to look up. Never fails.
+ */
+const unresolvedObjectIdsOf = (tx: Transaction): ReadonlyArray<string> => {
+  try {
+    return tx.getData().inputs
+      .map((input) => input.UnresolvedObject?.objectId)
+      .filter((id): id is string => typeof id === "string")
+  } catch {
+    return []
   }
 }
 
@@ -332,11 +423,14 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  * client whose Core calls carry the Effect's `AbortSignal`.
  *
  * When the recipe set no expiration, `SubmitConfig.expiration` decides one.
- * The default, `ValidDuring`, bounds the transaction at `chainTime` plus
- * `SubmitConfig.validFor`, names the chain (bytes signed for testnet cannot
- * land on mainnet) and carries a random nonce. The expiration that ends up in
- * the bytes is recorded on the result, because it is what `Tx.reconcile` needs
- * later to prove a transaction can no longer land.
+ * The default, `ValidDuring`, bounds the transaction to the **current epoch and
+ * the next**, names the chain (bytes signed for testnet cannot land on mainnet)
+ * and carries a `u32` nonce from `SubmitConfig.nonce`. There is **no
+ * wall-clock bound** unless `SubmitConfig.validFor` asks for one: no Sui
+ * network accepts a timestamp expiration yet, and a node refuses any
+ * transaction carrying one. The expiration that ends up in the bytes is
+ * recorded on the result, because it is what `Tx.reconcile` needs later to
+ * prove a transaction can no longer land.
  *
  * `Tx.build` takes no sender lock; `Tx.run` is what holds one from build
  * through submit. Called on its own, two concurrent builds for one address can
@@ -373,6 +467,7 @@ export const build = Effect.fn("Tx.build")(function*(
   }
 
   const resolving = willResolve(tx)
+  const unresolved = unresolvedObjectIdsOf(tx)
   const bytes = yield* sui.core
     .use((client, signal) => tx.build({ client: abortableClient(client, signal) }))
     .pipe(
@@ -382,7 +477,22 @@ export const build = Effect.fn("Tx.build")(function*(
           Effect.fail(
             new BuildError({ message: `an input could not be resolved: ${SuiError.describe(error)}`, cause: error })
           )
-      )
+      ),
+      // A gRPC resolver that cannot find an input answers `NOT_FOUND` from
+      // `simulateTransaction` rather than raising the SDK's `ObjectError`, and
+      // that arrived as a bare `TransportError { method: "use" }` naming
+      // nothing. It is a `BuildError` like every other unresolvable input, and
+      // it names the object inputs the resolver was about to look up.
+      Effect.catchTag("TransportError", (error) =>
+        Effect.fail(
+          error.status === "NOT_FOUND"
+            ? new BuildError({
+              message: "an input could not be resolved: the node answered NOT_FOUND" +
+                (unresolved.length === 0 ? "" : ` for one of ${unresolved.join(", ")}`),
+              cause: error
+            })
+            : error
+        ))
     )
 
   if (!resolving) {
@@ -439,16 +549,18 @@ const epochOf = (epoch: string): Effect.Effect<bigint, TransportError> =>
  * A custom allocator that answers something else is a configuration mistake and
  * fails the build, rather than producing bytes a validator refuses.
  */
-const nonceOf = (config: SubmitConfigService): Effect.Effect<number, TransportError> =>
+const nonceOf = (config: SubmitConfigService): Effect.Effect<number, BuildError> =>
   Effect.flatMap(config.nonce, (nonce) =>
     Number.isInteger(nonce) && nonce >= 0 && nonce <= MAX_NONCE
       ? Effect.succeed(nonce)
       : Effect.fail(
-        new TransportError({
-          method: "SubmitConfig.nonce",
-          retryable: false,
-          status: "INVALID_ARGUMENT",
-          cause: `SubmitConfig.nonce produced ${nonce}, which is not a u32 (0 to ${MAX_NONCE})`
+        // A `BuildError`, not a `TransportError`: nothing was sent, no node was
+        // asked, and the build is what failed. `SubmitConfig.ts` and DESIGN
+        // section 6 both say so.
+        new BuildError({
+          message:
+            `SubmitConfig.nonce produced ${nonce}, which is not a u32 (0 to ${MAX_NONCE})`,
+          cause: nonce
         })
       ))
 
@@ -456,7 +568,7 @@ const nonceOf = (config: SubmitConfigService): Effect.Effect<number, TransportEr
 const defaultExpiration = Effect.fn("Tx.defaultExpiration")(function*(
   sui: Sui["Service"],
   config: SubmitConfigService
-): Effect.fn.Return<SdkExpiration | undefined, TransportError> {
+): Effect.fn.Return<SdkExpiration | undefined, BuildError | TransportError> {
   switch (config.expiration) {
     case "none":
       return undefined
@@ -708,7 +820,11 @@ const awaitVisible = (
     .pipe(
       Effect.timeout(config.visibilityTimeout),
       Effect.asVoid,
-      Effect.catchCause(() =>
+      // `Effect.catch`, not `Effect.catchCause`: a timeout, a `TransportError`
+      // and a `TransactionNotFound` are the failures this is allowed to swallow
+      // — a **defect** is a bug, and turning one into a warning line hid it
+      // behind an outcome that was going to stand anyway.
+      Effect.catch(() =>
         Effect.logWarning(
           "the transaction executed but did not become visible to reads within" +
             " SubmitConfig.visibilityTimeout; the outcome stands"
@@ -905,6 +1021,50 @@ type InputEvidence =
   | { readonly _tag: "Unreadable"; readonly objectId: string; readonly reason: string }
 
 /**
+ * The version of one object that a given transaction took as **input**, read
+ * out of that transaction's own effects.
+ *
+ * `changedObjects[].inputVersion` is the only field on the network that answers
+ * "which version did this transaction consume": there is no `v + 1` rule to
+ * lean on, because Sui stamps every output of a transaction with that
+ * transaction's **Lamport version** — `max(input versions) + 1` across all of
+ * its inputs — so an owned object read alongside a newer gas coin jumps from
+ * version 4 to 6,436,928 and the object "at version 5" never existed.
+ *
+ * A transaction that **failed** on chain still consumed its inputs, so its
+ * effects are read out of `ExecutionFailed` as readily as out of `Executed`.
+ * `undefined` means the question cannot be answered here — the node does not
+ * serve that transaction, or its effects do not mention this object (it was
+ * created rather than consumed).
+ *
+ * Fails with: `TransportError`.
+ */
+const consumedVersionOf = Effect.fn("Tx.consumedVersionOf")(function*(
+  sui: Sui["Service"],
+  by: string,
+  objectId: string
+): Effect.fn.Return<bigint | undefined, TransportError> {
+  const decoded = decodeDigestOption(by)
+  if (decoded._tag !== "Some") return undefined
+  const found = yield* Effect.result(sui.getTransaction(decoded.value))
+  if (found._tag === "Failure" && found.failure._tag === "TransportError") {
+    return yield* found.failure
+  }
+  const effects = found._tag === "Success"
+    ? found.success.effects
+    : found.failure._tag === "ExecutionFailed"
+    ? found.failure.effects
+    : undefined
+  if (effects === undefined) return undefined
+  const wanted = normalizeSuiAddress(objectId)
+  for (const change of effects.changedObjects) {
+    if (normalizeSuiAddress(change.objectId) !== wanted) continue
+    return change.inputVersion ?? undefined
+  }
+  return undefined
+})
+
+/**
  * Reads every object the bytes pinned — owned inputs and gas coins alike — and
  * says what their current state proves.
  *
@@ -912,21 +1072,29 @@ type InputEvidence =
  * A version that has moved (or an object that is gone) says only *that* it
  * moved; it does not say **who** moved it, and that is the whole question.
  *
- * `previousTransaction` on the current object is the wrong answer to it: it
- * names the **latest** mutation, so a transaction T that consumed version 3 and
- * a later transaction U that consumed version 4 leave an object that names U,
- * and reconciling T against it would report `NotApplied` for a transaction that
- * applied. The consumer of version `v` is named by the object **at version
- * `v + 1`**, which is what `SuiCore.getObjectAtVersion` reads:
+ * The live object's `previousTransaction` names the **latest** mutation, which
+ * is not necessarily the consumer of the version these bytes pinned: T can
+ * consume version 3 and U version 4, and the object then names U. So the answer
+ * is read out of that transaction's own effects:
  *
- * - a **different** digest there means those exact bytes can never execute
- *   again, and that is the one thing `NotApplied { inputConsumed }` may be
- *   built on;
- * - **our own** digest means the transaction applied, whatever the read replica
- *   that answered `getTransaction` thought;
- * - **no readable successor** — a pruned version, a transport with no
- *   historical read, a node that does not serve the field — proves nothing
- *   either way, and the honest answer is that the outcome is unknown.
+ * - `previousTransaction` is **our** digest: the transaction applied, whatever
+ *   the read replica that answered `getTransaction` thought;
+ * - it is a **different** digest, and that transaction's effects report
+ *   `inputVersion` **equal to the version we pinned**: those exact bytes can
+ *   never execute again, and that is the one thing `NotApplied
+ *   { inputConsumed }` may be built on;
+ * - it is a different digest whose `inputVersion` is **greater** than ours:
+ *   something between the two consumed our version and the node does not serve
+ *   the state in between, so nothing is proven;
+ * - nothing readable at all — a deleted object, a node that names no
+ *   transaction, a transaction the node has pruned — proves nothing either way.
+ *
+ * **Every pinned reference is tried.** A gas coin that merely moved on, or an
+ * input whose consumer cannot be read, does not end the search: the first
+ * inconclusive reference is remembered and the next one is read, and the
+ * remembered reason is only reported when no reference proved anything. Giving
+ * up on the first moved reference is how a reconcile with `AppliedByUs`
+ * evidence one read away returned `SubmissionUnknown`.
  *
  * Fails with: `TransportError`.
  */
@@ -935,32 +1103,42 @@ const inputEvidence = Effect.fn("Tx.inputEvidence")(function*(
   digest: Digest,
   signed: Signed
 ): Effect.fn.Return<InputEvidence, TransportError> {
+  let inconclusive: InputEvidence | undefined
+  const remember = (objectId: string, reason: string): void => {
+    if (inconclusive === undefined) inconclusive = { _tag: "Unreadable", objectId, reason }
+  }
   for (const pinned of pinnedRefsOfBytes(signed.bytes)) {
     const decoded = decodeObjectId(pinned.objectId)
     if (decoded._tag !== "Some") continue
-    const state = yield* inputStateOf(sui, decoded.value)
+    const objectId = decoded.value
+    const state = yield* inputStateOf(sui, objectId)
     if (state._tag === "Present" && state.version <= pinned.version) continue
-    // The pinned version is behind us. Whoever produced the version after it is
-    // the transaction that consumed ours.
-    const successor = yield* sui.core.getObjectAtVersion({
-      objectId: decoded.value,
-      version: (pinned.version + 1n).toString()
-    })
-    if (successor._tag !== "Found") {
-      return { _tag: "Unreadable", objectId: decoded.value, reason: successor.reason }
+    if (state._tag === "Absent") {
+      remember(objectId, "it is gone, and a deleted object names no transaction")
+      continue
     }
-    const by = successor.previousTransaction
+    const by = state.previousTransaction
     if (by === undefined) {
-      return {
-        _tag: "Unreadable",
-        objectId: decoded.value,
-        reason: "the node served the next version but named no transaction for it"
-      }
+      remember(objectId, "the node served the object but named no transaction as its last mutation")
+      continue
     }
-    if (by === digest) return { _tag: "AppliedByUs", objectId: decoded.value }
-    return { _tag: "ConsumedByOther", objectId: decoded.value, by }
+    if (by === digest) return { _tag: "AppliedByUs", objectId }
+    const consumed = yield* consumedVersionOf(sui, by, objectId)
+    if (consumed === undefined) {
+      remember(
+        objectId,
+        `the node does not say which version transaction ${by}, which last mutated it, consumed`
+      )
+      continue
+    }
+    if (consumed === pinned.version) return { _tag: "ConsumedByOther", objectId, by }
+    remember(
+      objectId,
+      `transaction ${by} consumed version ${consumed} of it, not the version ${pinned.version}` +
+        " these bytes pinned, and the state in between is not served"
+    )
   }
-  return { _tag: "NoEvidence" }
+  return inconclusive ?? { _tag: "NoEvidence" }
 })
 
 /** The epoch the node currently reports. Fails with: `TransportError`. */
@@ -1029,17 +1207,22 @@ const chainOfSigned = (signed: Signed): string | undefined =>
  *   `SubmitConfig.expiryEvidence: "never"` to disable the rule entirely, which
  *   is what a deployment behind a mixed-node load balancer wants. The residual
  *   risk is a node whose transaction index lags its epoch view;
- * - `"inputConsumed"` when the object **at the version after** one this
- *   transaction pinned names a **different** transaction as the one that
- *   produced it, so those exact bytes can never execute again.
+ * - `"inputConsumed"` when the transaction that last mutated a pinned object is
+ *   a **different** one **and its own effects report `inputVersion` equal to
+ *   the version these bytes pinned**, so those exact bytes can never execute
+ *   again.
  *
  * An input that merely advanced is not evidence: the transaction being
  * reconciled is itself the likeliest thing to have advanced it, and calling
  * that `NotApplied` would tell the documented retry idiom to execute the
- * caller's intent a second time. When the successor version names *our* digest
- * the transaction applied and `getTransaction` is asked again; when the
- * successor cannot be read at all the answer is `SubmissionUnknown`, which
- * carries the bytes so a later process, or a person, can settle it.
+ * caller's intent a second time. When the live object names *our* digest the
+ * transaction applied and `getTransaction` is asked again; when the consuming
+ * transaction took a **later** version than ours — which is the common case,
+ * because Sui stamps every output with the transaction's Lamport version and
+ * the object "one version on" from ours usually never existed — nothing is
+ * proven and the answer is `SubmissionUnknown`, which carries the bytes so a
+ * later process, or a person, can settle it. Every pinned reference is tried
+ * before that answer is given.
  *
  * **Chain identity is checked before anything is asked.** Bytes built for one
  * chain must never be declared expired by another chain's epoch, which a
@@ -1149,15 +1332,14 @@ const recover = Effect.fn("Tx.recover")(function*(
     case "ConsumedByOther":
       return yield* new NotApplied({ digest, evidence: "inputConsumed" })
     case "AppliedByUs": {
-      // The version after the one we pinned names this very transaction, so it
-      // applied; the `getTransaction` above was answered by a node that had not
-      // caught up. Ask once more for the receipt.
+      // Object ${objectId} names this very transaction as the one that last
+      // mutated it, so it applied; the `getTransaction` above was answered by a
+      // node that had not caught up. Ask once more for the receipt.
       const again = yield* lookup()
       if (again !== undefined) return again
       return yield* unknown(
-        `the version after the one this transaction pinned on object ${evidence.objectId}` +
-          " names it as the transaction that produced it, so it applied, but the node still" +
-          " does not serve it"
+        `object ${evidence.objectId} names this transaction as the one that last mutated it,` +
+          " so it applied, but the node still does not serve it"
       )
     }
     case "Unreadable":
@@ -1263,7 +1445,11 @@ export const run = Effect.fn("Tx.run")(function*(
   const sui = yield* Sui
   const config = yield* SubmitConfig
   const sender = opts.signer.address
-  const locked = opts.gasOwner === undefined || opts.gasOwner === sender
+  // Normalized on both sides: `0x2` and its 64-character spelling are one
+  // address, and comparing them as written took two locks on one account — in
+  // whichever order the two spellings happened to sort.
+  const locked = opts.gasOwner === undefined ||
+      normalizeSuiAddress(opts.gasOwner) === normalizeSuiAddress(sender)
     ? [sender]
     : [sender, opts.gasOwner].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
 
@@ -1344,22 +1530,6 @@ export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(): Effect.fn.
         yield* journalSettled(yield* failedEntry(failure))
         settled.push(failure)
         break
-      case "TransportError":
-        // A recovery read that failed says nothing about this entry, and
-        // nothing about the next one either: it becomes this entry's
-        // `SubmissionUnknown` and the loop continues, rather than aborting the
-        // whole startup on one unreachable read.
-        yield* journalSettled(
-          yield* unknownEntry(entry.signed, SuiError.describe(failure), attempts)
-        )
-        settled.push(
-          new SubmissionUnknown({
-            digest: entry.digest,
-            signed: entry.signed,
-            cause: failure
-          })
-        )
-        break
       case "NotApplied":
         // Terminal, so the entry leaves the unresolved index: without this a
         // durable journal would hold a proven-dead submission forever and
@@ -1367,12 +1537,26 @@ export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(): Effect.fn.
         yield* journalSettled(yield* notAppliedEntry(failure))
         settled.push(failure)
         break
-      default:
+      default: {
+        // `Tx.reconcile` converts every recovery read failure into
+        // `SubmissionUnknown`, so `TransportError` is in its signature and
+        // never in its values; it is mapped here anyway rather than given a
+        // case of its own that nothing could reach. Either way the failure
+        // settles **this** entry and the loop goes on, instead of aborting a
+        // whole startup on one unreachable read.
+        const unresolvedOutcome = failure._tag === "SubmissionUnknown"
+          ? failure
+          : new SubmissionUnknown({
+            digest: entry.digest,
+            signed: entry.signed,
+            cause: failure
+          })
         yield* journalSettled(
           yield* unknownEntry(entry.signed, SuiError.describe(failure), attempts)
         )
-        settled.push(failure)
+        settled.push(unresolvedOutcome)
         break
+      }
     }
   }
   return settled

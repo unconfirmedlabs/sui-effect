@@ -18,7 +18,15 @@ bun add -d effect@4.0.0-rc.112 @mysten/sui@2.30.0
 ```
 
 `effect` and `@mysten/sui` are peer dependencies: one copy of each per process,
-or `Context.Service` identities and `instanceof` checks stop matching.
+or `Context.Service` identities and `instanceof` checks stop matching. The
+`effect` peer is pinned **exactly** to `4.0.0-rc.112`, because rc.113 renamed
+`Config.nonEmptyString`, `Config.string` and `Config.redacted` to
+`Config.NonEmptyString`, `Config.String` and `Config.Redacted`, and neighbouring
+release candidates are not interchangeable.
+
+A **library** built on sui-effect puts all three in its own
+`peerDependencies` **and** `devDependencies`, never in `dependencies`; see
+`examples/extension-template/README.md`.
 
 ## A complete script
 
@@ -86,7 +94,9 @@ was built over as `sui.core`, which is why every `Tx.*` function needs only
 `Tx` is the lifecycle as functions — `build`, `sign`, `cosign`, `sponsored`,
 `submit`, `reconcile`, `run`, `reconcileAll` — each with a closed error union
 and `R = Sui`. `Tx.run` holds the sender lock from build through submit, builds
-(which always simulates, so a transaction that would abort never gets signed),
+(which always simulates before anything is signed — the SDK's resolver does it
+when there is anything to resolve, and `Tx.build` runs one explicitly when
+there is not, so a transaction that would abort never gets signed),
 signs, journals the signed bytes before the first execute, re-sends the
 identical bytes — never a rebuild — on a retryable transport failure or a
 timeout, waits for the execution to be visible to reads before it releases the
@@ -106,13 +116,23 @@ requires the epoch (or timestamp) bound to be observed as passed, then a
 `getTransaction` miss, then — after `SubmitConfig.reconcileRecheck` — both
 again; a single observation is `SubmissionUnknown`, and
 `SubmitConfig.expiryEvidence: "never"` turns the rule off for a deployment
-behind a mixed-node load balancer. `"inputConsumed"` requires the object **at
-the version after** one the bytes pinned to name a *different* transaction: the
-live object's `previousTransaction` names the latest mutation, not the consumer
-of the version in question, and reading it would report `NotApplied` for a
-transaction that applied and was simply overtaken. Before any of this,
-reconcile compares the chain the bytes were built for with `sui.chainId` and
-refuses to reason across chains.
+behind a mixed-node load balancer. `"inputConsumed"` requires a *different*
+transaction's **own effects** to report that it took a pinned object at exactly
+the version the bytes pinned: reconcile follows the live object's
+`previousTransaction` — which names the latest mutation, not the consumer of the
+version in question — to that transaction and reads `inputVersion` off its
+`changedObjects`. There is no "the object at version `v + 1`" rule, because Sui
+stamps every output with the transaction's **Lamport version**, `max(input
+versions) + 1`, so a coin read alongside a newer gas object jumps from version 4
+to 6,436,928 and version 5 never existed. Every pinned reference — owned inputs
+and gas coins alike — is tried before reconcile gives up.
+
+**In practice that means `SubmissionUnknown`, not `NotApplied`, for almost
+every stuck submission** whose PTB touched a shared object or an owned object
+older than the gas coin. Plan an operator path or a `reconcileAll` at startup;
+do not build a retry loop that expects `NotApplied { inputConsumed }`. Before
+any of this, reconcile compares the chain the bytes were built for with
+`sui.chainId` and refuses to reason across chains.
 
 **A sponsored `Tx.run` needs both signatures.** When the gas owner is not the
 sender, pass `sponsor`: `Tx.run(recipe, { signer, gasOwner, sponsor })`. Without
@@ -245,14 +265,18 @@ repository touches the network, and neither should yours.
 
 | Package | Range | Tested against |
 |---|---|---|
-| `effect` | `>=4.0.0-rc.112 <4.1` | `4.0.0-rc.112` and `4.0.0-rc.113`, both in CI |
+| `effect` | `4.0.0-rc.112` (exact) | `4.0.0-rc.112`, in CI |
 | `@mysten/sui` | `^2.28` (the first version whose BCS and gRPC round-trip `ValidDuring` and `Validity` expirations) | `2.29.0` and `2.30.0`, both in CI; `2.30.0` is the pinned devDependency |
 | `@mysten/bcs` | `^2.1.1` | `2.1.1` |
 | TypeScript | `5.9.x` to build | `5.9.3` |
 | Bun | `1.4.x` | `1.4.2` |
 
-The SDK row is a matrix, not a hope: CI typechecks and runs the suite against
-`@mysten/sui` 2.29.0 and 2.30.0, which are the versions consumers pin today.
+The SDK row is a matrix, not a hope: CI builds, typechecks and runs the suite
+against `@mysten/sui` 2.29.0 and 2.30.0, which are the versions consumers pin
+today. The `effect` row is a matrix of one, and it is exact on purpose: rc.113
+renamed three `Config` constructors this package calls at four sites
+(`Script.ts`, `Signer.ts`, `SuiCore.ts`, `SuiGraphQL.ts`), so widening the range
+means supporting both spellings and proving the wider one in CI.
 
 **Consumers on TypeScript 7 (`tsgo`) are supported.** The shipped `.d.ts` needs
 nothing from the old compiler. The `prepare` script here

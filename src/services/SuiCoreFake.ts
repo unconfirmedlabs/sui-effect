@@ -70,6 +70,19 @@ export interface FakeChange {
   readonly objectId: string
   readonly type: string
   readonly version?: bigint
+  /**
+   * The version this transaction took the object at, which is what
+   * `Tx.reconcile` reads to decide that a **different** transaction consumed
+   * the version a set of bytes pinned.
+   *
+   * Sui stamps every output with the transaction's Lamport version —
+   * `max(input versions) + 1` across all of its inputs — so the input version
+   * is not "the output version minus one" on a real network, and a test that
+   * means "this transaction consumed version 3" has to say 3. It defaults to
+   * `version - 1` for a mutated or deleted object, and is `null` for a created
+   * one.
+   */
+  readonly inputVersion?: bigint
   readonly owner?: SuiClientTypes.ObjectOwner
   /** `PackageWrite` marks a published package; `AccumulatorWriteV1` an accumulator write. */
   readonly outputState?: SuiClientTypes.ChangedObject["outputState"]
@@ -93,7 +106,16 @@ export interface FakeExecution {
   readonly deleted?: ReadonlyArray<FakeChange>
   readonly events?: ReadonlyArray<SuiClientTypes.Event>
   readonly balanceChanges?: ReadonlyArray<SuiClientTypes.BalanceChange>
-  readonly commandResults?: ReadonlyArray<SuiClientTypes.CommandResult>
+  /**
+   * The per-command results a simulation reports.
+   *
+   * Both arrays of `SuiClientTypes.CommandResult` are required on the wire and
+   * either may be left out here: a missing one defaults to empty, which is what
+   * the node reports for a command that returned nothing. Giving only
+   * `returnValues` used to fail the whole `Simulation` decode with an issue
+   * naming `mutatedReferences`, a field the test never mentioned.
+   */
+  readonly commandResults?: ReadonlyArray<Partial<SuiClientTypes.CommandResult>>
   readonly gasUsed?: SuiClientTypes.GasCostSummary
   readonly checkpoint?: string
   readonly timestampMs?: number
@@ -171,6 +193,22 @@ export interface FakeScript {
   readonly buildSimulate?: ReadonlyArray<FakeOutcome>
   readonly execute?: ReadonlyArray<FakeOutcome>
   readonly getTransaction?: ReadonlyArray<FakeOutcome>
+  /**
+   * Transactions the node knows **by digest**, served before the ordered
+   * `getTransaction` script is consulted.
+   *
+   * The ordered script answers "what does the node say the next time it is
+   * asked", which is what a reconcile test drives. This answers "what does the
+   * node say about *that* transaction", which is what `Tx.reconcile` needs when
+   * it follows a pinned object's `previousTransaction` to find out which
+   * version the consuming transaction actually took: the answer has to depend
+   * on the digest, not on the call count.
+   *
+   * Give the consuming transaction's effects with an explicit `inputVersion` on
+   * the object in question — that equality is the whole of the
+   * `NotApplied { inputConsumed }` rule.
+   */
+  readonly transactions?: Readonly<Record<string, FakeOutcome>>
 }
 
 /** One call the fake received, in order. */
@@ -207,6 +245,11 @@ export interface SuiCoreFakeState {
   readonly setClock: (timestampMs: bigint) => Effect.Effect<void>
   /** Moves the epoch `getCurrentSystemState` reports. */
   readonly setEpoch: (epoch: bigint) => Effect.Effect<void>
+  /**
+   * Teaches the fake about one transaction **by digest**, the way
+   * `FakeScript.transactions` does for a script written up front.
+   */
+  readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void>
   /** Replaces the remaining scripted outcomes of a method. */
   readonly setOutcomes: (
     method: "simulate" | "execute" | "getTransaction" | "buildSimulate",
@@ -242,6 +285,8 @@ interface Mutable {
   }
   pendingDigests: Map<string, boolean>
   knownTransactions: Map<string, SettledTransaction>
+  /** What the node says about a transaction asked for by digest. */
+  byDigest: Map<string, FakeOutcome>
 }
 
 /** What a settled call produced, kept so `getTransaction` can serve it again. */
@@ -305,7 +350,9 @@ const changedObject = (
 ): SuiClientTypes.ChangedObject => ({
   objectId: normalizeSuiAddress(change.objectId),
   inputState: kind === "created" ? "DoesNotExist" : "Exists",
-  inputVersion: kind === "created" ? null : ((change.version ?? 2n) - 1n).toString(),
+  inputVersion: kind === "created"
+    ? null
+    : (change.inputVersion ?? (change.version ?? 2n) - 1n).toString(),
   inputDigest: kind === "created" ? null : fakeDigest(11),
   inputOwner: kind === "created" ? null : (change.owner ?? addressOwner("0x1")),
   outputState:
@@ -315,6 +362,19 @@ const changedObject = (
   outputOwner: kind === "deleted" ? null : (change.owner ?? addressOwner("0x1")),
   idOperation: kind === "created" ? "Created" : kind === "deleted" ? "Deleted" : "None"
 })
+
+/** One scripted command result with both of the arrays the wire shape requires. */
+const toCommandResult = (
+  result: Partial<SuiClientTypes.CommandResult>
+): SuiClientTypes.CommandResult => ({
+  returnValues: result.returnValues ?? [],
+  mutatedReferences: result.mutatedReferences ?? []
+})
+
+const commandResultsOf = (
+  execution: FakeExecution
+): ReadonlyArray<SuiClientTypes.CommandResult> =>
+  (execution.commandResults ?? []).map(toCommandResult)
 
 const executionToTransaction = (
   execution: FakeExecution,
@@ -397,6 +457,24 @@ const systemState = (epoch: bigint, timestampMs: bigint): SuiClientTypes.SystemS
   }
 })
 
+/**
+ * Whether two dynamic-field key encodings are the same bytes.
+ *
+ * A scripted entry with **no** `bcs` matches any key of its type, which is what
+ * a test that only cares about the type wants; two entries of one type on one
+ * parent are told apart by their bytes, which is what a test that cares about
+ * the key encoding needs and what matching on `name.type` alone made
+ * impossible. Never fails.
+ */
+const sameBytes = (left: Uint8Array | undefined, right: Uint8Array | undefined): boolean => {
+  if (left === undefined || right === undefined) return true
+  if (left.length !== right.length) return false
+  for (let index = 0; index < left.length; index++) {
+    if (left[index] !== right[index]) return false
+  }
+  return true
+}
+
 const rpcError = (status: string): Error => {
   const error = new Error(`fake transport error: ${status}`)
   Object.assign(error, { code: status, name: "RpcError" })
@@ -437,11 +515,23 @@ const unimplemented = (method: string): never => {
  * - **`listOwnedObjects` filters like a node.** The `type` option goes through
  *   the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
  *   instantiation of a generic rather than only its own spelling.
- * - **`getDynamicField` matches on `name.type` alone.** It returns the first
- *   scripted entry of the parent whose `name.type` equals the requested one; the
- *   `name.bcs` bytes are not compared. Two fields of the same key type on one
- *   parent cannot be told apart here — script them on different parents, and
- *   test your key encoding with a decode test instead.
+ * - **`getDynamicField` matches on `name.type` *and* `name.bcs`.** An entry
+ *   scripted without `bcs` still matches any key of its type, which is what a
+ *   test that only cares about the type wants; two entries of one type on one
+ *   parent are told apart by their bytes, so a test can prove which key encoding
+ *   a lookup used.
+ * - **Call recording is reached through `SuiTest.calls`.** Every call the fake
+ *   received, oldest first, optionally filtered by method:
+ *   `yield* SuiTest.calls("getDynamicField")`. That is how a test asserts what
+ *   an extension *sent* — the include set on a read, the fact that a recipe
+ *   fragment reached exactly one `executeTransaction` — rather than only what it
+ *   got back.
+ * - **`getTransaction` can be answered by digest.** `FakeScript.transactions`
+ *   (and `SuiTest.recordTransaction`) answers a specific digest before the
+ *   ordered `getTransaction` script is consulted, which is what `Tx.reconcile`
+ *   needs when it follows a pinned object's `previousTransaction` to find out
+ *   which version the consuming transaction took. `FakeChange.inputVersion` is
+ *   how a test says which version that was.
  *
  * @example
  * ```ts
@@ -503,7 +593,8 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
         buildSimulate: script.buildSimulate ?? []
       },
       pendingDigests: new Map(),
-      knownTransactions: new Map()
+      knownTransactions: new Map(),
+      byDigest: new Map(Object.entries(script.transactions ?? {}))
     })
   })
 
@@ -684,7 +775,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
             resolved
           ),
           failed: true,
-          commandResults: outcome.value.commandResults ?? []
+          commandResults: commandResultsOf(outcome.value)
         }
       }
       case "succeed": {
@@ -728,7 +819,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
             resolved
           ),
           failed: false,
-          commandResults: outcome.value.commandResults ?? []
+          commandResults: commandResultsOf(outcome.value)
         }
       }
     }
@@ -1000,7 +1091,8 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       record("getDynamicField", options)
       const parent = normalizeSuiAddress(options.parentId)
       const entry = (script.dynamicFields?.[parent] ?? []).find(
-        (field) => field.name.type === options.name.type
+        (field) =>
+          field.name.type === options.name.type && sameBytes(field.name.bcs, options.name.bcs)
       )
       if (entry === undefined) {
         throw new ObjectError("notFound", "dynamic field not found", {
@@ -1051,6 +1143,13 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       record("getTransaction", options)
       const pending = state.pendingDigests.get(options.digest)
       if (pending === false) throw new TransactionError("notFound", options.digest)
+      // Keyed by digest, so following one object's `previousTransaction` to the
+      // transaction that consumed it does not eat an entry of the ordered
+      // script, which is about *this* transaction and not about that one.
+      const recorded = state.byDigest.get(options.digest)
+      if (recorded !== undefined && recorded._tag !== "timeoutThen") {
+        return asResult(await applyOutcome(recorded, "getTransaction", options.digest))
+      }
       const known = state.knownTransactions.get(options.digest)
       if (known !== undefined && state.scripts.getTransaction.length === 0) {
         return asResult(known)
@@ -1200,11 +1299,27 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     tryGetPastObject,
     // The SDK's registration mechanism, implemented so an extension's derived
     // Promise face can be tested exactly the way a consumer writes it:
-    // `client.$extend(myExtension())`.
-    $extend: (registration: { readonly name: string; readonly register: (client: ClientWithCoreApi) => unknown }) =>
-      Object.assign(Object.create(Object.getPrototypeOf(client) ?? Object.prototype), client, {
-        [registration.name]: registration.register(client)
-      })
+    // `client.$extend(myExtension())` — variadic, and chainable, because the
+    // SDK's is both and a test that chains two registrations must not silently
+    // lose the first.
+    $extend(
+      this: ClientWithCoreApi | undefined,
+      ...registrations: ReadonlyArray<
+        { readonly name: string; readonly register: (client: ClientWithCoreApi) => unknown }
+      >
+    ) {
+      const base = (this ?? client) as ClientWithCoreApi
+      return Object.assign(
+        Object.create(Object.getPrototypeOf(base) ?? Object.prototype),
+        base,
+        Object.fromEntries(
+          // `client`, not `base`: the registration gets the one underlying
+          // client object, so two registrations on it share a base `Sui` the
+          // way they do against a real client.
+          registrations.map((registration) => [registration.name, registration.register(client)])
+        )
+      )
+    }
   } as unknown as ClientWithCoreApi
 
   return {
@@ -1238,6 +1353,10 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     setEpoch: (epoch) =>
       Effect.sync(() => {
         state.epoch = epoch
+      }),
+    recordTransaction: (digest, outcome) =>
+      Effect.sync(() => {
+        state.byDigest.set(digest, outcome)
       }),
     setOutcomes: (method, outcomes) =>
       Effect.sync(() => {

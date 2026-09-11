@@ -16,7 +16,7 @@
  */
 import { SuiGraphQLClient } from "@mysten/sui/graphql"
 import { Config, Context, Effect, Layer } from "effect"
-import { GraphQLUnavailable } from "../domain/errors.ts"
+import { GraphQLUnavailable, TransportError } from "../domain/errors.ts"
 
 /**
  * A client whose every method rejects with {@link GraphQLUnavailable}.
@@ -101,4 +101,40 @@ export class SuiGraphQL extends Context.Service<SuiGraphQL, SuiGraphQLClient>()(
    */
   static readonly layerUnavailableWith = (reason: string): Layer.Layer<SuiGraphQL> =>
     Layer.succeed(SuiGraphQL, unavailableClient(reason))
+
+  /**
+   * One call against the GraphQL client, with the two failures already sorted.
+   *
+   * Every extension that reads GraphQL was re-deriving the same three lines:
+   * yield the client, `Effect.tryPromise`, and remember that a rejection from
+   * `layerUnavailable` is already a `GraphQLUnavailable` and must be passed
+   * through rather than wrapped in a `TransportError` that hides why the
+   * endpoint was missing. This is those three lines, once.
+   *
+   * `method` is what a `TransportError` is labelled with; give the query's own
+   * name so a log says which read failed.
+   *
+   * Fails with: `GraphQLUnavailable` (there is no usable endpoint),
+   * `TransportError` (the call reached one and failed).
+   *
+   * @example
+   * ```ts
+   * import { SuiGraphQL } from "sui-effect"
+   *
+   * const chain = SuiGraphQL.query(
+   *   (client) => client.query({ query: "{ chainIdentifier }" }),
+   *   "chainIdentifier"
+   * )
+   * ```
+   */
+  static readonly query = <A>(
+    run: (client: SuiGraphQLClient) => Promise<A>,
+    method = "SuiGraphQL.query"
+  ): Effect.Effect<A, GraphQLUnavailable | TransportError, SuiGraphQL> =>
+    Effect.flatMap(SuiGraphQL, (client) =>
+      Effect.tryPromise({
+        try: () => run(client),
+        catch: (cause) =>
+          cause instanceof GraphQLUnavailable ? cause : TransportError.fromUnknown(method, cause)
+      }))
 }

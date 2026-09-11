@@ -188,10 +188,11 @@ export class SubmissionUnknown extends Schema.TaggedError<SubmissionUnknown>()(
 /**
  * The transaction provably cannot have been applied, and never will be.
  *
- * `evidence` is why. `"inputConsumed"` is only ever produced when the node
- * named a **different** transaction as the consuming one: an owned input that
- * merely moved on, with no readable `previousTransaction`, is
- * `SubmissionUnknown`, not this.
+ * `evidence` is why. `"inputConsumed"` is only ever produced when a
+ * **different** transaction's own effects report that it took a pinned object
+ * at exactly the version these bytes pinned. An owned input that merely moved
+ * on, one whose consumer took a later version, and one whose last mutation the
+ * node will not name are all `SubmissionUnknown`, not this.
  */
 export class NotApplied extends Schema.TaggedError<NotApplied>()("NotApplied", {
   digest: Digest,
@@ -322,8 +323,13 @@ export const SuiErrorSchema = Schema.Union([
 export type Outcome = "applied" | "not_applied" | "unknown"
 
 /**
- * An extension error may declare its own outcome; `SuiError.outcome` and
- * `Script.run` honour it and default to `"not_applied"`.
+ * An extension error may declare its own `outcome`, and `SuiError.outcome` and
+ * `Script.run` honour it before anything else.
+ *
+ * An error that declares none and carries a tag the taxonomy does not own is
+ * `"unknown"`, not `"not_applied"`: a tag this library has never heard of says
+ * nothing about whether a transaction applied, and `"not_applied"` would tell
+ * the documented retry idiom to send again on no evidence at all.
  */
 export interface HasOutcome {
   readonly outcome: Outcome
@@ -491,11 +497,47 @@ const describe = (error: SuiError): string => {
 
 const encode = Schema.encodeUnknownResult(SuiErrorSchema)
 
-const toJson = (error: SuiError): Record<string, unknown> => {
+/**
+ * One error encoded through **its own** schema.
+ *
+ * Every `Schema.TaggedError` class is itself a schema, and an instance's
+ * `constructor` is that class, so an error the closed taxonomy has never heard
+ * of — an extension's `EscrowSettlementUnknown { escrowId, outcome }` — still
+ * serializes with its fields instead of collapsing to a tag and a sentence.
+ * `undefined` when the value is not a schema-backed error, or when its own
+ * schema refuses it. Never fails.
+ */
+const encodeThroughOwnSchema = (error: unknown): Record<string, unknown> | undefined => {
+  const schema = (error as { readonly constructor?: unknown })?.constructor
+  if (!Schema.isSchema(schema)) return undefined
+  const encoded = Schema.encodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(error)
+  if (!Result.isSuccess(encoded)) return undefined
+  const value: unknown = encoded.success
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+/**
+ * The JSON an operator or a log line gets for a failure.
+ *
+ * A tag in the taxonomy encodes through {@link SuiErrorSchema}. **Anything
+ * else that is a `Schema.TaggedError` encodes through its own schema**, which
+ * is how an extension's errors serialize with their fields — including the
+ * `outcome` a wrapper script reads — rather than arriving as a bare
+ * `{ _tag, message }`. Only a value that is neither falls back to that.
+ *
+ * Never fails.
+ */
+const toJson = (error: SuiError | { readonly _tag: string }): Record<string, unknown> => {
   const encoded = encode(error)
-  return Result.isSuccess(encoded)
-    ? (encoded.success as Record<string, unknown>)
-    : { _tag: error._tag, message: describe(error) }
+  if (Result.isSuccess(encoded)) return encoded.success as Record<string, unknown>
+  const own = encodeThroughOwnSchema(error)
+  if (own !== undefined) return own
+  const message = TAXONOMY_TAGS.has(error._tag)
+    ? describe(error as SuiError)
+    : causeLine(error) ?? error._tag
+  return { _tag: error._tag, message }
 }
 
 /**

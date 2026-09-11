@@ -157,6 +157,13 @@ const parseSafe = (value: string): ReturnType<typeof parseStructTag> | undefined
  * compared as a normalized string. The object keeps its own instantiated type
  * on `SuiObject.type`; this only decides whether the bytes may be decoded.
  *
+ * **It never throws, which is the reason it is public** as
+ * `SuiSchema.matchesType`. A dynamic field's `name.type` is legally a primitive
+ * — `u64`, `bool`, `address`, `vector<u8>` — and the SDK's own
+ * `normalizeStructTag` throws on every one of them, so the obvious way to
+ * filter a `streamDynamicFields` by key type dies on the first `u64` key.
+ * Comparing tags with this is safe on any string at all.
+ *
  * Never fails.
  */
 export const typeMatches = (expected: string, actual: string): boolean => {

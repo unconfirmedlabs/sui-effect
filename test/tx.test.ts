@@ -110,6 +110,25 @@ const executed = FakeOutcome.succeed({
   mutated: [{ objectId: ESCROW_ID, type: ESCROW_TYPE, version: 4n, owner }]
 })
 
+/**
+ * What the node says about `OTHER_DIGEST`: a transaction that took `objectId`
+ * at exactly `version` and left it one on.
+ *
+ * The `NotApplied { inputConsumed }` rule is the equality between that
+ * `inputVersion` and the version the reconciled bytes pinned, so a test that
+ * wants that answer has to say which version the other transaction consumed.
+ */
+const consumedBySomeoneElse = (
+  objectId: string,
+  type: string,
+  version: bigint
+): Readonly<Record<string, FakeOutcome>> => ({
+  [OTHER_DIGEST]: FakeOutcome.succeed({
+    digest: OTHER_DIGEST,
+    mutated: [{ objectId, type, version: version + 1n, inputVersion: version, owner }]
+  })
+})
+
 const moveAbort: SuiClientTypes.ExecutionError = {
   $kind: "MoveAbort",
   message: "claim aborted",
@@ -693,8 +712,13 @@ describe("Tx.reconcile", () => {
     )
 
   test("an input consumed by another transaction is NotApplied inputConsumed", async () => {
-    const result = await afterInputMoved(() =>
-      SuiTest.bumpVersion(ESCROW_ID, { consumedBy: OTHER_DIGEST })
+    const result = await afterInputMoved(
+      () => SuiTest.bumpVersion(ESCROW_ID, { consumedBy: OTHER_DIGEST }),
+      {
+        ...baseScript,
+        getTransaction: [FakeOutcome.notFound()],
+        transactions: consumedBySomeoneElse(ESCROW_ID, ESCROW_TYPE, 3n)
+      }
     )
     expect(result._tag).toBe("Failure")
     if (result._tag !== "Failure") return
@@ -770,7 +794,8 @@ describe("Tx.reconcile", () => {
         // The coin has to be a readable object as well as a listed coin, so
         // that reconcile can see its version move.
         objects: [escrow(3n), coinObject],
-        getTransaction: [FakeOutcome.notFound()]
+        getTransaction: [FakeOutcome.notFound()],
+        transactions: consumedBySomeoneElse(COIN_ID, coin.type, 2n)
       }
     )
     expect(result._tag).toBe("Failure")
@@ -881,7 +906,8 @@ describe("Tx.submit", () => {
       {
         ...baseScript,
         execute: [FakeOutcome.timeoutThen(false)],
-        getTransaction: [FakeOutcome.notFound()]
+        getTransaction: [FakeOutcome.notFound()],
+        transactions: consumedBySomeoneElse(ESCROW_ID, ESCROW_TYPE, 3n)
       }
     )
     expect(error._tag).toBe("NotApplied")
@@ -1040,7 +1066,11 @@ describe("Tx.reconcileAll", () => {
         const settled = yield* Tx.reconcileAll()
         return { settled, entries: yield* journal.listUnresolved }
       }),
-      { ...baseScript, getTransaction: [FakeOutcome.notFound()] }
+      {
+        ...baseScript,
+        getTransaction: [FakeOutcome.notFound()],
+        transactions: consumedBySomeoneElse(ESCROW_ID, ESCROW_TYPE, 3n)
+      }
     )
     expect(settled).toHaveLength(1)
     expect((settled[0] as { _tag: string })._tag).toBe("NotApplied")

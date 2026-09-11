@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        effect: ["4.0.0-rc.112", "4.0.0-rc.113"]
+        effect: ["4.0.0-rc.112"]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -35,7 +35,9 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun add -d effect@${{ matrix.effect }} @effect/platform-bun@${{ matrix.effect }} || bun add -d effect@${{ matrix.effect }}
-      - run: bun run typecheck && bun test test/
+      # `bun run build` first: `test/llms.test.ts` compares LLMS.md against the
+      # emitted declarations in `dist/`, and skips with a message without them.
+      - run: bun run typecheck && bun run build && bun test test/
 
   # The `@mysten/sui` peer range is proved against the versions consumers pin.
   sui-sdk-matrix:
@@ -51,7 +53,7 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun add -d @mysten/sui@${{ matrix.sui }}
-      - run: bun run typecheck && bun test test/
+      - run: bun run typecheck && bun run build && bun test test/
 
   isolated-consumer:
     runs-on: ubuntu-latest
@@ -64,11 +66,15 @@ jobs:
       - run: bun run build && npm pack
       - name: Install the tarball into a fresh consumer and import every subpath
         run: |
-          mkdir /tmp/consumer && cd /tmp/consumer
+          set -euo pipefail
+          TARBALL="$(ls "$GITHUB_WORKSPACE"/sui-effect-*.tgz | head -n 1)"
+          mkdir -p /tmp/consumer && cd /tmp/consumer
           bun init -y >/dev/null
-          bun add ../../$GITHUB_WORKSPACE/sui-effect-*.tgz effect@4.0.0-rc.112 @mysten/sui@2.30.0 @mysten/bcs
+          bun add "$TARBALL" effect@4.0.0-rc.112 @mysten/sui@2.30.0 @mysten/bcs
           cat > check.ts <<'TS'
           import "sui-effect"; import "sui-effect/tx"; import "sui-effect/journal"
           import "sui-effect/extension"; import "sui-effect/script"; import "sui-effect/testing"
           TS
-          bunx tsc --noEmit --strict --moduleResolution bundler --module esnext --target esnext --skipLibCheck check.ts
+          # The repo's own pinned tsc (devDependencies: typescript 5.9.3), so the
+          # consumer check cannot drift with whatever `bunx tsc` would fetch.
+          "$GITHUB_WORKSPACE/node_modules/.bin/tsc" --noEmit --strict --moduleResolution bundler --module esnext --target esnext --skipLibCheck check.ts

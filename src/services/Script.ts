@@ -430,7 +430,9 @@ const SUI_ERROR_TAGS = new Set([
   "BuildError",
   "PolicyDenied",
   "JournalError",
-  "UnexpectedEffects"
+  "UnexpectedEffects",
+  "GraphQLUnavailable",
+  "ExtensionNotReady"
 ])
 
 const isSuiError = (error: { readonly _tag: string }): error is SuiError =>

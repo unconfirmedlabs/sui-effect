@@ -500,8 +500,9 @@ const Nonce = Schema.Number.pipe(
  * `TransactionExpiration` enum variant for variant, including its `$kind`
  * discriminant, so our narrowing and `TransactionDataBuilder`'s agree.
  *
- * `ValidDuring` is what `Tx.build` sets by default: its `maxTimestamp` is the
- * wall-clock bound `Tx.reconcile` reasons about, and its `chain` is a replay
+ * `ValidDuring` is what `Tx.build` sets by default, bounded by **epochs**:
+ * `maxTimestamp` is `null` unless `SubmitConfig.validFor` asks for one, because
+ * no Sui network accepts a timestamp expiration yet. Its `chain` is a replay
  * guard, so bytes signed for testnet cannot land on mainnet.
  */
 export const TransactionExpiration = Schema.Union([
@@ -569,10 +570,11 @@ export type SignedTransaction = typeof SignedTransaction.Type
 /**
  * Why a transaction provably never applied, and never will.
  *
- * `"expired"`: `chainTime` has passed the `maxTimestamp` in the bytes by more
- * than `SubmitConfig.expiryMargin`. `"inputConsumed"`: an owned input the
- * transaction pinned was consumed by a **different** transaction, whose digest
- * the node reported as that object's `previousTransaction`.
+ * `"expired"`: the expiration window was observed closed — the current epoch
+ * past the recorded `maxEpoch`, or `chainTime` past a recorded `maxTimestamp`
+ * by more than `SubmitConfig.expiryMargin` — around a `getTransaction` miss,
+ * twice. `"inputConsumed"`: a **different** transaction's own effects report
+ * that it took an object these bytes pinned at exactly the version they pinned.
  *
  * Shared by `NotApplied` and by the journal entry that records it, so the two
  * cannot drift.
@@ -596,11 +598,6 @@ export const Built = Schema.Struct({
 })
 export type Built = typeof Built.Type
 
-/**
- * The wall-clock bound after which a transaction can no longer be applied, in
- * milliseconds, or `undefined` when its expiration sets no such bound (`None`,
- * `Epoch`, or a `ValidDuring` with no `maxTimestamp`). Never fails.
- */
 /**
  * The last epoch in which a transaction can still be applied, or `undefined`
  * when its expiration sets no such bound (`None`, or a `ValidDuring` with no
@@ -630,6 +627,16 @@ export const maxEpochOf = (
   }
 }
 
+/**
+ * The wall-clock bound after which a transaction can no longer be applied, in
+ * milliseconds, or `undefined` when its expiration sets no such bound — which
+ * is `None`, `Epoch`, and the default `ValidDuring`, whose `maxTimestamp` is
+ * `null` unless `SubmitConfig.validFor` asks for one.
+ *
+ * `Tx.reconcile` compares it against `chainTime` with
+ * `SubmitConfig.expiryMargin` for skew, which the epoch bound needs none of.
+ * Never fails.
+ */
 export const maxTimestampMsOf = (
   expiration: TransactionExpiration | undefined
 ): bigint | undefined => {

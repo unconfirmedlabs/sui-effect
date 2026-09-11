@@ -5,7 +5,12 @@ the work plan. Where this file and the spec disagree, fix this file.
 
 ## Ground rules
 
-- **Effect v4 (`effect@4.0.0-rc.112`) only.** v3 names are compile errors. Never
+- **Effect v4, pinned to exactly `4.0.0-rc.112`.** The peer range is the exact
+  version, not a range: rc.113 renamed `Config.nonEmptyString`, `Config.string`
+  and `Config.redacted` to `Config.NonEmptyString`, `Config.String` and
+  `Config.Redacted`, which this package calls at four sites (`Script.ts:64,66`,
+  `Signer.ts:150,154`, `SuiCore.ts:458-462`, `SuiGraphQL.ts:73-77`). v3 names
+  are compile errors. Never
   write an Effect name from memory: verify it in `node_modules/effect/dist/*.d.ts`.
   The house skill `effect-ts` and its review checklist are binding.
 - **SDK names are the source of truth.** Read
@@ -100,9 +105,14 @@ after the network has answered, a failed journal write is logged and the answer
 stands.
 
 `Tx.build` bounds a transaction to the current epoch and the next and names the
-chain, records `sui.chainId` on `Built`/`Signed`, always simulates (explicitly
-when the SDK had nothing to resolve), and cancels its in-flight request when
-interrupted. It sets no `maxTimestamp`: no Sui network accepts a timestamp
+chain, records `sui.chainId` on `Built`/`Signed`, always simulates before
+anything is signed (the SDK's resolver does it whenever there is anything to
+resolve — a client with a base resolver and a preset gas budget resolves without
+simulating, and `willResolve` sees that and runs one explicitly), and cancels
+its in-flight request when interrupted, on **every** transport: the gRPC
+resolver's simulate is reached by rebuilding the SDK's own
+`GrpcCoreClient.resolveTransactionPlugin` over a client that carries the
+signal. It sets no `maxTimestamp`: no Sui network accepts a timestamp
 expiration yet (`test/live.devnet.test.ts`, behind `SUI_LIVE=1`, is the proof).
 `Tx.run` takes `sponsor?: Signer` and requires it whenever the bytes name a gas
 owner that is not the sender. `Tx.submit` waits for visibility before releasing
@@ -110,12 +120,19 @@ the sender lock.
 
 `NotApplied` needs evidence that is checked twice: `"expired"` is
 epoch-or-timestamp closed, then a `getTransaction` miss, then both again after
-`SubmitConfig.reconcileRecheck`; `"inputConsumed"` is the object **at the
-version after** a pinned one naming a different transaction, read with
-`SuiCore.getObjectAtVersion` (the live object's `previousTransaction` names the
-latest mutation and is never evidence). Chain identity is compared before any
-recovery query, and `reconcile`/`reconcileAll` turn every recovery read failure
-into `SubmissionUnknown`.
+`SubmitConfig.reconcileRecheck`; `"inputConsumed"` is a **different**
+transaction's own effects reporting `inputVersion` equal to the version the
+bytes pinned. Reconcile follows the live object's `previousTransaction` — which
+names the latest mutation, and is never evidence by itself — to that
+transaction and reads `changedObjects[].inputVersion` off it. There is no
+`v + 1` rule: Sui stamps every output with the transaction's Lamport version
+(`max(input versions) + 1`), so the object "one version on" from a pinned one
+usually never existed. `SuiCore.getObjectAtVersion` is still a public primitive;
+it is no longer part of the rule. Every pinned reference is tried before the
+answer is `SubmissionUnknown`, which is what almost every stuck submission gets.
+Chain identity is compared before any recovery query, and
+`reconcile`/`reconcileAll` turn every recovery read failure into
+`SubmissionUnknown`.
 
 `SuiCore` retries retryable `TransportError`s on reads only
 (`Schedule.min([exponential("250 millis"), spaced("10 seconds")])` jittered, five
@@ -155,9 +172,10 @@ may declare its own `outcome`, and should. `SuiError.isRetryable`, `SuiError.des
 `sui-effect/testing` ships `SuiCoreFake.layer(script)`, `layerTest(script)`
 (the real `Sui` over the fake `SuiCore`), `layerExtensionTest(layer, script)`
 (an extension's own layer over that) and `SuiTest` (`putObject`, `bumpVersion`,
-`deleteObject`, `setClock`, `setEpoch`, `scriptExecute`, `scriptSimulate`,
-`scriptGetTransaction`, `calls`), which is the whole harness an extension's
-tests need. The fake serves in-memory objects with
+`recordTransaction`, `deleteObject`, `setClock`, `setEpoch`, `scriptExecute`,
+`scriptSimulate`, `scriptGetTransaction`, `calls`), which is the whole harness
+an extension's tests need. Call recording is reached through `SuiTest.calls`,
+not off the fake handle. The fake serves in-memory objects with
 BCS content, the Clock object `0x6`, and scripted outcomes
 (`FakeOutcome.succeed`, `failWith`, `transportError`, `notFound`, `timeoutThen`)
 for simulate, execute, `getTransaction` and the resolver's budget simulation
@@ -172,7 +190,16 @@ method the script does not cover dies with a message naming it: a test never
 silently passes against a stub. Its `client` implements `$extend`, so a derived
 Promise face is testable the way a consumer writes it; `listOwnedObjects`
 filters through `typeMatches` rather than string equality, and `getDynamicField`
-matches an entry by `name.type` only, not by the `name.bcs` bytes.
+matches an entry on **both** `name.type` and `name.bcs` — an entry scripted
+without `bcs` still matches any key of its type, so two same-typed keys on one
+parent can be told apart and a test can prove which key bytes a lookup used.
+`FakeScript.transactions` (and `SuiTest.recordTransaction`) answers
+`getTransaction` **by digest**, before the ordered script, which is what a
+`NotApplied { inputConsumed }` test needs: the rule reads
+`changedObjects[].inputVersion` off the consuming transaction, and
+`FakeChange.inputVersion` is how a test says which version that was. A scripted
+`commandResults` entry may give either array; the missing one defaults to `[]`
+rather than failing a `Simulation` decode.
 
 The fake enforces the invariants the lifecycle depends on: a known digest
 executes idempotently, gas selection excludes object inputs, the coin set
