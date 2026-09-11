@@ -1,0 +1,675 @@
+/**
+ * `SuiCore`: a hand-written 1:1 Effect wrap of `ClientWithCoreApi` from
+ * `@mysten/sui/client`.
+ *
+ * Every method of `SuiClientTypes.TransportMethods` is here, none of them
+ * optional, with the SDK's `Include` generics preserved so an unrequested field
+ * is still statically `undefined`. Every call forwards the Effect's
+ * `AbortSignal` into the SDK's `signal` option, so `Effect.timeout` and
+ * interruption cancel the request. Every method carries a span named after it.
+ *
+ * @since 0.1.0
+ */
+import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
+import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
+import { SuiGrpcClient } from "@mysten/sui/grpc"
+import type { TransactionPlugin } from "@mysten/sui/transactions"
+import { Config, ConfigProvider, Context, Effect, Layer, Schedule, Schema } from "effect"
+import {
+  ObjectDeleted,
+  ObjectNotFound,
+  ObjectUnavailable,
+  SimulationFailed,
+  TransactionNotFound,
+  TransportError
+} from "../domain/errors.ts"
+import { Digest, executionReasonOf, ExecutionReason, KnownNetwork, ObjectId } from "../domain/schemas.ts"
+
+export { executionReasonOf } from "../domain/schemas.ts"
+
+const UNKNOWN_REASON = ExecutionReason.cases.Unknown.make({ $kind: "Unknown" })
+
+/** Every failure `mapSdkError` can produce. */
+export type SuiCoreError =
+  | TransportError
+  | ObjectNotFound
+  | ObjectDeleted
+  | ObjectUnavailable
+  | TransactionNotFound
+  | SimulationFailed
+
+/** The failures of an object lookup. */
+export type ObjectLookupError = ObjectNotFound | ObjectDeleted | ObjectUnavailable | TransportError
+
+/** The failures of a transaction lookup. */
+export type TransactionLookupError = TransactionNotFound | TransportError
+
+/** The failures of a simulation. */
+export type SimulationLookupError = SimulationFailed | TransportError
+
+const ZERO_OBJECT_ID = ObjectId.make(`0x${"0".repeat(64)}`)
+const ZERO_DIGEST = Digest.make("1".repeat(32))
+
+const asObjectId = (value: string | undefined): ObjectId => {
+  if (value === undefined) return ZERO_OBJECT_ID
+  const decoded = Schema.decodeUnknownOption(ObjectId)(value)
+  return decoded._tag === "Some" ? decoded.value : ZERO_OBJECT_ID
+}
+
+const asDigest = (value: string): Digest => {
+  const decoded = Schema.decodeUnknownOption(Digest)(value)
+  return decoded._tag === "Some" ? decoded.value : ZERO_DIGEST
+}
+
+/**
+ * gRPC status names a read may be retried on, plus HTTP 5xx and 429. Mirrors
+ * the spec's list; timeouts map to `DEADLINE_EXCEEDED` with `retryable: true`.
+ */
+const RETRYABLE_GRPC_STATUSES: ReadonlySet<string> = new Set([
+  "UNAVAILABLE",
+  "DEADLINE_EXCEEDED",
+  "RESOURCE_EXHAUSTED"
+])
+
+const isRetryableHttpStatus = (status: number): boolean => status === 429 || status >= 500
+
+const statusOf = (cause: unknown): { readonly status?: string; readonly retryable: boolean } => {
+  if (typeof cause !== "object" || cause === null) return { retryable: false }
+  const record = cause as Record<string, unknown>
+  const tag = record["_tag"]
+  const name = record["name"]
+  if (tag === "TimeoutError" || name === "TimeoutError" || name === "AbortError") {
+    return { status: "DEADLINE_EXCEEDED", retryable: true }
+  }
+  const httpStatus = record["status"]
+  if (typeof httpStatus === "number") {
+    return { status: String(httpStatus), retryable: isRetryableHttpStatus(httpStatus) }
+  }
+  const code = record["code"]
+  if (typeof code === "string") {
+    return { status: code, retryable: RETRYABLE_GRPC_STATUSES.has(code) }
+  }
+  if (typeof code === "number") return { status: String(code), retryable: false }
+  return { retryable: false }
+}
+
+/**
+ * A thrown value carrying this symbol is a bug in the caller or in a test
+ * double, not a transport failure. `mapSdkError` re-throws it so it surfaces as
+ * a defect instead of being classified as a `TransportError`.
+ */
+export const DefectMarker: unique symbol = Symbol.for("sui-effect/DefectMarker")
+
+const rethrowDefects = (cause: unknown): void => {
+  if (typeof cause === "object" && cause !== null && DefectMarker in cause) throw cause
+}
+
+const transportError = (method: string, cause: unknown): TransportError => {
+  rethrowDefects(cause)
+  const { retryable, status } = statusOf(cause)
+  return new TransportError({
+    method,
+    retryable,
+    ...(status === undefined ? {} : { status }),
+    cause
+  })
+}
+
+/**
+ * The one place an SDK failure becomes a sui-effect failure.
+ *
+ * `ObjectError` maps by its transport-neutral `reason`, `TransactionError` to
+ * `TransactionNotFound`, `SimulationError` to `SimulationFailed` with its
+ * `executionError` decoded into an `ExecutionReason`, and everything else
+ * (gRPC `RpcError`, `SuiHTTPStatusError`, `JsonRpcError`, `Cause.TimeoutError`,
+ * any thrown value at all) to a `TransportError` whose `retryable` says whether
+ * a read may try again.
+ *
+ * Never fails: it is a total function from a thrown value to an error class.
+ */
+export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
+  rethrowDefects(cause)
+  if (cause instanceof ObjectError) {
+    const objectId = asObjectId(cause.objectId)
+    switch (cause.reason) {
+      case "notFound":
+        return new ObjectNotFound({ objectId })
+      case "deleted":
+        return new ObjectDeleted({ objectId })
+      default:
+        return new ObjectUnavailable({ objectId })
+    }
+  }
+  if (cause instanceof TransactionError) {
+    return new TransactionNotFound({ digest: asDigest(cause.digest) })
+  }
+  if (cause instanceof SimulationError) {
+    return new SimulationFailed({
+      reason:
+        cause.executionError === undefined ? UNKNOWN_REASON : executionReasonOf(cause.executionError),
+      message: cause.message
+    })
+  }
+  return transportError(method, cause)
+}
+
+/** Narrows `mapSdkError` to the union an object lookup declares. */
+const objectError = (method: string) => (cause: unknown): ObjectLookupError => {
+  const error = mapSdkError(method, cause)
+  return error._tag === "TransactionNotFound" || error._tag === "SimulationFailed"
+    ? transportError(method, cause)
+    : error
+}
+
+/** Narrows `mapSdkError` to the union a transaction lookup declares. */
+const transactionError = (method: string) => (cause: unknown): TransactionLookupError => {
+  const error = mapSdkError(method, cause)
+  return error._tag === "TransactionNotFound" || error._tag === "TransportError"
+    ? error
+    : transportError(method, cause)
+}
+
+/** Narrows `mapSdkError` to the union a simulation declares. */
+const simulationError = (method: string) => (cause: unknown): SimulationLookupError => {
+  const error = mapSdkError(method, cause)
+  return error._tag === "SimulationFailed" || error._tag === "TransportError"
+    ? error
+    : transportError(method, cause)
+}
+
+/** Everything else: any failure at all becomes a `TransportError`. */
+const onlyTransportError = (method: string) => (cause: unknown): TransportError =>
+  transportError(method, cause)
+
+/**
+ * The read retry policy from the spec: jittered exponential backoff capped at a
+ * ten second gap, at most five attempts, and only while the failure is a
+ * retryable `TransportError`.
+ */
+export const readSchedule = Schedule.min([
+  Schedule.exponential("250 millis"),
+  Schedule.spaced("10 seconds")
+]).pipe(Schedule.jittered)
+
+const MAX_READ_ATTEMPTS = 5
+
+const retryReads = <A, E extends { readonly _tag: string }, R>(
+  effect: Effect.Effect<A, E, R>
+): Effect.Effect<A, E, R> =>
+  Effect.retry(effect, {
+    schedule: readSchedule,
+    times: MAX_READ_ATTEMPTS - 1,
+    while: (error: E) =>
+      error._tag === "TransportError" && (error as unknown as TransportError).retryable
+  })
+
+/** How the SDK client is reached; the fake implements the same shape. */
+export interface SuiCoreCall {
+  <A>(
+    method: string,
+    run: (client: ClientWithCoreApi, signal: AbortSignal) => Promise<A>
+  ): Effect.Effect<A, unknown>
+}
+
+type ObjectInclude = SuiClientTypes.ObjectInclude
+type TransactionInclude = SuiClientTypes.TransactionInclude
+type SimulateInclude = SuiClientTypes.SimulateTransactionInclude
+
+/**
+ * The mechanical tier: one member per `SuiClientTypes.TransportMethods` key,
+ * plus the four concrete conveniences `CoreClient` adds and the `use` hatch.
+ */
+export interface SuiCoreService {
+  /** The network the underlying client was constructed for. */
+  readonly network: SuiClientTypes.Network
+
+  /** Reads a batch of objects. Per-item failures are `Error` values in the result. Fails with: `TransportError`. */
+  readonly getObjects: <Include extends ObjectInclude = {}>(
+    options: SuiClientTypes.GetObjectsOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.GetObjectsResponse<Include>, TransportError>
+
+  /** Reads one object. Fails with: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`, `TransportError`. */
+  readonly getObject: <Include extends ObjectInclude = {}>(
+    options: SuiClientTypes.GetObjectOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.GetObjectResponse<Include>, ObjectLookupError>
+
+  /** One page of the objects an address owns. Fails with: `TransportError`. */
+  readonly listOwnedObjects: <Include extends ObjectInclude = {}>(
+    options: SuiClientTypes.ListOwnedObjectsOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.ListOwnedObjectsResponse<Include>, TransportError>
+
+  /** One page of the coins an address owns. Fails with: `TransportError`. */
+  readonly listCoins: (
+    options: SuiClientTypes.ListCoinsOptions
+  ) => Effect.Effect<SuiClientTypes.ListCoinsResponse, TransportError>
+
+  /** One page of a parent object's dynamic fields. Fails with: `TransportError`. */
+  readonly listDynamicFields: (
+    options: SuiClientTypes.ListDynamicFieldsOptions
+  ) => Effect.Effect<SuiClientTypes.ListDynamicFieldsResponse, TransportError>
+
+  /** Reads one dynamic field. Fails with: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`, `TransportError`. */
+  readonly getDynamicField: (
+    options: SuiClientTypes.GetDynamicFieldOptions
+  ) => Effect.Effect<SuiClientTypes.GetDynamicFieldResponse, ObjectLookupError>
+
+  /** Reads one dynamic object field. Fails with: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`, `TransportError`. */
+  readonly getDynamicObjectField: <Include extends ObjectInclude = {}>(
+    options: SuiClientTypes.GetDynamicObjectFieldOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.GetDynamicObjectFieldResponse<Include>, ObjectLookupError>
+
+  /** The balance of one coin type for one owner. Fails with: `TransportError`. */
+  readonly getBalance: (
+    options: SuiClientTypes.GetBalanceOptions
+  ) => Effect.Effect<SuiClientTypes.GetBalanceResponse, TransportError>
+
+  /** One page of every balance an owner holds. Fails with: `TransportError`. */
+  readonly listBalances: (
+    options: SuiClientTypes.ListBalancesOptions
+  ) => Effect.Effect<SuiClientTypes.ListBalancesResponse, TransportError>
+
+  /** Coin metadata for a coin type. Fails with: `TransportError`. */
+  readonly getCoinMetadata: (
+    options: SuiClientTypes.GetCoinMetadataOptions
+  ) => Effect.Effect<SuiClientTypes.GetCoinMetadataResponse, TransportError>
+
+  /** Reads an executed transaction by digest. Fails with: `TransactionNotFound`, `TransportError`. */
+  readonly getTransaction: <Include extends TransactionInclude = {}>(
+    options: SuiClientTypes.GetTransactionOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.TransactionResult<Include>, TransactionLookupError>
+
+  /** Submits signed bytes. Never retried at this tier. Fails with: `TransportError`. */
+  readonly executeTransaction: <Include extends TransactionInclude = {}>(
+    options: SuiClientTypes.ExecuteTransactionOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.TransactionResult<Include>, TransportError>
+
+  /** Signs and submits in one call. Never retried at this tier. Fails with: `TransportError`. */
+  readonly signAndExecuteTransaction: <Include extends TransactionInclude = {}>(
+    options: SuiClientTypes.SignAndExecuteTransactionOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.TransactionResult<Include>, TransportError>
+
+  /** Polls until a digest is visible. Fails with: `TransactionNotFound`, `TransportError`. */
+  readonly waitForTransaction: <Include extends TransactionInclude = {}>(
+    options: SuiClientTypes.WaitForTransactionOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.TransactionResult<Include>, TransactionLookupError>
+
+  /** Simulates a transaction. Fails with: `SimulationFailed`, `TransportError`. */
+  readonly simulateTransaction: <Include extends SimulateInclude = {}>(
+    options: SuiClientTypes.SimulateTransactionOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.SimulateTransactionResult<Include>, SimulationLookupError>
+
+  /** One page of transaction history. Fails with: `TransportError`. */
+  readonly listTransactions: <Include extends TransactionInclude = {}>(
+    options: SuiClientTypes.ListTransactionsOptions<Include>
+  ) => Effect.Effect<SuiClientTypes.ListTransactionsResponse<Include>, TransportError>
+
+  /** One page of events. Fails with: `TransportError`. */
+  readonly listEvents: (
+    options: SuiClientTypes.ListEventsOptions
+  ) => Effect.Effect<SuiClientTypes.ListEventsResponse, TransportError>
+
+  /** The current reference gas price. Fails with: `TransportError`. */
+  readonly getReferenceGasPrice: (
+    options?: SuiClientTypes.GetReferenceGasPriceOptions
+  ) => Effect.Effect<SuiClientTypes.GetReferenceGasPriceResponse, TransportError>
+
+  /** The current system state. Fails with: `TransportError`. */
+  readonly getCurrentSystemState: (
+    options?: SuiClientTypes.GetCurrentSystemStateOptions
+  ) => Effect.Effect<SuiClientTypes.GetCurrentSystemStateResponse, TransportError>
+
+  /** The protocol config. Fails with: `TransportError`. */
+  readonly getProtocolConfig: (
+    options?: SuiClientTypes.GetProtocolConfigOptions
+  ) => Effect.Effect<SuiClientTypes.GetProtocolConfigResponse, TransportError>
+
+  /** The genesis checkpoint digest identifying the network. Fails with: `TransportError`. */
+  readonly getChainIdentifier: (
+    options?: SuiClientTypes.GetChainIdentifierOptions
+  ) => Effect.Effect<SuiClientTypes.GetChainIdentifierResponse, TransportError>
+
+  /** Move function metadata. Fails with: `TransportError`. */
+  readonly getMoveFunction: (
+    options: SuiClientTypes.GetMoveFunctionOptions
+  ) => Effect.Effect<SuiClientTypes.GetMoveFunctionResponse, TransportError>
+
+  /** Verifies a zkLogin signature. Fails with: `TransportError`. */
+  readonly verifyZkLoginSignature: (
+    options: SuiClientTypes.VerifyZkLoginSignatureOptions
+  ) => Effect.Effect<SuiClientTypes.ZkLoginVerifyResponse, TransportError>
+
+  /** Resolves a SuiNS name to an address. Fails with: `TransportError`. */
+  readonly resolveNameServiceAddress: (
+    options: SuiClientTypes.ResolveNameServiceAddressOptions
+  ) => Effect.Effect<SuiClientTypes.ResolveNameServiceAddressResponse, TransportError>
+
+  /** The default SuiNS name of an address. Fails with: `TransportError`. */
+  readonly defaultNameServiceName: (
+    options: SuiClientTypes.DefaultNameServiceNameOptions
+  ) => Effect.Effect<SuiClientTypes.DefaultNameServiceNameResponse, TransportError>
+
+  /** Move Registry resolution. Each member fails with: `TransportError`. */
+  readonly mvr: {
+    readonly resolvePackage: (
+      options: SuiClientTypes.MvrResolvePackageOptions
+    ) => Effect.Effect<SuiClientTypes.MvrResolvePackageResponse, TransportError>
+    readonly resolveType: (
+      options: SuiClientTypes.MvrResolveTypeOptions
+    ) => Effect.Effect<SuiClientTypes.MvrResolveTypeResponse, TransportError>
+    readonly resolve: (
+      options: SuiClientTypes.MvrResolveOptions
+    ) => Effect.Effect<SuiClientTypes.MvrResolveResponse, TransportError>
+  }
+
+  /**
+   * The transport's build plugin, which the transaction builder needs to
+   * resolve inputs. A pure value constructor, wrapped in an Effect only so the
+   * fake can refuse it. Never fails.
+   */
+  readonly resolveTransactionPlugin: () => Effect.Effect<TransactionPlugin>
+
+  /**
+   * The low-level hatch: run one call against the SDK client object with the
+   * Effect's `AbortSignal` already forwarded.
+   *
+   * Fails with the full `mapSdkError` union: `TransportError`, `ObjectNotFound`,
+   * `ObjectDeleted`, `ObjectUnavailable`, `TransactionNotFound`,
+   * `SimulationFailed`.
+   */
+  readonly use: <A>(
+    run: (client: ClientWithCoreApi, signal: AbortSignal) => Promise<A>
+  ) => Effect.Effect<A, SuiCoreError>
+}
+
+/**
+ * The mechanical tier over `@mysten/sui`.
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { SuiCore } from "sui-effect"
+ *
+ * const chainId = Effect.gen(function*() {
+ *   const core = yield* SuiCore
+ *   const { chainIdentifier } = yield* core.getChainIdentifier()
+ *   return chainIdentifier
+ * })
+ * ```
+ */
+export class SuiCore extends Context.Service<SuiCore, SuiCoreService>()("sui-effect/SuiCore") {
+  /** Wraps a client the caller already built and configured. */
+  static readonly layerFromClient = (client: ClientWithCoreApi): Layer.Layer<SuiCore> =>
+    Layer.succeed(SuiCore, makeFromClient(client))
+
+  /** Builds a `SuiGrpcClient` and wraps it. */
+  static readonly layerGrpc = (options: SuiGrpcLayerOptions): Layer.Layer<SuiCore> =>
+    Layer.sync(SuiCore, () => makeFromClient(makeGrpcClient(options)))
+
+  /**
+   * Reads `SUI_NETWORK` (required, no default) and `SUI_RPC_URL` (optional,
+   * defaulted from {@link defaultGrpcUrl} for the four known networks).
+   *
+   * The layer fails with `ConfigError` when `SUI_NETWORK` is missing, or when
+   * it names a network with no built-in URL and `SUI_RPC_URL` is not set.
+   */
+  static readonly layerConfig: Layer.Layer<SuiCore, Config.ConfigError> = Layer.effect(
+    SuiCore,
+    Effect.gen(function*() {
+      const network = yield* Config.nonEmptyString("SUI_NETWORK")
+      const baseUrl = yield* Config.nonEmptyString("SUI_RPC_URL").pipe(
+        Config.orElse(() => {
+          const fallback = defaultGrpcUrl(network)
+          return fallback === undefined
+            ? Config.fail(
+                new ConfigProvider.SourceError({
+                  message: `SUI_RPC_URL is required: no built-in gRPC endpoint for network "${network}"`
+                })
+              ).pipe(Config.map(String))
+            : Config.succeed(fallback)
+        })
+      )
+      return makeFromClient(makeGrpcClient({ network, baseUrl }))
+    })
+  )
+}
+
+/** Options for {@link SuiCore.layerGrpc}, mirroring `SuiGrpcClientOptions`. */
+export interface SuiGrpcLayerOptions {
+  readonly network: SuiClientTypes.Network
+  readonly baseUrl: string
+  readonly timeout?: number
+  readonly mvr?: SuiClientTypes.MvrOptions
+}
+
+/**
+ * The gRPC endpoint sui-effect uses when `SUI_RPC_URL` is not set. The SDK
+ * ships no such table; these are the URLs its own documentation uses.
+ * Returns `undefined` for any other network. Never fails.
+ */
+export const defaultGrpcUrl = (network: string): string | undefined => {
+  const decoded = Schema.decodeUnknownOption(KnownNetwork)(network)
+  if (decoded._tag !== "Some") return undefined
+  switch (decoded.value) {
+    case "mainnet":
+      return "https://fullnode.mainnet.sui.io:443"
+    case "testnet":
+      return "https://fullnode.testnet.sui.io:443"
+    case "devnet":
+      return "https://fullnode.devnet.sui.io:443"
+    case "localnet":
+      return "http://127.0.0.1:9000"
+  }
+}
+
+const makeGrpcClient = (options: SuiGrpcLayerOptions): ClientWithCoreApi =>
+  new SuiGrpcClient({
+    network: options.network,
+    baseUrl: options.baseUrl,
+    ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
+    ...(options.mvr === undefined ? {} : { mvr: options.mvr })
+  })
+
+/**
+ * Wraps a client object into the service. Exported so `SuiExtension.fromService`
+ * and tests can build the same implementation over any `ClientWithCoreApi`.
+ */
+export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
+  const call = <A, E>(
+    method: string,
+    run: (core: ClientWithCoreApi["core"], signal: AbortSignal) => Promise<A>,
+    onError: (cause: unknown) => E
+  ): Effect.Effect<A, E> =>
+    Effect.tryPromise({
+      try: (signal) => run(client.core, signal),
+      catch: onError
+    }).pipe(Effect.withSpan(`SuiCore.${method}`))
+
+  const read = <A, E extends { readonly _tag: string }>(
+    method: string,
+    run: (core: ClientWithCoreApi["core"], signal: AbortSignal) => Promise<A>,
+    onError: (cause: unknown) => E
+  ): Effect.Effect<A, E> => retryReads(call(method, run, onError))
+
+  return {
+    network: client.network,
+    getObjects: (options) =>
+      read(
+        "getObjects",
+        (core, signal) => core.getObjects({ ...options, signal }),
+        onlyTransportError("getObjects")
+      ),
+    getObject: (options) =>
+      read(
+        "getObject",
+        (core, signal) => core.getObject({ ...options, signal }),
+        objectError("getObject")
+      ),
+    listOwnedObjects: (options) =>
+      read(
+        "listOwnedObjects",
+        (core, signal) => core.listOwnedObjects({ ...options, signal }),
+        onlyTransportError("listOwnedObjects")
+      ),
+    listCoins: (options) =>
+      read(
+        "listCoins",
+        (core, signal) => core.listCoins({ ...options, signal }),
+        onlyTransportError("listCoins")
+      ),
+    listDynamicFields: (options) =>
+      read(
+        "listDynamicFields",
+        (core, signal) => core.listDynamicFields({ ...options, signal }),
+        onlyTransportError("listDynamicFields")
+      ),
+    getDynamicField: (options) =>
+      read(
+        "getDynamicField",
+        (core, signal) => core.getDynamicField({ ...options, signal }),
+        objectError("getDynamicField")
+      ),
+    getDynamicObjectField: (options) =>
+      read(
+        "getDynamicObjectField",
+        (core, signal) => core.getDynamicObjectField({ ...options, signal }),
+        objectError("getDynamicObjectField")
+      ),
+    getBalance: (options) =>
+      read(
+        "getBalance",
+        (core, signal) => core.getBalance({ ...options, signal }),
+        onlyTransportError("getBalance")
+      ),
+    listBalances: (options) =>
+      read(
+        "listBalances",
+        (core, signal) => core.listBalances({ ...options, signal }),
+        onlyTransportError("listBalances")
+      ),
+    getCoinMetadata: (options) =>
+      read(
+        "getCoinMetadata",
+        (core, signal) => core.getCoinMetadata({ ...options, signal }),
+        onlyTransportError("getCoinMetadata")
+      ),
+    getTransaction: (options) =>
+      read(
+        "getTransaction",
+        (core, signal) => core.getTransaction({ ...options, signal }),
+        transactionError("getTransaction")
+      ),
+    executeTransaction: (options) =>
+      call(
+        "executeTransaction",
+        (core, signal) => core.executeTransaction({ ...options, signal }),
+        onlyTransportError("executeTransaction")
+      ),
+    signAndExecuteTransaction: (options) =>
+      call(
+        "signAndExecuteTransaction",
+        (core, signal) => core.signAndExecuteTransaction({ ...options, signal }),
+        onlyTransportError("signAndExecuteTransaction")
+      ),
+    waitForTransaction: (options) =>
+      read(
+        "waitForTransaction",
+        (core, signal) => core.waitForTransaction({ ...options, signal }),
+        transactionError("waitForTransaction")
+      ),
+    simulateTransaction: (options) =>
+      read(
+        "simulateTransaction",
+        (core, signal) => core.simulateTransaction({ ...options, signal }),
+        simulationError("simulateTransaction")
+      ),
+    listTransactions: (options) =>
+      read(
+        "listTransactions",
+        (core, signal) => core.listTransactions({ ...options, signal }),
+        onlyTransportError("listTransactions")
+      ),
+    listEvents: (options) =>
+      read(
+        "listEvents",
+        (core, signal) => core.listEvents({ ...options, signal }),
+        onlyTransportError("listEvents")
+      ),
+    getReferenceGasPrice: (options) =>
+      read(
+        "getReferenceGasPrice",
+        (core, signal) => core.getReferenceGasPrice({ ...options, signal }),
+        onlyTransportError("getReferenceGasPrice")
+      ),
+    getCurrentSystemState: (options) =>
+      read(
+        "getCurrentSystemState",
+        (core, signal) => core.getCurrentSystemState({ ...options, signal }),
+        onlyTransportError("getCurrentSystemState")
+      ),
+    getProtocolConfig: (options) =>
+      read(
+        "getProtocolConfig",
+        (core, signal) => core.getProtocolConfig({ ...options, signal }),
+        onlyTransportError("getProtocolConfig")
+      ),
+    getChainIdentifier: (options) =>
+      read(
+        "getChainIdentifier",
+        (core, signal) => core.getChainIdentifier({ ...options, signal }),
+        onlyTransportError("getChainIdentifier")
+      ),
+    getMoveFunction: (options) =>
+      read(
+        "getMoveFunction",
+        (core, signal) => core.getMoveFunction({ ...options, signal }),
+        onlyTransportError("getMoveFunction")
+      ),
+    verifyZkLoginSignature: (options) =>
+      read(
+        "verifyZkLoginSignature",
+        (core, signal) => core.verifyZkLoginSignature({ ...options, signal }),
+        onlyTransportError("verifyZkLoginSignature")
+      ),
+    resolveNameServiceAddress: (options) =>
+      read(
+        "resolveNameServiceAddress",
+        (core, signal) => core.resolveNameServiceAddress({ ...options, signal }),
+        onlyTransportError("resolveNameServiceAddress")
+      ),
+    defaultNameServiceName: (options) =>
+      read(
+        "defaultNameServiceName",
+        (core, signal) => core.defaultNameServiceName({ ...options, signal }),
+        onlyTransportError("defaultNameServiceName")
+      ),
+    mvr: {
+      resolvePackage: (options) =>
+        read(
+          "mvr.resolvePackage",
+          (core, signal) => core.mvr.resolvePackage({ ...options, signal }),
+          onlyTransportError("mvr.resolvePackage")
+        ),
+      resolveType: (options) =>
+        read(
+          "mvr.resolveType",
+          (core, signal) => core.mvr.resolveType({ ...options, signal }),
+          onlyTransportError("mvr.resolveType")
+        ),
+      resolve: (options) =>
+        read(
+          "mvr.resolve",
+          (core, signal) => core.mvr.resolve({ ...options, signal }),
+          onlyTransportError("mvr.resolve")
+        )
+    },
+    resolveTransactionPlugin: () =>
+      Effect.sync(() => client.core.resolveTransactionPlugin()).pipe(
+        Effect.withSpan("SuiCore.resolveTransactionPlugin")
+      ),
+    use: (run) =>
+      Effect.tryPromise({
+        try: (signal) => run(client, signal),
+        catch: (cause) => mapSdkError("use", cause)
+      }).pipe(Effect.withSpan("SuiCore.use"))
+  }
+}
