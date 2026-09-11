@@ -46,6 +46,32 @@ const encodeEntry = Schema.encodeEffect(Schema.fromJsonString(JournalEntry))
 const journalError = (cause: unknown): JournalError => new JournalError({ cause })
 
 /**
+ * The `put` semaphores, one per key prefix, at **module** level.
+ *
+ * Two `make` calls over the same store and prefix — two layer instances in one
+ * process, a test that builds the journal twice — used to get a semaphore each
+ * and could interleave their index read-modify-writes, losing one of the two
+ * digests. Keying the permit by prefix rather than by instance is what makes
+ * the serialization a property of the store's keyspace instead of a property of
+ * whoever happened to build the journal.
+ *
+ * **This is in-process only, and that is a documented limitation.** Two
+ * processes over one store (two pods, a script beside the service) still race:
+ * `KeyValueStore` offers no compare-and-set, so there is nothing to build a
+ * cross-process lock on. Run one writer per store prefix. A storage-level lock
+ * is deferred (DESIGN §8, §15).
+ */
+const PUT_LOCKS = new Map<string, Semaphore.Semaphore>()
+
+const putLock = (prefix: string): Semaphore.Semaphore => {
+  const existing = PUT_LOCKS.get(prefix)
+  if (existing !== undefined) return existing
+  const created = Semaphore.makeUnsafe(1)
+  PUT_LOCKS.set(prefix, created)
+  return created
+}
+
+/**
  * A journal backed by a `KeyValueStore`.
  *
  * The store has no key enumeration, so the journal keeps its own index: one
@@ -58,10 +84,21 @@ const journalError = (cause: unknown): JournalError => new JournalError({ cause 
  * because the index write is a read-modify-write over a store that offers no
  * compare-and-set: two concurrent `Tx.run`s from different senders would
  * otherwise each read the same index, each append their own digest, and the
- * second write would drop the first. The index is written **before** the entry,
- * so a crash between the two leaves a digest whose entry is missing —
- * `listUnresolved` skips it and the next `put` rewrites it — rather than an
- * entry no index points at, which nothing would ever reconcile.
+ * second write would drop the first. The semaphore is keyed by the store prefix
+ * at module level, so two journals built over one prefix share it.
+ *
+ * **The order of the two writes depends on which way a crash between them is
+ * survivable:**
+ *
+ * - an **unresolved** entry (`Signed`, `Unknown`) writes the **index first**, so
+ *   a crash leaves a digest whose entry is missing — `listUnresolved` skips it —
+ *   rather than an entry nothing points at;
+ * - a **terminal** entry (`Executed`, `Failed`, `NotApplied`) writes the
+ *   **entry first** and only then drops the digest from the index, so a crash
+ *   leaves the digest still indexed with its terminal answer already stored:
+ *   `listUnresolved` reads the entry, sees it is resolved, and skips it. Doing
+ *   it the other way round is how a settled transaction reverted to the stale
+ *   `Signed` entry that startup recovery could no longer find.
  *
  * Every member fails with `JournalError` and nothing else.
  */
@@ -92,19 +129,30 @@ export const make = (
     return Option.some(entry)
   })
 
-  // One permit, held across the index read-modify-write and the entry write.
-  const writes = Semaphore.makeUnsafe(1)
+  // One permit per store prefix, held across the index read-modify-write and
+  // the entry write.
+  const writes = putLock(options?.prefix ?? "")
 
   return {
     put: Effect.fn("Journal.put")(function*(entry: JournalEntry) {
       yield* Semaphore.withPermits(writes, 1)(
         Effect.gen(function*() {
           const json = yield* encodeEntry(entry).pipe(Effect.mapError(journalError))
+          const writeEntry = kv.set(`${ENTRY}${entry.digest}`, json).pipe(
+            Effect.mapError(journalError)
+          )
           const index = yield* readIndex
           const without = index.filter((digest) => digest !== entry.digest)
-          const next = isUnresolved(entry) ? [...without, entry.digest] : without
-          if (next.length !== index.length || isUnresolved(entry)) yield* writeIndex(next)
-          yield* kv.set(`${ENTRY}${entry.digest}`, json).pipe(Effect.mapError(journalError))
+          if (isUnresolved(entry)) {
+            yield* writeIndex([...without, entry.digest])
+            yield* writeEntry
+            return
+          }
+          // Terminal: the answer is durable before the digest stops being
+          // indexed, so a crash in between can only leave a resolved entry
+          // still listed, which `listUnresolved` filters out.
+          yield* writeEntry
+          if (without.length !== index.length) yield* writeIndex(without)
         })
       )
     }),

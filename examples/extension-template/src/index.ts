@@ -18,4 +18,11 @@ export {
 export { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
 export { escrow } from "./extension.ts"
 export { Platform, platform, type PlatformOptions, type PlatformService } from "./Platform.ts"
-export { ESCROW_PACKAGE, EscrowContent, RECEIPT_TYPE, Settlement, SettlementContent } from "./schema.ts"
+export {
+  ESCROW_PACKAGE,
+  EscrowContent,
+  escrowType,
+  receiptType,
+  Settlement,
+  SettlementContent
+} from "./schema.ts"

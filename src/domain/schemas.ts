@@ -8,7 +8,7 @@
  * @since 0.1.0
  */
 import type { SuiClientTypes } from "@mysten/sui/client"
-import { Schema, SchemaGetter, SchemaTransformation } from "effect"
+import { Effect, Schema, SchemaGetter, SchemaIssue, SchemaTransformation } from "effect"
 import {
   isValidStructTag,
   isValidSuiAddress,
@@ -420,21 +420,80 @@ export const Signature = Schema.String.pipe(
 )
 export type Signature = typeof Signature.Type
 
+/** The largest value a Move `u64` can hold. */
+export const U64_MAX = 18_446_744_073_709_551_615n
+
+/** The largest value a Move `u32` can hold, which is the nonce's range. */
+export const U32_MAX = 4_294_967_295
+
+const DECIMAL = /^(?:0|[1-9][0-9]*)$/
+
+/**
+ * The `bigint` a `u64` field carries, or `undefined` when the value is not one:
+ * a string that is not a plain non-negative decimal, a number that is not a
+ * safe non-negative integer, or anything at all outside `[0, 2^64)`.
+ */
+const u64Of = (value: string | number): bigint | undefined => {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) return undefined
+    return BigInt(value)
+  }
+  const trimmed = value.trim()
+  if (!DECIMAL.test(trimmed)) return undefined
+  const parsed = BigInt(trimmed)
+  return parsed > U64_MAX ? undefined : parsed
+}
+
 /**
  * A `u64` as the SDK's transaction data carries it: a decimal string or, for
  * small values, a number. Decodes to `bigint` and encodes back to a string.
+ *
+ * The transformation is **checked**: `BigInt("not-a-number")` throws, and a
+ * throwing `transform` is a defect, which would take a malformed persisted
+ * journal entry straight out of the `JournalError` channel it is supposed to
+ * fail in. A value that is not a non-negative integer below `2^64` is a schema
+ * issue like any other.
  */
 const U64 = Schema.Union([Schema.String, Schema.Number]).pipe(
   Schema.decodeTo(
     Schema.BigInt,
-    SchemaTransformation.transform<bigint, string | number>({
-      decode: (value) => BigInt(value),
-      encode: (value) => value.toString()
+    SchemaTransformation.transformOrFail<bigint, string | number>({
+      decode: (value, options) => {
+        const parsed = u64Of(value)
+        return parsed === undefined
+          ? Effect.fail(
+            new SchemaIssue.InvalidValue(
+              { message: `${JSON.stringify(value)} is not a u64` },
+              value,
+              options
+            )
+          )
+          : Effect.succeed(parsed)
+      },
+      encode: (value, options) =>
+        value < 0n || value > U64_MAX
+          ? Effect.fail(
+            new SchemaIssue.InvalidValue(
+              { message: `${value} is outside the u64 range` },
+              value,
+              options
+            )
+          )
+          : Effect.succeed(value.toString())
     })
   )
 )
 
 const NullableU64 = Schema.NullOr(U64)
+
+/**
+ * The replay-guard nonce a `ValidDuring` or `Validity` expiration carries. It
+ * is a `u32` on the wire, so anything outside `[0, 2^32)` is a schema issue
+ * rather than bytes the validator will reject later.
+ */
+const Nonce = Schema.Number.pipe(
+  Schema.check(Schema.isInt(), Schema.isBetween({ minimum: 0, maximum: U32_MAX }))
+)
 
 /**
  * When a transaction stops being valid. Mirrors the SDK's
@@ -456,7 +515,7 @@ export const TransactionExpiration = Schema.Union([
       minTimestamp: NullableU64,
       maxTimestamp: NullableU64,
       chain: Schema.String,
-      nonce: Schema.Number
+      nonce: Nonce
     })
   }),
   Schema.Struct({
@@ -470,7 +529,7 @@ export const TransactionExpiration = Schema.Union([
       minTimestamp: NullableU64,
       maxTimestamp: NullableU64,
       chain: Schema.String,
-      nonce: Schema.Number
+      nonce: Nonce
     })
   })
 ]).pipe(Schema.toTaggedUnion("$kind"))
@@ -491,7 +550,19 @@ export const SignedTransaction = Schema.Struct({
   bytes: Schema.Uint8ArrayFromBase64,
   signatures: Schema.Array(Signature),
   sender: SuiAddress,
-  expiration: Schema.optional(TransactionExpiration)
+  expiration: Schema.optional(TransactionExpiration),
+  /**
+   * The chain identifier the bytes were built against, recorded by `Tx.build`
+   * so `Tx.reconcile` can refuse to reason about a transaction with a node on
+   * another chain.
+   *
+   * A `ValidDuring` or `Validity` expiration already names its chain, and that
+   * is what is compared when it is there. This field is what an `Epoch` or
+   * `None` expiration — which name no chain at all — leaves behind instead, so
+   * a process-wide journal holding submissions from two networks cannot settle
+   * one of them against the other's epoch.
+   */
+  chain: Schema.optional(Schema.String)
 })
 export type SignedTransaction = typeof SignedTransaction.Type
 
@@ -519,7 +590,9 @@ export const Built = Schema.Struct({
   bytes: Schema.Uint8ArrayFromBase64,
   sender: SuiAddress,
   gasOwner: Schema.optional(SuiAddress),
-  expiration: Schema.optional(TransactionExpiration)
+  expiration: Schema.optional(TransactionExpiration),
+  /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
+  chain: Schema.optional(Schema.String)
 })
 export type Built = typeof Built.Type
 
@@ -566,6 +639,30 @@ export const maxTimestampMsOf = (
       return expiration.ValidDuring.maxTimestamp ?? undefined
     case "Validity":
       return expiration.Validity.maxTimestamp ?? undefined
+    default:
+      return undefined
+  }
+}
+
+/**
+ * The chain identifier an expiration names, or `undefined` for the variants
+ * that name none (`None`, `Epoch`).
+ *
+ * This is the first half of the chain-identity guard `Tx.reconcile` applies
+ * before it asks a node anything: bytes built for one chain must not be
+ * declared expired by another chain's epoch. The second half is
+ * `SignedTransaction.chain`, which `Tx.build` records for the variants that
+ * carry no chain of their own. Never fails.
+ */
+export const chainOf = (
+  expiration: TransactionExpiration | undefined
+): string | undefined => {
+  if (expiration === undefined) return undefined
+  switch (expiration.$kind) {
+    case "ValidDuring":
+      return expiration.ValidDuring.chain
+    case "Validity":
+      return expiration.Validity.chain
     default:
       return undefined
   }

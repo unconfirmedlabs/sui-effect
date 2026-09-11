@@ -63,6 +63,40 @@ export const objectRefOf = (ref: ChangedRef): ObjectRef | undefined =>
     : { id: ref.id, type: ref.type, version: ref.version, digest: ref.digest, owner: ref.owner }
 
 /**
+ * The shape `Transaction#objectRef` and `Inputs.ObjectRef` want: `objectId`
+ * rather than `id`, and a decimal **string** version rather than a `bigint`.
+ *
+ * sui-effect's own `ObjectRef` carries the branded `id` and a `bigint`
+ * `version`, because that is what a domain model wants and what a `Version`
+ * check can be run on; the SDK builder wants neither. This is the one
+ * conversion, so nobody writes `{ objectId: ref.id, version: String(ref.version) }`
+ * by hand and gets the field name wrong.
+ *
+ * **Only for an address-owned (or immutable) object.** `tx.objectRef` pins a
+ * version, which is exactly right for an owned input and exactly wrong for a
+ * **shared** object: a shared object is passed with `tx.sharedObjectRef({
+ * objectId, initialSharedVersion, mutable })` (the initial shared version lives
+ * on `ref.owner.Shared.initialSharedVersion`), and a **receiving** object with
+ * `tx.receivingRef(...)`, which takes the same three fields this returns.
+ * Passing a shared object by `objectRef` produces bytes a validator rejects.
+ *
+ * `undefined` when the effects did not carry a version or a digest — a deleted
+ * object has no output version, and nothing can be consumed without both.
+ * Never fails.
+ */
+export const sdkRefOf = (ref: ChangedRef | ObjectRef): SdkObjectRef | undefined =>
+  ref.version === undefined || ref.digest === undefined
+    ? undefined
+    : { objectId: ref.id, version: ref.version.toString(), digest: ref.digest }
+
+/** The SDK's own object reference shape, as `Transaction#objectRef` takes it. */
+export interface SdkObjectRef {
+  readonly objectId: string
+  readonly version: string
+  readonly digest: string
+}
+
+/**
  * A transaction the network executed, built from the fixed execute include set:
  * effects, events, balance changes and object types.
  */
@@ -170,10 +204,43 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
 
   /**
    * Objects this transaction deleted or wrapped. The refs carry the versions the
-   * objects had going in, since they have no output version. Never fails.
+   * objects had going in, since they have no output version.
+   *
+   * Two effect shapes land here, because from a caller's side both mean "this
+   * object is gone from where it was":
+   *
+   * - a **delete**, which the node reports as `idOperation: "Deleted"`;
+   * - a **wrap**, which has no id operation at all (`"None"`) and shows up only
+   *   as an input that existed and an output that does not. {@link wrapped}
+   *   returns just those, for a caller that has to tell the two apart — a
+   *   wrapped object still exists inside its wrapper and can come back.
+   *
+   * Never fails.
    */
   deleted(): ReadonlyArray<ChangedRef> {
-    return this.select((change) => change.idOperation === "Deleted", "input")
+    return this.select(
+      (change) => Executed.isDeleted(change) || Executed.isWrapped(change),
+      "input"
+    )
+  }
+
+  /**
+   * Objects this transaction wrapped: they went in existing and came out
+   * nonexistent without their id being deleted, which is how the SDK's effects
+   * converter represents wrapping. They are a subset of {@link deleted}.
+   * Never fails.
+   */
+  wrapped(): ReadonlyArray<ChangedRef> {
+    return this.select(Executed.isWrapped, "input")
+  }
+
+  private static isDeleted(change: ChangedObject): boolean {
+    return change.idOperation === "Deleted"
+  }
+
+  private static isWrapped(change: ChangedObject): boolean {
+    return change.idOperation === "None" && change.inputState === "Exists" &&
+      change.outputState === "DoesNotExist"
   }
 
   /**

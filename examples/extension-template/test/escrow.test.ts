@@ -29,7 +29,11 @@ import { Journal, Signer } from "sui-effect/tx"
 import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "../src/errors.ts"
 import { Platform } from "../src/Platform.ts"
-import { ESCROW_PACKAGE, RECEIPT_TYPE, Settlement, SettlementContent } from "../src/schema.ts"
+import { ESCROW_PACKAGE, receiptType, Settlement, SettlementContent } from "../src/schema.ts"
+
+/** The type constants under the package this test's fixtures use. */
+const RECEIPT_TYPE = receiptType(ESCROW_PACKAGE)
+const SETTLEMENT = SettlementContent(ESCROW_PACKAGE)
 
 const padded = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
 const ESCROW_ID = ObjectId.make(padded("e5c0"))
@@ -266,7 +270,7 @@ describe("Settlement: a domain class over the BCS bridge", () => {
       settled_at_ms: "1700000000000",
       claimed_by: SENDER
     }).toBytes()
-    const settlement = await Effect.runPromise(SuiSchema.decode(SettlementContent, bytes))
+    const settlement = await Effect.runPromise(SuiSchema.decode(SETTLEMENT, bytes))
     expect(settlement).toBeInstanceOf(Settlement)
     expect(settlement.escrowId).toBe(ESCROW_ID)
     expect(settlement.claimedBy).toBe(SENDER)
@@ -279,9 +283,9 @@ describe("Settlement: a domain class over the BCS bridge", () => {
       settled_at_ms: "1700000000000",
       claimed_by: SENDER
     }).toBytes()
-    const settlement = await Effect.runPromise(SuiSchema.decode(SettlementContent, bytes))
+    const settlement = await Effect.runPromise(SuiSchema.decode(SETTLEMENT, bytes))
     const encoded = await Effect.runPromise(
-      Schema.encodeUnknownEffect(SettlementContent)(settlement)
+      Schema.encodeUnknownEffect(SETTLEMENT)(settlement)
     )
     expect(Array.from(encoded)).toEqual(Array.from(bytes))
   })
@@ -294,7 +298,7 @@ describe("Settlement: a domain class over the BCS bridge", () => {
       claimed_by: SENDER
     }).toBytes()
     const error = await Effect.runPromise(
-      Effect.flip(SuiSchema.decode(SettlementContent, bytes, { objectId: ESCROW_ID }))
+      Effect.flip(SuiSchema.decode(SETTLEMENT, bytes, { objectId: ESCROW_ID }))
     )
     expect(error._tag).toBe("DecodeError")
     expect(error.objectId).toBe(ESCROW_ID)
@@ -365,5 +369,91 @@ describe("Platform: one extension composed on another", () => {
     )
     expect(claimed).toHaveLength(1)
     expect(claimed[0]?.id).toBe(ObjectId.make(RECEIPT_ID))
+  })
+})
+
+/**
+ * Regression tests for the codex audit of 2026-09-11, findings 18 and 23.
+ */
+describe("configuring a package moves the codecs with it", () => {
+  const OTHER_PACKAGE = padded("beef")
+
+  const underOtherPackage = {
+    ...script,
+    objects: [
+      {
+        ...escrowObject("5"),
+        // A correctly encoded escrow, published to the *configured* package.
+        type: `${OTHER_PACKAGE}::escrow::Escrow`
+      }
+    ]
+  }
+
+  const withPackage = <A, E>(
+    effect: Effect.Effect<A, E, Escrow | Sui | SuiCore | SuiCoreFake | TestClock.TestClock>,
+    packageId: string
+  ) =>
+    Effect.runPromise(
+      Effect.provide(
+        effect,
+        Layer.mergeAll(
+          layerExtensionTest(
+            Escrow.layer({
+              packageId,
+              url: "https://settlement.example",
+              apiKey: Redacted.make("key")
+            }),
+            underOtherPackage
+          ),
+          TestClock.layer(),
+          Journal.layerMemory
+        ),
+        { local: true }
+      )
+    )
+
+  test("a valid object under the configured package decodes", async () => {
+    // Before the fix the codec and the receipt type came from the module-level
+    // constant, so configuring a package id made every read fail with
+    // `DecodeError` and every claim report a missing receipt.
+    const escrow = await withPackage(
+      Effect.flatMap(Escrow, (service) => service.get(ESCROW_ID)),
+      OTHER_PACKAGE
+    )
+    expect(escrow.content.amount).toBe("5")
+    expect(String(escrow.type)).toBe(`${OTHER_PACKAGE}::escrow::Escrow`)
+  })
+
+  test("the service reports the type origin it was built with", async () => {
+    const origin = await withPackage(
+      Effect.map(Escrow, (service) => service.typeOrigin),
+      OTHER_PACKAGE
+    )
+    expect(origin).toBe(OTHER_PACKAGE)
+  })
+
+  test("the default package still refuses an object of another package", async () => {
+    const error = await Effect.runPromise(
+      Effect.provide(
+        Effect.flip(Effect.flatMap(Escrow, (service) => service.get(ESCROW_ID))),
+        Layer.mergeAll(
+          layerExtensionTest(Escrow.layerTest(), underOtherPackage),
+          TestClock.layer(),
+          Journal.layerMemory
+        ),
+        { local: true }
+      )
+    )
+    expect(error._tag).toBe("DecodeError")
+  })
+})
+
+describe("the test fee collector", () => {
+  test("resolves to a normalized address instead of failing", async () => {
+    // `SuiAddress.make("0x1")` validates the decoded representation and does
+    // not normalize it, so the abbreviated form threw inside the fake API and
+    // arrived as a `TransportError` from a member that never touched a network.
+    const address = await provide(Effect.flatMap(Escrow, (service) => service.feeCollector))
+    expect(String(address)).toBe(padded("1"))
   })
 })

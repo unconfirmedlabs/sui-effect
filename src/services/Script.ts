@@ -17,6 +17,7 @@ import { Cause, Config, ConfigProvider, Context, Effect, Exit, Fiber, Layer, Log
 import type { NetworkMismatch, SuiError, TransportError } from "../domain/errors.ts"
 import { digestOf, SuiError as SuiErrorHelpers } from "../domain/errors.ts"
 import type { JournalEntry } from "../domain/journal-entry.ts"
+import type { JournalService } from "./Journal.ts"
 import { Journal } from "./Journal.ts"
 import type { Signer } from "./Signer.ts"
 import { fromConfig } from "./Signer.ts"
@@ -206,7 +207,10 @@ export class Script extends Context.Service<Script, ScriptService>()("sui-effect
   )
 
   /** See {@link exitCode}. */
-  static readonly exitCode = <A, E>(exit: Exit.Exit<A, E>): number => exitCode(exit)
+  static readonly exitCode = <A, E>(
+    exit: Exit.Exit<A, E>,
+    options?: ExitCodeOptions
+  ): number => exitCode(exit, options)
 
   /** See {@link run}. */
   static readonly run = <A, E>(
@@ -238,6 +242,24 @@ const hasOutcomeField = (error: unknown): error is { readonly outcome: string } 
   typeof error === "object" && error !== null &&
   typeof (error as { readonly outcome?: unknown }).outcome === "string"
 
+/** What {@link exitCode} needs to know beyond the `Exit` itself. */
+export interface ExitCodeOptions {
+  /**
+   * How many submissions the script's journal still holds unresolved.
+   *
+   * It is what decides a timeout or an interrupt. `Effect.timeout` around a
+   * whole submission interrupts it and produces an outer `Cause.TimeoutError`
+   * that never went through `Tx.submit`'s own mapping, so the bytes may well be
+   * on the wire; the journal is the only thing that knows. With an unresolved
+   * entry the exit is 3, "reconcile before doing anything else"; with none it
+   * is the ordinary 4 for a timeout and 130 for an interrupt.
+   *
+   * `Script.run` fills it in from the journal the script ran with. Left out, it
+   * is zero, and a timeout is 4 as before.
+   */
+  readonly unresolved?: number
+}
+
 /**
  * The exit code one failure deserves.
  *
@@ -245,7 +267,9 @@ const hasOutcomeField = (error: unknown): error is { readonly outcome: string } 
  * charged, do not retry), is the outcome unknown (3, reconcile before doing
  * anything else), or did nothing apply (4, safe to retry)? Configuration
  * problems are 2 because no amount of retrying fixes them, a defect is 1, and
- * an interrupt is 130 the way a shell expects.
+ * an interrupt is 130 the way a shell expects — unless the journal says there
+ * is a submission outstanding, in which case it is 3, because a wrapper that
+ * sees 130 has no reason to go looking for one.
  *
  * An extension error that declares an `outcome` is honoured, so a downstream
  * SDK's own failures land on the same axis. `SchemaError` — what Effect's own
@@ -261,19 +285,23 @@ const hasOutcomeField = (error: unknown): error is { readonly outcome: string } 
  * are told to declare `outcome` on every error precisely so their failures
  * never land here. Never fails.
  */
-export const exitCode = <A, E>(exit: Exit.Exit<A, E>): number => {
+export const exitCode = <A, E>(
+  exit: Exit.Exit<A, E>,
+  options?: ExitCodeOptions
+): number => {
   if (Exit.isSuccess(exit)) return EXIT.success
   const cause = exit.cause
+  const unresolved = options?.unresolved ?? 0
   if (Cause.hasInterrupts(cause) && !Cause.hasFails(cause) && !Cause.hasDies(cause)) {
-    return EXIT.interrupted
+    return unresolved > 0 ? EXIT.unknown : EXIT.interrupted
   }
   if (Cause.hasDies(cause)) return EXIT.defect
   const failure = Cause.findErrorOption(cause)
-  return failure._tag === "Some" ? codeOfError(failure.value) : EXIT.defect
+  return failure._tag === "Some" ? codeOfError(failure.value, unresolved) : EXIT.defect
 }
 
 /** The exit code of one error value, the same mapping {@link exitCode} uses. */
-const codeOfError = (error: unknown): number => {
+const codeOfError = (error: unknown, unresolved: number): number => {
   if (isConfigError(error)) return EXIT.configuration
   if (hasOutcomeField(error)) return codeOfOutcome((error as unknown as HasOutcomeLike).outcome)
   if (!hasTag(error)) return EXIT.defect
@@ -283,11 +311,19 @@ const codeOfError = (error: unknown): number => {
     case "SubmissionUnknown":
       return EXIT.unknown
     case "ExecutionFailed":
+    // An `UnexpectedEffects` is built from an `Executed`: the transaction
+    // applied and gas was charged, and only the receipt is missing. Exit 4
+    // would tell a wrapper to run the caller's intent a second time.
+    case "UnexpectedEffects":
       return EXIT.applied
     // `Effect.timeout` puts a `TimeoutError` in the error channel that is not
-    // part of the taxonomy; a timeout that reached here was not a submission,
-    // because `Tx.submit` turns those into `SubmissionUnknown`.
+    // part of the taxonomy. It used to be mapped unconditionally to "not
+    // applied" on the theory that `Tx.submit` turns a timed-out submission into
+    // `SubmissionUnknown` — but an `Effect.timeout` wrapped *around* a
+    // submission interrupts it from the outside and never reaches that mapping,
+    // so the bytes may be on the wire. The journal is what knows.
     case "TimeoutError":
+      return unresolved > 0 ? EXIT.unknown : EXIT.notApplied
     case "TransportError":
     case "ObjectNotFound":
     case "ObjectDeleted":
@@ -300,7 +336,6 @@ const codeOfError = (error: unknown): number => {
     case "BuildError":
     case "PolicyDenied":
     case "JournalError":
-    case "UnexpectedEffects":
     case "GraphQLUnavailable":
     case "ExtensionNotReady":
       return EXIT.notApplied
@@ -439,21 +474,29 @@ const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<st
 }
 
 /**
- * Reads the **default** journal — the process-wide in-memory one — for entries
- * that never got an answer.
+ * Reads the journal **the script actually ran with** for entries that never got
+ * an answer.
  *
  * A script interrupted mid-submit has a `Signed` entry and nothing else: no
- * digest in an error, no bytes on stderr, and an exit code of 130 that says
- * only that someone pressed Ctrl-C. Printing the entry is the difference
- * between a transaction an operator can reconcile and one nobody can account
- * for. A script that provided its own durable journal has the record on disk
- * already, and this finds nothing, which is correct.
+ * digest in an error, no bytes on stderr, and an exit code that says only that
+ * someone pressed Ctrl-C. Printing the entry is the difference between a
+ * transaction an operator can reconcile and one nobody can account for.
+ *
+ * The journal is captured inside the script's own runtime rather than read off
+ * the bare reference afterwards: a script that provided a durable `Journal` —
+ * which is exactly the script with something to lose — would otherwise have its
+ * unresolved entries looked for in the process-wide in-memory default, find
+ * none, and print nothing.
  */
-const readUnresolved = async (): Promise<ReadonlyArray<JournalEntry>> =>
+const readUnresolved = async (
+  journal: JournalService | undefined
+): Promise<ReadonlyArray<JournalEntry>> =>
   Effect.runPromise(
-    Effect.flatMap(Journal, (journal) => journal.listUnresolved).pipe(
-      Effect.catchCause(() => Effect.succeed<ReadonlyArray<JournalEntry>>([]))
-    )
+    (journal === undefined
+      ? Effect.flatMap(Journal, (found) => found.listUnresolved)
+      : journal.listUnresolved).pipe(
+        Effect.catchCause(() => Effect.succeed<ReadonlyArray<JournalEntry>>([]))
+      )
   )
 
 /**
@@ -467,9 +510,12 @@ const readUnresolved = async (): Promise<ReadonlyArray<JournalEntry>> =>
  * prints the base64 of the signed bytes and a line saying to reconcile, because
  * those bytes are the durable record a script has.
  *
- * On an interrupt or a defect it also prints whatever the default journal still
- * holds unresolved, which is the only record of bytes that may be on the wire
- * when a script is killed between signing and the answer.
+ * On **every** non-zero exit it also prints whatever the journal the script ran
+ * with still holds unresolved, which is the only record of bytes that may be on
+ * the wire when a script is killed — or fails — between signing and the answer.
+ * That count is also what decides a timeout (3 rather than 4) and an interrupt
+ * (3 rather than 130): an `Effect.timeout` around a submission interrupts it
+ * from the outside and never reaches `Tx.submit`'s own mapping.
  *
  * **A second SIGINT does nothing.** The handler interrupts the root fiber once;
  * pressing Ctrl-C again while finalizers run is ignored, because the whole
@@ -494,8 +540,15 @@ export const run = async <A, E>(
   const signals = options?.signals ?? process
   const names = options?.signalNames ?? ["SIGINT", "SIGTERM"]
 
+  // The journal the script ran with, captured from inside its own context so an
+  // interrupt can report what it left on the wire even when the script provided
+  // a durable journal of its own.
+  let journal: JournalService | undefined
   const fiber = Effect.runFork(
-    effect.pipe(
+    Effect.flatMap(Journal, (found) => {
+      journal = found
+      return effect
+    }).pipe(
       Effect.provide(
         Layer.merge(options?.layer ?? Script.layer, Logger.layer([stderrLogger(write)]))
       )
@@ -512,6 +565,7 @@ export const run = async <A, E>(
   const exit = await Effect.runPromise(Fiber.await(fiber))
   for (const [name, handler] of handlers) signals.off?.(name, handler)
 
+  let unresolved: ReadonlyArray<JournalEntry> = []
   if (Exit.isFailure(exit)) {
     if (Cause.hasDies(exit.cause)) {
       write(Cause.pretty(exit.cause))
@@ -525,11 +579,14 @@ export const run = async <A, E>(
         write(Cause.pretty(exit.cause))
       }
     }
-    if (Cause.hasDies(exit.cause) || Cause.hasInterrupts(exit.cause)) {
-      for (const line of unresolvedLines(await readUnresolved())) write(line)
-    }
+    // On **every** non-zero exit, not only a defect or an interrupt: a typed
+    // failure escaping after a submission — an outer timeout, a preflight that
+    // ran too late, an extension error raised past `Tx.submit` — leaves the
+    // same record on the wire, and the operator needs the same bytes.
+    unresolved = await readUnresolved(journal)
+    for (const line of unresolvedLines(unresolved)) write(line)
   }
-  const code = exitCode(exit)
+  const code = exitCode(exit, { unresolved: unresolved.length })
   stop(code)
   return code
 }

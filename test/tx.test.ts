@@ -492,7 +492,8 @@ describe("Tx.run", () => {
           Effect.forkChild(
             Tx.run(Tx.sponsored({ sender: who.address, gasOwner: sponsor.address })(claim), {
               signer: who,
-              gasOwner: sponsor.address
+              gasOwner: sponsor.address,
+              sponsor
             }).pipe(
               Effect.tap(() => Effect.sync(() => order.push(name))),
               Effect.provideService(SubmitConfig, config)
@@ -521,11 +522,11 @@ describe("Tx.run", () => {
       Effect.gen(function*() {
         const left = Tx.run(
           Tx.sponsored({ sender: signer.address, gasOwner: other.address })(claim),
-          { signer, gasOwner: other.address }
+          { signer, gasOwner: other.address, sponsor: other }
         )
         const right = Tx.run(
           Tx.sponsored({ sender: other.address, gasOwner: signer.address })(claim),
-          { signer: other, gasOwner: signer.address }
+          { signer: other, gasOwner: signer.address, sponsor: signer }
         )
         const first = yield* Effect.forkChild(left)
         const second = yield* Effect.forkChild(right)
@@ -619,7 +620,10 @@ describe("Tx.reconcile", () => {
         yield* SuiTest.setEpoch(99n)
         return yield* Tx.reconcile(signed).pipe(Effect.flip)
       }),
-      { ...baseScript, epoch: 42n, getTransaction: [FakeOutcome.notFound()] }
+      { ...baseScript, epoch: 42n, getTransaction: [FakeOutcome.notFound()] },
+      // The rule is ordered and repeated — closed, missing, wait, closed,
+      // missing — so the recheck delay has to pass for it to conclude.
+      withConfig({ reconcileRecheck: Duration.zero })
     )
     expect(error._tag).toBe("NotApplied")
     if (error._tag === "NotApplied") expect(error.evidence).toBe("expired")
@@ -736,14 +740,14 @@ describe("Tx.reconcile", () => {
   })
 
   test("a version that advanced with no consuming digest proves nothing", async () => {
-    // A node that does not serve `previousTransaction` is not evidence. Before
-    // the guard this was `NotApplied { inputConsumed }`.
+    // A node that does not name the transaction behind the next version is not
+    // evidence. Before the guard this was `NotApplied { inputConsumed }`.
     const result = await afterInputMoved(() => SuiTest.bumpVersion(ESCROW_ID))
     expect(result._tag).toBe("Failure")
     if (result._tag !== "Failure") return
     expect(result.failure._tag).toBe("SubmissionUnknown")
     if (result.failure._tag === "SubmissionUnknown") {
-      expect(String(result.failure.cause)).toContain("did not say")
+      expect(String(result.failure.cause)).toContain("named no transaction")
     }
   })
 
@@ -1062,20 +1066,23 @@ describe("Tx.reconcileAll", () => {
     if (entry._tag === "Unknown") expect(entry.signed.bytes.length).toBeGreaterThan(0)
   })
 
-  test("a dead node stops the whole call with TransportError", async () => {
-    // Per entry there is no failure; the call as a whole fails only when the
-    // network cannot be read at all, and the journal is left for the next try.
-    const { entries, error } = await withSignedEntry(
+  test("a dead node settles the entry as SubmissionUnknown, not TransportError", async () => {
+    // A recovery read that failed says nothing about whether this submission
+    // applied, and `TransportError` is `not_applied` in the taxonomy — which
+    // would tell the retry idiom to send it again. It becomes this entry's
+    // `SubmissionUnknown`, the entry stays unresolved, and the loop goes on.
+    const { entries, settled } = await withSignedEntry(
       Effect.gen(function*() {
         const journal = yield* Journal
-        const fiber = yield* Effect.forkChild(Tx.reconcileAll().pipe(Effect.flip))
+        const fiber = yield* Effect.forkChild(Tx.reconcileAll())
         yield* TestClock.adjust("5 minutes")
-        const error = yield* Fiber.join(fiber)
-        return { error, entries: yield* journal.listUnresolved }
+        const settled = yield* Fiber.join(fiber)
+        return { settled, entries: yield* journal.listUnresolved }
       }),
       { ...baseScript, getTransaction: [FakeOutcome.transportError("UNAVAILABLE")] }
     )
-    expect(error._tag).toBe("TransportError")
+    expect(settled).toHaveLength(1)
+    expect((settled[0] as { readonly _tag?: string })?._tag).toBe("SubmissionUnknown")
     expect(entries).toHaveLength(1)
   })
 })

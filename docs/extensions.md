@@ -31,8 +31,14 @@ what consumers, agents and `LLMS.md` read.
 
 ```ts
 export interface EscrowService {
-  /** The package this service reads and writes. */
+  /** The package this service calls into. */
   readonly packageId: string
+  /**
+   * The package the types this service decodes were **first** published in,
+   * which is what appears inside every Move type name. It is the same as
+   * `packageId` until the package is upgraded.
+   */
+  readonly typeOrigin: string
   /**
    * The address the package collects fees at, read through the upstream SDK.
    *
@@ -216,7 +222,7 @@ same thing about the chain.
 
 ```ts
 const get = Effect.fn("Escrow.get")(function*(id: ObjectId) {
-  return yield* sui.getObject(id, { schema: EscrowContent }).pipe(
+  return yield* sui.getObject(id, { schema: content }).pipe(
     Effect.catchTag(
       ["ObjectNotFound", "ObjectDeleted"],
       () => Effect.fail(new EscrowNotFound({ escrowId: id }))
@@ -252,44 +258,29 @@ So a codec that maps into your own domain types is a `BcsType` **composed with
 <!-- from: examples/extension-template/src/schema.ts -->
 
 ```ts
-export const SettlementContent = SuiSchema.bcs(
-  SettlementBcs,
-  `${ESCROW_PACKAGE}::escrow::Settlement`
-).pipe(
-  Schema.decodeTo(
-    Settlement,
-    SchemaTransformation.transformOrFail<SettlementParts, typeof SettlementBcs.$inferType>({
-      decode: (fields, options) =>
-        // `transformOrFail`, not `transform`, because one of these mappings can
-        // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
-        // whose body throws is a **defect**, which is not what a bad byte on the
-        // wire should be; failing with a `SchemaIssue` here is what makes it a
-        // `DecodeError` like any other.
-        Effect.map(
-          Effect.fromOption(
-            DateTime.make(Number(fields.settled_at_ms)),
-            () =>
-              new SchemaIssue.InvalidValue(
-                { message: `settled_at_ms ${fields.settled_at_ms} is not a time` },
-                fields,
-                options
-              )
-          ),
-          (settledAt): SettlementParts => ({
-            escrowId: fields.escrow_id,
-            settledAt,
-            claimedBy: fields.claimed_by
-          })
-        ),
-      encode: (settlement) =>
-        Effect.succeed({
-          escrow_id: settlement.escrowId,
-          settled_at_ms: String(DateTime.toEpochMillis(settlement.settledAt)),
-          claimed_by: settlement.claimedBy
-        })
-    })
-  )
-)
+export const SettlementContent = (typeOrigin: string) =>
+  SuiSchema.bcs(
+    SettlementBcs,
+    `${typeOrigin}::escrow::Settlement`
+  ).pipe(
+    Schema.decodeTo(
+      Settlement,
+      SchemaTransformation.transformOrFail<SettlementParts, typeof SettlementBcs.$inferType>({
+        decode: (fields, options) =>
+          // `transformOrFail`, not `transform`, because one of these mappings can
+          // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
+          // whose body throws is a **defect**, which is not what a bad byte on the
+          // wire should be; failing with a `SchemaIssue` here is what makes it a
+          // `DecodeError` like any other.
+          Effect.map(
+            Effect.fromOption(
+              DateTime.make(Number(fields.settled_at_ms)),
+              () =>
+                new SchemaIssue.InvalidValue(
+                  { message: `settled_at_ms ${fields.settled_at_ms} is not a time` },
+                  fields,
+                  options
+                )
 ```
 
 The domain class is an ordinary `Schema.Class`:
@@ -329,6 +320,57 @@ option of `getObject` / `getObjectOption` / `getObjects`, `SuiSchema.decode`'s
 in tests. The object keeps the type it actually has on `SuiObject.type`, so an
 extension that cares which instantiation it read can still look.
 
+### Every type-shaped constant is a function of the package id
+
+A Move type name **contains its package id**. So a codec, an owned-object
+filter or a receipt type built from a module-level constant checks the wrong
+type the moment a consumer configures a different package, and the symptom is
+brutal: a correctly encoded object fails with `DecodeError`, and a claim that
+applied on chain reports a missing receipt. The template derives all of them
+from the id the service was built with:
+
+<!-- from: examples/extension-template/src/schema.ts -->
+
+```ts
+export const escrowType = (typeOrigin: string): string =>
+  `${typeOrigin}::escrow::Escrow`
+
+/** The Move type of a claim receipt, which `claimFor` expects to be created. */
+export const receiptType = (typeOrigin: string): string =>
+  `${typeOrigin}::escrow::Receipt`
+
+/**
+ * `escrow::Escrow`, the object this extension reads, **as a function of the
+ * package it lives in**.
+ *
+ * A Move type name contains its package id, so a codec built from a hard-coded
+ * constant checks the wrong type the moment a consumer configures a different
+ * package: `getObject(id, { schema })` compares the object's tag before it
+ * parses a byte, and a correctly encoded object under the configured package
+ * fails with `DecodeError`. Every type-shaped constant in an extension takes
+ * the package id the service was built with, and the service passes its own.
+ *
+ * **Which package id.** The one that appears in a type name is the **type
+ * origin**: the package the type was *first* published in. Upgrading a package
+ * gives it a new id for *calls*, and the type origin does not move. So an
+ * extension over an upgraded package carries two ids — `packageId` for
+ * `moveCall` targets, `typeOrigin` for codecs, filters and receipt types — and
+ * they are the same value until the first upgrade. `Escrow.layer` takes both.
+ */
+export const EscrowContent = (typeOrigin: string) => SuiSchema.bcs(
+  EscrowBcs,
+  escrowType(typeOrigin)
+)
+```
+
+**Which id, though.** The one inside a type name is the **type origin**: the
+package the type was *first* published in. Upgrading a package gives it a new id
+for `moveCall` targets and leaves every type name pointing at the original. So
+an extension over an upgradeable package carries two: `packageId` for calls,
+`typeOrigin` for codecs, filters and expected types. They are the same value
+until the first upgrade, which is why `EscrowOptions.typeOrigin` defaults to
+`packageId`.
+
 ### Bytes you already have
 
 Where you already have bytes — a `Stream` of envelopes, a dynamic field's value,
@@ -342,14 +384,14 @@ when you know the type the bytes came from and the tag check runs here too:
 
 ```ts
 const stream = (owner: SuiAddress) =>
-  sui.streamOwnedObjects(owner, { type: escrowType }).pipe(
+  sui.streamOwnedObjects(owner, { type: ownedFilter }).pipe(
     Stream.mapEffect((object) =>
       // `SuiSchema.decode` is the same decode `sui.getObject({ schema })`
       // does, for the places that already have bytes. Bytes that do not
       // decode are a `DecodeError` naming the object and the type — not a
       // transport failure, which is what a node that could not be reached
       // is.
-      SuiSchema.decode(EscrowContent, object.content, {
+      SuiSchema.decode(content, object.content, {
         objectId: object.id,
         // The type the object actually has. Give it and `SuiSchema.decode`
         // runs the same tag check `getObject` does, under the same rule: a
@@ -409,9 +451,9 @@ const claimFor = Effect.fn("Escrow.claimFor")(function*(
   // receipt. That is what `UnexpectedEffects` means, and `outcome` puts it
   // on "applied". Mapping it to `TransportError` would tell a wrapper the
   // opposite — nothing happened, retry — about a claim that ran.
-  const receipt = yield* executed.expectCreated(RECEIPT_TYPE)
+  const created = yield* executed.expectCreated(receipt)
   yield* notify(id, executed.digest)
-  return receipt
+  return created
 // `Tx.*` requires `Sui`, and the layer has one: providing it here is what
 // keeps every member's requirement channel empty, which is what
 // `SuiExtension.fromService` and every consumer expect.
@@ -511,14 +553,35 @@ one process may legitimately hold two.
 
 ```ts
 export interface EscrowOptions {
-  /** The published package id. */
+  /** The published package id, which is what `moveCall` targets name. */
   readonly packageId: string
+  /**
+   * The type origin: the package the Move **types** were first published in,
+   * which is what appears inside `pkg::escrow::Escrow`.
+   *
+   * Defaults to `packageId`, which is right until the package is upgraded —
+   * an upgrade gives the package a new id for calls and leaves every type name
+   * pointing at the original. Set it then, and codecs, owned-object filters and
+   * the receipt type keep checking the type that exists.
+   */
+  readonly typeOrigin?: string
   /** The operator's settlement service. */
   readonly url: string
   /** The extension's own credential — never the consumer's. */
   readonly apiKey: Redacted.Redacted<string>
 }
 ```
+
+**A sponsored write needs two of them.** When the transaction's gas owner is not
+its sender, both parties sign; one signature on such bytes is something a
+validator rejects outright. `Tx.run(recipe, { signer, gasOwner, sponsor })`
+takes the sponsor's `Signer` and co-signs, and refuses with `SigningError` —
+before anything is built — when a gas owner has no sponsor to go with it. The
+same check runs on the addresses read back out of the built bytes, so a recipe
+that set its own gas owner (anything built with `Tx.sponsored`) is caught too.
+An extension whose two parties cannot both sign in one process — the sponsor is
+a remote service, the sender is a wallet — uses the explicit lifecycle instead:
+`Tx.build`, `Tx.sign`, hand the bytes over, `Tx.cosign`, `Tx.submit`.
 
 ## 6. Layers
 
@@ -545,6 +608,7 @@ static readonly layer = (options: EscrowOptions): Layer.Layer<Escrow, never, Sui
     Escrow,
     make({
       packageId: options.packageId,
+      ...(options.typeOrigin === undefined ? {} : { typeOrigin: options.typeOrigin }),
       api: settlementApi({ url: options.url, apiKey: Redacted.value(options.apiKey) })
     })
   )
@@ -660,9 +724,10 @@ export const escrow = (options: EscrowOptions) =>
 ```
 
 `register(client)` does no work until the first call. Then it builds one
-`ManagedRuntime` over `SuiCore.layerFromClient(client)`, `Sui.layerNoDeps` and
-your layer, so the extension and the consumer share one transport and one
-chain-identifier check. After that:
+`ManagedRuntime` over your layer and a **base shared per client** —
+`SuiCore.layerFromClient(client)` plus `Sui.layerNoDeps` — so the extension and
+the consumer share one transport and one chain-identifier check, and so do two
+different extensions on the same client. After that:
 
 - an `Effect` member is a zero-argument method returning a `Promise`;
 - a function returning an `Effect` keeps its arguments and returns a `Promise`;
@@ -681,6 +746,12 @@ Promise-returning and leaves everything else alone: a recipe builder
 `packageId` is still a `string`. But **until the runtime exists there is no
 service object**, so nothing knows what a member is, and a placeholder is not a
 `Recipe` and not a string.
+
+An `Effect` member and a `Stream` member both work cold, because the face
+promises a `Promise` for one and an `AsyncIterable` for the other and a cold
+call can be both at once: what it returns is a thenable *and* an async iterable,
+so `await client.status()` and `for await (const x of client.owned.stream(a))`
+are each right before anything has been awaited.
 
 So a synchronous member used before the runtime exists fails with
 `ExtensionNotReady`, naming itself — a value read as a string throws, a
@@ -736,7 +807,19 @@ must report, which is how an extension whose deployment names a custom network's
 available as `dispose()`) is not final: it releases what the layer acquired and
 forgets the runtime, and the next call builds a fresh one, so dispose when the
 consumer is done rather than between calls. Registering the same extension
-twice, or on two clients, gives two independent runtimes and two layer builds.
+twice, or on two clients, still gives two independent runtimes and two layer
+builds — two copies of whatever *your* layer holds.
+
+**The base is shared, and it matters more than it sounds.** `Sui` owns the
+sender lock: one semaphore per address, which is what stops two `Tx.run`s from
+selecting the same gas coin. When each registration built its own `Sui`, two
+extensions on one client had two lock maps and could do exactly that, and
+"register each extension once" did not help. Now every registration on a client
+(for one base configuration — a different `sui.chainId` is a different base, on
+purpose) shares one `Sui`, one chain-id read and one lock map. It is reference
+counted: the base is built by the first registration that needs it and released
+when the **last** one is disposed, so `$dispose()` on one extension never tears
+the transport out from under another.
 `examples/extension-consumer.ts` in this repository shows both consumers of one
 extension side by side.
 
@@ -1092,6 +1175,16 @@ Because your errors declare an `outcome`, a script that fails inside your
 extension exits with the code a wrapper can act on — 5 applied, 4 not applied,
 3 unknown — with no handling lines anywhere.
 
+Two of those deserve a second look. `UnexpectedEffects` — what
+`executed.expectCreated(type)` fails with — is **applied**, exit 5: it can only
+come from an `Executed`, so the transaction ran and gas was charged and only the
+receipt is missing; treating it as "safe to retry" would run the caller's intent
+twice. And a `Cause.TimeoutError` from an `Effect.timeout` wrapped *around* a
+submission exits 3, not 4, when the journal still holds an unresolved entry: the
+outer timeout interrupts the submission from outside and the bytes may be on the
+wire. `Script.run` prints those unresolved entries, with their base64 bytes, on
+every non-zero exit.
+
 ## 12. Converting an existing facade
 
 Copying the template is the greenfield path. A 14k-line facade with standalone
@@ -1241,8 +1334,28 @@ copy even when you have no checkout of this repository.
 
 `examples/extension-template/README.md` has the step by step: rename the
 package, the service identifier and the registration name; drop the `paths`
-block that resolves `sui-effect` inside this repository; replace the package id,
+blocks that resolve `sui-effect` inside this repository; replace the package id,
 the BCS layouts and the Move targets; keep the shape.
+
+### The package has to actually build
+
+`exports` points into `dist`, so something has to put a `dist` there. The
+template ships `tsconfig.build.json` (emit on, `rootDir: src`, declarations and
+maps) and a `build` script, and its `files` list is `dist` plus the README —
+which is exactly the combination that is easy to get wrong and impossible to
+notice, because `tsc --noEmit` and `bun test` both import `src/` and pass for a
+package that ships nothing at all.
+
+So the template's own check does not stop at those two. `bun run check` also
+runs `scripts/check-package.ts`, which builds, packs the tarball, unpacks it
+into a throwaway `node_modules`, and imports the package the way a consumer
+will. Copy that script along with the rest: it is the only step that looks at
+what you are actually publishing.
+
+The template is `version: "0.0.0"` and **not** `private`, because a package
+meant to be copied and published must not carry a flag that silently refuses to
+publish. Set your own name, version and `publishConfig.access` before you run
+`npm publish`.
 
 ### TypeScript
 

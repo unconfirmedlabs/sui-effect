@@ -154,6 +154,63 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null &&
   (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
 
+/**
+ * The base `Sui` + `SuiCore` over one client, shared by every registration on
+ * that client.
+ *
+ * Two things have to be the same object for sharing to work: the base `Layer`
+ * itself (a `Layer.effect` is memoized **by identity**, so a fresh
+ * `Sui.layerNoDepsWith({})` per registration is a fresh `Sui` per registration)
+ * and the `Layer.MemoMap` the runtimes build through. With both, two extensions
+ * on one client get one `Sui`, one chain-id read and — the reason this matters
+ * — **one sender-lock map**, so `Tx.run` from two different extensions for the
+ * same address serializes.
+ *
+ * The memo map is reference counted by Effect: the base is built on the first
+ * registration that needs it and released when the last registration that used
+ * it disposes, after which the next call builds it again. That is exactly the
+ * lifetime `$dispose()` documents, extended across registrations.
+ *
+ * Keyed by client, then by the base's own configuration, because two
+ * extensions that pin different chain identifiers are not asking for the same
+ * `Sui` and must not be handed one.
+ *
+ * **Only the base is shared.** Each registration still builds its own
+ * extension layer with its own memoization, so "register once per client and
+ * keep the extended client" is still the rule for whatever the extension's own
+ * layer holds — a cache, a connection, a fake's state.
+ */
+type BaseLayer = Layer.Layer<Sui | SuiCore, NetworkMismatch | TransportError>
+
+const SHARED_BASES = new WeakMap<ClientWithCoreApi, Map<string, BaseLayer>>()
+
+const sharedBase = (
+  client: ClientWithCoreApi,
+  key: string,
+  build: () => BaseLayer
+): BaseLayer => {
+  let byKey = SHARED_BASES.get(client)
+  if (byKey === undefined) {
+    byKey = new Map()
+    SHARED_BASES.set(client, byKey)
+  }
+  const existing = byKey.get(key)
+  if (existing !== undefined) return existing
+  const raw = build()
+  // One memo map for this client and this configuration, shared by every
+  // registration: `Layer.effect` memoizes by layer identity, so building `raw`
+  // through it hands the second registration the `Sui` the first one built —
+  // one chain-id read, and one sender-lock map. The memo map is reference
+  // counted by Effect, so the base is released when the last registration that
+  // used it is disposed and rebuilt on the next call after that.
+  const memoMap = Layer.makeMemoMapUnsafe()
+  const shared: BaseLayer = Layer.fromBuild((_registrationMemo, scope) =>
+    Layer.buildWithMemoMap(raw, memoMap, scope)
+  )
+  byKey.set(key, shared)
+  return shared
+}
+
 /** What the Promise facade needs from the lazily built runtime. */
 interface Bridge {
   readonly runPromise: <A>(effect: Effect.Effect<A, unknown, never>) => Promise<A>
@@ -241,15 +298,22 @@ export const fromService = <Self, Shape, E, const Name extends string>(
     let runtime: Runtime | undefined
     let instance: Shape | undefined
 
+    const baseOf = (): BaseLayer =>
+      sharedBase(
+        client,
+        `read:${options.sui?.chainId ?? ""}`,
+        () =>
+          // `Sui` and `SuiCore` over the very client `$extend` was called on, so
+          // the extension and the consumer share one transport, one chain-id
+          // check and one sender-lock map.
+          SuiService.layerNoDepsWith(options.sui ?? {}).pipe(
+            Layer.provideMerge(SuiCore.layerFromClient(client))
+          )
+      )
+
     const runtimeOf = (): Runtime => {
       if (runtime === undefined) {
-        // `Sui` and `SuiCore` over the very client `$extend` was called on, so
-        // the extension and the consumer share one transport and one chain-id
-        // check.
-        const base = SuiService.layerNoDepsWith(options.sui ?? {}).pipe(
-          Layer.provideMerge(SuiCore.layerFromClient(client))
-        )
-        runtime = ManagedRuntime.make(options.layer.pipe(Layer.provideMerge(base)))
+        runtime = ManagedRuntime.make(options.layer.pipe(Layer.provideMerge(baseOf())))
       }
       return runtime
     }
@@ -280,8 +344,13 @@ export const fromService = <Self, Shape, E, const Name extends string>(
             "warm build never asks the node"
         )
       }
-      const base = SuiService.layerNoDepsPinned(chainId).pipe(
-        Layer.provideMerge(SuiCore.layerFromClient(client))
+      const base = sharedBase(
+        client,
+        `pinned:${chainId}`,
+        () =>
+          SuiService.layerNoDepsPinned(chainId).pipe(
+            Layer.provideMerge(SuiCore.layerFromClient(client))
+          )
       )
       const warmRuntime: Runtime = ManagedRuntime.make(
         options.layer.pipe(Layer.provideMerge(base))
@@ -312,8 +381,8 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         for (const key of path) current = (current as Record<string, unknown>)[key]
         return current
       }
-      const node = (...args: ReadonlyArray<unknown>) =>
-        at().then((member) => {
+      const node = (...args: ReadonlyArray<unknown>) => {
+        const settled = at().then((member) => {
           const mapped = mapMember(member, bridge)
           if (typeof mapped !== "function") {
             // The member was a plain value, and the caller used it as a
@@ -322,16 +391,44 @@ export const fromService = <Self, Shape, E, const Name extends string>(
           }
           const result = (mapped as (...a: ReadonlyArray<unknown>) => unknown)(...args)
           // A member that returns an `Effect` or a `Stream` is typed as
-          // Promise-returning, so answering with a Promise is the truth. A
-          // member that returns anything else is typed as **synchronous**, and
-          // a Promise of its value is not the value: say so instead of handing
-          // back something the type says cannot be awaited.
+          // Promise-returning or as an `AsyncIterable`, so answering with
+          // either is the truth. A member that returns anything else is typed
+          // as **synchronous**, and a Promise of its value is not the value:
+          // say so instead of handing back something the type says cannot be
+          // awaited.
           if (result instanceof Promise) return result
           if (typeof result === "object" && result !== null && Symbol.asyncIterator in result) {
             return result
           }
           throw notReady(path)
         })
+        // Both faces at once, because until the runtime exists nothing knows
+        // which one this member has. `PromiseFace` types an `Effect`-returning
+        // method as `Promise` and a `Stream`-returning one as `AsyncIterable`;
+        // a bare Promise of an `AsyncIterable` satisfies neither `for await`
+        // nor the declared type, which is what a cold Stream call used to hand
+        // back. So the returned value is a thenable **and** an async iterable:
+        // awaited it is the Promise, iterated it awaits the runtime and then
+        // delegates to the real stream.
+        return {
+          then: <A, B>(
+            onFulfilled?: ((value: unknown) => A | PromiseLike<A>) | null,
+            onRejected?: ((reason: unknown) => B | PromiseLike<B>) | null
+          ) => settled.then(onFulfilled, onRejected),
+          catch: <B>(onRejected?: ((reason: unknown) => B | PromiseLike<B>) | null) =>
+            settled.catch(onRejected),
+          finally: (onFinally?: (() => void) | null) => settled.finally(onFinally),
+          [Symbol.asyncIterator]: async function*() {
+            const value = await settled
+            if (
+              typeof value !== "object" || value === null || !(Symbol.asyncIterator in value)
+            ) {
+              throw notReady(path)
+            }
+            yield* value as AsyncIterable<unknown>
+          }
+        }
+      }
       // Every synchronous use of a placeholder — a plain value read as a
       // string, a number, a JSON payload — lands on one of these, and each one
       // says the same thing: the runtime does not exist yet.
