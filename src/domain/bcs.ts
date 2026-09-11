@@ -9,7 +9,7 @@
  * @since 0.1.0
  */
 import type { BcsType } from "@mysten/bcs"
-import { normalizeStructTag } from "@mysten/sui/utils"
+import { normalizeStructTag, parseStructTag } from "@mysten/sui/utils"
 import { Effect, Schema, SchemaAST, SchemaIssue, SchemaTransformation } from "effect"
 import { DecodeError } from "./errors.ts"
 import type { ObjectId } from "./schemas.ts"
@@ -31,13 +31,26 @@ const normalizeSafe = (value: string): string => {
  * Decoding fails with a `SchemaError` (which `Sui` maps to `DecodeError`) when
  * the bytes do not parse; encoding fails the same way when the value does not
  * serialize. The expected type is normalized with `normalizeStructTag`, so
- * `Coin<0x2::sui::SUI>` and its padded spelling are the same type.
+ * `Coin<0x2::sui::SUI>` and its padded spelling are the same type, and a tag
+ * with no type arguments matches every instantiation of it (see
+ * {@link typeMatches}).
+ *
+ * **`expectedType` is optional.** A Move *return value* has no struct tag —
+ * `sui.view(recipe, bcs.Address())` reads a `vector<u8>` off a command result —
+ * and inventing one so the bridge has something to compare is worse than saying
+ * there is nothing to compare. A codec built without an expected type carries
+ * none, so nothing checks a tag before it parses: the re-serialize length check
+ * is still what rejects mis-shaped bytes. Give the type whenever the bytes come
+ * from an object, which is every `getObject(id, { schema })` read.
  */
 export const bcs = <T extends Input, Input>(
   bcsType: BcsType<T, Input>,
-  expectedType: string
+  expectedType?: string
 ): Schema.Codec<T, Uint8Array> => {
-  const normalized = normalizeSafe(expectedType)
+  const normalized = expectedType === undefined ? undefined : normalizeSafe(expectedType)
+  // What the failure messages call the layout when it has no Move type of its
+  // own: `bcsType.name` is what `@mysten/bcs` named it (`"Escrow"`, `"vector"`).
+  const label = normalized ?? bcsType.name
   // A BCS layout carries no runtime type to test a decoded value against: the
   // parse below is the validation, so the target schema accepts whatever the
   // layout produced.
@@ -55,13 +68,13 @@ export const bcs = <T extends Input, Input>(
               // where `content` was expected. Re-serializing costs one pass and
               // catches both trailing and mis-shaped bytes.
               if (bcsType.serialize(parsed).toBytes().length !== bytes.length) {
-                throw new Error(`expected ${bytes.length} bytes of ${normalized}`)
+                throw new Error(`expected ${bytes.length} bytes of ${label}`)
               }
               return parsed
             },
             catch: (cause) =>
               new SchemaIssue.InvalidValue(
-                { message: `Could not parse ${normalized} from BCS content: ${String(cause)}` },
+                { message: `Could not parse ${label} from BCS content: ${String(cause)}` },
                 bytes,
                 options
               )
@@ -71,14 +84,16 @@ export const bcs = <T extends Input, Input>(
             try: () => bcsType.serialize(value).toBytes(),
             catch: (cause) =>
               new SchemaIssue.InvalidValue(
-                { message: `Could not serialize ${normalized} to BCS: ${String(cause)}` },
+                { message: `Could not serialize ${label} to BCS: ${String(cause)}` },
                 value,
                 options
               )
           })
       })
     )
-  ).annotate({ [SUI_TYPE_ANNOTATION]: normalized }) as unknown as Schema.Codec<T, Uint8Array>
+  ).annotate(
+    normalized === undefined ? {} : { [SUI_TYPE_ANNOTATION]: normalized }
+  ) as unknown as Schema.Codec<T, Uint8Array>
 }
 
 const MAX_ENCODING_DEPTH = 32
@@ -112,12 +127,49 @@ const findSuiType = (ast: SchemaAST.AST, depth: number): string | undefined => {
 export const expectedTypeOf = <T, E>(schema: Schema.Codec<T, E>): string | undefined =>
   findSuiType(schema.ast, 0)
 
+const parseSafe = (value: string): ReturnType<typeof parseStructTag> | undefined => {
+  try {
+    return parseStructTag(value)
+  } catch {
+    return undefined
+  }
+}
+
 /**
- * Whether an object's type tag satisfies a codec's expected type, comparing
- * normalized struct tags so generic instantiations match. Never fails.
+ * Whether an object's type tag satisfies an expected type.
+ *
+ * One rule, used everywhere a Move type is checked — the BCS bridge, the
+ * `expectedType` option of `Sui.getObject`, `getObjectOption` and `getObjects`,
+ * `SuiSchema.decode`, and the fake's owned-object filter:
+ *
+ * - **An expected tag with no type arguments names the generic itself**, so
+ *   `pkg::m::Composition` matches every instantiation:
+ *   `pkg::m::Composition<0x…::share::Share>` included. Only
+ *   `address::module::name` is compared, with the address normalized. This is
+ *   what a node does when a bare type is used as a filter, and it is what makes
+ *   a generic Move type usable with the bridge at all: a codec is written once
+ *   for `Composition<T>`, and the instantiation lives on the object.
+ * - **An expected tag that carries type arguments is compared in full**, after
+ *   `normalizeStructTag`, so `Coin<0x2::sui::SUI>` and its padded spelling are
+ *   the same type and `Coin<0x2::sui::SUI>` does not match `Coin<0x…::usdc::USDC>`.
+ *
+ * Anything that is not a struct tag — the literal `package`, a primitive — is
+ * compared as a normalized string. The object keeps its own instantiated type
+ * on `SuiObject.type`; this only decides whether the bytes may be decoded.
+ *
+ * Never fails.
  */
-export const typeMatches = (expected: string, actual: string): boolean =>
-  normalizeSafe(expected) === normalizeSafe(actual)
+export const typeMatches = (expected: string, actual: string): boolean => {
+  const expectedTag = parseSafe(expected)
+  if (expectedTag === undefined || expectedTag.typeParams.length > 0) {
+    return normalizeSafe(expected) === normalizeSafe(actual)
+  }
+  const actualTag = parseSafe(actual)
+  if (actualTag === undefined) return normalizeSafe(expected) === normalizeSafe(actual)
+  return expectedTag.address === actualTag.address &&
+    expectedTag.module === actualTag.module &&
+    expectedTag.name === actualTag.name
+}
 
 /**
  * Decodes BCS `content` bytes with a codec, turning any schema failure into a
@@ -131,7 +183,11 @@ export const typeMatches = (expected: string, actual: string): boolean =>
  * `DecodeError` it produces is worse than this one.
  *
  * `expectedType` defaults to the Move type the codec was built with, so passing
- * it is only needed for a codec that carries none. `objectId` is recorded on
+ * it is only needed for a codec that carries none, or to override the recorded
+ * one. `actualType` is the Move type the bytes actually came from, when the
+ * caller knows it — a dynamic field's `name.type`, a stream envelope's `type`:
+ * give it and the same tag check `getObject` does runs here, under the
+ * {@link typeMatches} rule, before a byte is parsed. `objectId` is recorded on
  * the error so an operator knows which object did not decode.
  *
  * Fails with: `DecodeError`.
@@ -139,19 +195,35 @@ export const typeMatches = (expected: string, actual: string): boolean =>
 export const decodeContent = <T>(
   schema: Schema.Codec<T, Uint8Array>,
   content: Uint8Array,
-  context?: { readonly objectId?: ObjectId; readonly expectedType?: string }
-): Effect.Effect<T, DecodeError> =>
-  Schema.decodeUnknownEffect(schema)(content).pipe(
+  context?: {
+    readonly objectId?: ObjectId
+    readonly expectedType?: string
+    readonly actualType?: string
+  }
+): Effect.Effect<T, DecodeError> => {
+  const expected = context?.expectedType ?? expectedTypeOf(schema)
+  const withExpected = expected === undefined ? {} : { expectedType: expected }
+  const withObject = context?.objectId === undefined ? {} : { objectId: context.objectId }
+  const actual = context?.actualType
+  if (expected !== undefined && actual !== undefined && !typeMatches(expected, actual)) {
+    return Effect.fail(
+      new DecodeError({
+        ...withObject,
+        ...withExpected,
+        issue: `${
+          context?.objectId === undefined ? "the bytes have" : `object ${context.objectId} has`
+        } type ${actual}`
+      })
+    )
+  }
+  return Schema.decodeUnknownEffect(schema)(content).pipe(
     Effect.mapError(
       (error) =>
         new DecodeError({
-          ...(context?.objectId === undefined ? {} : { objectId: context.objectId }),
-          ...(context?.expectedType === undefined
-            ? expectedTypeOf(schema) === undefined
-              ? {}
-              : { expectedType: expectedTypeOf(schema)! }
-            : { expectedType: context.expectedType }),
+          ...withObject,
+          ...withExpected,
           issue: error.message
         })
     )
   )
+}

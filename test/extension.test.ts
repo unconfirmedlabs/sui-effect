@@ -1,11 +1,17 @@
 import { describe, expect, test } from "bun:test"
+import type { BcsType } from "@mysten/bcs"
+import { bcs } from "@mysten/sui/bcs"
 import { Context, Effect, Layer, Schema, Stream } from "effect"
+import { ExtensionNotReady } from "../src/domain/errors.ts"
 import type { PromiseFace } from "../src/services/SuiExtension.ts"
 import { SuiExtension } from "../src/services/SuiExtension.ts"
 import { Sui } from "../src/services/Sui.ts"
 import { SuiCoreFake } from "../src/services/SuiCoreFake.ts"
 
 const CHAIN_ID = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
+
+/** Compile-time assignability, as a value a test can assert on. */
+const assignableTo = <_A extends _B, _B>(): true => true
 
 /** An extension's own error, to prove a rejection keeps the instance. */
 class EscrowClosed extends Schema.TaggedError<EscrowClosed>()("EscrowClosed", {
@@ -205,4 +211,153 @@ describe("SuiExtension.fromService", () => {
     await first.dispose()
     await second.dispose()
   })
+})
+
+/** A service whose surface is mostly synchronous, which is the common case. */
+class Sync extends Context.Service<Sync, {
+  /** A plain value. */
+  readonly packageId: string
+  /** A synchronous function: a recipe builder, in a real extension. */
+  readonly claim: (id: string) => { readonly target: string }
+  /** A class instance, which is a leaf: the face must not walk into it. */
+  readonly codec: BcsType<string, string>
+  /** And one Effect member, so the lazy path is exercised beside them. */
+  readonly status: Effect.Effect<string, never>
+}>()("demo/Sync") {
+  static readonly codec: BcsType<string, string> = bcs.string()
+
+  static readonly layer: Layer.Layer<Sync, never, Sui> = Layer.effect(
+    Sync,
+    Effect.gen(function*() {
+      yield* Sui
+      return {
+        packageId: "0xabc",
+        claim: (id: string) => ({ target: `0xabc::escrow::claim:${id}` }),
+        codec: Sync.codec,
+        status: Effect.succeed("ready")
+      }
+    })
+  )
+}
+
+const syncClient = (
+  options?: Partial<Parameters<typeof SuiExtension.fromService<Sync, Sync["Service"], never, "sync">>[1]>,
+  network = "mainnet"
+) => {
+  const fake = Effect.runSync(
+    Effect.provide(SuiCoreFake, SuiCoreFake.layer({ chainId: CHAIN_ID, network }), { local: true })
+  )
+  return SuiExtension.fromService(Sync, {
+    name: "sync",
+    layer: Sync.layer,
+    ...options
+  }).register(fake.client)
+}
+
+describe("SuiExtension.fromService: synchronous members", () => {
+  test("a plain value read before the runtime exists throws ExtensionNotReady", () => {
+    const api = syncClient()
+    // The placeholder cannot be the string, and pretending otherwise is the
+    // bug: any synchronous use of it says so instead.
+    expect(() => `${api.packageId}`).toThrow(ExtensionNotReady)
+    expect(() => JSON.stringify({ id: api.packageId })).toThrow(ExtensionNotReady)
+  })
+
+  test("a synchronous function called before the runtime exists rejects with ExtensionNotReady", async () => {
+    const api = syncClient()
+    const result = api.claim("0x1") as unknown as Promise<unknown>
+    const error = await result.then(() => undefined, (cause: unknown) => cause)
+    expect(error).toBeInstanceOf(ExtensionNotReady)
+    expect((error as ExtensionNotReady).extension).toBe("sync")
+    expect((error as ExtensionNotReady).member).toBe("claim")
+  })
+
+  test("$ready makes every member real, synchronous ones included", async () => {
+    const api = syncClient()
+    await api.$ready()
+    expect(api.packageId).toBe("0xabc")
+    expect(api.claim("0x1")).toEqual({ target: "0xabc::escrow::claim:0x1" })
+    expect(await api.status()).toBe("ready")
+    await api.$dispose()
+  })
+
+  test("$ready is idempotent and dispose is still its old name", async () => {
+    const api = syncClient()
+    await api.$ready()
+    await api.$ready()
+    expect(api.packageId).toBe("0xabc")
+    expect(api.dispose).toBe(api.$dispose)
+    await api.dispose()
+  })
+
+  test("warm builds the runtime inside register, so nothing has to be awaited", () => {
+    const api = syncClient({ warm: {} })
+    expect(api.packageId).toBe("0xabc")
+    expect(api.claim("0x2")).toEqual({ target: "0xabc::escrow::claim:0x2" })
+  })
+
+  test("a class instance member survives untouched, warm or not", async () => {
+    const warm = syncClient({ warm: {} })
+    expect(warm.codec).toBe(Sync.codec)
+    const lazy = syncClient()
+    await lazy.$ready()
+    expect(lazy.codec).toBe(Sync.codec)
+    expect(lazy.codec.parse(Sync.codec.serialize("hello").toBytes())).toBe("hello")
+    await lazy.$dispose()
+  })
+
+  test("warm on a network with no known chain id refuses rather than guessing", () => {
+    expect(() => syncClient({ warm: {} }, "devnet")).toThrow(/chain id/)
+    // With one given, it builds.
+    const api = syncClient({ warm: { chainId: "whatever-this-devnet-is" } }, "devnet")
+    expect(api.packageId).toBe("0xabc")
+  })
+
+  test("warm refuses a layer that needs an asynchronous step", () => {
+    const asyncLayer: Layer.Layer<Sync, never, Sui> = Layer.effect(
+      Sync,
+      Effect.flatMap(Effect.promise(() => Promise.resolve("0xdef")), (packageId) =>
+        Effect.map(Sui, () => ({
+          packageId,
+          claim: (id: string) => ({ target: id }),
+          codec: Sync.codec,
+          status: Effect.succeed("ready")
+        })))
+    )
+    expect(() => syncClient({ warm: {}, layer: asyncLayer })).toThrow()
+  })
+
+  test("options.sui pins the chain id the node must report", async () => {
+    const fake = Effect.runSync(
+      Effect.provide(SuiCoreFake, SuiCoreFake.layer({ chainId: CHAIN_ID, network: "devnet" }), {
+        local: true
+      })
+    )
+    const api = SuiExtension.fromService(Sync, {
+      name: "sync",
+      layer: Sync.layer,
+      sui: { chainId: "a-different-chain" }
+    }).register(fake.client)
+    const error = await api.status().then(() => undefined, (cause: unknown) => cause)
+    expect((error as { readonly _tag?: string })._tag).toBe("NetworkMismatch")
+    await api.$dispose()
+  })
+})
+
+/** The face's type, asserted rather than described. */
+test("PromiseFace keeps synchronous members synchronous and class instances whole", () => {
+  type Face = PromiseFace<Sync["Service"]>
+  expect(assignableTo<Face["packageId"], string>()).toBe(true)
+  expect(assignableTo<Face["claim"], (id: string) => { readonly target: string }>()).toBe(true)
+  expect(assignableTo<Face["codec"], BcsType<string, string>>()).toBe(true)
+  expect(assignableTo<Face["status"], () => Promise<string>>()).toBe(true)
+})
+
+test("awaiting a plain-value member before the runtime exists fails loudly", async () => {
+  const api = syncClient()
+  const error = await Promise.resolve(api.packageId as unknown as Promise<string>).then(
+    () => undefined,
+    (cause: unknown) => cause
+  )
+  expect(error).toBeInstanceOf(ExtensionNotReady)
 })

@@ -17,6 +17,8 @@ export {
   BuildError,
   DecodeError,
   ExecutionFailed,
+  ExtensionNotReady,
+  GraphQLUnavailable,
   type HasOutcome,
   JournalError,
   NetworkMismatch,
@@ -101,6 +103,9 @@ export {
   type SuiGrpcLayerOptions,
   type TransactionLookupError
 } from "./services/SuiCore.ts"
+
+/** The SDK's GraphQL client as one shared tag. sui-effect wraps no GraphQL API. */
+export { SuiGraphQL } from "./services/SuiGraphQL.ts"
 
 /**
  * The BCS bridge, namespaced the way the spec spells it:

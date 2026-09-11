@@ -72,9 +72,12 @@ need a field or a method the tier above does not expose, and through
 `Sui` is the opinionated tier over it, and is what application and extension
 code reads through: fixed include sets, BCS content decoded through `Schema`
 with the object's Move type checked first, `Option` where absence is normal,
-batch reads chunked to 50 and checked for missing or duplicated ids, pagination
+batch reads chunked to 50 and checked for missing or duplicated ids — per-item
+`Result` from `getObjects`, first-error-wins from `getObjectsOrFail` — pagination
 as `Stream`, one lock per sender so two transactions from one address cannot
-pick the same gas coin, and the chain's own clock. It carries the `SuiCore` it
+pick the same gas coin, and the chain's own clock. A Move type with no type
+arguments matches every instantiation of it, wherever a type is compared, so one
+codec covers a generic Move type and the object keeps its own instantiated type. It carries the `SuiCore` it
 was built over as `sui.core`, which is why every `Tx.*` function needs only
 `Sui`.
 
@@ -117,7 +120,21 @@ is derived — not hand-maintained — by `SuiExtension.fromService`, so a consu
 with an SDK client writes `client.$extend(escrow(options))` and then plain
 `await`s, with the same tagged error instances on rejection.
 **[`docs/extensions.md`](docs/extensions.md) is the contract**, and
-`examples/extension-template/` is a copyable package that implements it.
+`examples/extension-template/` is a copyable package that implements it — it
+ships inside the published package, so
+`node_modules/sui-effect/examples/extension-template/` is there to copy without
+a checkout.
+
+Three things an extension author should know before reading the guide. A layer
+may require `Sui | SuiCore` and must provide everything else itself, including
+another extension's service — the guide's "composing extensions" section is that
+pattern. A Promise face's **synchronous** members (recipe builders, a package
+id) are real only once the runtime exists, so either `await client.<name>.$ready()`
+once or register with `warm`; calling one before that fails with
+`ExtensionNotReady` rather than returning a Promise the type does not mention.
+And `SuiGraphQL` is sui-effect's tag over the SDK's `SuiGraphQLClient` — one
+client shared by every extension that reads GraphQL; sui-effect wraps no GraphQL
+API of its own.
 
 ## Errors
 
@@ -140,6 +157,8 @@ no error inheritance to match on.
 | `PolicyDenied` | `rule`, `message` | A preflight policy refused it before it was signed |
 | `JournalError` | `cause` | The journal could not be read or written. It escapes `Tx.submit` only from the write that happens **before** the first send; after the network has answered, a failed write is logged and the answer stands |
 | `UnexpectedEffects` | `digest`, `expected`, `found` | The effects did not contain what the caller expected |
+| `GraphQLUnavailable` | `method`, `reason` | The GraphQL endpoint an extension needs is not usable. What `SuiGraphQL.layerUnavailable` rejects every call with |
+| `ExtensionNotReady` | `extension`, `member` | A synchronous member of a Promise face was called before its runtime existed: `await client.<name>.$ready()`, or register with `warm` |
 
 `ExecutionReason` mirrors the SDK's `ExecutionError` variant for variant, with
 `MoveAbort.abortCode` as a `bigint` and clever-error constant names decoded.
@@ -196,11 +215,20 @@ repository touches the network, and neither should yours.
 
 | Package | Range | Tested against |
 |---|---|---|
-| `effect` | `>=4.0.0-rc.112 <4.1` | `4.0.0-rc.112` |
-| `@mysten/sui` | `^2.28` (the first version whose BCS and gRPC round-trip `ValidDuring` and `Validity` expirations) | `2.30.0` |
+| `effect` | `>=4.0.0-rc.112 <4.1` | `4.0.0-rc.112` and `4.0.0-rc.113`, both in CI |
+| `@mysten/sui` | `^2.28` (the first version whose BCS and gRPC round-trip `ValidDuring` and `Validity` expirations) | `2.29.0` and `2.30.0`, both in CI; `2.30.0` is the pinned devDependency |
 | `@mysten/bcs` | `^2.1.1` | `2.1.1` |
-| TypeScript | `5.9.x` | `5.9.3` |
+| TypeScript | `5.9.x` to build | `5.9.3` |
 | Bun | `1.4.x` | `1.4.2` |
+
+The SDK row is a matrix, not a hope: CI typechecks and runs the suite against
+`@mysten/sui` 2.29.0 and 2.30.0, which are the versions consumers pin today.
+
+**Consumers on TypeScript 7 (`tsgo`) are supported.** The shipped `.d.ts` needs
+nothing from the old compiler. The `prepare` script here
+(`effect-language-service patch`) is a library concern — it patches the checker
+this repository develops against — and should not be copied into a consumer or
+an extension package.
 
 `bun run check` is typecheck, build, tests and the extension template's own
 check.

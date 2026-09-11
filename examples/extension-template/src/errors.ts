@@ -41,3 +41,21 @@ export class EscrowSettlementUnknown extends Schema.TaggedError<EscrowSettlement
 ) {
   readonly outcome: Outcome = "unknown"
 }
+
+/**
+ * This release bundles no deployment for the network the client is on.
+ *
+ * The typed failure of `Escrow.layerBundled`: a layer that picks its package id
+ * from `sui.network` has exactly one way to fail, and a caller that can run on
+ * an unknown network wants to see it in the type rather than in a log line.
+ *
+ * Nothing was submitted — nothing was even built — so the outcome is
+ * `not_applied`. A predecessor library's `DeploymentError` becomes this: your
+ * own tag, prefixed with your package name, declaring its outcome.
+ */
+export class EscrowUnsupportedNetwork extends Schema.TaggedError<EscrowUnsupportedNetwork>()(
+  "escrow/EscrowUnsupportedNetwork",
+  { network: Schema.String }
+) {
+  readonly outcome: Outcome = "not_applied"
+}

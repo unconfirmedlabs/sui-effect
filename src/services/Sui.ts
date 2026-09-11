@@ -8,6 +8,7 @@
  *
  * @since 0.1.0
  */
+import type { BcsType } from "@mysten/bcs"
 import { bcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { Transaction } from "@mysten/sui/transactions"
@@ -25,7 +26,7 @@ import {
   Semaphore,
   Stream
 } from "effect"
-import { bcs as bcsCodec, decodeContent, expectedTypeOf, typeMatches } from "../domain/bcs.ts"
+import { bcs as bcsCodec, decodeContent } from "../domain/bcs.ts"
 import {
   BuildError,
   DecodeError,
@@ -196,6 +197,29 @@ export interface SuiService {
     >
   }
 
+  /**
+   * `getObjects` for a caller who wants the first per-item failure to fail the
+   * whole read.
+   *
+   * The soft idiom — filter or default the `Result` array `getObjects` returns
+   * — is right when a missing object is ordinary. This is the hard one: every
+   * id must be there, and the first that is not is the failure. Order is the
+   * order of `ids`.
+   *
+   * Fails with: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`,
+   * `DecodeError`, `TransportError`.
+   */
+  readonly getObjectsOrFail: {
+    <S>(
+      ids: ReadonlyArray<ObjectId>,
+      opts: { readonly schema: Schema.Codec<S, Uint8Array>; readonly expectedType?: string }
+    ): Effect.Effect<ReadonlyArray<SuiObject<S>>, BatchItemError | TransportError>
+    (
+      ids: ReadonlyArray<ObjectId>,
+      opts?: { readonly schema?: undefined; readonly expectedType?: string }
+    ): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>
+  }
+
   /** The balance of one coin type for one owner. Fails with: `TransportError`. */
   readonly getBalance: (
     owner: SuiAddress,
@@ -225,10 +249,18 @@ export interface SuiService {
   /**
    * Simulates a transaction with the fixed simulate include set.
    *
+   * `opts.sender` is set on the transaction when the recipe did not set one.
+   * A simulation needs *a* sender: the SDK substitutes the zero address when
+   * the transaction carries none, which is what a read-only simulation of a
+   * public function wants and is what happens here when `sender` is omitted. A
+   * recipe may `tx.setSender(...)` itself, and then it wins. Bytes that are
+   * already serialized carry their own sender and `opts.sender` does not apply.
+   *
    * Fails with: `SimulationFailed`, `BuildError`, `TransportError`.
    */
   readonly simulate: (
-    input: Recipe | Transaction | Uint8Array
+    input: Recipe | Transaction | Uint8Array,
+    opts?: { readonly sender?: SuiAddress }
   ) => Effect.Effect<Simulation, SimulationFailed | BuildError | TransportError>
 
   /**
@@ -236,12 +268,25 @@ export interface SuiService {
    * and decodes return value `result` (default 0) of command `command`
    * (default the last command).
    *
+   * The codec may be a bare `@mysten/bcs` `BcsType` — `bcs.Address()`,
+   * `bcs.vector(bcs.u64())` — because a Move **return value** has no struct tag
+   * to check it against. A `SuiSchema.bcs` codec works too, and so does one
+   * composed with `Schema.decodeTo(DomainClass, …)`; no type tag is compared
+   * either way.
+   *
+   * `opts.sender` is the address the call is simulated as, defaulting to the
+   * zero address the way the SDK does; a recipe that sets its own sender wins.
+   *
    * Fails with: `SimulationFailed`, `BuildError`, `DecodeError`, `TransportError`.
    */
-  readonly view: <S>(
+  readonly view: <S, I>(
     recipe: Recipe,
-    schema: Schema.Codec<S, Uint8Array>,
-    opts?: { readonly command?: number; readonly result?: number }
+    schema: Schema.Codec<S, Uint8Array> | BcsType<S, I>,
+    opts?: {
+      readonly command?: number
+      readonly result?: number
+      readonly sender?: SuiAddress
+    }
   ) => Effect.Effect<S, SimulationFailed | BuildError | DecodeError | TransportError>
 
   /** Every object an address owns, paginated. Fails with: `TransportError`. */
@@ -279,6 +324,20 @@ interface ReadOptions<S> {
   readonly expectedType?: string
 }
 
+/**
+ * A `@mysten/bcs` layout rather than a `Schema.Codec`.
+ *
+ * Structural rather than `instanceof`: a consumer whose `@mysten/bcs` is a
+ * second copy in the tree would fail the identity test while holding a
+ * perfectly good layout. A `Schema.Codec` has neither a `read` function nor a
+ * `serialize` method, so the two cannot be confused.
+ */
+const isBcsType = <S, I>(
+  value: Schema.Codec<S, Uint8Array> | BcsType<S, I>
+): value is BcsType<S, I> =>
+  typeof (value as { readonly read?: unknown }).read === "function" &&
+  typeof (value as { readonly serialize?: unknown }).serialize === "function"
+
 const keyOf = (id: string): string => {
   try {
     return normalizeSuiAddress(id)
@@ -302,17 +361,13 @@ const makeSui = (
     const envelope = yield* envelopeOf(object)
     const schema = opts?.schema
     if (schema === undefined) return makeSuiObject(envelope, object.content)
-    const expected = opts?.expectedType ?? expectedTypeOf(schema)
-    if (expected !== undefined && !typeMatches(expected, envelope.type)) {
-      return yield* new DecodeError({
-        objectId: envelope.objectId,
-        expectedType: expected,
-        issue: `object ${envelope.objectId} has type ${envelope.type}`
-      })
-    }
+    // One rule for every Move type check in the library: `typeMatches` inside
+    // `decodeContent`, which accepts a bare tag as every instantiation of it
+    // and compares a parameterized one in full.
     const content = yield* decodeContent(schema, object.content, {
       objectId: envelope.objectId,
-      expectedType: envelope.type
+      ...(opts?.expectedType === undefined ? {} : { expectedType: opts.expectedType }),
+      actualType: envelope.type
     })
     return makeSuiObject(envelope, content)
   })
@@ -421,6 +476,22 @@ const makeSui = (
     return results
   })
 
+  const getObjectsOrFail = Effect.fn("Sui.getObjectsOrFail")(function*<S>(
+    ids: ReadonlyArray<ObjectId>,
+    opts?: ReadOptions<S>
+  ): Effect.fn.Return<
+    ReadonlyArray<SuiObject<S | Uint8Array>>,
+    BatchItemError | TransportError
+  > {
+    const results = yield* getObjects(ids, opts)
+    const objects: Array<SuiObject<S | Uint8Array>> = []
+    for (const result of results) {
+      if (Result.isFailure(result)) return yield* result.failure
+      objects.push(result.success)
+    }
+    return objects
+  })
+
   const getBalance = Effect.fn("Sui.getBalance")(function*(
     owner: SuiAddress,
     coinType?: CoinType
@@ -465,14 +536,17 @@ const makeSui = (
   })
 
   const toTransaction = (
-    input: Recipe | Transaction | Uint8Array
+    input: Recipe | Transaction | Uint8Array,
+    sender?: SuiAddress
   ): Effect.Effect<Transaction | Uint8Array, BuildError> => {
     if (input instanceof Uint8Array) return Effect.succeed(input)
-    if (typeof input !== "function") return Effect.succeed(input)
     return Effect.try({
       try: () => {
-        const tx = new Transaction()
-        input(tx)
+        const tx = typeof input === "function" ? new Transaction() : input
+        if (typeof input === "function") input(tx)
+        // `setSenderIfNotSet`, so a recipe that set its own sender wins. With
+        // no sender at all the SDK simulates as the zero address.
+        if (sender !== undefined) tx.setSenderIfNotSet(sender)
         return tx
       },
       catch: (cause) => new BuildError({ message: "the recipe threw", cause })
@@ -481,12 +555,13 @@ const makeSui = (
 
   const simulateRaw = Effect.fn("Sui.simulateRaw")(function*(
     input: Recipe | Transaction | Uint8Array,
-    checksEnabled: boolean
+    checksEnabled: boolean,
+    sender?: SuiAddress
   ): Effect.fn.Return<
     SuiClientTypes.SimulateTransactionResult<typeof SIMULATE_INCLUDE>,
     SimulationFailed | BuildError | TransportError
   > {
-    const transaction = yield* toTransaction(input)
+    const transaction = yield* toTransaction(input, sender)
     return yield* core.simulateTransaction({
       transaction,
       include: SIMULATE_INCLUDE,
@@ -523,17 +598,29 @@ const makeSui = (
   })
 
   const simulate = Effect.fn("Sui.simulate")(function*(
-    input: Recipe | Transaction | Uint8Array
+    input: Recipe | Transaction | Uint8Array,
+    opts?: { readonly sender?: SuiAddress }
   ): Effect.fn.Return<Simulation, SimulationFailed | BuildError | TransportError> {
-    return yield* toSimulation(yield* simulateRaw(input, true))
+    return yield* toSimulation(yield* simulateRaw(input, true, opts?.sender))
   })
 
-  const view = Effect.fn("Sui.view")(function*<S>(
+  const view = Effect.fn("Sui.view")(function*<S, I>(
     recipe: Recipe,
-    schema: Schema.Codec<S, Uint8Array>,
-    opts?: { readonly command?: number; readonly result?: number }
+    schema: Schema.Codec<S, Uint8Array> | BcsType<S, I>,
+    opts?: {
+      readonly command?: number
+      readonly result?: number
+      readonly sender?: SuiAddress
+    }
   ): Effect.fn.Return<S, SimulationFailed | BuildError | DecodeError | TransportError> {
-    const simulation = yield* toSimulation(yield* simulateRaw(recipe, false))
+    // A `BcsType` is a class from `@mysten/bcs` with a `read` function and a
+    // `serialize` method; a `Schema.Codec` has neither. The cast on the bridge
+    // call is the `T extends Input` constraint `bcs` carries for encoding,
+    // which a view never uses: it only ever decodes.
+    const codec = isBcsType(schema)
+      ? bcsCodec(schema as unknown as BcsType<S, S>)
+      : schema
+    const simulation = yield* toSimulation(yield* simulateRaw(recipe, false, opts?.sender))
     const index = opts?.command ?? simulation.commandResults.length - 1
     const command = simulation.commandResults[index]
     if (command === undefined) {
@@ -546,7 +633,7 @@ const makeSui = (
         issue: `command ${index} has no return value ${position}`
       })
     }
-    return yield* decodeContent(schema, value.bcs)
+    return yield* decodeContent(codec, value.bcs)
   })
 
   const streamOwnedObjects = (owner: SuiAddress, opts?: { readonly type?: StructTag }) =>
@@ -658,6 +745,7 @@ const makeSui = (
     getObject: getObject as SuiService["getObject"],
     getObjectOption: getObjectOption as SuiService["getObjectOption"],
     getObjects: getObjects as SuiService["getObjects"],
+    getObjectsOrFail: getObjectsOrFail as SuiService["getObjectsOrFail"],
     getBalance,
     getDynamicFieldOption,
     getTransaction,
@@ -728,6 +816,33 @@ export class Sui extends Context.Service<Sui, SuiService>()("sui-effect/Sui") {
           idleTimeToLive: SENDER_LOCK_TTL
         })
         return makeSui(core, chainIdentifier, locks)
+      })
+    )
+
+  /**
+   * `Sui` over whatever `SuiCore` is provided, **without reading the chain
+   * identifier**: the one given is taken as the chain's.
+   *
+   * This exists for one caller: `SuiExtension.fromService` with `warm`, which
+   * builds its runtime synchronously inside `register` and therefore cannot
+   * await a `getChainIdentifier` round trip. Nothing is asserted, because
+   * nothing is asked — a node on another chain is not detected here. What still
+   * protects a warm registration is the chain itself: `Tx.build` stamps this id
+   * on the transaction's `ValidDuring` expiration, and a validator refuses
+   * bytes signed for another chain.
+   *
+   * Prefer {@link layerNoDeps}, which asks. Never fails.
+   */
+  static readonly layerNoDepsPinned = (chainId: string): Layer.Layer<Sui, never, SuiCore> =>
+    Layer.effect(
+      Sui,
+      Effect.gen(function*() {
+        const core = yield* SuiCore
+        const locks = yield* RcMap.make({
+          lookup: (_address: string) => Effect.succeed(Semaphore.makeUnsafe(1)),
+          idleTimeToLive: SENDER_LOCK_TTL
+        })
+        return makeSui(core, chainId, locks)
       })
     )
 

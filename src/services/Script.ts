@@ -301,6 +301,8 @@ const codeOfError = (error: unknown): number => {
     case "PolicyDenied":
     case "JournalError":
     case "UnexpectedEffects":
+    case "GraphQLUnavailable":
+    case "ExtensionNotReady":
       return EXIT.notApplied
     case "SchemaError":
       return EXIT.configuration

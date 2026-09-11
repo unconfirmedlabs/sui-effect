@@ -24,6 +24,7 @@ import {
   toBase58
 } from "@mysten/sui/utils"
 import { Context, Effect, Layer, Option } from "effect"
+import { typeMatches } from "../domain/bcs.ts"
 import type { SuiCoreService } from "./SuiCore.ts"
 import { DefectMarker, makeFromClient, SuiCore } from "./SuiCore.ts"
 
@@ -404,6 +405,22 @@ const unimplemented = (method: string): never => {
 /**
  * The in-memory `SuiCore`.
  *
+ * Three things about it that a test has to know, because they are not visible
+ * from the outside:
+ *
+ * - **Its `client` implements `$extend`.** `SuiCoreFakeState.client` is a
+ *   `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` gives a
+ *   derived Promise face over the fake and a test can exercise a registration
+ *   exactly the way a consumer writes it, with no network.
+ * - **`listOwnedObjects` filters like a node.** The `type` option goes through
+ *   the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
+ *   instantiation of a generic rather than only its own spelling.
+ * - **`getDynamicField` matches on `name.type` alone.** It returns the first
+ *   scripted entry of the parent whose `name.type` equals the requested one; the
+ *   `name.bcs` bytes are not compared. Two fields of the same key type on one
+ *   parent cannot be told apart here — script them on different parents, and
+ *   test your key encoding with a decode test instead.
+ *
  * @example
  * ```ts
  * import { Effect } from "effect"
@@ -756,7 +773,10 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         const objectOwner = object.owner ?? addressOwner("0x1")
         if (objectOwner.$kind !== "AddressOwner") return false
         if (normalizeSuiAddress(objectOwner.AddressOwner) !== owner) return false
-        return options.type === undefined || object.type === options.type
+        // A node matches a bare type filter against every instantiation of a
+        // generic; exact string equality here would hide `Composition<Share>`
+        // from a `streamOwnedObjects(owner, { type: "pkg::m::Composition" })`.
+        return options.type === undefined || typeMatches(options.type, object.type)
       })
       const result = page(owned, options.cursor, options.limit)
       return {

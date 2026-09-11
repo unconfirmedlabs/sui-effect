@@ -9,7 +9,7 @@
  *
  * @since 0.1.0
  */
-import type { Keypair } from "@mysten/sui/cryptography"
+import type { Keypair, Signer as SdkSigner } from "@mysten/sui/cryptography"
 import { decodeSuiPrivateKey } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
@@ -55,14 +55,23 @@ const signatureOf = (signature: string): Effect.Effect<Signature, SigningError> 
   )
 
 /**
- * Wraps an SDK `Keypair` (or anything with the same `toSuiAddress`,
- * `getKeyScheme`, `signTransaction` and `signPersonalMessage` surface).
+ * Wraps any `@mysten/sui/cryptography` `Signer`.
  *
- * The keypair holds the secret; the `Signer` it returns does not expose it.
+ * The SDK's `Signer` is the base class every credential extends: `Keypair` and
+ * its three schemes, but also a Ledger signer, a wallet adapter's signer, a KMS
+ * signer — anything that can `toSuiAddress`, `getKeyScheme`, `signTransaction`
+ * and `signPersonalMessage`. Nothing here needs the secret, so nothing here
+ * needs a keypair, and the `Signer` this returns exposes no secret material
+ * either.
+ *
+ * For a credential that is not an SDK `Signer` at all — a remote service, a
+ * hardware device behind your own protocol — use {@link remote}, which takes
+ * Effects and the address to sign as.
+ *
  * Never fails: a bad address or signature surfaces as a `SigningError` from the
  * member that produced it, not from construction.
  */
-export const fromKeypair = (keypair: Keypair): Signer => {
+export const fromSdkSigner = (keypair: SdkSigner): Signer => {
   const address = keypair.toSuiAddress()
   return {
     // `toSuiAddress` returns the normalized form the SDK derived from the
@@ -86,6 +95,13 @@ export const fromKeypair = (keypair: Keypair): Signer => {
     })
   }
 }
+
+/**
+ * {@link fromSdkSigner} under the name the spec gave it when a keypair was the
+ * only thing it took. A `Keypair` **is** an SDK `Signer`, so this is a thin
+ * alias kept for callers who hold one. Never fails.
+ */
+export const fromKeypair = (keypair: Keypair): Signer => fromSdkSigner(keypair)
 
 /** Builds the keypair class the scheme flag of a Bech32 secret key names. */
 const keypairOf = (parsed: { scheme: string; secretKey: Uint8Array }): Keypair | undefined => {
@@ -211,10 +227,11 @@ export const remote = (signer: RemoteSigner): Signer => ({
 
 /**
  * The constructors, namespaced the way the spec spells them:
- * `Signer.fromKeypair`, `Signer.fromConfig`, `Signer.ephemeral`,
- * `Signer.remote`. The type `Signer` is the interface above.
+ * `Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.fromConfig`,
+ * `Signer.ephemeral`, `Signer.remote`. The type `Signer` is the interface above.
  */
 export const Signer = {
+  fromSdkSigner,
   fromKeypair,
   fromConfig,
   ephemeral,

@@ -14,7 +14,7 @@
         "typescript": "5.9.3",
       },
       "peerDependencies": {
-        "@mysten/bcs": "^2.1.0",
+        "@mysten/bcs": "^2.1.1",
         "@mysten/sui": "^2.28",
         "effect": ">=4.0.0-rc.112 <4.1",
       },

@@ -1,6 +1,6 @@
 {
   "name": "sui-effect",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "An opinionated Effect v4 layer over @mysten/sui: two client tiers, closed error unions, and a typed transaction lifecycle.",
   "license": "MIT",
   "type": "module",
@@ -36,7 +36,8 @@
     "LICENSE",
     "LLMS.md",
     "AGENTS.md",
-    "docs/extensions.md"
+    "docs/extensions.md",
+    "examples/extension-template"
   ],
   "scripts": {
     "prepare": "effect-language-service patch",

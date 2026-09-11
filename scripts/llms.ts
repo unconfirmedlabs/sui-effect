@@ -39,6 +39,39 @@ const WORKED_EXAMPLE_FILES = [
   "package.json"
 ]
 
+/**
+ * How every type in this file is rendered.
+ *
+ * `NoTruncation` is the important one: without it the checker stops at 160
+ * characters and writes `... 7 more ...`, which hides exactly the fields a
+ * reader came for. The alias flags ask the checker to name a type it can name
+ * instead of expanding it structurally.
+ */
+const TYPE_FLAGS = ts.TypeFormatFlags.NoTruncation |
+  ts.TypeFormatFlags.UseAliasDefinedOutsideCurrentScope |
+  ts.TypeFormatFlags.InTypeAlias
+
+/**
+ * The branded schema types, printed by the name they are exported under.
+ *
+ * `SuiAddress` is `Schema.String.pipe(Schema.brand("SuiAddress"))`, so its
+ * decoded type is an anonymous intersection `string & Brand<"SuiAddress">` that
+ * carries no alias symbol for the checker to print — `type SuiAddress = typeof
+ * SuiAddress.Type` names it, but nothing on the type points back at that name.
+ * The brand string is that name, so the intersection can be spelled back as the
+ * alias mechanically, and `SuiAddress` is what a caller writes.
+ *
+ * Also collapses the `import("effect/Brand").` qualifier the emitter adds when a
+ * type is written from a declaration in another file.
+ */
+const withBrandNames = (text: string): string =>
+  text
+    .replace(/import\("[^"]*\/Brand"\)\./g, "")
+    .replace(
+      /\(?\b(?:string|number|bigint|boolean|symbol)\s*&\s*Brand<"([A-Za-z0-9_$]+)">\)?/g,
+      "$1"
+    )
+
 const kindOf = (declaration: ts.Declaration): string => {
   if (ts.isClassDeclaration(declaration)) return "class"
   if (ts.isInterfaceDeclaration(declaration)) return "interface"
@@ -113,40 +146,115 @@ const fieldsOf = (
   return properties
     .map((property) =>
       `  readonly ${property.getName()}: ${
-        checker.typeToString(checker.getTypeOfSymbolAtLocation(property, declaration))
+        // The field itself is indented by two, so its own lines follow it.
+        typeTextOf(property, declaration, checker).split("\n").join("\n  ")
       }`
     )
     .join("\n")
 }
 
-/**
- * How much of a schema's inferred type is worth printing before it stops being
- * a signature and starts being noise.
- */
-const MAX_SCHEMA_SIGNATURE = 400
+/** Past this, a one-line type is broken across lines the way the emitter does. */
+const MAX_INLINE_TYPE = 200
 
 /**
- * And how much of any other `const`'s signature is worth printing. A function's
- * signature is the point, so this is generous; past it, the checker's own
- * summary reads better than an inlined page of structural types, and the error
- * union is in the "Fails with" line either way.
+ * A type the checker wrote on one line, laid out on several.
+ *
+ * `typeToString` has no pretty-printer — `MultilineObjectLiterals` indents but
+ * never breaks the line — so an untruncated decoded type arrives as one 4000
+ * character string. This is the emitter's own layout, applied afterwards: a
+ * brace opens a block, a semicolon ends a member, and text inside a string
+ * literal is left alone.
  */
-const MAX_SIGNATURE = 1200
+const indented = (text: string): string => {
+  if (text.length <= MAX_INLINE_TYPE) return text
+  let out = ""
+  let depth = 0
+  let quote: string | undefined
+  // A line break owed before the next character that is not a space.
+  let pending = false
+  const flush = (): void => {
+    if (!pending) return
+    out += `\n${"    ".repeat(depth)}`
+    pending = false
+  }
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]!
+    if (quote !== undefined) {
+      out += char
+      if (char === quote) quote = undefined
+      continue
+    }
+    if (char === "\"" || char === "'") {
+      flush()
+      quote = char
+      out += char
+      continue
+    }
+    if (char === " " && pending) continue
+    if (char === "{" && text[index + 1] === "}") {
+      flush()
+      out += "{}"
+      index++
+      continue
+    }
+    if (char === "{") {
+      flush()
+      out += "{"
+      depth++
+      pending = true
+      continue
+    }
+    if (char === "}") {
+      depth = Math.max(0, depth - 1)
+      pending = true
+      flush()
+      out += "}"
+      continue
+    }
+    flush()
+    out += char
+    if (char === ";") pending = true
+  }
+  return out
+}
+
+/** The type of one symbol, untruncated and with branded aliases named. */
+const typeTextOf = (
+  symbol: ts.Symbol,
+  declaration: ts.Declaration,
+  checker: ts.TypeChecker
+): string =>
+  indented(
+    withBrandNames(
+      checker.typeToString(
+        checker.getTypeOfSymbolAtLocation(symbol, declaration),
+        declaration,
+        TYPE_FLAGS
+      )
+    )
+  )
+
+/** The decoded type of a schema, as the comment printed under its declaration. */
+const decodesTo = (type: string): string =>
+  type.includes("\n")
+    ? ["// decodes to:", ...type.split("\n").map((line) => `// ${line}`)].join("\n")
+    : `// decodes to: ${type}`
 
 /**
  * The declaration as it appears in the `.d.ts`, without its JSDoc block.
  *
- * Interfaces and classes are printed whole: their bodies are the member list,
- * which is exactly what a reader wants. A `const` whose inferred type runs to
- * pages — every `Schema` in the package does — is printed as the checker
- * summarizes it, plus the type it decodes to, which is the part a caller uses.
+ * Everything is printed whole. The emitted declaration is already the whole
+ * member list, line by line and indented, so a long one costs lines rather than
+ * legibility — and every earlier attempt to compress a long signature ended in
+ * the checker's `... 6 more ...`, which drops the members a caller needs. A
+ * `Schema` also gets the type it decodes to, which is the part a caller holds.
  */
 const signatureOf = (
   symbol: ts.Symbol,
   declaration: ts.Declaration,
   checker: ts.TypeChecker
 ): string => {
-  const text = declaration.getText()
+  const text = withBrandNames(declaration.getText())
   if (ts.isClassDeclaration(declaration) && declaration.members.length === 0) {
     // A `Schema.TaggedError` class has an empty body and an extends clause the
     // emitter names `X_base`, so the fields are only visible on the type.
@@ -158,15 +266,11 @@ const signatureOf = (
   const prefix = ts.isVariableStatement(statement) ? "declare const " : ""
   const type = checker.getTypeOfSymbolAtLocation(symbol, declaration)
   const decoded = type.getProperty("Type")
-  // Only a `Schema` is compressed: a function's signature is worth printing in
-  // full however long it is, but a schema's inferred type is pages of
-  // combinator soup whose useful half is the type it decodes to.
-  const limit = decoded === undefined ? MAX_SIGNATURE : MAX_SCHEMA_SIGNATURE
-  if (text.length <= limit) return `${prefix}${text}`
-  const summary = `${prefix}${symbol.getName()}: ${checker.typeToString(type)}`
-  return decoded === undefined ? summary : [
-    summary,
-    `// decodes to: ${checker.typeToString(checker.getTypeOfSymbolAtLocation(decoded, declaration))}`
+  // A schema's declaration is pages of combinator soup, and the half a caller
+  // uses is the type it decodes to, so that is printed underneath it.
+  return decoded === undefined ? `${prefix}${text}` : [
+    `${prefix}${text}`,
+    decodesTo(typeTextOf(decoded, declaration, checker))
   ].join("\n")
 }
 

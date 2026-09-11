@@ -23,8 +23,10 @@ import {
   TransactionNotFound,
   TransportError
 } from "../domain/errors.ts"
+
 import { Digest, executionReasonOf, ExecutionReason, KnownNetwork, ObjectId } from "../domain/schemas.ts"
 
+export { RETRYABLE_GRPC_STATUSES } from "../domain/errors.ts"
 export { executionReasonOf } from "../domain/schemas.ts"
 
 const UNKNOWN_REASON = ExecutionReason.cases.Unknown.make({ $kind: "Unknown" })
@@ -62,47 +64,6 @@ const asDigest = (value: string): Digest => {
 }
 
 /**
- * gRPC status names a read may be retried on, plus HTTP 5xx and 429. Timeouts
- * map to `DEADLINE_EXCEEDED` with `retryable: true`.
- *
- * `INTERNAL` and `UNKNOWN` are transport-level failures, not answers from the
- * node: `@protobuf-ts/grpcweb-transport` turns a rejected `fetch` (connection
- * refused, DNS failure) into an `RpcError` with code `INTERNAL`, and its
- * grpc-web format maps HTTP 500 to `UNKNOWN` (503 to `UNAVAILABLE`, 504 to
- * `DEADLINE_EXCEEDED`, 429 to `RESOURCE_EXHAUSTED`). Without them a read
- * against a node that is merely down or restarting is never retried.
- */
-export const RETRYABLE_GRPC_STATUSES: ReadonlySet<string> = new Set([
-  "UNAVAILABLE",
-  "DEADLINE_EXCEEDED",
-  "RESOURCE_EXHAUSTED",
-  "INTERNAL",
-  "UNKNOWN"
-])
-
-const isRetryableHttpStatus = (status: number): boolean => status === 429 || status >= 500
-
-const statusOf = (cause: unknown): { readonly status?: string; readonly retryable: boolean } => {
-  if (typeof cause !== "object" || cause === null) return { retryable: false }
-  const record = cause as Record<string, unknown>
-  const tag = record["_tag"]
-  const name = record["name"]
-  if (tag === "TimeoutError" || name === "TimeoutError" || name === "AbortError") {
-    return { status: "DEADLINE_EXCEEDED", retryable: true }
-  }
-  const httpStatus = record["status"]
-  if (typeof httpStatus === "number") {
-    return { status: String(httpStatus), retryable: isRetryableHttpStatus(httpStatus) }
-  }
-  const code = record["code"]
-  if (typeof code === "string") {
-    return { status: code, retryable: RETRYABLE_GRPC_STATUSES.has(code) }
-  }
-  if (typeof code === "number") return { status: String(code), retryable: false }
-  return { retryable: false }
-}
-
-/**
  * A thrown value carrying this symbol is a bug in the caller or in a test
  * double, not a transport failure. `mapSdkError` re-throws it so it surfaces as
  * a defect instead of being classified as a `TransportError`.
@@ -115,13 +76,7 @@ const rethrowDefects = (cause: unknown): void => {
 
 const transportError = (method: string, cause: unknown): TransportError => {
   rethrowDefects(cause)
-  const { retryable, status } = statusOf(cause)
-  return new TransportError({
-    method,
-    retryable,
-    ...(status === undefined ? {} : { status }),
-    cause
-  })
+  return TransportError.fromUnknown(method, cause)
 }
 
 /**

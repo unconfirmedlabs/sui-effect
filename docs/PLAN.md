@@ -292,3 +292,106 @@ Additive only; no existing signature changed.
   property comes back as possibly `undefined` because the SDK types it through
   an indexed access. Consumers have to name it once; nothing on our side can fix
   it.
+
+## Scoping fixes (2026-09-11)
+
+Applied from four independent conversion scoping reviews (effect, partyos,
+musicos, platform), consolidated as items 1 to 20. One line each: what changed
+and why. Everything here is additive except where noted.
+
+### Library
+
+1. **One Move type rule.** `typeMatches` now parses both tags with
+   `parseStructTag`: a bare expected tag matches every instantiation
+   (`pkg::m::Composition` accepts `Composition<Share>`), a parameterized one is
+   compared in full. Four of musicos's seven object types are generic per
+   instance, so exact-tag matching made the bridge unusable for them. The rule is
+   applied in the bridge, in `expectedType`, in `SuiSchema.decode` (new
+   `actualType` context field) and in the fake's owned-object filter, which was
+   stricter than a node. DESIGN §11.
+2. **`SuiSchema.bcs(codec, expectedType?)` and `Sui.view` over a bare codec.** A
+   Move return value has no struct tag, so `view(recipe, bcs.Address())` now
+   takes a `BcsType` directly and the expected type is optional. `view` and
+   `simulate` gained `opts.sender` (`setSenderIfNotSet`, so a recipe's own sender
+   wins; the SDK's zero-address default otherwise).
+3. **The Promise face stops lying about synchronous members.** `fromService`
+   gained `warm`, which builds the runtime synchronously inside `register` (over
+   `Sui.layerNoDepsPinned`, so no chain-id round trip); the face gained
+   `$ready()` and `$dispose()` (`dispose` kept as an alias); and a synchronous
+   member used before the runtime exists now fails with `ExtensionNotReady`
+   instead of returning a `Promise` the type does not mention. Type tests pin
+   that `PromiseFace` keeps sync members sync and plain values plain.
+4. **`fromService` chain pinning.** `options.sui?: SuiLayerOptions` is routed to
+   `Sui.layerNoDepsWith`, and the real layer bound (`Layer<Self, E, Sui | SuiCore>`,
+   own dependencies provided inside) is documented rather than folklore.
+5. **`PromiseFace` and non-plain objects.** The runtime maps plain-prototype
+   objects only, and the type agrees because a class or interface type is not
+   assignable to `Record<string, unknown>`; both are now documented and tested
+   with a `BcsType` member, which survives untouched.
+6. **`Signer.fromSdkSigner(signer)`** accepts any `@mysten/sui/cryptography`
+   `Signer` — Ledger, wallet adapters, KMS — and `fromKeypair` is a thin alias.
+   Nothing in the wrapper ever needed the secret.
+7. **`SuiGraphQL`** is a bare tag over the SDK's `SuiGraphQLClient`, exported
+   from the core subpath, with `layer`, `layerConfig` (`SUI_GRAPHQL_URL` plus
+   `SUI_NETWORK`) and `layerUnavailable`, whose client rejects every call with
+   the new `GraphQLUnavailable`. musicos and platform both read GraphQL; one tag
+   beats two. sui-effect still wraps no GraphQL API. DESIGN §13.5.
+8. **`TransportError.fromUnknown(method, cause, retryable?)`** classifies status
+   and retryability the way `SuiCore` does, so an extension wrapping its own HTTP
+   calls does not hand-build the fields. The classifier moved to
+   `src/domain/errors.ts` and `SuiCore` now uses it.
+9. **`Sui.getObjectsOrFail(ids, opts)`** beside `getObjects`, for the hard batch
+   read; the soft `Result` idioms are written down in the guide.
+10. **Version `0.1.0`**, and the README states the tested SDK matrix; CI gained a
+    `@mysten/sui` 2.29.0 / 2.30.0 job, because consumers pin 2.29.0 exactly.
+
+### Docs
+
+11. Codec wording fixed everywhere: the bridge needs a `BcsType` (codegen's
+    `MoveStruct` / `MoveEnum` / `MoveTuple` qualify), a bare `{ parse }` is
+    refused because the bridge re-serializes, and domain mapping goes in
+    `Schema.decodeTo`. `docs/research/misofm-effect.md` requirement 1 is retired
+    rather than left contradicting DESIGN §11.
+12. A worked `Schema.decodeTo` block with snake_case-to-camelCase mapping, in the
+    template (`SettlementContent`) and quoted by the guide, including the note
+    that a failure inside the domain transform is still a `DecodeError` — and
+    that a fallible mapping uses `transformOrFail`, since a throwing `transform`
+    is a defect.
+13. New guide sections: composing extensions (a real `Platform` service in the
+    template that nests `Escrow` and provides its layer internally), converting
+    an existing facade, a layer that picks a bundled deployment from
+    `sui.network` (`Escrow.layerBundled` with `Layer.unwrap` and
+    `EscrowUnsupportedNetwork`), and how to depend on sui-effect before a
+    release.
+14. Guide clarifications: fragments may return builder arguments and `Recipe` is
+    the top-level draft type; a degenerate `layerTest = layer(fixedDeployment)`
+    is expected; domain absence as `Option`/`null` through `getObjectOption` is
+    blessed; `layerExtensionTest` composed with the extension's own fake; the
+    scoped identifier `"@misofm/partyos/Partyos"`; the `$ready` / `warm` rule;
+    and the executor row.
+15. The migration table gained the rows the reviews found missing: the
+    `client.core.x` reach-through, `new Transaction(); recipe(tx)`, branded ids at
+    the boundary, the two dynamic-field idioms, `DeploymentError` and
+    `GraphQLUnavailable`, async consumer thunks hoisting their `await`, and
+    `TransportError.fromUnknown`.
+16. `docs/research/misofm-effect.md`: the GraphQL sentence now says musicos uses
+    it too, and the call-site counts state their method and their tree date.
+17. DESIGN: §3 says `layerTest` lives in `sui-effect/testing` and documents
+    `layerNoDepsPinned`; §13.2 documents the `fromService` options and the
+    synchronous-member rule; §13.5 is the `SuiGraphQL` service; §10 gained the two
+    new error rows.
+18. The LLMS generator prints brand aliases by name, prints every `Tx` member,
+    and never elides struct fields (`DynamicFieldEntry.name.type` / `.bcs` are
+    what an extension needs). `LLMS.md` and `docs/extensions.md` regenerated;
+    the staleness tests still pass.
+
+### Packaging
+
+19. `examples/extension-template/` ships in `files`, so an npm consumer can copy
+    it; `@mysten/bcs` is named in the template's `peerDependencies` and in the
+    guide, because a second copy of it means a second `BcsType` class.
+20. README and guide: consumers on TypeScript 7 (`tsgo`) are supported, and
+    `prepare: effect-language-service patch` is library-only.
+
+Deferred, recorded, not done here: `Tx.runEffect` with an effectful recipe, and
+a GraphQL-backed `SuiCore` layer.

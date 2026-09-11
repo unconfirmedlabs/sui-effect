@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { bcs as suiBcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
-import { SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
+import { normalizeStructTag, SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
 import {
   DateTime,
   Deferred,
@@ -878,3 +878,159 @@ describe("withSenderLock", () => {
   })
 })
 
+
+describe("generic Move types", () => {
+  const GENERIC = "0xc0de::composition::Composition"
+  const INSTANTIATED = `${GENERIC}<0x5ha4e::share::Share>`.replace("0x5ha4e", PADDED("5aae"))
+  const CompositionBcs = suiBcs.struct("Composition", { id: suiBcs.Address })
+  const Composition = bcs(CompositionBcs, GENERIC)
+
+  const instantiated = (suffix: string) => ({
+    objectId: PADDED(suffix),
+    type: INSTANTIATED,
+    version: 1n,
+    owner,
+    content: CompositionBcs.serialize({ id: PADDED(suffix) }).toBytes()
+  })
+
+  const layer = layerTest({ ...baseScript, objects: [instantiated("c1"), instantiated("c2")] })
+
+  test("a codec built for the bare tag decodes an instantiation", async () => {
+    const object = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.getObject(ObjectId.make(PADDED("c1")), { schema: Composition })
+      }),
+      layer
+    )
+    expect(object.content.id).toBe(PADDED("c1"))
+    // The object keeps the type it actually has, instantiation and all.
+    expect(object.type).toBe(normalizeStructTag(INSTANTIATED) as never)
+  })
+
+  test("an expectedType with type arguments is still compared in full", async () => {
+    const error = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui
+          .getObject(ObjectId.make(PADDED("c1")), {
+            schema: Composition,
+            expectedType: `${GENERIC}<0x2::sui::SUI>`
+          })
+          .pipe(Effect.flip)
+      }),
+      layer
+    )
+    expect(error._tag).toBe("DecodeError")
+  })
+
+  test("streamOwnedObjects filters a bare tag against every instantiation", async () => {
+    const items = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* Stream.runCollect(
+          sui.streamOwnedObjects(SuiAddress.make(ALICE), { type: StructTag.make(GENERIC) })
+        )
+      }),
+      layer
+    )
+    expect(items.length).toBe(2)
+  })
+
+  test("streamOwnedObjects with a tag nothing instantiates sees nothing", async () => {
+    const items = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* Stream.runCollect(
+          sui.streamOwnedObjects(SuiAddress.make(ALICE), {
+            type: StructTag.make("0xc0de::composition::Draft")
+          })
+        )
+      }),
+      layer
+    )
+    expect(items.length).toBe(0)
+  })
+})
+
+describe("getObjectsOrFail", () => {
+  test("returns the objects in the order of the ids", async () => {
+    const objects = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.getObjectsOrFail(
+          [ObjectId.make(PADDED("e2")), ObjectId.make(PADDED("e1"))],
+          { schema: Escrow }
+        )
+      })
+    )
+    expect(objects.map((object) => object.content.amount)).toEqual(["7", "5"])
+  })
+
+  test("fails with the first item error instead of a Result", async () => {
+    const error = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui
+          .getObjectsOrFail([ObjectId.make(PADDED("e1")), ObjectId.make(PADDED("404"))])
+          .pipe(Effect.flip)
+      })
+    )
+    expect(error._tag).toBe("ObjectNotFound")
+  })
+})
+
+describe("view and simulate senders", () => {
+  const simulateOnly = (commandResults: Array<SuiClientTypes.CommandResult>) =>
+    layerTest({
+      ...baseScript,
+      simulate: [FakeOutcome.succeed({ digest: fakeDigest(60), commandResults })]
+    })
+
+  test("view takes a bare BcsType, with no invented type tag", async () => {
+    const value = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.view(() => {}, suiBcs.Address)
+      }),
+      simulateOnly([
+        { returnValues: [{ bcs: suiBcs.Address.serialize(ALICE).toBytes() }], mutatedReferences: [] }
+      ])
+    )
+    expect(value).toBe(ALICE)
+  })
+
+  test("view sets the sender it was given", async () => {
+    const call = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        const fake = yield* SuiCoreFake
+        yield* sui.view(() => {}, suiBcs.U64, { sender: SuiAddress.make(ALICE) })
+        const calls = yield* fake.calls
+        return calls.find((call) => call.method === "simulateTransaction")
+      }),
+      simulateOnly([
+        { returnValues: [{ bcs: suiBcs.U64.serialize("1").toBytes() }], mutatedReferences: [] }
+      ])
+    )
+    const options = call?.options as { readonly transaction: { getData: () => { sender: string } } }
+    expect(options.transaction.getData().sender).toBe(ALICE)
+  })
+
+  test("a recipe's own sender wins over opts.sender", async () => {
+    const call = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        const fake = yield* SuiCoreFake
+        yield* sui.simulate((tx) => tx.setSender(PADDED("b0b")), {
+          sender: SuiAddress.make(ALICE)
+        })
+        const calls = yield* fake.calls
+        return calls.find((call) => call.method === "simulateTransaction")
+      }),
+      simulateOnly([])
+    )
+    const options = call?.options as { readonly transaction: { getData: () => { sender: string } } }
+    expect(options.transaction.getData().sender).toBe(PADDED("b0b"))
+  })
+})

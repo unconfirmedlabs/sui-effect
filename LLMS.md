@@ -17,7 +17,7 @@ contract for building an extension package on top of it.
 ## `sui-effect`
 
 
-75 exported symbols.
+78 exported symbols.
 
 ### `Balance` (const)
 
@@ -28,6 +28,7 @@ declare const Balance: Schema.Struct<{
     readonly coinBalance: Schema.brand<Schema.BigIntFromString, "Mist">;
     readonly addressBalance: Schema.brand<Schema.BigIntFromString, "Mist">;
 }>
+// decodes to: { readonly coinType: CoinType; readonly balance: Mist; readonly coinBalance: Mist; readonly addressBalance: Mist; }
 ```
 
 A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`.
@@ -40,6 +41,7 @@ declare const BalanceChange: Schema.Struct<{
     readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
     readonly amount: Schema.BigIntFromString;
 }>
+// decodes to: { readonly coinType: CoinType; readonly address: SuiAddress; readonly amount: bigint; }
 ```
 
 A balance delta produced by a transaction. Mirrors `SuiClientTypes.BalanceChange`.
@@ -66,8 +68,81 @@ The transaction could not be built into bytes.
 ### `Built` (const)
 
 ```ts
-declare const Built: Struct<{ readonly digest: brand<String, "Digest">; readonly bytes: Uint8ArrayFromBase64; readonly sender: brand<decodeTo<toType<String>, String, never, never>, "SuiAddress">; readonly gasOwner: optional<...>; readonly expiration: optional<...>; }>
-// decodes to: { readonly digest: string & Brand<"Digest">; readonly bytes: Uint8Array<ArrayBufferLike>; readonly sender: string & Brand<"SuiAddress">; readonly gasOwner?: (string & Brand<...>) | undefined; readonly expiration?: { ...; } | ... 3 more ... | undefined; }
+declare const Built: Schema.Struct<{
+    readonly digest: Schema.brand<Schema.String, "Digest">;
+    readonly bytes: Schema.Uint8ArrayFromBase64;
+    readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+    readonly gasOwner: Schema.optional<Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">>;
+    readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+        readonly $kind: Schema.Literal<"None">;
+        readonly None: Schema.Literal<true>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Epoch">;
+        readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ValidDuring">;
+        readonly ValidDuring: Schema.Struct<{
+            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly chain: Schema.String;
+            readonly nonce: Schema.Number;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Validity">;
+        readonly Validity: Schema.Struct<{
+            readonly allowedProposers: Schema.NullOr<Schema.Struct<{
+                readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+                readonly proposers: Schema.$Array<Schema.Number>;
+            }>>;
+            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly chain: Schema.String;
+            readonly nonce: Schema.Number;
+        }>;
+    }>]>>;
+}>
+// decodes to:
+// {
+//     readonly digest: Digest;
+//     readonly bytes: Uint8Array<ArrayBufferLike>;
+//     readonly sender: SuiAddress;
+//     readonly gasOwner?: SuiAddress | undefined;
+//     readonly expiration?: {
+//         readonly $kind: "None";
+//         readonly None: true;
+//     } | {
+//         readonly $kind: "Epoch";
+//         readonly Epoch: bigint;
+//     } | {
+//         readonly $kind: "ValidDuring";
+//         readonly ValidDuring: {
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | {
+//         readonly $kind: "Validity";
+//         readonly Validity: {
+//             readonly allowedProposers: {
+//                 readonly epoch: bigint;
+//                 readonly proposers: readonly number[];
+//             } | null;
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | undefined;
+// }
 ```
 
 A transaction built into bytes and ready to sign, with the expiration the
@@ -77,8 +152,119 @@ the builder, whether the transaction can still land.
 ### `ChangedObject` (const)
 
 ```ts
-declare const ChangedObject: Struct<{ readonly objectId: brand<decodeTo<toType<String>, String, never, never>, "ObjectId">; readonly inputState: Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>; ... 7 more ...; readonly idOperation: Literals<...>; }>
-// decodes to: { readonly objectId: string & Brand<"ObjectId">; readonly inputState: "Unknown" | "DoesNotExist" | "Exists"; readonly inputVersion: (bigint & Brand<"Version">) | null; ... 6 more ...; readonly idOperation: "None" | ... 2 more ... | "Deleted"; }
+declare const ChangedObject: Schema.Struct<{
+    readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
+    readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+    readonly inputDigest: Schema.NullOr<Schema.String>;
+    readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+        readonly $kind: Schema.Literal<"AddressOwner">;
+        readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ObjectOwner">;
+        readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Shared">;
+        readonly Shared: Schema.Struct<{
+            readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Immutable">;
+        readonly Immutable: Schema.Literal<true>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+        readonly ConsensusAddressOwner: Schema.Struct<{
+            readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+            readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Unknown">;
+    }>]>>;
+    readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
+    readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+    readonly outputDigest: Schema.NullOr<Schema.String>;
+    readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+        readonly $kind: Schema.Literal<"AddressOwner">;
+        readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ObjectOwner">;
+        readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Shared">;
+        readonly Shared: Schema.Struct<{
+            readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Immutable">;
+        readonly Immutable: Schema.Literal<true>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+        readonly ConsensusAddressOwner: Schema.Struct<{
+            readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+            readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Unknown">;
+    }>]>>;
+    readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
+}>
+// decodes to:
+// {
+//     readonly objectId: ObjectId;
+//     readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
+//     readonly inputVersion: Version | null;
+//     readonly inputDigest: string | null;
+//     readonly inputOwner: {
+//         readonly $kind: "AddressOwner";
+//         readonly AddressOwner: SuiAddress;
+//     } | {
+//         readonly $kind: "ObjectOwner";
+//         readonly ObjectOwner: ObjectId;
+//     } | {
+//         readonly $kind: "Shared";
+//         readonly Shared: {
+//             readonly initialSharedVersion: Version;
+//         };
+//     } | {
+//         readonly $kind: "Immutable";
+//         readonly Immutable: true;
+//     } | {
+//         readonly $kind: "ConsensusAddressOwner";
+//         readonly ConsensusAddressOwner: {
+//             readonly startVersion: Version;
+//             readonly owner: SuiAddress;
+//         };
+//     } | {
+//         readonly $kind: "Unknown";
+//     } | null;
+//     readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
+//     readonly outputVersion: Version | null;
+//     readonly outputDigest: string | null;
+//     readonly outputOwner: {
+//         readonly $kind: "AddressOwner";
+//         readonly AddressOwner: SuiAddress;
+//     } | {
+//         readonly $kind: "ObjectOwner";
+//         readonly ObjectOwner: ObjectId;
+//     } | {
+//         readonly $kind: "Shared";
+//         readonly Shared: {
+//             readonly initialSharedVersion: Version;
+//         };
+//     } | {
+//         readonly $kind: "Immutable";
+//         readonly Immutable: true;
+//     } | {
+//         readonly $kind: "ConsensusAddressOwner";
+//         readonly ConsensusAddressOwner: {
+//             readonly startVersion: Version;
+//             readonly owner: SuiAddress;
+//         };
+//     } | {
+//         readonly $kind: "Unknown";
+//     } | null;
+//     readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+// }
 ```
 
 One object touched by a transaction. Mirrors `SuiClientTypes.ChangedObject`.
@@ -114,6 +300,14 @@ declare const CleverError: Schema.Struct<{
     readonly constantType: Schema.optional<Schema.String>;
     readonly value: Schema.optional<Schema.String>;
 }>
+// decodes to:
+// {
+//     readonly errorCode?: number | undefined;
+//     readonly lineNumber?: number | undefined;
+//     readonly constantName?: string | undefined;
+//     readonly constantType?: string | undefined;
+//     readonly value?: string | undefined;
+// }
 ```
 
 A decoded `#[error]` constant. Mirrors `SuiClientTypes.CleverError`.
@@ -122,6 +316,7 @@ A decoded `#[error]` constant. Mirrors `SuiClientTypes.CleverError`.
 
 ```ts
 declare const CoinType: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "CoinType">
+// decodes to: CoinType
 ```
 
 A coin type: a struct tag used as the type argument of `0x2::coin::Coin`.
@@ -137,6 +332,7 @@ declare const CommandResult: Schema.Struct<{
         readonly bcs: Schema.Uint8Array;
     }>>;
 }>
+// decodes to: { readonly returnValues: readonly { readonly bcs: Uint8Array<ArrayBufferLike>; }[]; readonly mutatedReferences: readonly { readonly bcs: Uint8Array<ArrayBufferLike>; }[]; }
 ```
 
 The return values and mutated references of one command. Mirrors `SuiClientTypes.CommandResult`.
@@ -146,7 +342,7 @@ The return values and mutated references of one command. Mirrors `SuiClientTypes
 ```ts
 export declare class DecodeError extends DecodeError_base {
   readonly issue: string
-  readonly objectId: (string & Brand<"ObjectId">) | undefined
+  readonly objectId: ObjectId | undefined
   readonly expectedType: string | undefined
 }
 ```
@@ -169,6 +365,7 @@ Returns `undefined` for any other network.
 
 ```ts
 declare const Digest: Schema.brand<Schema.String, "Digest">
+// decodes to: Digest
 ```
 
 A base58 transaction digest. Not normalized; rejected when not 32 bytes.
@@ -176,8 +373,41 @@ A base58 transaction digest. Not normalized; rejected when not 32 bytes.
 ### `DynamicField` (const)
 
 ```ts
-declare const DynamicField: Struct<{ readonly fieldId: brand<decodeTo<toType<String>, String, never, never>, "ObjectId">; readonly type: String; readonly name: Struct<{ readonly type: String; readonly bcs: Uint8Array; }>; ... 5 more ...; readonly digest: String; }>
-// decodes to: { readonly $kind: "DynamicField" | "DynamicObject"; readonly digest: string; readonly fieldId: string & Brand<"ObjectId">; readonly type: string; readonly name: { readonly type: string; readonly bcs: Uint8Array<...>; }; readonly valueType: string; readonly value: { ...; }; readonly version: bigint & Brand<...>; read...
+declare const DynamicField: Schema.Struct<{
+    readonly fieldId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    readonly type: Schema.String;
+    readonly name: Schema.Struct<{
+        readonly type: Schema.String;
+        readonly bcs: Schema.Uint8Array;
+    }>;
+    readonly valueType: Schema.String;
+    readonly $kind: Schema.Literals<readonly ["DynamicField", "DynamicObject"]>;
+    readonly childId: Schema.optional<Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">>;
+    readonly value: Schema.Struct<{
+        readonly type: Schema.String;
+        readonly bcs: Schema.Uint8Array;
+    }>;
+    readonly version: Schema.brand<Schema.BigIntFromString, "Version">;
+    readonly digest: Schema.String;
+}>
+// decodes to:
+// {
+//     readonly digest: string;
+//     readonly $kind: "DynamicField" | "DynamicObject";
+//     readonly value: {
+//         readonly type: string;
+//         readonly bcs: Uint8Array<ArrayBufferLike>;
+//     };
+//     readonly fieldId: ObjectId;
+//     readonly type: string;
+//     readonly name: {
+//         readonly type: string;
+//         readonly bcs: Uint8Array<ArrayBufferLike>;
+//     };
+//     readonly valueType: string;
+//     readonly version: Version;
+//     readonly childId?: ObjectId | undefined;
+// }
 ```
 
 A dynamic field with its value. Mirrors `SuiClientTypes.DynamicField`.
@@ -185,8 +415,29 @@ A dynamic field with its value. Mirrors `SuiClientTypes.DynamicField`.
 ### `DynamicFieldEntry` (const)
 
 ```ts
-declare const DynamicFieldEntry: Struct<{ readonly fieldId: brand<decodeTo<toType<String>, String, never, never>, "ObjectId">; readonly type: String; readonly name: Struct<{ readonly type: String; readonly bcs: Uint8Array; }>; readonly valueType: String; readonly $kind: Literals<...>; readonly childId: optional<...>; }>
-// decodes to: { readonly $kind: "DynamicField" | "DynamicObject"; readonly fieldId: string & Brand<"ObjectId">; readonly type: string; readonly name: { readonly type: string; readonly bcs: Uint8Array<ArrayBufferLike>; }; readonly valueType: string; readonly childId?: (string & Brand<...>) | undefined; }
+declare const DynamicFieldEntry: Schema.Struct<{
+    readonly fieldId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    readonly type: Schema.String;
+    readonly name: Schema.Struct<{
+        readonly type: Schema.String;
+        readonly bcs: Schema.Uint8Array;
+    }>;
+    readonly valueType: Schema.String;
+    readonly $kind: Schema.Literals<readonly ["DynamicField", "DynamicObject"]>;
+    readonly childId: Schema.optional<Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">>;
+}>
+// decodes to:
+// {
+//     readonly $kind: "DynamicField" | "DynamicObject";
+//     readonly fieldId: ObjectId;
+//     readonly type: string;
+//     readonly name: {
+//         readonly type: string;
+//         readonly bcs: Uint8Array<ArrayBufferLike>;
+//     };
+//     readonly valueType: string;
+//     readonly childId?: ObjectId | undefined;
+// }
 ```
 
 One entry of a dynamic-field listing. Mirrors `SuiClientTypes.DynamicFieldEntry`.
@@ -198,6 +449,7 @@ declare const DynamicFieldName: Schema.Struct<{
     readonly type: Schema.String;
     readonly bcs: Schema.Uint8Array;
 }>
+// decodes to: { readonly type: string; readonly bcs: Uint8Array<ArrayBufferLike>; }
 ```
 
 The BCS-encoded name of a dynamic field. Mirrors `SuiClientTypes.DynamicFieldName`.
@@ -212,6 +464,7 @@ declare const Event: Schema.Struct<{
     readonly eventType: Schema.String;
     readonly bcs: Schema.Uint8Array;
 }>
+// decodes to: { readonly packageId: ObjectId; readonly module: string; readonly sender: SuiAddress; readonly eventType: string; readonly bcs: Uint8Array<ArrayBufferLike>; }
 ```
 
 An emitted Move event. Mirrors `SuiClientTypes.Event`; `json` is dropped on purpose.
@@ -285,9 +538,215 @@ effects, events, balance changes and object types.
 
 ```ts
 export declare class ExecutionFailed extends ExecutionFailed_base {
-  readonly digest: string & Brand<"Digest">
-  readonly reason: { readonly $kind: "MoveAbort"; readonly MoveAbort: { readonly abortCode: bigint; readonly location?: { readonly function?: number | undefined; readonly package?: string | undefined; readonly module?: string | undefined; readonly functionName?: string | undefined; readonly instruction?: number | undefined; } | undefi...
-  readonly effects: { readonly version: number; readonly status: { readonly success: boolean; }; readonly gasUsed: { readonly computationCost: bigint & Brand<"Mist">; readonly storageCost: bigint & Brand<"Mist">; readonly storageRebate: bigint & Brand<...>; readonly nonRefundableStorageFee: bigint & Brand<...>; }; ... 7 more ...; reado...
+  readonly digest: Digest
+  readonly reason: {
+      readonly $kind: "MoveAbort";
+      readonly MoveAbort: {
+          readonly abortCode: bigint;
+          readonly location?: {
+              readonly function?: number | undefined;
+              readonly module?: string | undefined;
+              readonly package?: string | undefined;
+              readonly functionName?: string | undefined;
+              readonly instruction?: number | undefined;
+          } | undefined;
+          readonly cleverError?: {
+              readonly errorCode?: number | undefined;
+              readonly lineNumber?: number | undefined;
+              readonly constantName?: string | undefined;
+              readonly constantType?: string | undefined;
+              readonly value?: string | undefined;
+          } | undefined;
+      };
+  } | {
+      readonly $kind: "SizeError";
+      readonly SizeError: {
+          readonly name: string;
+          readonly size: number;
+          readonly maxSize: number;
+      };
+  } | {
+      readonly $kind: "CommandArgumentError";
+      readonly CommandArgumentError: {
+          readonly argument: number;
+          readonly name: string;
+      };
+  } | {
+      readonly $kind: "TypeArgumentError";
+      readonly TypeArgumentError: {
+          readonly typeArgument: number;
+          readonly name: string;
+      };
+  } | {
+      readonly $kind: "PackageUpgradeError";
+      readonly PackageUpgradeError: {
+          readonly name: string;
+          readonly digest?: string | undefined;
+          readonly packageId?: string | undefined;
+      };
+  } | {
+      readonly $kind: "IndexError";
+      readonly IndexError: {
+          readonly index?: number | undefined;
+          readonly subresult?: number | undefined;
+      };
+  } | {
+      readonly $kind: "CoinDenyListError";
+      readonly CoinDenyListError: {
+          readonly coinType: string;
+          readonly name: string;
+          readonly address?: string | undefined;
+      };
+  } | {
+      readonly $kind: "CongestedObjects";
+      readonly CongestedObjects: {
+          readonly name: string;
+          readonly objects: readonly string[];
+      };
+  } | {
+      readonly $kind: "ObjectIdError";
+      readonly ObjectIdError: {
+          readonly objectId: string;
+          readonly name?: string | undefined;
+      };
+  } | {
+      readonly $kind: "Unknown";
+  }
+  readonly effects: {
+      readonly version: number;
+      readonly status: {
+          readonly success: boolean;
+      };
+      readonly gasUsed: {
+          readonly computationCost: Mist;
+          readonly storageCost: Mist;
+          readonly storageRebate: Mist;
+          readonly nonRefundableStorageFee: Mist;
+      };
+      readonly transactionDigest: Digest;
+      readonly gasObject: {
+          readonly objectId: ObjectId;
+          readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
+          readonly inputVersion: Version | null;
+          readonly inputDigest: string | null;
+          readonly inputOwner: {
+              readonly $kind: "AddressOwner";
+              readonly AddressOwner: SuiAddress;
+          } | {
+              readonly $kind: "ObjectOwner";
+              readonly ObjectOwner: ObjectId;
+          } | {
+              readonly $kind: "Shared";
+              readonly Shared: {
+                  readonly initialSharedVersion: Version;
+              };
+          } | {
+              readonly $kind: "Immutable";
+              readonly Immutable: true;
+          } | {
+              readonly $kind: "ConsensusAddressOwner";
+              readonly ConsensusAddressOwner: {
+                  readonly startVersion: Version;
+                  readonly owner: SuiAddress;
+              };
+          } | {
+              readonly $kind: "Unknown";
+          } | null;
+          readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
+          readonly outputVersion: Version | null;
+          readonly outputDigest: string | null;
+          readonly outputOwner: {
+              readonly $kind: "AddressOwner";
+              readonly AddressOwner: SuiAddress;
+          } | {
+              readonly $kind: "ObjectOwner";
+              readonly ObjectOwner: ObjectId;
+          } | {
+              readonly $kind: "Shared";
+              readonly Shared: {
+                  readonly initialSharedVersion: Version;
+              };
+          } | {
+              readonly $kind: "Immutable";
+              readonly Immutable: true;
+          } | {
+              readonly $kind: "ConsensusAddressOwner";
+              readonly ConsensusAddressOwner: {
+                  readonly startVersion: Version;
+                  readonly owner: SuiAddress;
+              };
+          } | {
+              readonly $kind: "Unknown";
+          } | null;
+          readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+      } | null;
+      readonly eventsDigest: string | null;
+      readonly dependencies: readonly string[];
+      readonly lamportVersion: Version | null;
+      readonly changedObjects: readonly {
+          readonly objectId: ObjectId;
+          readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
+          readonly inputVersion: Version | null;
+          readonly inputDigest: string | null;
+          readonly inputOwner: {
+              readonly $kind: "AddressOwner";
+              readonly AddressOwner: SuiAddress;
+          } | {
+              readonly $kind: "ObjectOwner";
+              readonly ObjectOwner: ObjectId;
+          } | {
+              readonly $kind: "Shared";
+              readonly Shared: {
+                  readonly initialSharedVersion: Version;
+              };
+          } | {
+              readonly $kind: "Immutable";
+              readonly Immutable: true;
+          } | {
+              readonly $kind: "ConsensusAddressOwner";
+              readonly ConsensusAddressOwner: {
+                  readonly startVersion: Version;
+                  readonly owner: SuiAddress;
+              };
+          } | {
+              readonly $kind: "Unknown";
+          } | null;
+          readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
+          readonly outputVersion: Version | null;
+          readonly outputDigest: string | null;
+          readonly outputOwner: {
+              readonly $kind: "AddressOwner";
+              readonly AddressOwner: SuiAddress;
+          } | {
+              readonly $kind: "ObjectOwner";
+              readonly ObjectOwner: ObjectId;
+          } | {
+              readonly $kind: "Shared";
+              readonly Shared: {
+                  readonly initialSharedVersion: Version;
+              };
+          } | {
+              readonly $kind: "Immutable";
+              readonly Immutable: true;
+          } | {
+              readonly $kind: "ConsensusAddressOwner";
+              readonly ConsensusAddressOwner: {
+                  readonly startVersion: Version;
+                  readonly owner: SuiAddress;
+              };
+          } | {
+              readonly $kind: "Unknown";
+          } | null;
+          readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+      }[];
+      readonly unchangedConsensusObjects: readonly {
+          readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
+          readonly objectId: ObjectId;
+          readonly version: Version | null;
+          readonly digest: string | null;
+      }[];
+      readonly auxiliaryDataDigest: string | null;
+  }
   readonly command: number | undefined
 }
 ```
@@ -297,8 +756,153 @@ The transaction was applied on chain and failed. Gas was charged.
 ### `ExecutionReason` (const)
 
 ```ts
-declare const ExecutionReason: toTaggedUnion<"$kind", readonly [Struct<{ readonly $kind: Literal<"MoveAbort">; readonly MoveAbort: Struct<{ readonly abortCode: BigIntFromString; readonly location: optional<Struct<{ readonly package: optional<String>; readonly module: optional<...>; readonly function: optional<...>; readonly functionName: optional...
-// decodes to: { readonly $kind: "MoveAbort"; readonly MoveAbort: { readonly abortCode: bigint; readonly location?: { readonly function?: number | undefined; readonly package?: string | undefined; readonly module?: string | undefined; readonly functionName?: string | undefined; readonly instruction?: number | undefined; } | undefi...
+declare const ExecutionReason: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+    readonly $kind: Schema.Literal<"MoveAbort">;
+    readonly MoveAbort: Schema.Struct<{
+        readonly abortCode: Schema.BigIntFromString;
+        readonly location: Schema.optional<Schema.Struct<{
+            readonly package: Schema.optional<Schema.String>;
+            readonly module: Schema.optional<Schema.String>;
+            readonly function: Schema.optional<Schema.Number>;
+            readonly functionName: Schema.optional<Schema.String>;
+            readonly instruction: Schema.optional<Schema.Number>;
+        }>>;
+        readonly cleverError: Schema.optional<Schema.Struct<{
+            readonly errorCode: Schema.optional<Schema.Number>;
+            readonly lineNumber: Schema.optional<Schema.Number>;
+            readonly constantName: Schema.optional<Schema.String>;
+            readonly constantType: Schema.optional<Schema.String>;
+            readonly value: Schema.optional<Schema.String>;
+        }>>;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"SizeError">;
+    readonly SizeError: Schema.Struct<{
+        readonly name: Schema.String;
+        readonly size: Schema.Number;
+        readonly maxSize: Schema.Number;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"CommandArgumentError">;
+    readonly CommandArgumentError: Schema.Struct<{
+        readonly argument: Schema.Number;
+        readonly name: Schema.String;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"TypeArgumentError">;
+    readonly TypeArgumentError: Schema.Struct<{
+        readonly typeArgument: Schema.Number;
+        readonly name: Schema.String;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"PackageUpgradeError">;
+    readonly PackageUpgradeError: Schema.Struct<{
+        readonly name: Schema.String;
+        readonly packageId: Schema.optional<Schema.String>;
+        readonly digest: Schema.optional<Schema.String>;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"IndexError">;
+    readonly IndexError: Schema.Struct<{
+        readonly index: Schema.optional<Schema.Number>;
+        readonly subresult: Schema.optional<Schema.Number>;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"CoinDenyListError">;
+    readonly CoinDenyListError: Schema.Struct<{
+        readonly name: Schema.String;
+        readonly coinType: Schema.String;
+        readonly address: Schema.optional<Schema.String>;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"CongestedObjects">;
+    readonly CongestedObjects: Schema.Struct<{
+        readonly name: Schema.String;
+        readonly objects: Schema.$Array<Schema.String>;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"ObjectIdError">;
+    readonly ObjectIdError: Schema.Struct<{
+        readonly name: Schema.optional<Schema.String>;
+        readonly objectId: Schema.String;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"Unknown">;
+}>]>
+// decodes to:
+// {
+//     readonly $kind: "MoveAbort";
+//     readonly MoveAbort: {
+//         readonly abortCode: bigint;
+//         readonly location?: {
+//             readonly function?: number | undefined;
+//             readonly module?: string | undefined;
+//             readonly package?: string | undefined;
+//             readonly functionName?: string | undefined;
+//             readonly instruction?: number | undefined;
+//         } | undefined;
+//         readonly cleverError?: {
+//             readonly errorCode?: number | undefined;
+//             readonly lineNumber?: number | undefined;
+//             readonly constantName?: string | undefined;
+//             readonly constantType?: string | undefined;
+//             readonly value?: string | undefined;
+//         } | undefined;
+//     };
+// } | {
+//     readonly $kind: "SizeError";
+//     readonly SizeError: {
+//         readonly name: string;
+//         readonly size: number;
+//         readonly maxSize: number;
+//     };
+// } | {
+//     readonly $kind: "CommandArgumentError";
+//     readonly CommandArgumentError: {
+//         readonly argument: number;
+//         readonly name: string;
+//     };
+// } | {
+//     readonly $kind: "TypeArgumentError";
+//     readonly TypeArgumentError: {
+//         readonly typeArgument: number;
+//         readonly name: string;
+//     };
+// } | {
+//     readonly $kind: "PackageUpgradeError";
+//     readonly PackageUpgradeError: {
+//         readonly name: string;
+//         readonly digest?: string | undefined;
+//         readonly packageId?: string | undefined;
+//     };
+// } | {
+//     readonly $kind: "IndexError";
+//     readonly IndexError: {
+//         readonly index?: number | undefined;
+//         readonly subresult?: number | undefined;
+//     };
+// } | {
+//     readonly $kind: "CoinDenyListError";
+//     readonly CoinDenyListError: {
+//         readonly coinType: string;
+//         readonly name: string;
+//         readonly address?: string | undefined;
+//     };
+// } | {
+//     readonly $kind: "CongestedObjects";
+//     readonly CongestedObjects: {
+//         readonly name: string;
+//         readonly objects: readonly string[];
+//     };
+// } | {
+//     readonly $kind: "ObjectIdError";
+//     readonly ObjectIdError: {
+//         readonly objectId: string;
+//         readonly name?: string | undefined;
+//     };
+// } | {
+//     readonly $kind: "Unknown";
+// }
 ```
 
 Why a transaction failed on chain or in simulation. Mirrors
@@ -313,12 +917,35 @@ carries the reason rather than being repeated in every variant.
 declare const ExecutionStatus: Schema.Struct<{
     readonly success: Schema.Boolean;
 }>
+// decodes to: { readonly success: boolean; }
 ```
 
 Whether a transaction succeeded. Mirrors `SuiClientTypes.ExecutionStatus`
 minus its `error` payload: the failure detail is carried by `ExecutionFailed`
 and `SimulationFailed` as an `ExecutionReason`, so there is exactly one
 representation of an on-chain failure.
+
+### `ExtensionNotReady` (class)
+
+```ts
+export declare class ExtensionNotReady extends ExtensionNotReady_base {
+  readonly extension: string
+  readonly member: string
+}
+```
+
+A synchronous member of a Promise-faced extension was called before its
+runtime existed.
+
+`SuiExtension.fromService` builds its `ManagedRuntime` on first use, so until
+something has been awaited there is no service object and no synchronous
+member to read. Rather than hand back a Promise where the type says a value,
+the face throws this. Two cures, both in the extension's own hands:
+`await client.<name>.$ready()` once after registering, or register with
+`warm`, which builds the runtime inside `register` and makes every member
+real immediately.
+
+Outcome `not_applied`: nothing was sent.
 
 ### `GasCostSummary` (const)
 
@@ -329,6 +956,7 @@ declare const GasCostSummary: Schema.Struct<{
     readonly storageRebate: Schema.brand<Schema.BigIntFromString, "Mist">;
     readonly nonRefundableStorageFee: Schema.brand<Schema.BigIntFromString, "Mist">;
 }>
+// decodes to: { readonly computationCost: Mist; readonly storageCost: Mist; readonly storageRebate: Mist; readonly nonRefundableStorageFee: Mist; }
 ```
 
 Gas cost breakdown. Mirrors `SuiClientTypes.GasCostSummary`.
@@ -340,6 +968,27 @@ export type GetObjectError = ObjectNotFound | ObjectDeleted | ObjectUnavailable 
 ```
 
 What can go wrong reading one object with a schema.
+
+### `GraphQLUnavailable` (class)
+
+```ts
+export declare class GraphQLUnavailable extends GraphQLUnavailable_base {
+  readonly method: string
+  readonly reason: string
+}
+```
+
+The GraphQL endpoint an extension needs is not usable: none was configured,
+or the one that was could not be reached.
+
+sui-effect does not wrap the GraphQL API — it owns the `SuiGraphQL`
+*tag*, so two extensions that both read GraphQL share one client rather than
+opening two. This is the failure the tag's `layerUnavailable` produces, which
+is what an application provides when it has no endpoint: every call rejects
+with this instead of the extension discovering a missing dependency at
+construction. An extension maps it into its own union, or lets it through.
+
+Outcome `not_applied`: a read that did not happen changed nothing.
 
 ### `HasOutcome` (interface)
 
@@ -378,6 +1027,7 @@ and `Sui.layerNoDeps` records whatever the node reports instead of asserting.
 
 ```ts
 declare const KnownNetwork: Schema.Literals<readonly ["mainnet", "testnet", "devnet", "localnet"]>
+// decodes to: "mainnet" | "testnet" | "devnet" | "localnet"
 ```
 
 The four networks with a built-in default gRPC endpoint.
@@ -412,6 +1062,7 @@ declare const maxTimestampMsOf: (expiration: TransactionExpiration | undefined) 
 
 ```ts
 declare const Mist: Schema.brand<Schema.BigIntFromString, "Mist">
+// decodes to: Mist
 ```
 
 An amount in MIST. Encoded as the decimal string every SDK response uses.
@@ -426,6 +1077,14 @@ declare const MoveLocation: Schema.Struct<{
     readonly functionName: Schema.optional<Schema.String>;
     readonly instruction: Schema.optional<Schema.Number>;
 }>
+// decodes to:
+// {
+//     readonly function?: number | undefined;
+//     readonly module?: string | undefined;
+//     readonly package?: string | undefined;
+//     readonly functionName?: string | undefined;
+//     readonly instruction?: number | undefined;
+// }
 ```
 
 Where a Move abort happened. Mirrors `SuiClientTypes.MoveLocation`.
@@ -437,6 +1096,7 @@ package that no longer parses as an object id.
 
 ```ts
 declare const Network: Schema.brand<Schema.String, "Network">
+// decodes to: Network
 ```
 
 The network a client is pointed at. Mirrors `SuiClientTypes.Network`.
@@ -456,7 +1116,7 @@ The chain identifier the node reported is not the one the layer was built for.
 
 ```ts
 export declare class NotApplied extends NotApplied_base {
-  readonly digest: string & Brand<"Digest">
+  readonly digest: Digest
   readonly evidence: "expired" | "inputConsumed"
 }
 ```
@@ -472,6 +1132,7 @@ merely moved on, with no readable `previousTransaction`, is
 
 ```ts
 declare const NotAppliedEvidence: Schema.Literals<readonly ["expired", "inputConsumed"]>
+// decodes to: "expired" | "inputConsumed"
 ```
 
 Why a transaction provably never applied, and never will.
@@ -488,8 +1149,8 @@ cannot drift.
 
 ```ts
 export declare class ObjectDeleted extends ObjectDeleted_base {
-  readonly objectId: string & Brand<"ObjectId">
-  readonly version: (bigint & Brand<"Version">) | undefined
+  readonly objectId: ObjectId
+  readonly version: Version | undefined
 }
 ```
 
@@ -498,8 +1159,65 @@ The object existed and has been deleted or wrapped.
 ### `ObjectEnvelope` (const)
 
 ```ts
-declare const ObjectEnvelope: Struct<{ readonly objectId: brand<decodeTo<toType<String>, String, never, never>, "ObjectId">; readonly version: brand<BigIntFromString, "Version">; readonly digest: String; readonly owner: toTaggedUnion<...>; readonly type: Union<...>; }>
-// decodes to: { readonly objectId: string & Brand<"ObjectId">; readonly version: bigint & Brand<"Version">; readonly digest: string; readonly owner: { readonly $kind: "AddressOwner"; readonly AddressOwner: string & Brand<...>; } | ... 4 more ... | { ...; }; readonly type: "package" | (string & Brand<...>); }
+declare const ObjectEnvelope: Schema.Struct<{
+    readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    readonly version: Schema.brand<Schema.BigIntFromString, "Version">;
+    readonly digest: Schema.String;
+    readonly owner: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+        readonly $kind: Schema.Literal<"AddressOwner">;
+        readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ObjectOwner">;
+        readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Shared">;
+        readonly Shared: Schema.Struct<{
+            readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Immutable">;
+        readonly Immutable: Schema.Literal<true>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+        readonly ConsensusAddressOwner: Schema.Struct<{
+            readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+            readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Unknown">;
+    }>]>;
+    readonly type: Schema.Union<readonly [Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "StructTag">, Schema.Literal<"package">]>;
+}>
+// decodes to:
+// {
+//     readonly objectId: ObjectId;
+//     readonly version: Version;
+//     readonly digest: string;
+//     readonly owner: {
+//         readonly $kind: "AddressOwner";
+//         readonly AddressOwner: SuiAddress;
+//     } | {
+//         readonly $kind: "ObjectOwner";
+//         readonly ObjectOwner: ObjectId;
+//     } | {
+//         readonly $kind: "Shared";
+//         readonly Shared: {
+//             readonly initialSharedVersion: Version;
+//         };
+//     } | {
+//         readonly $kind: "Immutable";
+//         readonly Immutable: true;
+//     } | {
+//         readonly $kind: "ConsensusAddressOwner";
+//         readonly ConsensusAddressOwner: {
+//             readonly startVersion: Version;
+//             readonly owner: SuiAddress;
+//         };
+//     } | {
+//         readonly $kind: "Unknown";
+//     };
+//     readonly type: "package" | StructTag;
+// }
 ```
 
 The fixed set of object fields sui-effect always requests: `content`, plus
@@ -509,6 +1227,7 @@ the owner, type, version and digest the SDK returns unconditionally.
 
 ```ts
 declare const ObjectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">
+// decodes to: ObjectId
 ```
 
 A 32-byte object id. Same encoding rules as `SuiAddress`; the brand is
@@ -526,8 +1245,8 @@ The failures of an object lookup.
 
 ```ts
 export declare class ObjectNotFound extends ObjectNotFound_base {
-  readonly objectId: string & Brand<"ObjectId">
-  readonly version: (bigint & Brand<"Version">) | undefined
+  readonly objectId: ObjectId
+  readonly version: Version | undefined
 }
 ```
 
@@ -536,8 +1255,65 @@ The object does not exist, or has never existed.
 ### `ObjectRef` (const)
 
 ```ts
-declare const ObjectRef: Struct<{ readonly id: brand<decodeTo<toType<String>, String, never, never>, "ObjectId">; readonly type: Union<readonly [brand<decodeTo<toType<String>, String, never, never>, "StructTag">, Literal<...>]>; readonly version: brand<...>; readonly digest: String; readonly owner: toTaggedUnion<...>; }>
-// decodes to: { readonly id: string & Brand<"ObjectId">; readonly type: "package" | (string & Brand<"StructTag">); readonly version: bigint & Brand<"Version">; readonly digest: string; readonly owner: { ...; } | ... 4 more ... | { ...; }; }
+declare const ObjectRef: Schema.Struct<{
+    readonly id: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    readonly type: Schema.Union<readonly [Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "StructTag">, Schema.Literal<"package">]>;
+    readonly version: Schema.brand<Schema.BigIntFromString, "Version">;
+    readonly digest: Schema.String;
+    readonly owner: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+        readonly $kind: Schema.Literal<"AddressOwner">;
+        readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ObjectOwner">;
+        readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Shared">;
+        readonly Shared: Schema.Struct<{
+            readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Immutable">;
+        readonly Immutable: Schema.Literal<true>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+        readonly ConsensusAddressOwner: Schema.Struct<{
+            readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+            readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Unknown">;
+    }>]>;
+}>
+// decodes to:
+// {
+//     readonly id: ObjectId;
+//     readonly type: "package" | StructTag;
+//     readonly version: Version;
+//     readonly digest: string;
+//     readonly owner: {
+//         readonly $kind: "AddressOwner";
+//         readonly AddressOwner: SuiAddress;
+//     } | {
+//         readonly $kind: "ObjectOwner";
+//         readonly ObjectOwner: ObjectId;
+//     } | {
+//         readonly $kind: "Shared";
+//         readonly Shared: {
+//             readonly initialSharedVersion: Version;
+//         };
+//     } | {
+//         readonly $kind: "Immutable";
+//         readonly Immutable: true;
+//     } | {
+//         readonly $kind: "ConsensusAddressOwner";
+//         readonly ConsensusAddressOwner: {
+//             readonly startVersion: Version;
+//             readonly owner: SuiAddress;
+//         };
+//     } | {
+//         readonly $kind: "Unknown";
+//     };
+// }
 ```
 
 Everything the transaction builder needs to consume an object again, plus the
@@ -558,6 +1334,7 @@ every field the builder needs.
 
 ```ts
 declare const ObjectType: Schema.Union<readonly [Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "StructTag">, Schema.Literal<"package">]>
+// decodes to: "package" | StructTag
 ```
 
 The `type` field of an object envelope. Almost always a struct tag, but gRPC
@@ -569,8 +1346,8 @@ readable object like any other.
 
 ```ts
 export declare class ObjectUnavailable extends ObjectUnavailable_base {
-  readonly objectId: string & Brand<"ObjectId">
-  readonly version: (bigint & Brand<"Version">) | undefined
+  readonly objectId: ObjectId
+  readonly version: Version | undefined
 }
 ```
 
@@ -588,8 +1365,53 @@ or a wrapper script acts on.
 ### `Owner` (const)
 
 ```ts
-declare const Owner: toTaggedUnion<"$kind", readonly [Struct<{ readonly $kind: Literal<"AddressOwner">; readonly AddressOwner: brand<decodeTo<toType<String>, String, never, never>, "SuiAddress">; }>, ... 4 more ..., Struct<...>]>
-// decodes to: { readonly $kind: "AddressOwner"; readonly AddressOwner: string & Brand<"SuiAddress">; } | { readonly $kind: "ObjectOwner"; readonly ObjectOwner: string & Brand<"ObjectId">; } | { ...; } | { ...; } | { ...; } | { ...; }
+declare const Owner: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+    readonly $kind: Schema.Literal<"AddressOwner">;
+    readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"ObjectOwner">;
+    readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"Shared">;
+    readonly Shared: Schema.Struct<{
+        readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"Immutable">;
+    readonly Immutable: Schema.Literal<true>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+    readonly ConsensusAddressOwner: Schema.Struct<{
+        readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+        readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"Unknown">;
+}>]>
+// decodes to:
+// {
+//     readonly $kind: "AddressOwner";
+//     readonly AddressOwner: SuiAddress;
+// } | {
+//     readonly $kind: "ObjectOwner";
+//     readonly ObjectOwner: ObjectId;
+// } | {
+//     readonly $kind: "Shared";
+//     readonly Shared: {
+//         readonly initialSharedVersion: Version;
+//     };
+// } | {
+//     readonly $kind: "Immutable";
+//     readonly Immutable: true;
+// } | {
+//     readonly $kind: "ConsensusAddressOwner";
+//     readonly ConsensusAddressOwner: {
+//         readonly startVersion: Version;
+//         readonly owner: SuiAddress;
+//     };
+// } | {
+//     readonly $kind: "Unknown";
+// }
 ```
 
 An object owner. Mirrors `SuiClientTypes.ObjectOwner` exactly, including its
@@ -618,6 +1440,7 @@ A synchronous transaction draft. Reads happen before it, so it stays replayable.
 
 ```ts
 declare const Signature: Schema.brand<Schema.String, "Signature">
+// decodes to: Signature
 ```
 
 A serialized signature, as every SDK signer returns it: the base64 of the
@@ -627,8 +1450,81 @@ where a digest or an address is expected.
 ### `SignedTransaction` (const)
 
 ```ts
-declare const SignedTransaction: Struct<{ readonly digest: brand<String, "Digest">; readonly bytes: Uint8ArrayFromBase64; readonly signatures: $Array<brand<String, "Signature">>; readonly sender: brand<...>; readonly expiration: optional<...>; }>
-// decodes to: { readonly digest: string & Brand<"Digest">; readonly bytes: Uint8Array<ArrayBufferLike>; readonly sender: string & Brand<"SuiAddress">; readonly signatures: readonly (string & Brand<...>)[]; readonly expiration?: { ...; } | ... 3 more ... | undefined; }
+declare const SignedTransaction: Schema.Struct<{
+    readonly digest: Schema.brand<Schema.String, "Digest">;
+    readonly bytes: Schema.Uint8ArrayFromBase64;
+    readonly signatures: Schema.$Array<Schema.brand<Schema.String, "Signature">>;
+    readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+    readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+        readonly $kind: Schema.Literal<"None">;
+        readonly None: Schema.Literal<true>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Epoch">;
+        readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ValidDuring">;
+        readonly ValidDuring: Schema.Struct<{
+            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly chain: Schema.String;
+            readonly nonce: Schema.Number;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Validity">;
+        readonly Validity: Schema.Struct<{
+            readonly allowedProposers: Schema.NullOr<Schema.Struct<{
+                readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+                readonly proposers: Schema.$Array<Schema.Number>;
+            }>>;
+            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly chain: Schema.String;
+            readonly nonce: Schema.Number;
+        }>;
+    }>]>>;
+}>
+// decodes to:
+// {
+//     readonly digest: Digest;
+//     readonly bytes: Uint8Array<ArrayBufferLike>;
+//     readonly sender: SuiAddress;
+//     readonly signatures: readonly Signature[];
+//     readonly expiration?: {
+//         readonly $kind: "None";
+//         readonly None: true;
+//     } | {
+//         readonly $kind: "Epoch";
+//         readonly Epoch: bigint;
+//     } | {
+//         readonly $kind: "ValidDuring";
+//         readonly ValidDuring: {
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | {
+//         readonly $kind: "Validity";
+//         readonly Validity: {
+//             readonly allowedProposers: {
+//                 readonly epoch: bigint;
+//                 readonly proposers: readonly number[];
+//             } | null;
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | undefined;
+// }
 ```
 
 The signed bytes of a transaction, kept so an uncertain submission can be
@@ -653,8 +1549,327 @@ A signer refused or failed to produce a signature.
 ### `Simulation` (const)
 
 ```ts
-declare const Simulation: Struct<{ readonly digest: brand<String, "Digest">; readonly effects: Struct<{ readonly version: Number; readonly status: Struct<{ readonly success: Boolean; }>; ... 8 more ...; readonly auxiliaryDataDigest: NullOr<...>; }>; readonly events: $Array<...>; readonly balanceChanges: $Array<...>; readonly objectTypes: $Re...
-// decodes to: { readonly digest: string & Brand<"Digest">; readonly effects: { readonly version: number; readonly status: { readonly success: boolean; }; readonly gasUsed: { readonly computationCost: bigint & Brand<"Mist">; readonly storageCost: bigint & Brand<...>; readonly storageRebate: bigint & Brand<...>; readonly nonRefunda...
+declare const Simulation: Schema.Struct<{
+    readonly digest: Schema.brand<Schema.String, "Digest">;
+    readonly effects: Schema.Struct<{
+        readonly version: Schema.Number;
+        readonly status: Schema.Struct<{
+            readonly success: Schema.Boolean;
+        }>;
+        readonly gasUsed: Schema.Struct<{
+            readonly computationCost: Schema.brand<Schema.BigIntFromString, "Mist">;
+            readonly storageCost: Schema.brand<Schema.BigIntFromString, "Mist">;
+            readonly storageRebate: Schema.brand<Schema.BigIntFromString, "Mist">;
+            readonly nonRefundableStorageFee: Schema.brand<Schema.BigIntFromString, "Mist">;
+        }>;
+        readonly transactionDigest: Schema.brand<Schema.String, "Digest">;
+        readonly gasObject: Schema.NullOr<Schema.Struct<{
+            readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+            readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
+            readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+            readonly inputDigest: Schema.NullOr<Schema.String>;
+            readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+                readonly $kind: Schema.Literal<"AddressOwner">;
+                readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ObjectOwner">;
+                readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Shared">;
+                readonly Shared: Schema.Struct<{
+                    readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Immutable">;
+                readonly Immutable: Schema.Literal<true>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+                readonly ConsensusAddressOwner: Schema.Struct<{
+                    readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                    readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Unknown">;
+            }>]>>;
+            readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
+            readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+            readonly outputDigest: Schema.NullOr<Schema.String>;
+            readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+                readonly $kind: Schema.Literal<"AddressOwner">;
+                readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ObjectOwner">;
+                readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Shared">;
+                readonly Shared: Schema.Struct<{
+                    readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Immutable">;
+                readonly Immutable: Schema.Literal<true>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+                readonly ConsensusAddressOwner: Schema.Struct<{
+                    readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                    readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Unknown">;
+            }>]>>;
+            readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
+        }>>;
+        readonly eventsDigest: Schema.NullOr<Schema.String>;
+        readonly dependencies: Schema.$Array<Schema.String>;
+        readonly lamportVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+        readonly changedObjects: Schema.$Array<Schema.Struct<{
+            readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+            readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
+            readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+            readonly inputDigest: Schema.NullOr<Schema.String>;
+            readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+                readonly $kind: Schema.Literal<"AddressOwner">;
+                readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ObjectOwner">;
+                readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Shared">;
+                readonly Shared: Schema.Struct<{
+                    readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Immutable">;
+                readonly Immutable: Schema.Literal<true>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+                readonly ConsensusAddressOwner: Schema.Struct<{
+                    readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                    readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Unknown">;
+            }>]>>;
+            readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
+            readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+            readonly outputDigest: Schema.NullOr<Schema.String>;
+            readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+                readonly $kind: Schema.Literal<"AddressOwner">;
+                readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ObjectOwner">;
+                readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Shared">;
+                readonly Shared: Schema.Struct<{
+                    readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Immutable">;
+                readonly Immutable: Schema.Literal<true>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+                readonly ConsensusAddressOwner: Schema.Struct<{
+                    readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                    readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Unknown">;
+            }>]>>;
+            readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
+        }>>;
+        readonly unchangedConsensusObjects: Schema.$Array<Schema.Struct<{
+            readonly kind: Schema.Literals<readonly ["Unknown", "ReadOnlyRoot", "MutateConsensusStreamEnded", "ReadConsensusStreamEnded", "Cancelled", "PerEpochConfig"]>;
+            readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+            readonly version: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+            readonly digest: Schema.NullOr<Schema.String>;
+        }>>;
+        readonly auxiliaryDataDigest: Schema.NullOr<Schema.String>;
+    }>;
+    readonly events: Schema.$Array<Schema.Struct<{
+        readonly packageId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+        readonly module: Schema.String;
+        readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        readonly eventType: Schema.String;
+        readonly bcs: Schema.Uint8Array;
+    }>>;
+    readonly balanceChanges: Schema.$Array<Schema.Struct<{
+        readonly coinType: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "CoinType">;
+        readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        readonly amount: Schema.BigIntFromString;
+    }>>;
+    readonly objectTypes: Schema.$Record<Schema.String, Schema.String>;
+    readonly commandResults: Schema.$Array<Schema.Struct<{
+        readonly returnValues: Schema.$Array<Schema.Struct<{
+            readonly bcs: Schema.Uint8Array;
+        }>>;
+        readonly mutatedReferences: Schema.$Array<Schema.Struct<{
+            readonly bcs: Schema.Uint8Array;
+        }>>;
+    }>>;
+}>
+// decodes to:
+// {
+//     readonly digest: Digest;
+//     readonly effects: {
+//         readonly version: number;
+//         readonly status: {
+//             readonly success: boolean;
+//         };
+//         readonly gasUsed: {
+//             readonly computationCost: Mist;
+//             readonly storageCost: Mist;
+//             readonly storageRebate: Mist;
+//             readonly nonRefundableStorageFee: Mist;
+//         };
+//         readonly transactionDigest: Digest;
+//         readonly gasObject: {
+//             readonly objectId: ObjectId;
+//             readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
+//             readonly inputVersion: Version | null;
+//             readonly inputDigest: string | null;
+//             readonly inputOwner: {
+//                 readonly $kind: "AddressOwner";
+//                 readonly AddressOwner: SuiAddress;
+//             } | {
+//                 readonly $kind: "ObjectOwner";
+//                 readonly ObjectOwner: ObjectId;
+//             } | {
+//                 readonly $kind: "Shared";
+//                 readonly Shared: {
+//                     readonly initialSharedVersion: Version;
+//                 };
+//             } | {
+//                 readonly $kind: "Immutable";
+//                 readonly Immutable: true;
+//             } | {
+//                 readonly $kind: "ConsensusAddressOwner";
+//                 readonly ConsensusAddressOwner: {
+//                     readonly startVersion: Version;
+//                     readonly owner: SuiAddress;
+//                 };
+//             } | {
+//                 readonly $kind: "Unknown";
+//             } | null;
+//             readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
+//             readonly outputVersion: Version | null;
+//             readonly outputDigest: string | null;
+//             readonly outputOwner: {
+//                 readonly $kind: "AddressOwner";
+//                 readonly AddressOwner: SuiAddress;
+//             } | {
+//                 readonly $kind: "ObjectOwner";
+//                 readonly ObjectOwner: ObjectId;
+//             } | {
+//                 readonly $kind: "Shared";
+//                 readonly Shared: {
+//                     readonly initialSharedVersion: Version;
+//                 };
+//             } | {
+//                 readonly $kind: "Immutable";
+//                 readonly Immutable: true;
+//             } | {
+//                 readonly $kind: "ConsensusAddressOwner";
+//                 readonly ConsensusAddressOwner: {
+//                     readonly startVersion: Version;
+//                     readonly owner: SuiAddress;
+//                 };
+//             } | {
+//                 readonly $kind: "Unknown";
+//             } | null;
+//             readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+//         } | null;
+//         readonly eventsDigest: string | null;
+//         readonly dependencies: readonly string[];
+//         readonly lamportVersion: Version | null;
+//         readonly changedObjects: readonly {
+//             readonly objectId: ObjectId;
+//             readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
+//             readonly inputVersion: Version | null;
+//             readonly inputDigest: string | null;
+//             readonly inputOwner: {
+//                 readonly $kind: "AddressOwner";
+//                 readonly AddressOwner: SuiAddress;
+//             } | {
+//                 readonly $kind: "ObjectOwner";
+//                 readonly ObjectOwner: ObjectId;
+//             } | {
+//                 readonly $kind: "Shared";
+//                 readonly Shared: {
+//                     readonly initialSharedVersion: Version;
+//                 };
+//             } | {
+//                 readonly $kind: "Immutable";
+//                 readonly Immutable: true;
+//             } | {
+//                 readonly $kind: "ConsensusAddressOwner";
+//                 readonly ConsensusAddressOwner: {
+//                     readonly startVersion: Version;
+//                     readonly owner: SuiAddress;
+//                 };
+//             } | {
+//                 readonly $kind: "Unknown";
+//             } | null;
+//             readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
+//             readonly outputVersion: Version | null;
+//             readonly outputDigest: string | null;
+//             readonly outputOwner: {
+//                 readonly $kind: "AddressOwner";
+//                 readonly AddressOwner: SuiAddress;
+//             } | {
+//                 readonly $kind: "ObjectOwner";
+//                 readonly ObjectOwner: ObjectId;
+//             } | {
+//                 readonly $kind: "Shared";
+//                 readonly Shared: {
+//                     readonly initialSharedVersion: Version;
+//                 };
+//             } | {
+//                 readonly $kind: "Immutable";
+//                 readonly Immutable: true;
+//             } | {
+//                 readonly $kind: "ConsensusAddressOwner";
+//                 readonly ConsensusAddressOwner: {
+//                     readonly startVersion: Version;
+//                     readonly owner: SuiAddress;
+//                 };
+//             } | {
+//                 readonly $kind: "Unknown";
+//             } | null;
+//             readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+//         }[];
+//         readonly unchangedConsensusObjects: readonly {
+//             readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
+//             readonly objectId: ObjectId;
+//             readonly version: Version | null;
+//             readonly digest: string | null;
+//         }[];
+//         readonly auxiliaryDataDigest: string | null;
+//     };
+//     readonly events: readonly {
+//         readonly packageId: ObjectId;
+//         readonly module: string;
+//         readonly sender: SuiAddress;
+//         readonly eventType: string;
+//         readonly bcs: Uint8Array<ArrayBufferLike>;
+//     }[];
+//     readonly balanceChanges: readonly {
+//         readonly coinType: CoinType;
+//         readonly address: SuiAddress;
+//         readonly amount: bigint;
+//     }[];
+//     readonly objectTypes: {
+//         readonly [x: string]: string;
+//     };
+//     readonly commandResults: readonly {
+//         readonly returnValues: readonly {
+//             readonly bcs: Uint8Array<ArrayBufferLike>;
+//         }[];
+//         readonly mutatedReferences: readonly {
+//             readonly bcs: Uint8Array<ArrayBufferLike>;
+//         }[];
+//     }[];
+// }
 ```
 
 The result of a successful simulation, with the fixed include set `Sui` asks
@@ -664,7 +1879,79 @@ for: effects, events, balance changes, object types and command results.
 
 ```ts
 export declare class SimulationFailed extends SimulationFailed_base {
-  readonly reason: { readonly $kind: "MoveAbort"; readonly MoveAbort: { readonly abortCode: bigint; readonly location?: { readonly function?: number | undefined; readonly package?: string | undefined; readonly module?: string | undefined; readonly functionName?: string | undefined; readonly instruction?: number | undefined; } | undefi...
+  readonly reason: {
+      readonly $kind: "MoveAbort";
+      readonly MoveAbort: {
+          readonly abortCode: bigint;
+          readonly location?: {
+              readonly function?: number | undefined;
+              readonly module?: string | undefined;
+              readonly package?: string | undefined;
+              readonly functionName?: string | undefined;
+              readonly instruction?: number | undefined;
+          } | undefined;
+          readonly cleverError?: {
+              readonly errorCode?: number | undefined;
+              readonly lineNumber?: number | undefined;
+              readonly constantName?: string | undefined;
+              readonly constantType?: string | undefined;
+              readonly value?: string | undefined;
+          } | undefined;
+      };
+  } | {
+      readonly $kind: "SizeError";
+      readonly SizeError: {
+          readonly name: string;
+          readonly size: number;
+          readonly maxSize: number;
+      };
+  } | {
+      readonly $kind: "CommandArgumentError";
+      readonly CommandArgumentError: {
+          readonly argument: number;
+          readonly name: string;
+      };
+  } | {
+      readonly $kind: "TypeArgumentError";
+      readonly TypeArgumentError: {
+          readonly typeArgument: number;
+          readonly name: string;
+      };
+  } | {
+      readonly $kind: "PackageUpgradeError";
+      readonly PackageUpgradeError: {
+          readonly name: string;
+          readonly digest?: string | undefined;
+          readonly packageId?: string | undefined;
+      };
+  } | {
+      readonly $kind: "IndexError";
+      readonly IndexError: {
+          readonly index?: number | undefined;
+          readonly subresult?: number | undefined;
+      };
+  } | {
+      readonly $kind: "CoinDenyListError";
+      readonly CoinDenyListError: {
+          readonly coinType: string;
+          readonly name: string;
+          readonly address?: string | undefined;
+      };
+  } | {
+      readonly $kind: "CongestedObjects";
+      readonly CongestedObjects: {
+          readonly name: string;
+          readonly objects: readonly string[];
+      };
+  } | {
+      readonly $kind: "ObjectIdError";
+      readonly ObjectIdError: {
+          readonly objectId: string;
+          readonly name?: string | undefined;
+      };
+  } | {
+      readonly $kind: "Unknown";
+  }
   readonly message: string
 }
 ```
@@ -683,6 +1970,7 @@ The failures of a simulation.
 
 ```ts
 declare const StructTag: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "StructTag">
+// decodes to: StructTag
 ```
 
 A fully qualified Move struct tag, normalized with `normalizeStructTag` on
@@ -693,8 +1981,44 @@ decode so `0x2::sui::SUI` and its padded form compare equal.
 ```ts
 export declare class SubmissionUnknown extends SubmissionUnknown_base {
   readonly cause: unknown
-  readonly digest: string & Brand<"Digest">
-  readonly signed: { readonly digest: string & Brand<"Digest">; readonly bytes: Uint8Array<ArrayBufferLike>; readonly sender: string & Brand<"SuiAddress">; readonly signatures: readonly (string & Brand<...>)[]; readonly expiration?: { ...; } | ... 3 more ... | undefined; } | undefined
+  readonly digest: Digest
+  readonly signed: {
+      readonly digest: Digest;
+      readonly bytes: Uint8Array<ArrayBufferLike>;
+      readonly sender: SuiAddress;
+      readonly signatures: readonly Signature[];
+      readonly expiration?: {
+          readonly $kind: "None";
+          readonly None: true;
+      } | {
+          readonly $kind: "Epoch";
+          readonly Epoch: bigint;
+      } | {
+          readonly $kind: "ValidDuring";
+          readonly ValidDuring: {
+              readonly minEpoch: bigint | null;
+              readonly maxEpoch: bigint | null;
+              readonly minTimestamp: bigint | null;
+              readonly maxTimestamp: bigint | null;
+              readonly chain: string;
+              readonly nonce: number;
+          };
+      } | {
+          readonly $kind: "Validity";
+          readonly Validity: {
+              readonly allowedProposers: {
+                  readonly epoch: bigint;
+                  readonly proposers: readonly number[];
+              } | null;
+              readonly minEpoch: bigint | null;
+              readonly maxEpoch: bigint | null;
+              readonly minTimestamp: bigint | null;
+              readonly maxTimestamp: bigint | null;
+              readonly chain: string;
+              readonly nonce: number;
+          };
+      } | undefined;
+  } | undefined
 }
 ```
 
@@ -712,6 +2036,21 @@ export declare class Sui extends Sui_base {
      * Fails with: `NetworkMismatch`, `TransportError`.
      */
     static readonly layerNoDepsWith: (options: SuiLayerOptions) => Layer.Layer<Sui, NetworkMismatch | TransportError, SuiCore>;
+    /**
+     * `Sui` over whatever `SuiCore` is provided, **without reading the chain
+     * identifier**: the one given is taken as the chain's.
+     *
+     * This exists for one caller: `SuiExtension.fromService` with `warm`, which
+     * builds its runtime synchronously inside `register` and therefore cannot
+     * await a `getChainIdentifier` round trip. Nothing is asserted, because
+     * nothing is asked — a node on another chain is not detected here. What still
+     * protects a warm registration is the chain itself: `Tx.build` stamps this id
+     * on the transaction's `ValidDuring` expiration, and a validator refuses
+     * bytes signed for another chain.
+     *
+     * Prefer {@link layerNoDeps}, which asks. Never fails.
+     */
+    static readonly layerNoDepsPinned: (chainId: string) => Layer.Layer<Sui, never, SuiCore>;
     /**
      * Builds `Sui` over whatever `SuiCore` is provided, reading the chain
      * identifier once.
@@ -747,6 +2086,7 @@ The opinionated tier.
 
 ```ts
 declare const SuiAddress: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">
+// decodes to: SuiAddress
 ```
 
 A 32-byte Sui account address, normalized to the padded lowercase `0x` form on
@@ -867,10 +2207,50 @@ plus the four concrete conveniences `CoreClient` adds and the `use` hatch.
 ### `SuiError` (type)
 
 ```ts
-export type SuiError = TransportError | ObjectNotFound | ObjectDeleted | ObjectUnavailable | TransactionNotFound | NetworkMismatch | DecodeError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError | UnexpectedEffects;
+export type SuiError = TransportError | ObjectNotFound | ObjectDeleted | ObjectUnavailable | TransactionNotFound | NetworkMismatch | DecodeError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError | UnexpectedEffects | GraphQLUnavailable | ExtensionNotReady;
 ```
 
 Every failure sui-effect can produce.
+
+### `SuiGraphQL` (class)
+
+```ts
+export declare class SuiGraphQL extends SuiGraphQL_base {
+    /**
+     * The tag over a client the caller built. Never fails.
+     */
+    static readonly layer: (client: SuiGraphQLClient) => Layer.Layer<SuiGraphQL>;
+    /**
+     * A client pointed at `SUI_GRAPHQL_URL`, on the network `SUI_NETWORK` names —
+     * the same variable `SuiCore.layerConfig` reads, because a GraphQL endpoint
+     * for one chain and a node for another is a misconfiguration no error can
+     * describe after the fact.
+     *
+     * Fails with: `ConfigError` when either variable is missing or empty.
+     */
+    static readonly layerConfig: Layer.Layer<SuiGraphQL, Config.ConfigError>;
+    /**
+     * The tag over a client whose every call rejects with `GraphQLUnavailable`.
+     *
+     * This is what an application provides when it has no GraphQL endpoint and
+     * still wants to build an extension that can use one. The alternative — no
+     * layer at all — is a compile error in code that may never run the GraphQL
+     * path; this turns the absence into the failure the extension already
+     * handles, at the call it would have made.
+     *
+     * Never fails to build; every call through it fails.
+     */
+    static readonly layerUnavailable: Layer.Layer<SuiGraphQL>;
+    /**
+     * `layerUnavailable` with the caller's own wording, for an application that
+     * knows why the endpoint is missing. Never fails to build.
+     */
+    static readonly layerUnavailableWith: (reason: string) => Layer.Layer<SuiGraphQL>;
+}
+```
+
+The SDK's GraphQL client as a service, so an extension can require it
+without constructing one.
 
 ### `SuiGrpcLayerOptions` (interface)
 
@@ -926,7 +2306,7 @@ a `ref` ready to feed straight back into the transaction builder.
 #### `bcs` (const)
 
 ```ts
-declare const bcs: <T extends Input, Input>(bcsType: BcsType<T, Input>, expectedType: string) => Schema.Codec<T, Uint8Array>
+declare const bcs: <T extends Input, Input>(bcsType: BcsType<T, Input>, expectedType?: string) => Schema.Codec<T, Uint8Array>
 ```
 
 Turns a BCS layout into a `Schema.Codec<T, Uint8Array>` tagged with the Move
@@ -935,7 +2315,17 @@ type it belongs to.
 Decoding fails with a `SchemaError` (which `Sui` maps to `DecodeError`) when
 the bytes do not parse; encoding fails the same way when the value does not
 serialize. The expected type is normalized with `normalizeStructTag`, so
-`Coin<0x2::sui::SUI>` and its padded spelling are the same type.
+`Coin<0x2::sui::SUI>` and its padded spelling are the same type, and a tag
+with no type arguments matches every instantiation of it (see
+`typeMatches`).
+
+**`expectedType` is optional.** A Move *return value* has no struct tag —
+`sui.view(recipe, bcs.Address())` reads a `vector<u8>` off a command result —
+and inventing one so the bridge has something to compare is worse than saying
+there is nothing to compare. A codec built without an expected type carries
+none, so nothing checks a tag before it parses: the re-serialize length check
+is still what rejects mis-shaped bytes. Give the type whenever the bytes come
+from an object, which is every `getObject(id, { schema })` read.
 
 #### `decode` (const)
 
@@ -943,6 +2333,7 @@ serialize. The expected type is normalized with `normalizeStructTag`, so
 declare const decodeContent: <T>(schema: Schema.Codec<T, Uint8Array>, content: Uint8Array, context?: {
     readonly objectId?: ObjectId;
     readonly expectedType?: string;
+    readonly actualType?: string;
 }) => Effect.Effect<T, DecodeError>
 ```
 
@@ -957,7 +2348,11 @@ same `Schema.decodeUnknownEffect(...).pipe(Effect.mapError(...))`, and the
 `DecodeError` it produces is worse than this one.
 
 `expectedType` defaults to the Move type the codec was built with, so passing
-it is only needed for a codec that carries none. `objectId` is recorded on
+it is only needed for a codec that carries none, or to override the recorded
+one. `actualType` is the Move type the bytes actually came from, when the
+caller knows it — a dynamic field's `name.type`, a stream envelope's `type`:
+give it and the same tag check `getObject` does runs here, under the
+`typeMatches` rule, before a byte is parsed. `objectId` is recorded on
 the error so an operator knows which object did not decode.
 
 **Fails with: `DecodeError`.**
@@ -1044,6 +2439,28 @@ export interface SuiService {
             readonly expectedType?: string;
         }): Effect.Effect<ReadonlyArray<Result.Result<SuiObject<Uint8Array>, BatchItemError>>, TransportError>;
     };
+    /**
+     * `getObjects` for a caller who wants the first per-item failure to fail the
+     * whole read.
+     *
+     * The soft idiom — filter or default the `Result` array `getObjects` returns
+     * — is right when a missing object is ordinary. This is the hard one: every
+     * id must be there, and the first that is not is the failure. Order is the
+     * order of `ids`.
+     *
+     * Fails with: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`,
+     * `DecodeError`, `TransportError`.
+     */
+    readonly getObjectsOrFail: {
+        <S>(ids: ReadonlyArray<ObjectId>, opts: {
+            readonly schema: Schema.Codec<S, Uint8Array>;
+            readonly expectedType?: string;
+        }): Effect.Effect<ReadonlyArray<SuiObject<S>>, BatchItemError | TransportError>;
+        (ids: ReadonlyArray<ObjectId>, opts?: {
+            readonly schema?: undefined;
+            readonly expectedType?: string;
+        }): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>;
+    };
     /** The balance of one coin type for one owner. Fails with: `TransportError`. */
     readonly getBalance: (owner: SuiAddress, coinType?: CoinType) => Effect.Effect<Balance, TransportError>;
     /**
@@ -1062,19 +2479,38 @@ export interface SuiService {
     /**
      * Simulates a transaction with the fixed simulate include set.
      *
+     * `opts.sender` is set on the transaction when the recipe did not set one.
+     * A simulation needs *a* sender: the SDK substitutes the zero address when
+     * the transaction carries none, which is what a read-only simulation of a
+     * public function wants and is what happens here when `sender` is omitted. A
+     * recipe may `tx.setSender(...)` itself, and then it wins. Bytes that are
+     * already serialized carry their own sender and `opts.sender` does not apply.
+     *
      * Fails with: `SimulationFailed`, `BuildError`, `TransportError`.
      */
-    readonly simulate: (input: Recipe | Transaction | Uint8Array) => Effect.Effect<Simulation, SimulationFailed | BuildError | TransportError>;
+    readonly simulate: (input: Recipe | Transaction | Uint8Array, opts?: {
+        readonly sender?: SuiAddress;
+    }) => Effect.Effect<Simulation, SimulationFailed | BuildError | TransportError>;
     /**
      * Reads a Move return value without executing: simulates with checks disabled
      * and decodes return value `result` (default 0) of command `command`
      * (default the last command).
      *
+     * The codec may be a bare `@mysten/bcs` `BcsType` — `bcs.Address()`,
+     * `bcs.vector(bcs.u64())` — because a Move **return value** has no struct tag
+     * to check it against. A `SuiSchema.bcs` codec works too, and so does one
+     * composed with `Schema.decodeTo(DomainClass, …)`; no type tag is compared
+     * either way.
+     *
+     * `opts.sender` is the address the call is simulated as, defaulting to the
+     * zero address the way the SDK does; a recipe that sets its own sender wins.
+     *
      * Fails with: `SimulationFailed`, `BuildError`, `DecodeError`, `TransportError`.
      */
-    readonly view: <S>(recipe: Recipe, schema: Schema.Codec<S, Uint8Array>, opts?: {
+    readonly view: <S, I>(recipe: Recipe, schema: Schema.Codec<S, Uint8Array> | BcsType<S, I>, opts?: {
         readonly command?: number;
         readonly result?: number;
+        readonly sender?: SuiAddress;
     }) => Effect.Effect<S, SimulationFailed | BuildError | DecodeError | TransportError>;
     /** Every object an address owns, paginated. Fails with: `TransportError`. */
     readonly streamOwnedObjects: (owner: SuiAddress, opts?: {
@@ -1095,8 +2531,277 @@ The opinionated tier over `SuiCore`.
 ### `TransactionEffects` (const)
 
 ```ts
-declare const TransactionEffects: Struct<{ readonly version: Number; readonly status: Struct<{ readonly success: Boolean; }>; readonly gasUsed: Struct<{ readonly computationCost: brand<BigIntFromString, "Mist">; readonly storageCost: brand<...>; readonly storageRebate: brand<...>; readonly nonRefundableStorageFee: brand<...>; }>; ... 7 more ...; rea...
-// decodes to: { readonly version: number; readonly status: { readonly success: boolean; }; readonly gasUsed: { readonly computationCost: bigint & Brand<"Mist">; readonly storageCost: bigint & Brand<"Mist">; readonly storageRebate: bigint & Brand<...>; readonly nonRefundableStorageFee: bigint & Brand<...>; }; ... 7 more ...; reado...
+declare const TransactionEffects: Schema.Struct<{
+    readonly version: Schema.Number;
+    readonly status: Schema.Struct<{
+        readonly success: Schema.Boolean;
+    }>;
+    readonly gasUsed: Schema.Struct<{
+        readonly computationCost: Schema.brand<Schema.BigIntFromString, "Mist">;
+        readonly storageCost: Schema.brand<Schema.BigIntFromString, "Mist">;
+        readonly storageRebate: Schema.brand<Schema.BigIntFromString, "Mist">;
+        readonly nonRefundableStorageFee: Schema.brand<Schema.BigIntFromString, "Mist">;
+    }>;
+    readonly transactionDigest: Schema.brand<Schema.String, "Digest">;
+    readonly gasObject: Schema.NullOr<Schema.Struct<{
+        readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+        readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
+        readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+        readonly inputDigest: Schema.NullOr<Schema.String>;
+        readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+            readonly $kind: Schema.Literal<"AddressOwner">;
+            readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"ObjectOwner">;
+            readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Shared">;
+            readonly Shared: Schema.Struct<{
+                readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Immutable">;
+            readonly Immutable: Schema.Literal<true>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+            readonly ConsensusAddressOwner: Schema.Struct<{
+                readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Unknown">;
+        }>]>>;
+        readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
+        readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+        readonly outputDigest: Schema.NullOr<Schema.String>;
+        readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+            readonly $kind: Schema.Literal<"AddressOwner">;
+            readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"ObjectOwner">;
+            readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Shared">;
+            readonly Shared: Schema.Struct<{
+                readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Immutable">;
+            readonly Immutable: Schema.Literal<true>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+            readonly ConsensusAddressOwner: Schema.Struct<{
+                readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Unknown">;
+        }>]>>;
+        readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
+    }>>;
+    readonly eventsDigest: Schema.NullOr<Schema.String>;
+    readonly dependencies: Schema.$Array<Schema.String>;
+    readonly lamportVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+    readonly changedObjects: Schema.$Array<Schema.Struct<{
+        readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+        readonly inputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "Exists"]>;
+        readonly inputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+        readonly inputDigest: Schema.NullOr<Schema.String>;
+        readonly inputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+            readonly $kind: Schema.Literal<"AddressOwner">;
+            readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"ObjectOwner">;
+            readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Shared">;
+            readonly Shared: Schema.Struct<{
+                readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Immutable">;
+            readonly Immutable: Schema.Literal<true>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+            readonly ConsensusAddressOwner: Schema.Struct<{
+                readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Unknown">;
+        }>]>>;
+        readonly outputState: Schema.Literals<readonly ["Unknown", "DoesNotExist", "ObjectWrite", "PackageWrite", "AccumulatorWriteV1"]>;
+        readonly outputVersion: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+        readonly outputDigest: Schema.NullOr<Schema.String>;
+        readonly outputOwner: Schema.NullOr<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+            readonly $kind: Schema.Literal<"AddressOwner">;
+            readonly AddressOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"ObjectOwner">;
+            readonly ObjectOwner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Shared">;
+            readonly Shared: Schema.Struct<{
+                readonly initialSharedVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Immutable">;
+            readonly Immutable: Schema.Literal<true>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"ConsensusAddressOwner">;
+            readonly ConsensusAddressOwner: Schema.Struct<{
+                readonly startVersion: Schema.brand<Schema.BigIntFromString, "Version">;
+                readonly owner: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Unknown">;
+        }>]>>;
+        readonly idOperation: Schema.Literals<readonly ["Unknown", "None", "Created", "Deleted"]>;
+    }>>;
+    readonly unchangedConsensusObjects: Schema.$Array<Schema.Struct<{
+        readonly kind: Schema.Literals<readonly ["Unknown", "ReadOnlyRoot", "MutateConsensusStreamEnded", "ReadConsensusStreamEnded", "Cancelled", "PerEpochConfig"]>;
+        readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+        readonly version: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+        readonly digest: Schema.NullOr<Schema.String>;
+    }>>;
+    readonly auxiliaryDataDigest: Schema.NullOr<Schema.String>;
+}>
+// decodes to:
+// {
+//     readonly version: number;
+//     readonly status: {
+//         readonly success: boolean;
+//     };
+//     readonly gasUsed: {
+//         readonly computationCost: Mist;
+//         readonly storageCost: Mist;
+//         readonly storageRebate: Mist;
+//         readonly nonRefundableStorageFee: Mist;
+//     };
+//     readonly transactionDigest: Digest;
+//     readonly gasObject: {
+//         readonly objectId: ObjectId;
+//         readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
+//         readonly inputVersion: Version | null;
+//         readonly inputDigest: string | null;
+//         readonly inputOwner: {
+//             readonly $kind: "AddressOwner";
+//             readonly AddressOwner: SuiAddress;
+//         } | {
+//             readonly $kind: "ObjectOwner";
+//             readonly ObjectOwner: ObjectId;
+//         } | {
+//             readonly $kind: "Shared";
+//             readonly Shared: {
+//                 readonly initialSharedVersion: Version;
+//             };
+//         } | {
+//             readonly $kind: "Immutable";
+//             readonly Immutable: true;
+//         } | {
+//             readonly $kind: "ConsensusAddressOwner";
+//             readonly ConsensusAddressOwner: {
+//                 readonly startVersion: Version;
+//                 readonly owner: SuiAddress;
+//             };
+//         } | {
+//             readonly $kind: "Unknown";
+//         } | null;
+//         readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
+//         readonly outputVersion: Version | null;
+//         readonly outputDigest: string | null;
+//         readonly outputOwner: {
+//             readonly $kind: "AddressOwner";
+//             readonly AddressOwner: SuiAddress;
+//         } | {
+//             readonly $kind: "ObjectOwner";
+//             readonly ObjectOwner: ObjectId;
+//         } | {
+//             readonly $kind: "Shared";
+//             readonly Shared: {
+//                 readonly initialSharedVersion: Version;
+//             };
+//         } | {
+//             readonly $kind: "Immutable";
+//             readonly Immutable: true;
+//         } | {
+//             readonly $kind: "ConsensusAddressOwner";
+//             readonly ConsensusAddressOwner: {
+//                 readonly startVersion: Version;
+//                 readonly owner: SuiAddress;
+//             };
+//         } | {
+//             readonly $kind: "Unknown";
+//         } | null;
+//         readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+//     } | null;
+//     readonly eventsDigest: string | null;
+//     readonly dependencies: readonly string[];
+//     readonly lamportVersion: Version | null;
+//     readonly changedObjects: readonly {
+//         readonly objectId: ObjectId;
+//         readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
+//         readonly inputVersion: Version | null;
+//         readonly inputDigest: string | null;
+//         readonly inputOwner: {
+//             readonly $kind: "AddressOwner";
+//             readonly AddressOwner: SuiAddress;
+//         } | {
+//             readonly $kind: "ObjectOwner";
+//             readonly ObjectOwner: ObjectId;
+//         } | {
+//             readonly $kind: "Shared";
+//             readonly Shared: {
+//                 readonly initialSharedVersion: Version;
+//             };
+//         } | {
+//             readonly $kind: "Immutable";
+//             readonly Immutable: true;
+//         } | {
+//             readonly $kind: "ConsensusAddressOwner";
+//             readonly ConsensusAddressOwner: {
+//                 readonly startVersion: Version;
+//                 readonly owner: SuiAddress;
+//             };
+//         } | {
+//             readonly $kind: "Unknown";
+//         } | null;
+//         readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
+//         readonly outputVersion: Version | null;
+//         readonly outputDigest: string | null;
+//         readonly outputOwner: {
+//             readonly $kind: "AddressOwner";
+//             readonly AddressOwner: SuiAddress;
+//         } | {
+//             readonly $kind: "ObjectOwner";
+//             readonly ObjectOwner: ObjectId;
+//         } | {
+//             readonly $kind: "Shared";
+//             readonly Shared: {
+//                 readonly initialSharedVersion: Version;
+//             };
+//         } | {
+//             readonly $kind: "Immutable";
+//             readonly Immutable: true;
+//         } | {
+//             readonly $kind: "ConsensusAddressOwner";
+//             readonly ConsensusAddressOwner: {
+//                 readonly startVersion: Version;
+//                 readonly owner: SuiAddress;
+//             };
+//         } | {
+//             readonly $kind: "Unknown";
+//         } | null;
+//         readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+//     }[];
+//     readonly unchangedConsensusObjects: readonly {
+//         readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
+//         readonly objectId: ObjectId;
+//         readonly version: Version | null;
+//         readonly digest: string | null;
+//     }[];
+//     readonly auxiliaryDataDigest: string | null;
+// }
 ```
 
 Transaction effects. Mirrors `SuiClientTypes.TransactionEffects`.
@@ -1104,8 +2809,69 @@ Transaction effects. Mirrors `SuiClientTypes.TransactionEffects`.
 ### `TransactionExpiration` (const)
 
 ```ts
-declare const TransactionExpiration: toTaggedUnion<"$kind", readonly [Struct<{ readonly $kind: Literal<"None">; readonly None: Literal<true>; }>, Struct<{ readonly $kind: Literal<"Epoch">; readonly Epoch: decodeTo<BigInt, Union<...>, never, never>; }>, Struct<...>, Struct<...>]>
-// decodes to: { readonly $kind: "None"; readonly None: true; } | { readonly $kind: "Epoch"; readonly Epoch: bigint; } | { readonly $kind: "ValidDuring"; readonly ValidDuring: { readonly minEpoch: bigint | null; ... 4 more ...; readonly nonce: number; }; } | { ...; }
+declare const TransactionExpiration: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+    readonly $kind: Schema.Literal<"None">;
+    readonly None: Schema.Literal<true>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"Epoch">;
+    readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"ValidDuring">;
+    readonly ValidDuring: Schema.Struct<{
+        readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly chain: Schema.String;
+        readonly nonce: Schema.Number;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"Validity">;
+    readonly Validity: Schema.Struct<{
+        readonly allowedProposers: Schema.NullOr<Schema.Struct<{
+            readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+            readonly proposers: Schema.$Array<Schema.Number>;
+        }>>;
+        readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly chain: Schema.String;
+        readonly nonce: Schema.Number;
+    }>;
+}>]>
+// decodes to:
+// {
+//     readonly $kind: "None";
+//     readonly None: true;
+// } | {
+//     readonly $kind: "Epoch";
+//     readonly Epoch: bigint;
+// } | {
+//     readonly $kind: "ValidDuring";
+//     readonly ValidDuring: {
+//         readonly minEpoch: bigint | null;
+//         readonly maxEpoch: bigint | null;
+//         readonly minTimestamp: bigint | null;
+//         readonly maxTimestamp: bigint | null;
+//         readonly chain: string;
+//         readonly nonce: number;
+//     };
+// } | {
+//     readonly $kind: "Validity";
+//     readonly Validity: {
+//         readonly allowedProposers: {
+//             readonly epoch: bigint;
+//             readonly proposers: readonly number[];
+//         } | null;
+//         readonly minEpoch: bigint | null;
+//         readonly maxEpoch: bigint | null;
+//         readonly minTimestamp: bigint | null;
+//         readonly maxTimestamp: bigint | null;
+//         readonly chain: string;
+//         readonly nonce: number;
+//     };
+// }
 ```
 
 When a transaction stops being valid. Mirrors the SDK's
@@ -1128,7 +2894,7 @@ The failures of a transaction lookup.
 
 ```ts
 export declare class TransactionNotFound extends TransactionNotFound_base {
-  readonly digest: string & Brand<"Digest">
+  readonly digest: Digest
 }
 ```
 
@@ -1138,10 +2904,37 @@ No transaction with this digest is known to the node.
 
 ```ts
 export declare class TransportError extends TransportError_base {
-  readonly cause: unknown
-  readonly method: string
-  readonly retryable: boolean
-  readonly status: string | undefined
+    /**
+     * Builds a `TransportError` out of whatever a call threw, classifying the
+     * status and the retryability the way `SuiCore` does for the SDK's own
+     * failures.
+     *
+     * This is for an extension that makes its own network calls — an operator
+     * HTTP API, a GraphQL endpoint, a sidecar — and wants its failures to sit on
+     * the same axis as the library's: `retryable` read off a gRPC status name, an
+     * HTTP status number (5xx and 429), or an abort or timeout, and `status`
+     * recorded as the node or the transport spelled it. Hand-building the three
+     * fields per call site is how they drift.
+     *
+     * `retryable` may be forced when the caller knows better than the shape of
+     * the cause — an idempotent read that is always safe to repeat, a write that
+     * never is. Left out, it is inferred, and inferred conservatively: an
+     * unrecognisable cause is **not** retryable.
+     *
+     * Never fails.
+     *
+     * @example
+     * ```ts
+     * import { TransportError } from "sui-effect"
+     * import { Effect } from "effect"
+     *
+     * const status = Effect.tryPromise({
+     *   try: (signal) => fetch("https://operator.example/status", { signal }),
+     *   catch: (cause) => TransportError.fromUnknown("operator.status", cause)
+     * })
+     * ```
+     */
+    static readonly fromUnknown: (method: string, cause: unknown, retryable?: boolean) => TransportError;
 }
 ```
 
@@ -1156,8 +2949,19 @@ retried.
 ### `UnchangedConsensusObject` (const)
 
 ```ts
-declare const UnchangedConsensusObject: Struct<{ readonly kind: Literals<readonly ["Unknown", "ReadOnlyRoot", "MutateConsensusStreamEnded", "ReadConsensusStreamEnded", "Cancelled", "PerEpochConfig"]>; readonly objectId: brand<...>; readonly version: NullOr<...>; readonly digest: NullOr<...>; }>
-// decodes to: { readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig"; readonly objectId: string & Brand<"ObjectId">; readonly version: (bigint & Brand<...>) | null; readonly digest: string | null; }
+declare const UnchangedConsensusObject: Schema.Struct<{
+    readonly kind: Schema.Literals<readonly ["Unknown", "ReadOnlyRoot", "MutateConsensusStreamEnded", "ReadConsensusStreamEnded", "Cancelled", "PerEpochConfig"]>;
+    readonly objectId: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "ObjectId">;
+    readonly version: Schema.NullOr<Schema.brand<Schema.BigIntFromString, "Version">>;
+    readonly digest: Schema.NullOr<Schema.String>;
+}>
+// decodes to:
+// {
+//     readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
+//     readonly objectId: ObjectId;
+//     readonly version: Version | null;
+//     readonly digest: string | null;
+// }
 ```
 
 Mirrors `SuiClientTypes.UnchangedConsensusObject`.
@@ -1166,9 +2970,9 @@ Mirrors `SuiClientTypes.UnchangedConsensusObject`.
 
 ```ts
 export declare class UnexpectedEffects extends UnexpectedEffects_base {
-  readonly digest: string & Brand<"Digest">
+  readonly digest: Digest
   readonly expected: string
-  readonly found: readonly (string & Brand<"ObjectId">)[]
+  readonly found: readonly ObjectId[]
 }
 ```
 
@@ -1178,6 +2982,7 @@ The effects of an applied transaction did not contain what the caller expected.
 
 ```ts
 declare const Version: Schema.brand<Schema.BigIntFromString, "Version">
+// decodes to: Version
 ```
 
 A Move object version. Encoded as the decimal string the SDK returns.
@@ -1185,12 +2990,51 @@ A Move object version. Encoded as the decimal string the SDK returns.
 ## `sui-effect/tx`
 
 
-34 exported symbols.
+35 exported symbols.
 
 ### `build` (const)
 
 ```ts
-declare const build: (input: Transaction | Recipe, opts: { readonly sender: string & Brand<"SuiAddress">; readonly gasOwner?: (string & Brand<"SuiAddress">) | undefined; }) => Effect<...>
+declare const build: (input: Transaction | Recipe, opts: {
+    readonly sender: SuiAddress;
+    readonly gasOwner?: SuiAddress;
+}) => Effect.Effect<{
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+    readonly gasOwner?: SuiAddress | undefined;
+}, TransportError | SimulationFailed | BuildError, Sui>
 ```
 
 Builds a transaction into signable bytes.
@@ -1216,8 +3060,81 @@ pick the same gas coin.
 ### `Built` (const)
 
 ```ts
-declare const Built: Struct<{ readonly digest: brand<String, "Digest">; readonly bytes: Uint8ArrayFromBase64; readonly sender: brand<decodeTo<toType<String>, String, never, never>, "SuiAddress">; readonly gasOwner: optional<...>; readonly expiration: optional<...>; }>
-// decodes to: { readonly digest: string & Brand<"Digest">; readonly bytes: Uint8Array<ArrayBufferLike>; readonly sender: string & Brand<"SuiAddress">; readonly gasOwner?: (string & Brand<...>) | undefined; readonly expiration?: { ...; } | ... 3 more ... | undefined; }
+declare const Built: Schema.Struct<{
+    readonly digest: Schema.brand<Schema.String, "Digest">;
+    readonly bytes: Schema.Uint8ArrayFromBase64;
+    readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+    readonly gasOwner: Schema.optional<Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">>;
+    readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+        readonly $kind: Schema.Literal<"None">;
+        readonly None: Schema.Literal<true>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Epoch">;
+        readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"ValidDuring">;
+        readonly ValidDuring: Schema.Struct<{
+            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly chain: Schema.String;
+            readonly nonce: Schema.Number;
+        }>;
+    }>, Schema.Struct<{
+        readonly $kind: Schema.Literal<"Validity">;
+        readonly Validity: Schema.Struct<{
+            readonly allowedProposers: Schema.NullOr<Schema.Struct<{
+                readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+                readonly proposers: Schema.$Array<Schema.Number>;
+            }>>;
+            readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+            readonly chain: Schema.String;
+            readonly nonce: Schema.Number;
+        }>;
+    }>]>>;
+}>
+// decodes to:
+// {
+//     readonly digest: Digest;
+//     readonly bytes: Uint8Array<ArrayBufferLike>;
+//     readonly sender: SuiAddress;
+//     readonly gasOwner?: SuiAddress | undefined;
+//     readonly expiration?: {
+//         readonly $kind: "None";
+//         readonly None: true;
+//     } | {
+//         readonly $kind: "Epoch";
+//         readonly Epoch: bigint;
+//     } | {
+//         readonly $kind: "ValidDuring";
+//         readonly ValidDuring: {
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | {
+//         readonly $kind: "Validity";
+//         readonly Validity: {
+//             readonly allowedProposers: {
+//                 readonly epoch: bigint;
+//                 readonly proposers: readonly number[];
+//             } | null;
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | undefined;
+// }
 ```
 
 A transaction built into bytes and ready to sign, with the expiration the
@@ -1227,7 +3144,79 @@ the builder, whether the transaction can still land.
 ### `cosign` (const)
 
 ```ts
-declare const cosign: (signed: { readonly digest: string & Brand<"Digest">; readonly sender: string & Brand<"SuiAddress">; readonly signatures: readonly (string & Brand<"Signature">)[]; readonly bytes: Uint8Array<...>; readonly expiration?: { ...; } | ... 3 more ... | undefined; }, signer: Signer) => Effect<...>
+declare const cosign: (signed: {
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly signatures: readonly Signature[];
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+}, signer: Signer) => Effect.Effect<{
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly signatures: readonly Signature[];
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+}, SigningError, never>
 ```
 
 Adds one more signature to already signed bytes, for a sponsored or
@@ -1287,10 +3276,31 @@ the input it rejected.
 declare const fromKeypair: (keypair: Keypair) => Signer
 ```
 
-Wraps an SDK `Keypair` (or anything with the same `toSuiAddress`,
-`getKeyScheme`, `signTransaction` and `signPersonalMessage` surface).
+`fromSdkSigner` under the name the spec gave it when a keypair was the
+only thing it took. A `Keypair` **is** an SDK `Signer`, so this is a thin
+alias kept for callers who hold one.
 
-The keypair holds the secret; the `Signer` it returns does not expose it.
+**Never fails.**
+
+### `fromSdkSigner` (const)
+
+```ts
+declare const fromSdkSigner: (keypair: SdkSigner) => Signer
+```
+
+Wraps any `@mysten/sui/cryptography` `Signer`.
+
+The SDK's `Signer` is the base class every credential extends: `Keypair` and
+its three schemes, but also a Ledger signer, a wallet adapter's signer, a KMS
+signer — anything that can `toSuiAddress`, `getKeyScheme`, `signTransaction`
+and `signPersonalMessage`. Nothing here needs the secret, so nothing here
+needs a keypair, and the `Signer` this returns exposes no secret material
+either.
+
+For a credential that is not an SDK `Signer` at all — a remote service, a
+hardware device behind your own protocol — use `remote`, which takes
+Effects and the address to sign as.
+
 Never fails: a bad address or signature surfaces as a `SigningError` from the
 member that produced it, not from construction.
 
@@ -1299,7 +3309,262 @@ member that produced it, not from construction.
 ### `isUnresolved` (const)
 
 ```ts
-declare const isUnresolved: (value: { readonly _tag: "Unknown"; readonly digest: string & Brand<"Digest">; readonly signed: { readonly digest: string & Brand<"Digest">; readonly sender: string & Brand<"SuiAddress">; readonly signatures: readonly (string & Brand<...>)[]; readonly bytes: Uint8Array<...>; readonly expiration?: { ...; } | ... 3 mo...
+declare const isUnresolved: (value: {
+    readonly _tag: "Unknown";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly lastError: string;
+    readonly attempts: number;
+    readonly at: import("effect/DateTime").Utc;
+} | {
+    readonly _tag: "NotApplied";
+    readonly digest: Digest;
+    readonly evidence: "expired" | "inputConsumed";
+    readonly at: import("effect/DateTime").Utc;
+} | {
+    readonly _tag: "Signed";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly signedAt: import("effect/DateTime").Utc;
+} | {
+    readonly at: import("effect/DateTime").Utc;
+    readonly digest: Digest;
+    readonly _tag: "Executed";
+    readonly checkpoint?: bigint | undefined;
+} | {
+    readonly _tag: "Failed";
+    readonly digest: Digest;
+    readonly reason: {
+        readonly $kind: "MoveAbort";
+        readonly MoveAbort: {
+            readonly abortCode: bigint;
+            readonly location?: {
+                readonly function?: number | undefined;
+                readonly package?: string | undefined;
+                readonly module?: string | undefined;
+                readonly functionName?: string | undefined;
+                readonly instruction?: number | undefined;
+            } | undefined;
+            readonly cleverError?: {
+                readonly value?: string | undefined;
+                readonly errorCode?: number | undefined;
+                readonly lineNumber?: number | undefined;
+                readonly constantName?: string | undefined;
+                readonly constantType?: string | undefined;
+            } | undefined;
+        };
+    } | {
+        readonly $kind: "SizeError";
+        readonly SizeError: {
+            readonly name: string;
+            readonly size: number;
+            readonly maxSize: number;
+        };
+    } | {
+        readonly $kind: "CommandArgumentError";
+        readonly CommandArgumentError: {
+            readonly argument: number;
+            readonly name: string;
+        };
+    } | {
+        readonly $kind: "TypeArgumentError";
+        readonly TypeArgumentError: {
+            readonly typeArgument: number;
+            readonly name: string;
+        };
+    } | {
+        readonly $kind: "PackageUpgradeError";
+        readonly PackageUpgradeError: {
+            readonly name: string;
+            readonly digest?: string | undefined;
+            readonly packageId?: string | undefined;
+        };
+    } | {
+        readonly $kind: "IndexError";
+        readonly IndexError: {
+            readonly index?: number | undefined;
+            readonly subresult?: number | undefined;
+        };
+    } | {
+        readonly $kind: "CoinDenyListError";
+        readonly CoinDenyListError: {
+            readonly coinType: string;
+            readonly name: string;
+            readonly address?: string | undefined;
+        };
+    } | {
+        readonly $kind: "CongestedObjects";
+        readonly CongestedObjects: {
+            readonly name: string;
+            readonly objects: readonly string[];
+        };
+    } | {
+        readonly $kind: "ObjectIdError";
+        readonly ObjectIdError: {
+            readonly objectId: string;
+            readonly name?: string | undefined;
+        };
+    } | {
+        readonly $kind: "Unknown";
+    };
+    readonly at: import("effect/DateTime").Utc;
+}) => value is {
+    readonly _tag: "Unknown";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly lastError: string;
+    readonly attempts: number;
+    readonly at: import("effect/DateTime").Utc;
+} | {
+    readonly _tag: "Signed";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly signedAt: import("effect/DateTime").Utc;
+}
 ```
 
 Whether this entry is still waiting for an answer, and therefore something
@@ -1334,8 +3599,352 @@ the next, and `listUnresolved` returns other tests' submissions.
 ### `JournalEntry` (const)
 
 ```ts
-declare const JournalEntry: TaggedUnion<{ readonly Unknown: TaggedStruct<"Unknown", { readonly digest: brand<String, "Digest">; readonly signed: Struct<{ readonly digest: brand<String, "Digest">; readonly bytes: Uint8ArrayFromBase64; readonly signatures: $Array<...>; readonly sender: brand<...>; readonly expiration: optional<...>; }>; readonly...
-// decodes to: { readonly _tag: "Unknown"; readonly digest: string & Brand<"Digest">; readonly signed: { readonly digest: string & Brand<"Digest">; readonly bytes: Uint8Array<ArrayBufferLike>; readonly sender: string & Brand<...>; readonly signatures: readonly (string & Brand<...>)[]; readonly expiration?: { ...; } | ... 3 more .....
+declare const JournalEntry: Schema.TaggedUnion<{
+    readonly Unknown: Schema.TaggedStruct<"Unknown", {
+        readonly digest: Schema.brand<Schema.String, "Digest">;
+        readonly signed: Schema.Struct<{
+            readonly digest: Schema.brand<Schema.String, "Digest">;
+            readonly bytes: Schema.Uint8ArrayFromBase64;
+            readonly signatures: Schema.$Array<Schema.brand<Schema.String, "Signature">>;
+            readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+                readonly $kind: Schema.Literal<"None">;
+                readonly None: Schema.Literal<true>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Epoch">;
+                readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ValidDuring">;
+                readonly ValidDuring: Schema.Struct<{
+                    readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly chain: Schema.String;
+                    readonly nonce: Schema.Number;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Validity">;
+                readonly Validity: Schema.Struct<{
+                    readonly allowedProposers: Schema.NullOr<Schema.Struct<{
+                        readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+                        readonly proposers: Schema.$Array<Schema.Number>;
+                    }>>;
+                    readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly chain: Schema.String;
+                    readonly nonce: Schema.Number;
+                }>;
+            }>]>>;
+        }>;
+        readonly lastError: Schema.String;
+        readonly attempts: Schema.Number;
+        readonly at: Schema.DateTimeUtcFromMillis;
+    }>;
+    readonly NotApplied: Schema.TaggedStruct<"NotApplied", {
+        readonly digest: Schema.brand<Schema.String, "Digest">;
+        readonly evidence: Schema.Literals<readonly ["expired", "inputConsumed"]>;
+        readonly at: Schema.DateTimeUtcFromMillis;
+    }>;
+    readonly Signed: Schema.TaggedStruct<"Signed", {
+        readonly digest: Schema.brand<Schema.String, "Digest">;
+        readonly signed: Schema.Struct<{
+            readonly digest: Schema.brand<Schema.String, "Digest">;
+            readonly bytes: Schema.Uint8ArrayFromBase64;
+            readonly signatures: Schema.$Array<Schema.brand<Schema.String, "Signature">>;
+            readonly sender: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            readonly expiration: Schema.optional<Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+                readonly $kind: Schema.Literal<"None">;
+                readonly None: Schema.Literal<true>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Epoch">;
+                readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"ValidDuring">;
+                readonly ValidDuring: Schema.Struct<{
+                    readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly chain: Schema.String;
+                    readonly nonce: Schema.Number;
+                }>;
+            }>, Schema.Struct<{
+                readonly $kind: Schema.Literal<"Validity">;
+                readonly Validity: Schema.Struct<{
+                    readonly allowedProposers: Schema.NullOr<Schema.Struct<{
+                        readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+                        readonly proposers: Schema.$Array<Schema.Number>;
+                    }>>;
+                    readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+                    readonly chain: Schema.String;
+                    readonly nonce: Schema.Number;
+                }>;
+            }>]>>;
+        }>;
+        readonly signedAt: Schema.DateTimeUtcFromMillis;
+    }>;
+    readonly Executed: Schema.TaggedStruct<"Executed", {
+        readonly digest: Schema.brand<Schema.String, "Digest">;
+        readonly checkpoint: Schema.optional<Schema.BigIntFromString>;
+        readonly at: Schema.DateTimeUtcFromMillis;
+    }>;
+    readonly Failed: Schema.TaggedStruct<"Failed", {
+        readonly digest: Schema.brand<Schema.String, "Digest">;
+        readonly reason: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+            readonly $kind: Schema.Literal<"MoveAbort">;
+            readonly MoveAbort: Schema.Struct<{
+                readonly abortCode: Schema.BigIntFromString;
+                readonly location: Schema.optional<Schema.Struct<{
+                    readonly package: Schema.optional<Schema.String>;
+                    readonly module: Schema.optional<Schema.String>;
+                    readonly function: Schema.optional<Schema.Number>;
+                    readonly functionName: Schema.optional<Schema.String>;
+                    readonly instruction: Schema.optional<Schema.Number>;
+                }>>;
+                readonly cleverError: Schema.optional<Schema.Struct<{
+                    readonly errorCode: Schema.optional<Schema.Number>;
+                    readonly lineNumber: Schema.optional<Schema.Number>;
+                    readonly constantName: Schema.optional<Schema.String>;
+                    readonly constantType: Schema.optional<Schema.String>;
+                    readonly value: Schema.optional<Schema.String>;
+                }>>;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"SizeError">;
+            readonly SizeError: Schema.Struct<{
+                readonly name: Schema.String;
+                readonly size: Schema.Number;
+                readonly maxSize: Schema.Number;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"CommandArgumentError">;
+            readonly CommandArgumentError: Schema.Struct<{
+                readonly argument: Schema.Number;
+                readonly name: Schema.String;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"TypeArgumentError">;
+            readonly TypeArgumentError: Schema.Struct<{
+                readonly typeArgument: Schema.Number;
+                readonly name: Schema.String;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"PackageUpgradeError">;
+            readonly PackageUpgradeError: Schema.Struct<{
+                readonly name: Schema.String;
+                readonly packageId: Schema.optional<Schema.String>;
+                readonly digest: Schema.optional<Schema.String>;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"IndexError">;
+            readonly IndexError: Schema.Struct<{
+                readonly index: Schema.optional<Schema.Number>;
+                readonly subresult: Schema.optional<Schema.Number>;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"CoinDenyListError">;
+            readonly CoinDenyListError: Schema.Struct<{
+                readonly name: Schema.String;
+                readonly coinType: Schema.String;
+                readonly address: Schema.optional<Schema.String>;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"CongestedObjects">;
+            readonly CongestedObjects: Schema.Struct<{
+                readonly name: Schema.String;
+                readonly objects: Schema.$Array<Schema.String>;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"ObjectIdError">;
+            readonly ObjectIdError: Schema.Struct<{
+                readonly name: Schema.optional<Schema.String>;
+                readonly objectId: Schema.String;
+            }>;
+        }>, Schema.Struct<{
+            readonly $kind: Schema.Literal<"Unknown">;
+        }>]>;
+        readonly at: Schema.DateTimeUtcFromMillis;
+    }>;
+}>
+// decodes to:
+// {
+//     readonly _tag: "Unknown";
+//     readonly digest: Digest;
+//     readonly signed: {
+//         readonly digest: Digest;
+//         readonly bytes: Uint8Array<ArrayBufferLike>;
+//         readonly sender: SuiAddress;
+//         readonly signatures: readonly Signature[];
+//         readonly expiration?: {
+//             readonly $kind: "None";
+//             readonly None: true;
+//         } | {
+//             readonly $kind: "Epoch";
+//             readonly Epoch: bigint;
+//         } | {
+//             readonly $kind: "ValidDuring";
+//             readonly ValidDuring: {
+//                 readonly minEpoch: bigint | null;
+//                 readonly maxEpoch: bigint | null;
+//                 readonly minTimestamp: bigint | null;
+//                 readonly maxTimestamp: bigint | null;
+//                 readonly chain: string;
+//                 readonly nonce: number;
+//             };
+//         } | {
+//             readonly $kind: "Validity";
+//             readonly Validity: {
+//                 readonly allowedProposers: {
+//                     readonly epoch: bigint;
+//                     readonly proposers: readonly number[];
+//                 } | null;
+//                 readonly minEpoch: bigint | null;
+//                 readonly maxEpoch: bigint | null;
+//                 readonly minTimestamp: bigint | null;
+//                 readonly maxTimestamp: bigint | null;
+//                 readonly chain: string;
+//                 readonly nonce: number;
+//             };
+//         } | undefined;
+//     };
+//     readonly lastError: string;
+//     readonly attempts: number;
+//     readonly at: Utc;
+// } | {
+//     readonly _tag: "NotApplied";
+//     readonly digest: Digest;
+//     readonly evidence: "expired" | "inputConsumed";
+//     readonly at: Utc;
+// } | {
+//     readonly _tag: "Signed";
+//     readonly digest: Digest;
+//     readonly signed: {
+//         readonly digest: Digest;
+//         readonly bytes: Uint8Array<ArrayBufferLike>;
+//         readonly sender: SuiAddress;
+//         readonly signatures: readonly Signature[];
+//         readonly expiration?: {
+//             readonly $kind: "None";
+//             readonly None: true;
+//         } | {
+//             readonly $kind: "Epoch";
+//             readonly Epoch: bigint;
+//         } | {
+//             readonly $kind: "ValidDuring";
+//             readonly ValidDuring: {
+//                 readonly minEpoch: bigint | null;
+//                 readonly maxEpoch: bigint | null;
+//                 readonly minTimestamp: bigint | null;
+//                 readonly maxTimestamp: bigint | null;
+//                 readonly chain: string;
+//                 readonly nonce: number;
+//             };
+//         } | {
+//             readonly $kind: "Validity";
+//             readonly Validity: {
+//                 readonly allowedProposers: {
+//                     readonly epoch: bigint;
+//                     readonly proposers: readonly number[];
+//                 } | null;
+//                 readonly minEpoch: bigint | null;
+//                 readonly maxEpoch: bigint | null;
+//                 readonly minTimestamp: bigint | null;
+//                 readonly maxTimestamp: bigint | null;
+//                 readonly chain: string;
+//                 readonly nonce: number;
+//             };
+//         } | undefined;
+//     };
+//     readonly signedAt: Utc;
+// } | {
+//     readonly _tag: "Executed";
+//     readonly digest: Digest;
+//     readonly at: Utc;
+//     readonly checkpoint?: bigint | undefined;
+// } | {
+//     readonly _tag: "Failed";
+//     readonly digest: Digest;
+//     readonly reason: {
+//         readonly $kind: "MoveAbort";
+//         readonly MoveAbort: {
+//             readonly abortCode: bigint;
+//             readonly location?: {
+//                 readonly function?: number | undefined;
+//                 readonly module?: string | undefined;
+//                 readonly package?: string | undefined;
+//                 readonly functionName?: string | undefined;
+//                 readonly instruction?: number | undefined;
+//             } | undefined;
+//             readonly cleverError?: {
+//                 readonly errorCode?: number | undefined;
+//                 readonly lineNumber?: number | undefined;
+//                 readonly constantName?: string | undefined;
+//                 readonly constantType?: string | undefined;
+//                 readonly value?: string | undefined;
+//             } | undefined;
+//         };
+//     } | {
+//         readonly $kind: "SizeError";
+//         readonly SizeError: {
+//             readonly name: string;
+//             readonly size: number;
+//             readonly maxSize: number;
+//         };
+//     } | {
+//         readonly $kind: "CommandArgumentError";
+//         readonly CommandArgumentError: {
+//             readonly argument: number;
+//             readonly name: string;
+//         };
+//     } | {
+//         readonly $kind: "TypeArgumentError";
+//         readonly TypeArgumentError: {
+//             readonly typeArgument: number;
+//             readonly name: string;
+//         };
+//     } | {
+//         readonly $kind: "PackageUpgradeError";
+//         readonly PackageUpgradeError: {
+//             readonly name: string;
+//             readonly digest?: string | undefined;
+//             readonly packageId?: string | undefined;
+//         };
+//     } | {
+//         readonly $kind: "IndexError";
+//         readonly IndexError: {
+//             readonly index?: number | undefined;
+//             readonly subresult?: number | undefined;
+//         };
+//     } | {
+//         readonly $kind: "CoinDenyListError";
+//         readonly CoinDenyListError: {
+//             readonly coinType: string;
+//             readonly name: string;
+//             readonly address?: string | undefined;
+//         };
+//     } | {
+//         readonly $kind: "CongestedObjects";
+//         readonly CongestedObjects: {
+//             readonly name: string;
+//             readonly objects: readonly string[];
+//         };
+//     } | {
+//         readonly $kind: "ObjectIdError";
+//         readonly ObjectIdError: {
+//             readonly objectId: string;
+//             readonly name?: string | undefined;
+//         };
+//     } | {
+//         readonly $kind: "Unknown";
+//     };
+//     readonly at: Utc;
+// }
 ```
 
 One line of the submission journal.
@@ -1556,7 +4165,79 @@ what building, preflighting and signing can produce.
 ### `sign` (const)
 
 ```ts
-declare const sign: (built: { readonly digest: string & Brand<"Digest">; readonly sender: string & Brand<"SuiAddress">; readonly bytes: Uint8Array<ArrayBufferLike>; readonly expiration?: { ...; } | ... 3 more ... | undefined; readonly gasOwner?: (string & Brand<...>) | undefined; }, signer: Signer) => Effect<...>
+declare const sign: (built: {
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+    readonly gasOwner?: SuiAddress | undefined;
+}, signer: Signer) => Effect.Effect<{
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly signatures: readonly Signature[];
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+}, SigningError, never>
 ```
 
 Signs built bytes.
@@ -1572,6 +4253,7 @@ address it signs as truthfully.
 
 ```ts
 declare const Signature: Schema.brand<Schema.String, "Signature">
+// decodes to: Signature
 ```
 
 A serialized signature, as every SDK signer returns it: the base64 of the
@@ -1772,8 +4454,69 @@ than repeating four tags that will grow with the taxonomy.
 ### `TransactionExpiration` (const)
 
 ```ts
-declare const TransactionExpiration: toTaggedUnion<"$kind", readonly [Struct<{ readonly $kind: Literal<"None">; readonly None: Literal<true>; }>, Struct<{ readonly $kind: Literal<"Epoch">; readonly Epoch: decodeTo<BigInt, Union<...>, never, never>; }>, Struct<...>, Struct<...>]>
-// decodes to: { readonly $kind: "None"; readonly None: true; } | { readonly $kind: "Epoch"; readonly Epoch: bigint; } | { readonly $kind: "ValidDuring"; readonly ValidDuring: { readonly minEpoch: bigint | null; ... 4 more ...; readonly nonce: number; }; } | { ...; }
+declare const TransactionExpiration: Schema.toTaggedUnion<"$kind", readonly [Schema.Struct<{
+    readonly $kind: Schema.Literal<"None">;
+    readonly None: Schema.Literal<true>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"Epoch">;
+    readonly Epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"ValidDuring">;
+    readonly ValidDuring: Schema.Struct<{
+        readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly chain: Schema.String;
+        readonly nonce: Schema.Number;
+    }>;
+}>, Schema.Struct<{
+    readonly $kind: Schema.Literal<"Validity">;
+    readonly Validity: Schema.Struct<{
+        readonly allowedProposers: Schema.NullOr<Schema.Struct<{
+            readonly epoch: Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>;
+            readonly proposers: Schema.$Array<Schema.Number>;
+        }>>;
+        readonly minEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly maxEpoch: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly minTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly maxTimestamp: Schema.NullOr<Schema.decodeTo<Schema.BigInt, Schema.Union<readonly [Schema.String, Schema.Number]>, never, never>>;
+        readonly chain: Schema.String;
+        readonly nonce: Schema.Number;
+    }>;
+}>]>
+// decodes to:
+// {
+//     readonly $kind: "None";
+//     readonly None: true;
+// } | {
+//     readonly $kind: "Epoch";
+//     readonly Epoch: bigint;
+// } | {
+//     readonly $kind: "ValidDuring";
+//     readonly ValidDuring: {
+//         readonly minEpoch: bigint | null;
+//         readonly maxEpoch: bigint | null;
+//         readonly minTimestamp: bigint | null;
+//         readonly maxTimestamp: bigint | null;
+//         readonly chain: string;
+//         readonly nonce: number;
+//     };
+// } | {
+//     readonly $kind: "Validity";
+//     readonly Validity: {
+//         readonly allowedProposers: {
+//             readonly epoch: bigint;
+//             readonly proposers: readonly number[];
+//         } | null;
+//         readonly minEpoch: bigint | null;
+//         readonly maxEpoch: bigint | null;
+//         readonly minTimestamp: bigint | null;
+//         readonly maxTimestamp: bigint | null;
+//         readonly chain: string;
+//         readonly nonce: number;
+//     };
+// }
 ```
 
 When a transaction stops being valid. Mirrors the SDK's
@@ -1787,7 +4530,205 @@ guard, so bytes signed for testnet cannot land on mainnet.
 ### `Tx` (const)
 
 ```ts
-declare const Tx: { readonly build: (input: Transaction | Recipe, opts: { readonly sender: string & Brand<"SuiAddress">; readonly gasOwner?: (string & Brand<"SuiAddress">) | undefined; }) => Effect<...>; ... 6 more ...; readonly reconcileAll: () => Effect<...>; }
+declare const Tx: {
+    readonly build: (input: Transaction | Recipe, opts: {
+        readonly sender: SuiAddress;
+        readonly gasOwner?: SuiAddress;
+    }) => Effect.Effect<{
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+        readonly gasOwner?: SuiAddress | undefined;
+    }, TransportError | SimulationFailed | BuildError, Sui>;
+    readonly sign: (built: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+        readonly gasOwner?: SuiAddress | undefined;
+    }, signer: Signer) => Effect.Effect<{
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    }, SigningError, never>;
+    readonly cosign: (signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    }, signer: Signer) => Effect.Effect<{
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    }, SigningError, never>;
+    readonly sponsored: (opts: {
+        readonly sender: SuiAddress;
+        readonly gasOwner: SuiAddress;
+    }) => (recipe: Recipe) => Recipe;
+    readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
+    readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, TransportError | ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
+    readonly run: (recipe: Transaction | Recipe, opts: {
+        readonly signer: Signer;
+        readonly gasOwner?: SuiAddress;
+    }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>;
+    readonly reconcileAll: () => Effect.Effect<readonly Reconciled[], TransportError | JournalError, Sui>;
+}
 ```
 
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
@@ -1918,49 +4859,88 @@ Every member fails with `JournalError` and nothing else.
 ## `sui-effect/extension`
 
 
-4 exported symbols.
+5 exported symbols.
+
+### `ExtensionFace` (interface)
+
+```ts
+export interface ExtensionFace {
+    /**
+     * Builds the runtime and resolves the service, so every member afterwards is
+     * the real thing — synchronous members included.
+     *
+     * Call it once after `$extend` when the extension has synchronous members
+     * (recipe builders, ids, codecs) and the registration is not `warm`. It is
+     * idempotent and costs nothing after the first time.
+     */
+    readonly $ready: () => Promise<void>;
+    /**
+     * Releases everything the layer acquired and forgets the runtime. Not final:
+     * the next call builds a fresh one.
+     */
+    readonly $dispose: () => Promise<void>;
+    /** The name `$dispose` had first. The same function. */
+    readonly dispose: () => Promise<void>;
+}
+```
+
+What every registration carries besides the service's own members, under
+`$`-prefixed names so an extension is free to call a member `ready` or
+`dispose` itself.
 
 ### `fromService` (const)
 
 ```ts
-declare const fromService: <Self, Shape, E, const Name extends string>(service: Context.Key<Self, Shape>, options: SuiExtensionOptions<Self, E, Name>) => SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & {
-    readonly dispose: () => Promise<void>;
-}>
+declare const fromService: <Self, Shape, E, const Name extends string>(service: Context.Key<Self, Shape>, options: SuiExtensionOptions<Self, E, Name>) => SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & ExtensionFace>
 ```
 
 Turns an Effect service into a `SuiClientRegistration` a Promise consumer
 passes to `client.$extend(...)`.
 
-`register(client)` does no work: the `ManagedRuntime` over
-`SuiCore.layerFromClient(client)`, `Sui.layerNoDeps` and the extension's own
-layer is built on the first call and shared by every call after it. A
-rejection carries the original tagged error instance, so a Promise consumer
-can still switch on `_tag`.
-
-Until the runtime has been built once, a member that is a plain value cannot
-be read as a value — nothing knows what it is yet — and comes back as a
-callable, iterable placeholder that resolves on use. After the first
-`await`, every member is the real thing.
+`register(client)` does no work by default: the `ManagedRuntime` over
+`SuiCore.layerFromClient(client)`, `Sui.layerNoDepsWith(options.sui)` and the
+extension's own layer is built on the first call and shared by every call
+after it. A rejection carries the original tagged error instance, so a
+Promise consumer can still switch on `_tag`.
 
 `name` is generic in a string literal, so `client.escrow` is a property of
 the extended client's type and not an index lookup: no cast, and no
 `| undefined` under `noUncheckedIndexedAccess`.
 
+**The window before the runtime exists.** Until then nothing knows what a
+member *is*, so a member read off the face is a placeholder. An `Effect` or
+`Stream` member behaves exactly as its type says — the call returns a
+Promise, the iteration works — because that is what the face promises for
+them anyway. A **synchronous** member does not: `PromiseFace` types a recipe
+builder as returning a `Recipe` and a plain value as that value, and a
+placeholder has neither. So a synchronous member used in that window fails
+with `ExtensionNotReady` naming itself, rather than quietly handing back a
+Promise where the type says `Recipe` — which is a bug that only shows up on
+the *second* call, when the member has become real. Two cures:
+
+- `await client.<name>.$ready()` once after `$extend`, which builds the
+  runtime and resolves the service; every member is real from then on;
+- register with `warm`, which does the same synchronously inside `register`,
+  for a layer that needs no network.
+
 Two lifetimes worth knowing:
 
-- **`dispose()` is not final.** It releases everything the layer acquired and
-  forgets the runtime; the next call builds a fresh one. That is what a
+- **`$dispose()` is not final.** It releases everything the layer acquired
+  and forgets the runtime; the next call builds a fresh one. That is what a
   long-lived page wants (a disposed extension is usable again after a
-  reconnect) and it does mean a `dispose()` that races an in-flight call can
+  reconnect) and it does mean a `$dispose()` that races an in-flight call can
   leave the caller's Promise rejected while a new runtime starts behind it.
-  Dispose when the consumer is done, not between calls.
+  Dispose when the consumer is done, not between calls. `dispose()` is the
+  same function under the name it had first.
 - **Each `register` is independent.** Registering the same extension on two
   clients — or twice on one — gives two runtimes, two layer builds and two
   copies of whatever the layer holds (a cache, a connection). Register once
   per client and keep the extended client.
 
-Never fails; the layer's own failures surface as rejections of the first
-call that needs it.
+Never fails, except a `warm` registration, which throws out of `register`
+when the layer needs an asynchronous step or when the network has no known
+chain identifier and none was given. Otherwise the layer's own failures
+surface as rejections of the first call that needs it.
 
 **Never fails.**
 
@@ -1980,13 +4960,23 @@ function returning an `Effect` keeps its arguments and returns a Promise, a
 is mapped the same way (platform SDKs namespace their surface as
 `client.miso.protocol.*`), and anything else passes through untouched.
 
+**A synchronous member stays synchronous**: a recipe builder
+`(p: Params) => Recipe` is still `(p: Params) => Recipe` here, and a plain
+value is still that value. The type says so and, once the runtime exists, the
+runtime agrees — see `warm` and `$ready` on `fromService` for the
+window before it does.
+
+**A class instance is a leaf.** The recursion is into plain object literals
+only, which is what the runtime maps; a `BcsType`, a `Schema.Class` instance,
+a `Date`, anything with a prototype of its own passes through whole, in the
+type and at runtime alike. (An interface or class type is not assignable to
+`Record<string, unknown>`, which is what keeps the two in step.)
+
 ### `SuiExtension` (const)
 
 ```ts
 declare const SuiExtension: {
-    readonly fromService: <Self, Shape, E, const Name extends string>(service: Context.Key<Self, Shape>, options: SuiExtensionOptions<Self, E, Name>) => SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & {
-        readonly dispose: () => Promise<void>;
-    }>;
+    readonly fromService: <Self, Shape, E, const Name extends string>(service: Context.Key<Self, Shape>, options: SuiExtensionOptions<Self, E, Name>) => SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & ExtensionFace>;
 }
 ```
 
@@ -2006,10 +4996,55 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
      */
     readonly name: Name;
     /**
-     * The extension's layer. It may require `Sui` and `SuiCore`, which this
-     * module builds over the client `$extend` was called on, and nothing else.
+     * The extension's layer.
+     *
+     * The bound is `Layer<Self, E, Sui | SuiCore>`: it may require either tier,
+     * because this module builds both over the client `$extend` was called on,
+     * and **nothing else**. An extension with a dependency of its own — an
+     * `HttpClient`, a `SuiGraphQL` — provides it inside this layer
+     * (`Layer.provide(SuiGraphQL.layerConfig)`) or in the function that builds
+     * the registration. The rule is not "requires `Sui` and nothing else"; it is
+     * "requires nothing the consumer's client could have provided".
      */
     readonly layer: Layer.Layer<Self, E, Sui | SuiCore>;
+    /**
+     * Options for the `Sui` layer built under the extension's own.
+     *
+     * `sui.chainId` pins the chain identifier the node must report, overriding
+     * the built-in table for `mainnet` and `testnet` and asserting one where
+     * there is none — which is how an extension whose deployment names a custom
+     * network's `chainIdentifier` refuses to run against a different chain.
+     */
+    readonly sui?: SuiLayerOptions;
+    /**
+     * Build the runtime **inside `register`**, synchronously, instead of on the
+     * first call.
+     *
+     * Give it when the extension has synchronous members — recipe builders, a
+     * package id, a codec — that a consumer expects to read the moment it
+     * registers. Every member is then the real thing immediately, and
+     * `$ready()` has nothing left to do.
+     *
+     * Two conditions, both enforced:
+     *
+     * - **The layer must not perform an asynchronous step.** A layer that reads
+     *   the network, opens a connection or awaits anything cannot be built
+     *   synchronously and `register` throws. This is the documented contract of
+     *   `warm`, not an accident: an extension that needs the network at build is
+     *   registered without it.
+     * - **The chain identifier is not read.** `Sui` normally calls
+     *   `getChainIdentifier` at layer build, which is a round trip. A warm
+     *   registration takes `warm.chainId` (or `sui.chainId`, or the entry in the
+     *   built-in table for `mainnet` and `testnet`) as the chain's identifier and
+     *   asks nothing, so a node on another chain is not detected at
+     *   registration. It is still detected by the chain: `Tx.build` stamps that
+     *   id on the expiration and a validator refuses bytes signed for another
+     *   chain. On `devnet`, `localnet` or a custom network there is no table
+     *   entry, so `warm` without a `chainId` throws rather than guess.
+     */
+    readonly warm?: {
+        readonly chainId?: string;
+    };
 }
 ```
 
@@ -2466,6 +5501,22 @@ export declare class SuiCoreFake extends SuiCoreFake_base {
 
 The in-memory `SuiCore`.
 
+Three things about it that a test has to know, because they are not visible
+from the outside:
+
+- **Its `client` implements `$extend`.** `SuiCoreFakeState.client` is a
+  `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` gives a
+  derived Promise face over the fake and a test can exercise a registration
+  exactly the way a consumer writes it, with no network.
+- **`listOwnedObjects` filters like a node.** The `type` option goes through
+  the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
+  instantiation of a generic rather than only its own spelling.
+- **`getDynamicField` matches on `name.type` alone.** It returns the first
+  scripted entry of the parent whose `name.type` equals the requested one; the
+  `name.bcs` bytes are not compared. Two fields of the same key type on one
+  parent cannot be told apart here — script them on different parents, and
+  test your key encoding with a decode test instead.
+
 ### `SuiCoreFakeState` (interface)
 
 ```ts
@@ -2792,10 +5843,20 @@ the source of every code block in `docs/extensions.md`.
  * registration. Nothing from `upstream.ts` is re-exported: upstream types are
  * narrowed to sui-effect schemas inside the service and never reach a consumer.
  */
-export { Escrow, type EscrowFields, type EscrowObject, type EscrowOptions, type EscrowService, type ClaimForError } from "./Escrow.ts"
-export { EscrowNotFound, EscrowSettlementUnknown } from "./errors.ts"
+export {
+  DEPLOYMENTS,
+  Escrow,
+  type ClaimForError,
+  type EscrowDeployment,
+  type EscrowFields,
+  type EscrowObject,
+  type EscrowOptions,
+  type EscrowService
+} from "./Escrow.ts"
+export { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
 export { escrow } from "./extension.ts"
-export { ESCROW_PACKAGE, EscrowContent, RECEIPT_TYPE } from "./schema.ts"
+export { Platform, platform, type PlatformOptions, type PlatformService } from "./Platform.ts"
+export { ESCROW_PACKAGE, EscrowContent, RECEIPT_TYPE, Settlement, SettlementContent } from "./schema.ts"
 ```
 
 ### `examples/extension-template/src/schema.ts`
@@ -2810,7 +5871,8 @@ export { ESCROW_PACKAGE, EscrowContent, RECEIPT_TYPE } from "./schema.ts"
  * naming both types rather than a confusing parse failure.
  */
 import { bcs } from "@mysten/sui/bcs"
-import { SuiSchema } from "sui-effect"
+import { DateTime, Effect, Schema, SchemaIssue, SchemaTransformation } from "effect"
+import { ObjectId, SuiAddress, SuiSchema } from "sui-effect"
 
 /** The package the template's example type lives in. Replace it with yours. */
 export const ESCROW_PACKAGE = "0x0000000000000000000000000000000000000000000000000000000000000002"
@@ -2827,6 +5889,108 @@ export const EscrowContent = SuiSchema.bcs(
 
 /** The Move type of a claim receipt, which `claimFor` expects to be created. */
 export const RECEIPT_TYPE = `${ESCROW_PACKAGE}::escrow::Receipt`
+
+/**
+ * The Move layout of `escrow::Settlement`, whose fields are `snake_case`
+ * because Move's are.
+ */
+const SettlementBcs = bcs.struct("Settlement", {
+  escrow_id: bcs.Address,
+  settled_at_ms: bcs.u64(),
+  claimed_by: bcs.Address
+})
+
+/**
+ * The domain type a consumer of this package sees: `camelCase`, branded ids,
+ * a `DateTime` instead of a string of milliseconds.
+ *
+ * The mapping lives in `Schema.decodeTo`, never in a custom `parse`: the bridge
+ * needs a real `BcsType` so it can re-serialize what it parsed and reject
+ * trailing bytes, and a domain type is not a BCS layout.
+ */
+export class Settlement extends Schema.Class<Settlement>("Settlement")({
+  escrowId: ObjectId,
+  settledAt: Schema.DateTimeUtc,
+  claimedBy: SuiAddress
+}) {}
+
+/**
+ * The halfway shape the transformation produces: the domain field names, before
+ * `Settlement`'s own schema brands the ids.
+ */
+interface SettlementParts {
+  readonly escrowId: string
+  readonly settledAt: DateTime.Utc
+  readonly claimedBy: string
+}
+
+/**
+ * The composed codec: BCS bytes to `Settlement`, and back.
+ *
+ * `SuiSchema.bcs(...)` decodes the bytes into the Move shape;
+ * `Schema.decodeTo(Settlement, SchemaTransformation.transform({ decode, encode }))`
+ * renames the fields, and `Settlement` itself does the rest — branding the ids
+ * and checking them. The Move type the bridge recorded survives the
+ * composition, so
+ * `sui.getObject(id, { schema: SettlementContent })` still checks the object's
+ * type tag before parsing a byte.
+ *
+ * Two details worth copying:
+ *
+ * - **`decode` produces the target's field shape, not an instance.** `decodeTo`
+ *   sits between the source type and the target schema, which is what lets the
+ *   target's own checks — the `ObjectId` and `SuiAddress` brands here — run
+ *   afterwards.
+ * - **`encode` is the inverse mapper and is not optional.** A codec that cannot
+ *   encode is one `Schema.encodeUnknownEffect` fails on, and the compiler asks
+ *   for it here rather than at the call site.
+ * - **A mapping that can fail uses `transformOrFail`.** `transform` is for total
+ *   mappings; a body that throws produces a defect, and a byte that was wrong on
+ *   the wire deserves a failure.
+ *
+ * A failure *inside* this transform — an id that is not an address, a timestamp
+ * that is not a time — is still a `DecodeError` from `SuiSchema.decode` and
+ * `sui.getObject`, with the same fields: the domain mapping is part of the
+ * boundary, not a step after it.
+ */
+export const SettlementContent = SuiSchema.bcs(
+  SettlementBcs,
+  `${ESCROW_PACKAGE}::escrow::Settlement`
+).pipe(
+  Schema.decodeTo(
+    Settlement,
+    SchemaTransformation.transformOrFail<SettlementParts, typeof SettlementBcs.$inferType>({
+      decode: (fields, options) =>
+        // `transformOrFail`, not `transform`, because one of these mappings can
+        // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
+        // whose body throws is a **defect**, which is not what a bad byte on the
+        // wire should be; failing with a `SchemaIssue` here is what makes it a
+        // `DecodeError` like any other.
+        Effect.map(
+          Effect.fromOption(
+            DateTime.make(Number(fields.settled_at_ms)),
+            () =>
+              new SchemaIssue.InvalidValue(
+                { message: `settled_at_ms ${fields.settled_at_ms} is not a time` },
+                fields,
+                options
+              )
+          ),
+          (settledAt): SettlementParts => ({
+            escrowId: fields.escrow_id,
+            settledAt,
+            claimedBy: fields.claimed_by
+          })
+        ),
+      encode: (settlement) =>
+        Effect.succeed({
+          escrow_id: settlement.escrowId,
+          settled_at_ms: String(DateTime.toEpochMillis(settlement.settledAt)),
+          claimed_by: settlement.claimedBy
+        })
+    })
+  )
+)
 ```
 
 ### `examples/extension-template/src/errors.ts`
@@ -2875,6 +6039,24 @@ export class EscrowSettlementUnknown extends Schema.TaggedError<EscrowSettlement
 ) {
   readonly outcome: Outcome = "unknown"
 }
+
+/**
+ * This release bundles no deployment for the network the client is on.
+ *
+ * The typed failure of `Escrow.layerBundled`: a layer that picks its package id
+ * from `sui.network` has exactly one way to fail, and a caller that can run on
+ * an unknown network wants to see it in the type rather than in a log line.
+ *
+ * Nothing was submitted — nothing was even built — so the outcome is
+ * `not_applied`. A predecessor library's `DeploymentError` becomes this: your
+ * own tag, prefixed with your package name, declaring its outcome.
+ */
+export class EscrowUnsupportedNetwork extends Schema.TaggedError<EscrowUnsupportedNetwork>()(
+  "escrow/EscrowUnsupportedNetwork",
+  { network: Schema.String }
+) {
+  readonly outcome: Outcome = "not_applied"
+}
 ```
 
 ### `examples/extension-template/src/Escrow.ts`
@@ -2911,7 +6093,7 @@ import {
 } from "sui-effect"
 import type { RunError, Signer } from "sui-effect/tx"
 import { Tx } from "sui-effect/tx"
-import { EscrowNotFound, EscrowSettlementUnknown } from "./errors.ts"
+import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
 import { EscrowContent, ESCROW_PACKAGE, RECEIPT_TYPE } from "./schema.ts"
 import type { SettlementApi } from "./upstream.ts"
 import { settlementApi } from "./upstream.ts"
@@ -3133,7 +6315,11 @@ const make = (
           // is.
           SuiSchema.decode(EscrowContent, object.content, {
             objectId: object.id,
-            expectedType: escrowType
+            // The type the object actually has. Give it and `SuiSchema.decode`
+            // runs the same tag check `getObject` does, under the same rule: a
+            // bare expected tag matches every instantiation of it, a
+            // parameterized one is compared in full.
+            actualType: object.type
           }).pipe(Effect.map((content): EscrowObject => ({ ...object, content })))
         )
       )
@@ -3150,6 +6336,27 @@ const make = (
       }
     }
   })
+
+/**
+ * What this release knows about a network: the package it was published to,
+ * and the operator that settles for it.
+ */
+export interface EscrowDeployment {
+  readonly packageId: string
+  readonly url: string
+}
+
+/**
+ * The deployments this release bundles.
+ *
+ * Every extension over a Move package has one of these, because a package id is
+ * per network and a consumer should not have to carry a table of them. Replace
+ * the ids with yours.
+ */
+export const DEPLOYMENTS: Readonly<Record<string, EscrowDeployment>> = {
+  testnet: { packageId: ESCROW_PACKAGE, url: "https://settlement.testnet.example" },
+  mainnet: { packageId: ESCROW_PACKAGE, url: "https://settlement.example" }
+}
 
 /** The in-memory settlement service `layerTest` runs against. */
 const fakeApi = (settled: boolean): SettlementApi => ({
@@ -3198,6 +6405,39 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
       return Escrow.layer(options)
     })
   )
+
+  /**
+   * The layer for whatever network the client is already on, from the table
+   * this release bundles.
+   *
+   * This is the shape every extension over a Move package wants: the consumer
+   * has already chosen a network by building a client, and the package id
+   * follows from it. `Layer.unwrap` is what lets the layer *read* `Sui` before
+   * deciding which layer to be, and the network that has no entry is a typed
+   * failure rather than an `undefined` that surfaces as a Move abort three
+   * calls later.
+   *
+   * `layerConfig` still earns its place beside this one when configuration
+   * carries something the table cannot: the operator URL of a private
+   * deployment, a credential, a package id under test. When the only
+   * configuration *is* the package id, this layer is the one to ship and
+   * `layerConfig` is the override.
+   *
+   * Fails with: `EscrowUnsupportedNetwork`.
+   */
+  static readonly layerBundled = (
+    options: { readonly apiKey: Redacted.Redacted<string> }
+  ): Layer.Layer<Escrow, EscrowUnsupportedNetwork, Sui> =>
+    Layer.unwrap(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        const deployment = DEPLOYMENTS[sui.network]
+        if (deployment === undefined) {
+          return yield* new EscrowUnsupportedNetwork({ network: sui.network })
+        }
+        return Escrow.layer({ ...deployment, apiKey: options.apiKey })
+      })
+    )
 
   /**
    * The test layer: the real service over an in-memory settlement service, so
@@ -3335,16 +6575,28 @@ import { bcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
-import { Effect, Fiber, Layer, Stream } from "effect"
+import {
+  Cause,
+  DateTime,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Redacted,
+  Schema,
+  Stream
+} from "effect"
 import { TestClock } from "effect/testing"
 import type { Sui, SuiCore } from "sui-effect"
-import { ObjectId, SuiAddress } from "sui-effect"
+import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiSchema } from "sui-effect"
 import type { SuiCoreFake } from "sui-effect/testing"
-import { FakeOutcome, layerExtensionTest, SuiTest } from "sui-effect/testing"
+import { FakeOutcome, layerExtensionTest, layerTest, SuiTest } from "sui-effect/testing"
 import { Journal, Signer } from "sui-effect/tx"
-import { Escrow } from "../src/Escrow.ts"
-import { EscrowNotFound, EscrowSettlementUnknown } from "../src/errors.ts"
-import { ESCROW_PACKAGE, RECEIPT_TYPE } from "../src/schema.ts"
+import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
+import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "../src/errors.ts"
+import { Platform } from "../src/Platform.ts"
+import { ESCROW_PACKAGE, RECEIPT_TYPE, Settlement, SettlementContent } from "../src/schema.ts"
 
 const padded = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
 const ESCROW_ID = ObjectId.make(padded("e5c0"))
@@ -3567,6 +6819,121 @@ describe("Escrow under the two clocks", () => {
     expect(bytes).toBe(1)
   })
 })
+
+describe("Settlement: a domain class over the BCS bridge", () => {
+  const SettlementBcs = bcs.struct("Settlement", {
+    escrow_id: bcs.Address,
+    settled_at_ms: bcs.u64(),
+    claimed_by: bcs.Address
+  })
+
+  test("snake_case Move fields decode into the camelCase domain class", async () => {
+    const bytes = SettlementBcs.serialize({
+      escrow_id: ESCROW_ID,
+      settled_at_ms: "1700000000000",
+      claimed_by: SENDER
+    }).toBytes()
+    const settlement = await Effect.runPromise(SuiSchema.decode(SettlementContent, bytes))
+    expect(settlement).toBeInstanceOf(Settlement)
+    expect(settlement.escrowId).toBe(ESCROW_ID)
+    expect(settlement.claimedBy).toBe(SENDER)
+    expect(DateTime.toEpochMillis(settlement.settledAt)).toBe(1_700_000_000_000)
+  })
+
+  test("the encode direction is the inverse mapper", async () => {
+    const bytes = SettlementBcs.serialize({
+      escrow_id: ESCROW_ID,
+      settled_at_ms: "1700000000000",
+      claimed_by: SENDER
+    }).toBytes()
+    const settlement = await Effect.runPromise(SuiSchema.decode(SettlementContent, bytes))
+    const encoded = await Effect.runPromise(
+      Schema.encodeUnknownEffect(SettlementContent)(settlement)
+    )
+    expect(Array.from(encoded)).toEqual(Array.from(bytes))
+  })
+
+  test("a failure inside the domain transform is still a DecodeError", async () => {
+    const bytes = SettlementBcs.serialize({
+      escrow_id: ESCROW_ID,
+      // Beyond what a `Date` can be, so the domain mapping is what fails.
+      settled_at_ms: "99999999999999999",
+      claimed_by: SENDER
+    }).toBytes()
+    const error = await Effect.runPromise(
+      Effect.flip(SuiSchema.decode(SettlementContent, bytes, { objectId: ESCROW_ID }))
+    )
+    expect(error._tag).toBe("DecodeError")
+    expect(error.objectId).toBe(ESCROW_ID)
+  })
+})
+
+describe("layerBundled: the deployment follows the client's network", () => {
+  const apiKey = Redacted.make("test-key")
+
+  test("picks the package id bundled for the network the client is on", async () => {
+    const packageId = await Effect.runPromise(
+      Effect.provide(
+        Effect.map(Escrow, (escrow) => escrow.packageId),
+        Layer.provide(Escrow.layerBundled({ apiKey }), layerTest({ network: "testnet", chainId: KNOWN_CHAIN_IDS["testnet"]! })),
+        { local: true }
+      )
+    )
+    expect(packageId).toBe(DEPLOYMENTS["testnet"]!.packageId)
+  })
+
+  test("a network this release does not bundle is a typed layer failure", async () => {
+    const exit = await Effect.runPromise(
+      Effect.exit(
+        Effect.provide(
+          Effect.map(Escrow, (escrow) => escrow.packageId),
+          Layer.provide(Escrow.layerBundled({ apiKey }), layerTest({ network: "localnet" })),
+          { local: true }
+        )
+      )
+    )
+    expect(exit._tag).toBe("Failure")
+    const error = Exit.isFailure(exit)
+      ? Option.getOrUndefined(Cause.findErrorOption(exit.cause))
+      : undefined
+    expect(error).toBeInstanceOf(EscrowUnsupportedNetwork)
+    expect((error as EscrowUnsupportedNetwork).network).toBe("localnet")
+  })
+})
+
+describe("Platform: one extension composed on another", () => {
+  test("the dependency's surface is a namespace on the composition", async () => {
+    const amount = await Effect.runPromise(
+      Effect.provide(
+        Effect.flatMap(Platform, (platform) => platform.escrow.get(ESCROW_ID)),
+        Layer.mergeAll(
+          // The composition's own test layer over the harness: one fake for the
+          // chain, and the dependency's own fake for its operator service.
+          layerExtensionTest(Platform.layerTest({ settled: true }), script),
+          Journal.layerMemory
+        ),
+        { local: true }
+      ).pipe(Effect.map((escrow) => escrow.content.amount))
+    )
+    expect(amount).toBe("5")
+  })
+
+  test("an operation that spans the composed packages keeps the union honest", async () => {
+    const claimed = await Effect.runPromise(
+      Effect.provide(
+        Effect.flatMap(Platform, (platform) =>
+          platform.claimEverything([ESCROW_ID], { signer })),
+        Layer.mergeAll(
+          layerExtensionTest(Platform.layerTest({ settled: true }), script),
+          Journal.layerMemory
+        ),
+        { local: true }
+      )
+    )
+    expect(claimed).toHaveLength(1)
+    expect(claimed[0]?.id).toBe(ObjectId.make(RECEIPT_ID))
+  })
+})
 ```
 
 ### `examples/extension-template/package.json`
@@ -3596,9 +6963,10 @@ describe("Escrow under the two clocks", () => {
     "check": "tsc --noEmit && bun test"
   },
   "peerDependencies": {
+    "@mysten/bcs": "^2.1.1",
     "@mysten/sui": "^2.28",
     "effect": ">=4.0.0-rc.112 <4.1",
-    "sui-effect": ">=0.0.0"
+    "sui-effect": "^0.1.0"
   },
   "devDependencies": {
     "@mysten/bcs": "2.1.1",

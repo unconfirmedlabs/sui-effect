@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { decodeSuiPrivateKey } from "@mysten/sui/cryptography"
+import type { PublicKey, SignatureScheme } from "@mysten/sui/cryptography"
+import { decodeSuiPrivateKey, Signer as SdkSigner } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
 import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
@@ -163,5 +164,44 @@ describe("Signer.remote", () => {
     })
     const error = await run(signer.signTransaction(bytes).pipe(Effect.flip))
     expect(error._tag).toBe("SigningError")
+  })
+})
+
+describe("Signer.fromSdkSigner", () => {
+  /**
+   * A minimal SDK `Signer` that is not a `Keypair`: what a Ledger transport, a
+   * wallet adapter or a KMS credential looks like from here.
+   */
+  class DeviceSigner extends SdkSigner {
+    constructor(private readonly inner: Ed25519Keypair) {
+      super()
+    }
+    override async sign(data: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
+      return this.inner.sign(data)
+    }
+    override getKeyScheme(): SignatureScheme {
+      return this.inner.getKeyScheme()
+    }
+    override getPublicKey(): PublicKey {
+      return this.inner.getPublicKey()
+    }
+  }
+
+  test("wraps any SDK Signer, not only a Keypair", async () => {
+    const inner = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(9))
+    const device = new DeviceSigner(inner)
+    expect(device).not.toBeInstanceOf(Ed25519Keypair)
+    const signer = Signer.fromSdkSigner(device)
+    expect(signer.address).toBe(SuiAddress.make(inner.toSuiAddress()))
+    expect(signer.scheme).toBe("ED25519")
+    const signature = await run(signer.signTransaction(bytes))
+    expect(signature).toBe(Signature.make((await inner.signTransaction(bytes)).signature))
+    const personal = await run(signer.signPersonalMessage(bytes))
+    expect(personal).toBe(Signature.make((await inner.signPersonalMessage(bytes)).signature))
+  })
+
+  test("fromKeypair is the same function under its old name", () => {
+    const keypair = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(4))
+    expect(Signer.fromKeypair(keypair).address).toBe(Signer.fromSdkSigner(keypair).address)
   })
 })

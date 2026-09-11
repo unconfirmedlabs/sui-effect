@@ -37,6 +37,22 @@ jobs:
       - run: bun add -d effect@${{ matrix.effect }} @effect/platform-bun@${{ matrix.effect }} || bun add -d effect@${{ matrix.effect }}
       - run: bun run typecheck && bun test test/
 
+  # The `@mysten/sui` peer range is proved against the versions consumers pin.
+  sui-sdk-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sui: ["2.29.0", "2.30.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun add -d @mysten/sui@${{ matrix.sui }}
+      - run: bun run typecheck && bun test test/
+
   isolated-consumer:
     runs-on: ubuntu-latest
     steps:
