@@ -8,6 +8,7 @@ import {
   Effect,
   Exit,
   Fiber,
+  Latch,
   Layer,
   Option,
   Result,
@@ -277,8 +278,86 @@ describe("reads", () => {
     )
     const batches = calls.filter((call) => call.method === "getObjects")
     expect(batches).toHaveLength(3)
-    expect((batches[0]?.options as { objectIds: Array<string> }).objectIds).toHaveLength(50)
-    expect((batches[2]?.options as { objectIds: Array<string> }).objectIds).toHaveLength(20)
+    expect(
+      batches.map((batch) => (batch.options as { objectIds: Array<string> }).objectIds.length)
+    ).toEqual([50, 50, 20])
+  })
+
+  // NB5: the chunks go out concurrently, bounded by CHUNK_CONCURRENCY (4).
+  test("getObjects sends chunks concurrently", async () => {
+    const ids = Array.from(
+      { length: 120 },
+      (_, index) => ObjectId.make(PADDED(`${(index + 16).toString(16)}0`))
+    )
+    const latch = Effect.runSync(Latch.make(false))
+    const arrived: Array<number> = []
+    const result = await Effect.runPromise(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        const fiber = yield* Effect.forkChild(sui.getObjects(ids))
+        // The latch opens only once two chunk calls have been *recorded*, so a
+        // sequential implementation deadlocks here rather than passing.
+        yield* Latch.await(latch)
+        return yield* Fiber.join(fiber)
+      }).pipe(
+        Effect.provide(
+          Sui.layerNoDeps.pipe(
+            Layer.provide(
+              mockCore(() =>
+                Effect.suspend(() => {
+                  arrived.push(arrived.length)
+                  if (arrived.length >= 2) latch.openUnsafe()
+                  return Effect.as(Latch.await(latch), { objects: [] as ReadonlyArray<unknown> })
+                })
+              )
+            )
+          ),
+          { local: true }
+        ),
+        Effect.flip
+      )
+    )
+    // Two chunk calls were in flight at once before either could answer.
+    expect(arrived.length).toBeGreaterThanOrEqual(2)
+    // The empty answers then fail the integrity check, which is the point of
+    // the next test: the first failure escapes and no partial array does.
+    expect(result._tag).toBe("TransportError")
+  })
+
+  // NB5: first-failure semantics survive the concurrency. Nothing is asserted
+  // about whether chunk 3 was sent — under concurrency it may already be in
+  // flight — only that the failure escapes and no partial array comes back.
+  test("getObjects fails the whole read on a non-retryable failure in one chunk", async () => {
+    const many = Array.from({ length: 120 }, (_, index) =>
+      escrow(`${(index + 16).toString(16)}0`, String(index)))
+    let call = 0
+    const error = await Effect.runPromise(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.getObjects(many.map((object) => ObjectId.make(object.objectId)))
+      }).pipe(
+        Effect.provide(
+          Sui.layerNoDeps.pipe(
+            Layer.provide(
+              mockCore(() =>
+                Effect.suspend(() => {
+                  call += 1
+                  // The second chunk answers for too few objects, which is the
+                  // integrity check's non-retryable `TransportError`.
+                  return Effect.succeed({
+                    objects: call === 2 ? [] : new globalThis.Array(50).fill(undefined)
+                  })
+                })
+              )
+            )
+          ),
+          { local: true }
+        ),
+        Effect.flip
+      )
+    )
+    expect(error._tag).toBe("TransportError")
+    if (error._tag === "TransportError") expect(error.retryable).toBe(false)
   })
 
   test("getObjects deduplicates the request and answers once per id asked", async () => {

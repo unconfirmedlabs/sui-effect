@@ -5,7 +5,7 @@
  *
  * @since 0.1.0
  */
-import { Effect, Result, Schema } from "effect"
+import { Effect, Predicate, Result, Schema, SchemaIssue } from "effect"
 import {
   Digest,
   ExecutionReason,
@@ -239,13 +239,86 @@ export class DecodeError extends Schema.TaggedError<DecodeError>()("DecodeError"
     Schema.withDecodingDefaultKey(Effect.succeed("shape" as const)),
     Schema.withConstructorDefault(Effect.succeed("shape" as const))
   ),
-  issue: Schema.String
+  issue: Schema.String,
+  /**
+   * Every issue the schema reported, with its path — the structured form of
+   * {@link DecodeError.issue}, which is only the first issue's sentence.
+   *
+   * An operator debugging a relay envelope with three bad fields sees three
+   * paths rather than one line, and a UI can render a message per field. The
+   * key is absent when the producer had no structured issue to carry (a Move
+   * type mismatch, a hand-built `DecodeError`), so `SuiError.toJson` still
+   * round-trips for every error that was built without one.
+   *
+   * `kind` is still the field to branch on; this is for reading.
+   *
+   * @since 0.1.3
+   */
+  issues: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        /** The path into the decoded value, as the schema walked it. */
+        path: Schema.Array(Schema.Union([Schema.String, Schema.Number])),
+        /** What the schema said about that path. */
+        message: Schema.String
+      })
+    )
+  )
 }) {
   /** The one actionable line `SuiError.describe` produces for this error. */
   override get message(): string {
     return describe(this)
   }
 }
+
+const standardIssues = SchemaIssue.makeFormatterStandardSchemaV1()
+
+/**
+ * The **first** issue of a `SchemaError`'s formatted message, which is what
+ * {@link DecodeError}'s `issue` has always carried.
+ *
+ * The producers decode with `{ errors: "all" }` so `issues` can carry every
+ * path, and the formatter joins those issues with a newline — which turned
+ * `error.message` into a paragraph. `issue` is one sentence for a human and
+ * its shape is part of what 0.1.2 shipped, so it is cut back to the first
+ * issue's block: the message plus the indented `at [...]` line the formatter
+ * puts under it. A single-issue failure has no second block, so it comes
+ * through byte for byte. Never fails.
+ */
+const firstIssue = (message: string): string => {
+  const lines = message.split("\n")
+  // A continuation line of the same issue is indented; the next issue starts
+  // at column zero.
+  const next = lines.findIndex((line, index) => index > 0 && !line.startsWith("  "))
+  return next === -1 ? message : lines.slice(0, next).join("\n")
+}
+
+/**
+ * The `DecodeError` payload a failed decode deserves: the first issue as the
+ * sentence `issue` has always been, and every issue as `{ path, message }`.
+ *
+ * `SchemaError.issue` is a tree; the second half is Effect's own
+ * Standard-Schema formatter over it, so the paths are the ones every other
+ * tool prints. A decode run with `{ errors: "all" }` reports every field
+ * rather than the first. Never fails.
+ */
+export const decodePayload = (error: Schema.SchemaError): {
+  readonly issue: string
+  readonly issues: ReadonlyArray<
+    { readonly path: ReadonlyArray<string | number>; readonly message: string }
+  >
+} => ({ issue: firstIssue(error.message), issues: decodeIssues(error) })
+
+const decodeIssues = (
+  error: Schema.SchemaError
+): ReadonlyArray<{ readonly path: ReadonlyArray<string | number>; readonly message: string }> =>
+  standardIssues(error.issue).issues.map((issue) => ({
+    path: (issue.path ?? []).map((segment) => {
+      const key = Predicate.isObject(segment) ? segment["key"] : segment
+      return typeof key === "number" ? key : String(key)
+    }),
+    message: issue.message
+  }))
 
 /** Simulation reported an execution failure. No gas was charged. */
 export class SimulationFailed extends Schema.TaggedError<SimulationFailed>()("SimulationFailed", {
@@ -257,7 +330,7 @@ export class SimulationFailed extends Schema.TaggedError<SimulationFailed>()("Si
 export class ExecutionFailed extends Schema.TaggedError<ExecutionFailed>()("ExecutionFailed", {
   digest: Digest,
   reason: ExecutionReason,
-  command: Schema.optional(Schema.Number),
+  command: Schema.optional(Schema.Finite),
   effects: TransactionEffects
 }) {
   /** The one actionable line `SuiError.describe` produces for this error. */
@@ -442,6 +515,15 @@ export const SuiErrorSchema = Schema.Union([
 ])
 
 /**
+ * {@link SuiErrorSchema} as a tagged union, which is what makes the tag list
+ * derivable: `.cases` is keyed by `_tag`, so nothing has to repeat it.
+ *
+ * Not exported — `SuiErrorSchema` is the published shape and this is how the
+ * library reads its own keys.
+ */
+const SuiErrorTagged = SuiErrorSchema.pipe(Schema.toTaggedUnion("_tag"))
+
+/**
  * What a failure says about the transaction it came from, on the axis a caller
  * or a wrapper script acts on.
  */
@@ -484,27 +566,17 @@ const hasOutcome = (error: unknown): error is HasOutcome => isHasOutcome(error)
 const isRetryable = (error: SuiError): boolean =>
   error._tag === "TransportError" ? error.retryable : false
 
-/** Every tag the taxonomy owns, so a foreign tag can be told from one of ours. */
-const TAXONOMY_TAGS: ReadonlySet<string> = new Set([
-  "TransportError",
-  "ObjectNotFound",
-  "ObjectDeleted",
-  "ObjectUnavailable",
-  "TransactionNotFound",
-  "NetworkMismatch",
-  "DecodeError",
-  "SimulationFailed",
-  "ExecutionFailed",
-  "SubmissionUnknown",
-  "NotApplied",
-  "SigningError",
-  "BuildError",
-  "PolicyDenied",
-  "JournalError",
-  "UnexpectedEffects",
-  "GraphQLUnavailable",
-  "ExtensionNotReady"
-])
+/**
+ * Every tag the taxonomy owns, so a foreign tag can be told from one of ours.
+ *
+ * Derived from {@link SuiErrorSchema} rather than written out: a hand-kept copy
+ * of the tag list is one edit that can be forgotten, and forgetting it here
+ * used to mean an error the library defines being classified as somebody
+ * else's. Adding a class to the union adds its tag here.
+ */
+const TAXONOMY_TAGS: ReadonlySet<string> = new Set(
+  Object.keys(SuiErrorTagged.cases)
+)
 
 /**
  * What a failure says about the transaction it came from.
@@ -689,9 +761,7 @@ const encodeThroughOwnSchema = (error: unknown): Record<string, unknown> | undef
   const encoded = Schema.encodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(error)
   if (!Result.isSuccess(encoded)) return undefined
   const value: unknown = encoded.success
-  return typeof value === "object" && value !== null
-    ? (value as Record<string, unknown>)
-    : undefined
+  return Predicate.isObject(value) ? value : undefined
 }
 
 /**
@@ -719,6 +789,25 @@ const withOutcome = (
 }
 
 /**
+ * The human sentence, in the same key for every error.
+ *
+ * Fifteen of the eighteen taxonomy classes carry `message` as an
+ * `override get message()` rather than as a schema field, and a getter stays
+ * out of the encoding — so a JSON log line had a sentence for three tags and
+ * none for the rest, and an operator had to special-case them. This adds it
+ * when the encoding did not produce one. Additive: a decoder ignores the
+ * excess key, so every round trip still holds. Never fails.
+ */
+const withMessage = (
+  json: Record<string, unknown>,
+  sentence: () => string | undefined
+): Record<string, unknown> => {
+  if (typeof json["message"] === "string" && json["message"].length > 0) return json
+  const value = sentence()
+  return value === undefined || value.length === 0 ? json : { ...json, message: value }
+}
+
+/**
  * The JSON an operator or a log line gets for a failure.
  *
  * A tag in the taxonomy encodes through {@link SuiErrorSchema}. **Anything
@@ -733,15 +822,30 @@ const withOutcome = (
  * wrapper script acts on, and losing it in the log while `Script.exitCode` saw
  * it was the one inconsistency in the serialization.
  *
+ * **`message` is always there too**, for the same reason: fifteen of the
+ * eighteen taxonomy classes carry it as a getter, which stays out of the
+ * encoding, so a log line had a sentence for three tags and nothing for the
+ * rest. A taxonomy error gets {@link describe}; an extension error gets its own
+ * `.message` when it is a non-empty string. Added only when the encoding
+ * produced none, and ignored on decode, so nothing round-trips differently.
+ *
  * Never fails.
  */
 const toJson = (error: SuiError | { readonly _tag: string }): Record<string, unknown> => {
   const encoded = encode(error)
   if (Result.isSuccess(encoded)) {
-    return withOutcome(error, encoded.success as Record<string, unknown>)
+    return withMessage(
+      withOutcome(error, encoded.success as Record<string, unknown>),
+      () => describe(error as SuiError)
+    )
   }
   const own = encodeThroughOwnSchema(error)
-  if (own !== undefined) return withOutcome(error, own)
+  if (own !== undefined) {
+    return withMessage(withOutcome(error, own), () => {
+      const value = (error as { readonly message?: unknown }).message
+      return typeof value === "string" && value.length > 0 ? value : undefined
+    })
+  }
   const message = TAXONOMY_TAGS.has(error._tag)
     ? describe(error as SuiError)
     : causeLine(error) ?? error._tag
@@ -766,6 +870,12 @@ const isTaxonomy = (error: unknown): error is SuiError => {
  * The helpers every repo hand-rolls: is this worth retrying, did the
  * transaction land, is it even one of ours, what does an operator need to read,
  * and what goes in a log.
+ *
+ * For *branching* on a failure, the taxonomy is a flat tagged union, so
+ * `Effect.catchTags({ ObjectNotFound: ..., TransportError: ... })` in the error
+ * channel and `Match.tagsExhaustive` over a `SuiError` value both work and are
+ * the two documented consumer idioms; these helpers are for the questions that
+ * are the same whatever the tag is.
  */
 export const SuiError = {
   isRetryable,

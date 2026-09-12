@@ -268,6 +268,15 @@ describe("Settlement: a domain class over the BCS bridge", () => {
     claimed_by: bcs.Address
   })
 
+  // The identifier is the class's stable runtime marker and its JSON-Schema
+  // `$ref` key, so it follows the guide's `"<package>/<Name>"` rule: two
+  // extensions with a `Settlement` class must not collide in one document.
+  test("the class identifier is scoped to the package", () => {
+    expect(JSON.stringify(Schema.toJsonSchemaDocument(Settlement))).toContain(
+      "escrow/Settlement"
+    )
+  })
+
   test("snake_case Move fields decode into the camelCase domain class", async () => {
     const bytes = SettlementBcs.serialize({
       escrow_id: ESCROW_ID,
@@ -644,5 +653,40 @@ describe("the errors", () => {
     // the instance, so it is in the JSON anyway.
     expect(json["outcome"]).toBe("unknown")
     expect(json["outcome"]).toBe(SuiError.outcome(error))
+  })
+
+  /**
+   * `Schema.TaggedError` leaves `.message` empty, so an error that defines
+   * neither a getter nor a `message` schema field logs as an empty string and
+   * `SuiError.toJson` emits no `message` key at all. Every error here defines
+   * one, and the guide promises a reader that they will.
+   */
+  test("every error has a real message, and toJson carries it", () => {
+    const errors = [
+      new EscrowNotFound({ escrowId: ESCROW_ID }),
+      new EscrowSettlementUnknown({
+        escrowId: ESCROW_ID,
+        digest: "1".repeat(32) as never,
+        message: "the operator never confirmed"
+      }),
+      new EscrowUnsupportedNetwork({ network: "devnet" })
+    ]
+    for (const error of errors) {
+      expect([error._tag, error.message.length > 0]).toEqual([error._tag, true])
+      expect([error._tag, SuiError.toJson(error)["message"]]).toEqual([
+        error._tag,
+        error.message
+      ])
+    }
+    // The getter reads the error's own fields, so the sentence names the thing
+    // that failed rather than repeating the tag.
+    expect(new EscrowNotFound({ escrowId: ESCROW_ID }).message).toBe(`no escrow ${ESCROW_ID}`)
+    expect(new EscrowUnsupportedNetwork({ network: "devnet" }).message).toBe(
+      "this release bundles no escrow deployment for devnet"
+    )
+    // And a getter stays out of the encoding, so it is not a constructor
+    // argument: only `EscrowSettlementUnknown` takes a `message`.
+    expect(Object.keys(SuiError.toJson(new EscrowUnsupportedNetwork({ network: "devnet" }))))
+      .toEqual(["_tag", "network", "outcome", "message"])
   })
 })

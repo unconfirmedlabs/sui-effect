@@ -14,6 +14,7 @@ import type { SuiClientTypes } from "@mysten/sui/client"
 import { Transaction } from "@mysten/sui/transactions"
 import { normalizeSuiAddress, SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
 import {
+  Array,
   Config,
   Context,
   DateTime,
@@ -350,6 +351,15 @@ const SENDER_LOCK_TTL = "1 minute"
 
 const CHUNK = 50
 
+/**
+ * How many `getObjects` chunks are in flight at once.
+ *
+ * A 500-id read is ten chunk round trips sequentially and three at four; the
+ * bound is there because the other side is a rate-limited node, and a 429 is a
+ * retryable failure worth not provoking.
+ */
+const CHUNK_CONCURRENCY = 4
+
 /** Options every object read accepts. */
 interface ReadOptions<S> {
   readonly schema?: Schema.Codec<S, Uint8Array>
@@ -446,14 +456,6 @@ const makeSui = (
     )
   })
 
-  const chunk = <A>(items: ReadonlyArray<A>): ReadonlyArray<ReadonlyArray<A>> => {
-    const chunks: Array<ReadonlyArray<A>> = []
-    for (let index = 0; index < items.length; index += CHUNK) {
-      chunks.push(items.slice(index, index + CHUNK))
-    }
-    return chunks
-  }
-
   const getObjects = Effect.fn("Sui.getObjects")(function*<S>(
     ids: ReadonlyArray<ObjectId>,
     opts?: ReadOptions<S>
@@ -462,6 +464,7 @@ const makeSui = (
     TransportError
   > {
     type Item = Result.Result<SuiObject<S | Uint8Array>, BatchItemError>
+    type Entry = readonly [string, Item]
     const unique: Array<ObjectId> = []
     const requested = new Set<string>()
     for (const id of ids) {
@@ -470,8 +473,11 @@ const makeSui = (
       requested.add(key)
       unique.push(id)
     }
-    const answers = new Map<string, Item>()
-    for (const page of chunk(unique)) {
+
+    /** One chunk of at most {@link CHUNK} ids, as the entries it answered. */
+    const fetchPage = Effect.fn("Sui.getObjectsPage")(function*(
+      page: ReadonlyArray<ObjectId>
+    ): Effect.fn.Return<ReadonlyArray<Entry>, TransportError> {
       const response = yield* core.getObjects({
         objectIds: [...page],
         include: OBJECT_INCLUDE
@@ -483,6 +489,7 @@ const makeSui = (
           cause: `asked for ${page.length} objects and the node answered for ${response.objects.length}`
         })
       }
+      const entries: Array<Entry> = []
       for (let index = 0; index < page.length; index += 1) {
         const id = page[index] as ObjectId
         const item = response.objects[index]
@@ -494,7 +501,7 @@ const makeSui = (
           })
         }
         if (item instanceof Error) {
-          answers.set(keyOf(id), Result.fail(mapObjectItemError(id, item)))
+          entries.push([keyOf(id), Result.fail(mapObjectItemError(id, item))])
           continue
         }
         if (keyOf(item.objectId) !== keyOf(id)) {
@@ -507,12 +514,29 @@ const makeSui = (
         const decoded = yield* Effect.result(decodeObject(item, opts))
         if (Result.isFailure(decoded)) {
           if (decoded.failure._tag === "TransportError") return yield* decoded.failure
-          answers.set(keyOf(id), Result.fail(decoded.failure))
+          entries.push([keyOf(id), Result.fail(decoded.failure)])
           continue
         }
-        answers.set(keyOf(id), Result.succeed(decoded.success))
+        entries.push([keyOf(id), Result.succeed(decoded.success)])
       }
+      return entries
+    })
+
+    // `Effect.forEach` preserves input order and fails on the **first** failure,
+    // which is exactly what the sequential loop's `return yield*` relied on: an
+    // integrity failure or a `TransportError` out of `decodeObject` still fails
+    // the whole read and no partial array escapes. Bounded, not unbounded,
+    // because the other side of this is a rate-limited node.
+    const pages = yield* Effect.forEach(
+      Array.chunksOf(unique, CHUNK),
+      fetchPage,
+      { concurrency: CHUNK_CONCURRENCY }
+    )
+    const answers = new Map<string, Item>()
+    for (const page of pages) {
+      for (const [key, item] of page) answers.set(key, item)
     }
+
     const results: Array<Item> = []
     for (const id of ids) {
       const answer = answers.get(keyOf(id))
@@ -749,6 +773,7 @@ const makeSui = (
     Effect.fn("Sui.withSenderLock")(function*<A, E, R>(
       effect: Effect.Effect<A, E, R>
     ): Effect.fn.Return<A, E, R> {
+      yield* Effect.annotateCurrentSpan({ "sui.sender": address })
       // The semaphore is reference counted: whoever is inside the lock holds a
       // reference, so a sender's semaphore cannot be dropped while it is in
       // use, and an idle one is released a minute after the last holder leaves

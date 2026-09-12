@@ -21,14 +21,17 @@ import {
   SuiError,
   TransactionNotFound,
   TransportError,
+  SuiErrorSchema,
   UnexpectedEffects
 } from "../src/domain/errors.ts"
 import {
   Balance,
   CoinType,
   Digest,
+  Network,
   Mist,
   ObjectId,
+  ObjectRef,
   ObjectType,
   Owner,
   Signature,
@@ -37,6 +40,8 @@ import {
   TransactionEffects,
   Version
 } from "../src/domain/schemas.ts"
+import * as SuiSchema from "../src/domain/bcs.ts"
+import { bcs as suiBcs } from "@mysten/sui/bcs"
 
 const DIGEST = "7YcE7X6LmUcbqHcRYMRT8vBTxtnCbfGJkH6yZPFpTFwn"
 const ADDRESS = `0x${"ab".repeat(32)}`
@@ -493,5 +498,242 @@ describe("TransportError.fromUnknown", () => {
     const error = TransportError.fromUnknown("operator.status", cause)
     expect(error.cause).toBe(cause)
     expect(SuiError.describe(error)).toContain("connection refused")
+  })
+})
+
+/**
+ * NB3: `identifier` and `description` on the reusable schemas.
+ *
+ * The annotation has to sit on the node that *reports* — the string underneath
+ * the brand — because annotating after `Schema.check` targets the last check
+ * instead, which is the trap the docs warn about.
+ */
+describe("schema annotations", () => {
+  /**
+   * Every branded schema, not a sample.
+   *
+   * The annotation has to sit on the node that *reports*, and which node that
+   * is depends on how the brand is built: a brand with a decode transform
+   * reports from the string underneath it, a check-only brand reports from the
+   * checked node, and a `BigIntFromString` brand reports from its **encoded**
+   * string source (`Schema.annotateEncoded`). Getting one of the three wrong
+   * leaves `Expected string`, which is what this table catches.
+   */
+  const brands = [
+    ["SuiAddress", SuiAddress, "0xnothex", "Expected a 32-byte Sui address"],
+    ["ObjectId", ObjectId, "zz", "Expected a 32-byte Sui object id"],
+    ["Digest", Digest, "zz", "Expected a base58 32-byte transaction digest"],
+    ["StructTag", StructTag, "not a tag", "Expected a fully qualified Move struct tag"],
+    ["CoinType", CoinType, "not a tag", "Expected a fully qualified Move coin type"],
+    ["Signature", Signature, "", "Expected a value with a length of at least 1"],
+    ["Mist", Mist, "-1", "Expected a value greater than or equal to 0n"],
+    ["Version", Version, "-1", "Expected a value greater than or equal to 0n"],
+    // `Network` is a brand with no check at all, so it has no check message.
+    ["Network", Network, undefined, undefined]
+  ] as const
+
+  test("a wrong-typed input reports the identifier, not `Expected string`", () => {
+    for (const [name, schema] of brands) {
+      const result = Schema.decodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(5)
+      expect([name, result._tag]).toEqual([name, "Failure"])
+      if (result._tag !== "Failure") continue
+      expect([name, String(result.failure)]).toEqual([
+        name,
+        `SchemaError(Expected ${name})`
+      ])
+    }
+  })
+
+  test("a failed check still reports the check's own message", () => {
+    for (const [name, schema, badValue, message] of brands) {
+      if (badValue === undefined) continue
+      const result = Schema.decodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(badValue)
+      expect([name, result._tag]).toEqual([name, "Failure"])
+      if (result._tag !== "Failure") continue
+      expect([name, String(result.failure)]).toEqual([name, `SchemaError(${message})`])
+    }
+  })
+
+  test("every brand gets a named definition in a JSON Schema document", () => {
+    for (const [name, schema] of brands) {
+      const document = JSON.stringify(
+        Schema.toJsonSchemaDocument(
+          Schema.Struct({ value: schema as Schema.Codec<string, string> }).annotate({
+            identifier: "Holder"
+          })
+        )
+      )
+      expect([name, document.includes(`"${name}":`)]).toEqual([name, true])
+    }
+  })
+
+  test("a BCS bridge names its Move type instead of `<Declaration>`", () => {
+    const layout = suiBcs.struct("Escrow", { id: suiBcs.Address, amount: suiBcs.u64() })
+    const type = `0x${"0".repeat(63)}2::escrow::Escrow`
+    const result = Schema.decodeUnknownResult(SuiSchema.bcs(layout, type))(
+      new Uint8Array([1, 2, 3])
+    )
+    expect(result._tag).toBe("Failure")
+    if (result._tag === "Failure") {
+      expect(String(result.failure)).toContain("escrow::Escrow")
+      expect(String(result.failure)).not.toContain("<Declaration>")
+    }
+  })
+
+  test("a JSON Schema document names its definitions", () => {
+    const document = JSON.stringify(Schema.toJsonSchemaDocument(ObjectRef))
+    expect(document).toContain("\"ObjectRef\"")
+    expect(document).toContain("\"ObjectId\"")
+    expect(document).toContain("\"StructTag\"")
+  })
+})
+
+describe("DecodeError.issues round-trips (NB4)", () => {
+  test("toJson carries the structured issues and SuiErrorSchema decodes them back", () => {
+    const error = new DecodeError({
+      kind: "shape",
+      issue: "two fields",
+      issues: [
+        { path: ["effects", "gasUsed"], message: "Expected string" },
+        { path: ["events", 0, "eventType"], message: "Expected StructTag" }
+      ]
+    })
+    const json = SuiError.toJson(error)
+    const decoded = Schema.decodeUnknownSync(SuiErrorSchema)(json)
+    expect(decoded._tag).toBe("DecodeError")
+    if (decoded._tag !== "DecodeError") return
+    expect(decoded.issues).toEqual(error.issues)
+  })
+
+  test("the key is absent when nothing structured was carried", () => {
+    const json = SuiError.toJson(new DecodeError({ issue: "no tree here" }))
+    expect("issues" in json).toBe(false)
+    expect(Schema.decodeUnknownSync(SuiErrorSchema)(json)._tag).toBe("DecodeError")
+  })
+})
+
+/**
+ * NB8: every JSON log line carries a human sentence in the same key, whether or
+ * not the class has a `message` schema field.
+ */
+describe("SuiError.toJson message (NB8)", () => {
+  const ID = `0x${"ab".repeat(32)}`
+  const DIGEST_VALUE = Digest.make("7YcE7X6LmUcbqHcRYMRT8vBTxtnCbfGJkH6yZPFpTFwn")
+  const objectId = SuiAddress.make(ID) as never
+  const UNKNOWN = ExecutionReason.cases.Unknown.make({ $kind: "Unknown" })
+  const instances = [
+    new TransportError({ method: "getObject", retryable: true, cause: "down" }),
+    new ObjectNotFound({ objectId }),
+    new ObjectDeleted({ objectId }),
+    new ObjectUnavailable({ objectId }),
+    new TransactionNotFound({ digest: DIGEST_VALUE }),
+    new NetworkMismatch({ expected: "a", actual: "b" }),
+    new DecodeError({ issue: "bad bytes" }),
+    new SimulationFailed({ reason: UNKNOWN, message: "no" }),
+    new ExecutionFailed({
+      digest: DIGEST_VALUE,
+      reason: UNKNOWN,
+      effects: Schema.decodeUnknownSync(TransactionEffects)(effects(false))
+    }),
+    new SubmissionUnknown({ digest: DIGEST_VALUE, cause: "timeout" }),
+    new NotApplied({ digest: DIGEST_VALUE, evidence: "expired" }),
+    new SigningError({ cause: "no key" }),
+    new BuildError({ message: "no gas", cause: "x" }),
+    new PolicyDenied({ rule: "spend", message: "too much" }),
+    new JournalError({ cause: "disk full" }),
+    new UnexpectedEffects({ digest: DIGEST_VALUE, expected: "0x2::a::B", found: [] }),
+    new GraphQLUnavailable({ method: "query", reason: "no endpoint" }),
+    new ExtensionNotReady({ extension: "escrow", member: "status" })
+  ] as const
+
+  test("every taxonomy class gets the same sentence in the same key", () => {
+    expect(instances).toHaveLength(
+      Object.keys(SuiErrorSchema.pipe(Schema.toTaggedUnion("_tag")).cases).length
+    )
+    for (const error of instances) {
+      const json = SuiError.toJson(error)
+      expect([error._tag, typeof json["message"]]).toEqual([error._tag, "string"])
+      expect((json["message"] as string).length).toBeGreaterThan(0)
+      // The same sentence `.message` gives: `describe` for the fifteen classes
+      // that carry it as a getter, the field's own value for the three that
+      // declare `message` in their schema.
+      expect([error._tag, json["message"]]).toEqual([error._tag, (error as Error).message])
+      // The excess key is ignored on decode, so nothing round-trips differently.
+      expect(Schema.decodeUnknownSync(SuiErrorSchema)(json)._tag).toBe(error._tag)
+    }
+  })
+
+  test("an extension error keeps its own message", () => {
+    class Denied extends Schema.TaggedError<Denied>()("escrow/Denied", { rule: Schema.String }) {
+      readonly outcome = "not_applied" as const
+      override get message(): string {
+        return `escrow denied by ${this.rule}`
+      }
+    }
+    const json = SuiError.toJson(new Denied({ rule: "spend" }))
+    expect(json["message"]).toBe("escrow denied by spend")
+    expect(json["outcome"]).toBe("not_applied")
+  })
+})
+
+/** NB9: what `normalize` actually throws, which the docstring used to get wrong. */
+describe("normalize throws a SchemaError with the issue on it", () => {
+  test("ObjectId.normalize", () => {
+    expect(() => ObjectId.normalize("zz")).toThrow()
+    try {
+      ObjectId.normalize("zz")
+    } catch (error) {
+      expect(Schema.isSchemaError(error)).toBe(true)
+      if (Schema.isSchemaError(error)) {
+        expect(error.issue).toBeDefined()
+        expect(error.message.length).toBeGreaterThan(0)
+      }
+    }
+  })
+
+  test("SuiAddress.normalize", () => {
+    try {
+      SuiAddress.normalize("0xnothex")
+      throw new Error("expected a throw")
+    } catch (error) {
+      expect(Schema.isSchemaError(error)).toBe(true)
+    }
+  })
+
+  test(".make throws a plain Error with the issue in cause, not a SchemaError", () => {
+    try {
+      ObjectId.make("0x6")
+      throw new Error("expected a throw")
+    } catch (error) {
+      expect(Schema.isSchemaError(error)).toBe(false)
+      expect((error as Error).cause).toBeDefined()
+    }
+  })
+})
+
+/**
+ * NB14: a JSON number that reached a schema as `NaN` used to be a value.
+ * `Schema.Finite` makes it a `DecodeError`; the decoded `Type` is still
+ * `number`, so nothing downstream changes.
+ */
+describe("Schema.Finite where a JSON number is meant", () => {
+  test("a NaN version fails TransactionEffects", () => {
+    const good = decode(TransactionEffects, effects(true))
+    expect(Result.isSuccess(good)).toBe(true)
+    const bad = decode(TransactionEffects, { ...effects(true), version: Number.NaN })
+    expect(Result.isFailure(bad)).toBe(true)
+  })
+
+  test("an Infinity command fails ExecutionFailed's schema", () => {
+    const encoded = {
+      _tag: "ExecutionFailed",
+      digest: DIGEST,
+      reason: { $kind: "Unknown" },
+      command: Number.POSITIVE_INFINITY,
+      effects: effects(false)
+    }
+    expect(Result.isFailure(decode(SuiErrorSchema, encoded))).toBe(true)
+    const { command: _command, ...withoutCommand } = encoded
+    expect(Result.isSuccess(decode(SuiErrorSchema, withoutCommand))).toBe(true)
   })
 })

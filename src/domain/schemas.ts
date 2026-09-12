@@ -34,7 +34,10 @@ const normalizeStructTagSafe = (value: string): string => {
  * `SuiAddress.make("0x1")` throws. `SuiAddress.normalize("0x1")` is the one
  * that accepts every spelling a human writes, because it decodes first.
  */
-const SuiAddressSchema = Schema.String.pipe(
+const SuiAddressSchema = Schema.String.annotate({
+  identifier: "SuiAddress",
+  description: "A 32-byte Sui account address in the padded lowercase 0x form"
+}).pipe(
   Schema.decode({
     decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
     encode: SchemaGetter.passthrough()
@@ -58,10 +61,14 @@ const SuiAddressSchema = Schema.String.pipe(
  * document, every CLI flag and every human writes. `normalize` runs the
  * schema's own decode — `normalizeSuiAddress` — and then the check.
  *
- * **It throws** (an `Error` whose cause is the schema issue), like `.make`, so
- * it is for literals and configuration a caller controls. Anything that arrived
- * from outside goes through `Schema.decodeUnknownEffect(SuiAddress)`, which
- * puts the failure in the error channel where a caller can handle it.
+ * **It throws a `SchemaError`** — `Schema.isSchemaError(error)` is the guard —
+ * whose `.issue` is the structured schema issue and whose `.message` is the
+ * formatted line, because it is `Schema.decodeSync`. (`.make`, which validates
+ * without decoding, throws a plain `Error` with the issue in `cause` instead;
+ * the two are not the same shape.) So it is for literals and configuration a
+ * caller controls. Anything that arrived from outside goes through
+ * `Schema.decodeUnknownEffect(SuiAddress)`, which puts the failure in the error
+ * channel where a caller can handle it.
  *
  * @since 0.1.1
  *
@@ -90,7 +97,10 @@ export type SuiAddress = typeof SuiAddressSchema.Type
  * `ObjectId.make` validates without decoding; `ObjectId.normalize` decodes
  * first and is what takes `"0x6"`.
  */
-const ObjectIdSchema = Schema.String.pipe(
+const ObjectIdSchema = Schema.String.annotate({
+  identifier: "ObjectId",
+  description: "A 32-byte Sui object id in the padded lowercase 0x form"
+}).pipe(
   Schema.decode({
     decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
     encode: SchemaGetter.passthrough()
@@ -108,9 +118,11 @@ const ObjectIdSchema = Schema.String.pipe(
  * and branding after — the object-id twin of `SuiAddress.normalize`, and the
  * answer to `ObjectId.make("0x6")` throwing.
  *
- * **It throws**, like `.make`, so it is for literals and configuration a caller
- * controls; anything from outside goes through
- * `Schema.decodeUnknownEffect(ObjectId)`.
+ * **It throws a `SchemaError`** (`Schema.isSchemaError`), whose `.issue` is the
+ * schema issue and whose `.message` is the formatted line, because it is
+ * `Schema.decodeSync`; `.make` throws a plain `Error` with the issue in
+ * `cause`. So it is for literals and configuration a caller controls; anything
+ * from outside goes through `Schema.decodeUnknownEffect(ObjectId)`.
  *
  * @since 0.1.1
  *
@@ -130,21 +142,33 @@ export const ObjectId = Object.assign(ObjectIdSchema, { normalize: normalizeObje
 export type ObjectId = typeof ObjectIdSchema.Type
 
 /** A base58 transaction digest. Not normalized; rejected when not 32 bytes. */
-export const Digest = Schema.String.pipe(
+export const Digest = Schema.String.annotate({
+  identifier: "Digest",
+  description: "A base58 32-byte transaction digest"
+}).pipe(
   Schema.check(
     Schema.makeFilter((value: string) =>
       isValidTransactionDigest(value) ? undefined : "Expected a base58 32-byte transaction digest"
     )
-  ),
-  Schema.brand("Digest")
-)
+  )
+  // Again **after** the check, because a check-only brand reports from the
+  // checked node and the annotation on the bare `Schema.String` underneath it
+  // does not reach there. The check's own message still wins for a string of
+  // the wrong shape; this is only what a non-string is compared against.
+).annotate({
+  identifier: "Digest",
+  description: "A base58 32-byte transaction digest"
+}).pipe(Schema.brand("Digest"))
 export type Digest = typeof Digest.Type
 
 /**
  * A fully qualified Move struct tag, normalized with `normalizeStructTag` on
  * decode so `0x2::sui::SUI` and its padded form compare equal.
  */
-export const StructTag = Schema.String.pipe(
+export const StructTag = Schema.String.annotate({
+  identifier: "StructTag",
+  description: "A fully qualified Move struct tag, normalized"
+}).pipe(
   Schema.decode({
     decode: SchemaGetter.transform(normalizeStructTagSafe),
     encode: SchemaGetter.passthrough()
@@ -159,7 +183,10 @@ export const StructTag = Schema.String.pipe(
 export type StructTag = typeof StructTag.Type
 
 /** A coin type: a struct tag used as the type argument of `0x2::coin::Coin`. */
-export const CoinType = Schema.String.pipe(
+export const CoinType = Schema.String.annotate({
+  identifier: "CoinType",
+  description: "A struct tag used as the type argument of 0x2::coin::Coin"
+}).pipe(
   Schema.decode({
     decode: SchemaGetter.transform(normalizeStructTagSafe),
     encode: SchemaGetter.passthrough()
@@ -184,20 +211,42 @@ export type ObjectType = typeof ObjectType.Type
 
 /** An amount in MIST. Encoded as the decimal string every SDK response uses. */
 export const Mist = Schema.BigIntFromString.pipe(
-  Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n)),
+  Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n))
+).annotate({
+  identifier: "Mist",
+  description: "An amount in MIST, encoded as a decimal string"
+}).pipe(
+  // `Schema.annotateEncoded` is what names the **string** side: the wrong-type
+  // failure for a `BigIntFromString` comes from its unannotated string source,
+  // not from the bigint node the plain `annotate` reaches.
+  Schema.annotateEncoded({
+    identifier: "Mist",
+    description: "An amount in MIST, encoded as a decimal string"
+  }),
   Schema.brand("Mist")
 )
 export type Mist = typeof Mist.Type
 
 /** A Move object version. Encoded as the decimal string the SDK returns. */
 export const Version = Schema.BigIntFromString.pipe(
-  Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n)),
+  Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n))
+).annotate({
+  identifier: "Version",
+  description: "A Move object version, encoded as a decimal string"
+}).pipe(
+  Schema.annotateEncoded({
+    identifier: "Version",
+    description: "A Move object version, encoded as a decimal string"
+  }),
   Schema.brand("Version")
 )
 export type Version = typeof Version.Type
 
 /** The network a client is pointed at. Mirrors `SuiClientTypes.Network`. */
-export const Network = Schema.String.pipe(Schema.brand("Network"))
+export const Network = Schema.String.annotate({
+  identifier: "Network",
+  description: "The network a client is pointed at"
+}).pipe(Schema.brand("Network"))
 export type Network = typeof Network.Type
 
 /** The four networks with a built-in default gRPC endpoint. */
@@ -246,8 +295,19 @@ export const ObjectRef = Schema.Struct({
   version: Version,
   digest: Schema.String,
   owner: Owner
+}).annotate({
+  identifier: "ObjectRef",
+  description: "Everything the transaction builder needs to consume an object again"
 })
-export type ObjectRef = typeof ObjectRef.Type
+type ObjectRefType = typeof ObjectRef.Type
+/**
+ * The decoded shape of {@link ObjectRef}.
+ *
+ * Declared as an interface rather than as `typeof ObjectRef.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface ObjectRef extends ObjectRefType {}
 
 /** A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`. */
 export const Balance = Schema.Struct({
@@ -255,15 +315,37 @@ export const Balance = Schema.Struct({
   balance: Mist,
   coinBalance: Mist,
   addressBalance: Mist
+}).annotate({
+  identifier: "Balance",
+  description: "A coin balance for one coin type"
 })
-export type Balance = typeof Balance.Type
+type BalanceType = typeof Balance.Type
+/**
+ * The decoded shape of {@link Balance}.
+ *
+ * Declared as an interface rather than as `typeof Balance.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface Balance extends BalanceType {}
 
 /** The BCS-encoded name of a dynamic field. Mirrors `SuiClientTypes.DynamicFieldName`. */
 export const DynamicFieldName = Schema.Struct({
   type: Schema.String,
   bcs: Schema.Uint8Array
+}).annotate({
+  identifier: "DynamicFieldName",
+  description: "The BCS-encoded name of a dynamic field"
 })
-export type DynamicFieldName = typeof DynamicFieldName.Type
+type DynamicFieldNameType = typeof DynamicFieldName.Type
+/**
+ * The decoded shape of {@link DynamicFieldName}.
+ *
+ * Declared as an interface rather than as `typeof DynamicFieldName.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface DynamicFieldName extends DynamicFieldNameType {}
 
 /** One entry of a dynamic-field listing. Mirrors `SuiClientTypes.DynamicFieldEntry`. */
 export const DynamicFieldEntry = Schema.Struct({
@@ -273,8 +355,19 @@ export const DynamicFieldEntry = Schema.Struct({
   valueType: Schema.String,
   $kind: Schema.Literals(["DynamicField", "DynamicObject"]),
   childId: Schema.optional(ObjectId)
+}).annotate({
+  identifier: "DynamicFieldEntry",
+  description: "One entry of a dynamic-field listing"
 })
-export type DynamicFieldEntry = typeof DynamicFieldEntry.Type
+type DynamicFieldEntryType = typeof DynamicFieldEntry.Type
+/**
+ * The decoded shape of {@link DynamicFieldEntry}.
+ *
+ * Declared as an interface rather than as `typeof DynamicFieldEntry.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface DynamicFieldEntry extends DynamicFieldEntryType {}
 
 /** A dynamic field with its value. Mirrors `SuiClientTypes.DynamicField`. */
 export const DynamicField = Schema.Struct({
@@ -287,8 +380,19 @@ export const DynamicField = Schema.Struct({
   value: Schema.Struct({ type: Schema.String, bcs: Schema.Uint8Array }),
   version: Version,
   digest: Schema.String
+}).annotate({
+  identifier: "DynamicField",
+  description: "A dynamic field with its value"
 })
-export type DynamicField = typeof DynamicField.Type
+type DynamicFieldType = typeof DynamicField.Type
+/**
+ * The decoded shape of {@link DynamicField}.
+ *
+ * Declared as an interface rather than as `typeof DynamicField.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface DynamicField extends DynamicFieldType {}
 
 /** Gas cost breakdown. Mirrors `SuiClientTypes.GasCostSummary`. */
 export const GasCostSummary = Schema.Struct({
@@ -381,16 +485,16 @@ export type Event = typeof Event.Type
 export const MoveLocation = Schema.Struct({
   package: Schema.optional(Schema.String),
   module: Schema.optional(Schema.String),
-  function: Schema.optional(Schema.Number),
+  function: Schema.optional(Schema.Finite),
   functionName: Schema.optional(Schema.String),
-  instruction: Schema.optional(Schema.Number)
+  instruction: Schema.optional(Schema.Finite)
 })
 export type MoveLocation = typeof MoveLocation.Type
 
 /** A decoded `#[error]` constant. Mirrors `SuiClientTypes.CleverError`. */
 export const CleverError = Schema.Struct({
-  errorCode: Schema.optional(Schema.Number),
-  lineNumber: Schema.optional(Schema.Number),
+  errorCode: Schema.optional(Schema.Finite),
+  lineNumber: Schema.optional(Schema.Finite),
   constantName: Schema.optional(Schema.String),
   constantType: Schema.optional(Schema.String),
   value: Schema.optional(Schema.String)
@@ -417,17 +521,17 @@ export const ExecutionReason = Schema.Union([
     $kind: Schema.Literal("SizeError"),
     SizeError: Schema.Struct({
       name: Schema.String,
-      size: Schema.Number,
-      maxSize: Schema.Number
+      size: Schema.Finite,
+      maxSize: Schema.Finite
     })
   }),
   Schema.Struct({
     $kind: Schema.Literal("CommandArgumentError"),
-    CommandArgumentError: Schema.Struct({ argument: Schema.Number, name: Schema.String })
+    CommandArgumentError: Schema.Struct({ argument: Schema.Finite, name: Schema.String })
   }),
   Schema.Struct({
     $kind: Schema.Literal("TypeArgumentError"),
-    TypeArgumentError: Schema.Struct({ typeArgument: Schema.Number, name: Schema.String })
+    TypeArgumentError: Schema.Struct({ typeArgument: Schema.Finite, name: Schema.String })
   }),
   Schema.Struct({
     $kind: Schema.Literal("PackageUpgradeError"),
@@ -440,8 +544,8 @@ export const ExecutionReason = Schema.Union([
   Schema.Struct({
     $kind: Schema.Literal("IndexError"),
     IndexError: Schema.Struct({
-      index: Schema.optional(Schema.Number),
-      subresult: Schema.optional(Schema.Number)
+      index: Schema.optional(Schema.Finite),
+      subresult: Schema.optional(Schema.Finite)
     })
   }),
   Schema.Struct({
@@ -481,7 +585,7 @@ export type ExecutionStatus = typeof ExecutionStatus.Type
 
 /** Transaction effects. Mirrors `SuiClientTypes.TransactionEffects`. */
 export const TransactionEffects = Schema.Struct({
-  version: Schema.Number,
+  version: Schema.Finite,
   status: ExecutionStatus,
   gasUsed: GasCostSummary,
   transactionDigest: Digest,
@@ -500,10 +604,13 @@ export type TransactionEffects = typeof TransactionEffects.Type
  * flag, signature and public key bytes. Branded so a signature cannot be passed
  * where a digest or an address is expected.
  */
-export const Signature = Schema.String.pipe(
-  Schema.check(Schema.isNonEmpty()),
-  Schema.brand("Signature")
-)
+export const Signature = Schema.String.annotate({
+  identifier: "Signature",
+  description: "A serialized transaction signature"
+}).pipe(Schema.check(Schema.isNonEmpty())).annotate({
+  identifier: "Signature",
+  description: "A serialized transaction signature"
+}).pipe(Schema.brand("Signature"))
 export type Signature = typeof Signature.Type
 
 /** The largest value a Move `u64` can hold. */
@@ -540,7 +647,7 @@ const u64Of = (value: string | number): bigint | undefined => {
  * fail in. A value that is not a non-negative integer below `2^64` is a schema
  * issue like any other.
  */
-const U64 = Schema.Union([Schema.String, Schema.Number]).pipe(
+const U64 = Schema.Union([Schema.String, Schema.Finite]).pipe(
   Schema.decodeTo(
     Schema.BigInt,
     SchemaTransformation.transformOrFail<bigint, string | number>({
@@ -577,7 +684,7 @@ const NullableU64 = Schema.NullOr(U64)
  * is a `u32` on the wire, so anything outside `[0, 2^32)` is a schema issue
  * rather than bytes the validator will reject later.
  */
-const Nonce = Schema.Number.pipe(
+const Nonce = Schema.Finite.pipe(
   Schema.check(Schema.isInt(), Schema.isBetween({ minimum: 0, maximum: U32_MAX }))
 )
 
@@ -609,7 +716,7 @@ export const TransactionExpiration = Schema.Union([
     $kind: Schema.Literal("Validity"),
     Validity: Schema.Struct({
       allowedProposers: Schema.NullOr(
-        Schema.Struct({ epoch: U64, proposers: Schema.Array(Schema.Number) })
+        Schema.Struct({ epoch: U64, proposers: Schema.Array(Schema.Finite) })
       ),
       minEpoch: NullableU64,
       maxEpoch: NullableU64,
@@ -650,8 +757,19 @@ export const SignedTransaction = Schema.Struct({
    * one of them against the other's epoch.
    */
   chain: Schema.optional(Schema.String)
+}).annotate({
+  identifier: "SignedTransaction",
+  description: "The signed bytes of a transaction, with what reconciling needs"
 })
-export type SignedTransaction = typeof SignedTransaction.Type
+type SignedTransactionType = typeof SignedTransaction.Type
+/**
+ * The decoded shape of {@link SignedTransaction}.
+ *
+ * Declared as an interface rather than as `typeof SignedTransaction.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface SignedTransaction extends SignedTransactionType {}
 
 /**
  * Why a transaction provably never applied, and never will.
@@ -681,8 +799,19 @@ export const Built = Schema.Struct({
   expiration: Schema.optional(TransactionExpiration),
   /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
   chain: Schema.optional(Schema.String)
+}).annotate({
+  identifier: "Built",
+  description: "A transaction built into bytes and ready to sign"
 })
-export type Built = typeof Built.Type
+type BuiltType = typeof Built.Type
+/**
+ * The decoded shape of {@link Built}.
+ *
+ * Declared as an interface rather than as `typeof Built.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface Built extends BuiltType {}
 
 /**
  * The last epoch in which a transaction can still be applied, or `undefined`
@@ -771,8 +900,19 @@ export const ObjectEnvelope = Schema.Struct({
   digest: Schema.String,
   owner: Owner,
   type: ObjectType
+}).annotate({
+  identifier: "ObjectEnvelope",
+  description: "The fixed set of object fields sui-effect always requests"
 })
-export type ObjectEnvelope = typeof ObjectEnvelope.Type
+type ObjectEnvelopeType = typeof ObjectEnvelope.Type
+/**
+ * The decoded shape of {@link ObjectEnvelope}.
+ *
+ * Declared as an interface rather than as `typeof ObjectEnvelope.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface ObjectEnvelope extends ObjectEnvelopeType {}
 
 /**
  * An object read through `Sui`, with its BCS content already decoded to `S` and
@@ -823,8 +963,19 @@ export const Simulation = Schema.Struct({
   balanceChanges: Schema.Array(BalanceChange),
   objectTypes: Schema.Record(Schema.String, Schema.String),
   commandResults: Schema.Array(CommandResult)
+}).annotate({
+  identifier: "Simulation",
+  description: "The result of a successful simulation"
 })
-export type Simulation = typeof Simulation.Type
+type SimulationType = typeof Simulation.Type
+/**
+ * The decoded shape of {@link Simulation}.
+ *
+ * Declared as an interface rather than as `typeof Simulation.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface Simulation extends SimulationType {}
 
 const UNKNOWN_REASON = ExecutionReason.cases.Unknown.make({ $kind: "Unknown" })
 

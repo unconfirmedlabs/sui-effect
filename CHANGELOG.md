@@ -3,6 +3,37 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
+## 0.1.3
+
+Unreleased. Sixteen ergonomics changes from an audit of this package against
+Effect v4 rc.112's own documentation. Nothing was removed and no signature
+changed: an extension or an application built against 0.1.2 compiles unchanged.
+
+### Added
+
+- **`SubmitConfig.with(overrides)` and `SubmitConfig.layer(overrides)`.** A `Context.Reference` holds one whole value, so every override used to be `Effect.provideService(effect, SubmitConfig, { ...SubmitConfig.defaults, maxGasBudget })` — with a cast on every branded literal. `run.pipe(SubmitConfig.with({ maxGasBudget: Mist.make(1_000_000_000n) }))` is the same thing in one call, and `SubmitConfig.layer` is the `Layer` form for an application that sets its policy where the runtime is built. `SubmitConfig.defaults` is unchanged.
+- **`DecodeError.issues`**: every issue the schema reported, as `{ path, message }`, beside the `issue` sentence. The three producers decode with `{ errors: "all" }`, so a relay envelope with three bad fields reports three paths rather than the first one. `issue` still describes exactly **one** issue — the first — and a failure that only ever had one comes through byte for byte, so anything printing it is unaffected. The `issues` key is absent when the producer had no structured issue to carry, so `SuiError.toJson` round-trips exactly as before. `kind` is still the field to branch on.
+- **`SuiError.toJson` always carries a `message`.** Fifteen of the eighteen error classes hold their sentence in an `override get message()`, and a getter is not part of the encoding, so a JSON log line had a human sentence for three tags and nothing for the rest. It is now in the same key for every error — `SuiError.describe` for a taxonomy error, the instance's own `.message` for an extension error — added only when the encoding produced none, and ignored on decode.
+- **Span attributes on the calls a trace has to be joined to.** `sui.object_id`, `sui.object_count`, `sui.digest`, `sui.signature_count`, `sui.sender`, `sui.gas_owner`, `sui.signer`, `sui.attempt` and `sui.evidence`, plus a static `sui.network` on every `SuiCore` span. An OTLP trace of a stuck submission can now be searched by digest and by sender without reading the logs.
+- **`identifier` and `description` on every reusable schema**, so a failure reads `Expected ObjectId` instead of `Expected string`, a mis-shaped BCS value names its Move type instead of `<Declaration>`, and `Schema.toJsonSchemaDocument(ObjectRef)` produces named `$defs` instead of one anonymous inlined object.
+
+### Changed
+
+- **`Built`, `Signed`, `Simulation`, `ObjectRef`, `ObjectEnvelope`, `Balance`, `DynamicField` and `DynamicFieldEntry` print by name.** They were `typeof Schema.Type` aliases, which TypeScript expands at every use site, so `Tx.build` rendered as forty lines of structure in editor hover and in `LLMS.md`. They are interfaces over the same types now — structurally identical, so nothing breaks — and the `Tx` block of `LLMS.md` is 69 lines instead of 464.
+- **`Sui.getObjects` fetches its chunks concurrently**, four at a time. A 500-id read is three round trips instead of ten. Input order, the per-item `Result`s, the integrity checks and first-failure semantics are unchanged.
+- **`Script.exitCode` can no longer exit 1 for a real taxonomy error.** Its per-tag `switch` had a `default:` that silently answered "defect", so a tag added to the taxonomy and forgotten there exited 1 instead of 3, 4 or 5. There is no tag list left: the mapping goes through `SuiError.isTaxonomy` and `SuiError.outcome`, which are derived from the error schema. No exit code changed — `NetworkMismatch` is still 2.
+- **A `NaN` or an `Infinity` in a JSON number field is a `DecodeError`**, not a value: the seventeen fields that model a JSON number use `Schema.Finite`. The decoded type is still `number`.
+- **`SuiAddress.normalize` and `ObjectId.normalize` document what they actually throw**: a `SchemaError` (`Schema.isSchemaError`) carrying `.issue`, because they are `Schema.decodeSync`. `.make` is the one that throws a plain `Error` with the issue in `cause`.
+- Internals with no consumer-visible effect: `Encoding.encodeBase64` replaces a hand-rolled base64 helper, `Schema.revealCodec` replaces the two `as unknown as` casts in the BCS bridge, and the runtime type guards go through `Predicate`.
+
+### Documentation
+
+- **Extension authors:** the guide's claim that the halfway shape of a `Schema.decodeTo` into a domain class "must be an explicit interface" was wrong. `typeof Settlement.Encoded` is exactly that shape and compiles; only `typeof Settlement.Type` — the instance side — inverts the transformation. The template drops its hand-written `SettlementParts` for it, so there is one fewer interface per domain class and nothing left to drift.
+- **Extension authors:** `outcome: Schema.tag("not_applied")` is documented beside the class-field form as the schema-visible way to declare an outcome — it is encoded without a patch-back, decodable back into an error, and visible to `Schema.is`. The class-field form keeps working and the template still uses it.
+- **Extension authors:** every error in the template now defines a real `.message` — a getter over its own fields for two of them, the existing `message` schema field for the third — and the guide says plainly that `SuiError.toJson` emits a `message` key only for an error that has one. `Schema.TaggedError` leaves `.message` empty, so an error that defines neither logs as an empty string.
+- The template's `Settlement` class identifier is `"escrow/Settlement"`, following the guide's own `"<package>/<Name>"` rule: an identifier is the class's runtime marker and its JSON-Schema `$ref` key, and two extensions with a `Settlement` class collided.
+- README: the `SubmitConfig` override section shows `SubmitConfig.with` / `SubmitConfig.layer`.
+
 ## 0.1.2
 
 Two defects from the first three downstream conversions, and the surface they

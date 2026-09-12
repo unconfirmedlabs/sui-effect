@@ -2880,13 +2880,18 @@ export type SignatureScheme = "ED25519" | "Secp256k1" | "Secp256r1" | "MultiSig"
 
 The signature schemes a `Signer` built by this module can carry.
 
-### `Signed` (type)
+### `Signed` (interface)
 
 ```ts
-export type Signed = SignedTransaction;
+export interface Signed extends SignedTransaction {
+}
 ```
 
-Signed bytes: everything `executeTransaction` needs, plus what `reconcile` needs.
+Signed bytes: everything `executeTransaction` needs, plus what `reconcile`
+needs.
+
+An interface rather than a type alias so the name survives into `.d.ts`,
+editor hover and `LLMS.md`; structurally it is `SignedTransaction`.
 
 ### `Signer` (interface)
 
@@ -2922,15 +2927,10 @@ caller's error union does not grow a branch per credential kind.
 ```ts
 declare const SubmitConfig: Context.Reference<SubmitConfigService> & {
     defaults: SubmitConfigService;
+    layer: (overrides: Partial<SubmitConfigService>) => Layer.Layer<never>;
+    with: (overrides: Partial<SubmitConfigService>) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
 }
 ```
-
-The lifecycle settings.
-
-Because this is a `Context.Reference` and not a service, it never appears in
-an `R`: a one-shot script gets the defaults with no wiring, and an
-application overrides what it cares about with
-`Effect.provideService(effect, SubmitConfig, { ...SubmitConfig.defaults, validFor: "30 seconds" })`.
 
 ### `SubmitConfigService` (interface)
 
@@ -3096,412 +3096,17 @@ declare const Tx: {
     readonly build: (input: Transaction | Recipe, opts: {
         readonly sender: SuiAddress;
         readonly gasOwner?: SuiAddress;
-    }) => Effect.Effect<{
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-        readonly gasOwner?: SuiAddress | undefined;
-    }, TransportError | SimulationFailed | BuildError, Sui>;
-    readonly sign: (built: {
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-        readonly gasOwner?: SuiAddress | undefined;
-    }, signer: Signer) => Effect.Effect<{
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    }, SigningError, never>;
-    readonly cosign: (signed: {
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    }, signer: Signer) => Effect.Effect<{
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    }, SigningError, never>;
+    }) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError, Sui>;
+    readonly sign: (built: Built, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
+    readonly cosign: (signed: Signed, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
     readonly sponsored: (opts: {
         readonly sender: SuiAddress;
         readonly gasOwner: SuiAddress;
     }) => (recipe: Recipe) => Recipe;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
-    readonly submitVia: <E, R>(signed: {
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    }, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
+    readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
     readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, TransportError | ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
-    readonly recorded: (digest: Digest => Effect.Effect<Option.Option<{
-        readonly _tag: "Unknown";
-        readonly digest: Digest;
-        readonly signed: {
-            readonly digest: Digest;
-            readonly sender: SuiAddress;
-            readonly signatures: readonly Signature[];
-            readonly bytes: Uint8Array<ArrayBufferLike>;
-            readonly chain?: string | undefined;
-            readonly expiration?: {
-                readonly $kind: "None";
-                readonly None: true;
-            } | {
-                readonly $kind: "Epoch";
-                readonly Epoch: bigint;
-            } | {
-                readonly $kind: "ValidDuring";
-                readonly ValidDuring: {
-                    readonly minEpoch: bigint | null;
-                    readonly maxEpoch: bigint | null;
-                    readonly minTimestamp: bigint | null;
-                    readonly maxTimestamp: bigint | null;
-                    readonly chain: string;
-                    readonly nonce: number;
-                };
-            } | {
-                readonly $kind: "Validity";
-                readonly Validity: {
-                    readonly allowedProposers: {
-                        readonly epoch: bigint;
-                        readonly proposers: readonly number[];
-                    } | null;
-                    readonly minEpoch: bigint | null;
-                    readonly maxEpoch: bigint | null;
-                    readonly minTimestamp: bigint | null;
-                    readonly maxTimestamp: bigint | null;
-                    readonly chain: string;
-                    readonly nonce: number;
-                };
-            } | undefined;
-        };
-        readonly lastError: string;
-        readonly attempts: number;
-        readonly at: DateTime.Utc;
-    } | {
-        readonly _tag: "NotApplied";
-        readonly digest: Digest;
-        readonly evidence: "expired" | "inputConsumed";
-        readonly at: DateTime.Utc;
-    } | {
-        readonly _tag: "Signed";
-        readonly digest: Digest;
-        readonly signed: {
-            readonly digest: Digest;
-            readonly sender: SuiAddress;
-            readonly signatures: readonly Signature[];
-            readonly bytes: Uint8Array<ArrayBufferLike>;
-            readonly chain?: string | undefined;
-            readonly expiration?: {
-                readonly $kind: "None";
-                readonly None: true;
-            } | {
-                readonly $kind: "Epoch";
-                readonly Epoch: bigint;
-            } | {
-                readonly $kind: "ValidDuring";
-                readonly ValidDuring: {
-                    readonly minEpoch: bigint | null;
-                    readonly maxEpoch: bigint | null;
-                    readonly minTimestamp: bigint | null;
-                    readonly maxTimestamp: bigint | null;
-                    readonly chain: string;
-                    readonly nonce: number;
-                };
-            } | {
-                readonly $kind: "Validity";
-                readonly Validity: {
-                    readonly allowedProposers: {
-                        readonly epoch: bigint;
-                        readonly proposers: readonly number[];
-                    } | null;
-                    readonly minEpoch: bigint | null;
-                    readonly maxEpoch: bigint | null;
-                    readonly minTimestamp: bigint | null;
-                    readonly maxTimestamp: bigint | null;
-                    readonly chain: string;
-                    readonly nonce: number;
-                };
-            } | undefined;
-        };
-        readonly signedAt: DateTime.Utc;
-    } | {
-        readonly at: DateTime.Utc;
-        readonly digest: Digest;
-        readonly _tag: "Executed";
-        readonly checkpoint?: bigint | undefined;
-    } | {
-        readonly _tag: "Failed";
-        readonly digest: Digest;
-        readonly reason: {
-            readonly $kind: "MoveAbort";
-            readonly MoveAbort: {
-                readonly abortCode: bigint;
-                readonly location?: {
-                    readonly function?: number | undefined;
-                    readonly package?: string | undefined;
-                    readonly module?: string | undefined;
-                    readonly functionName?: string | undefined;
-                    readonly instruction?: number | undefined;
-                } | undefined;
-                readonly cleverError?: {
-                    readonly value?: string | undefined;
-                    readonly errorCode?: number | undefined;
-                    readonly lineNumber?: number | undefined;
-                    readonly constantName?: string | undefined;
-                    readonly constantType?: string | undefined;
-                } | undefined;
-            };
-        } | {
-            readonly $kind: "SizeError";
-            readonly SizeError: {
-                readonly name: string;
-                readonly size: number;
-                readonly maxSize: number;
-            };
-        } | {
-            readonly $kind: "CommandArgumentError";
-            readonly CommandArgumentError: {
-                readonly argument: number;
-                readonly name: string;
-            };
-        } | {
-            readonly $kind: "TypeArgumentError";
-            readonly TypeArgumentError: {
-                readonly typeArgument: number;
-                readonly name: string;
-            };
-        } | {
-            readonly $kind: "PackageUpgradeError";
-            readonly PackageUpgradeError: {
-                readonly name: string;
-                readonly digest?: string | undefined;
-                readonly packageId?: string | undefined;
-            };
-        } | {
-            readonly $kind: "IndexError";
-            readonly IndexError: {
-                readonly index?: number | undefined;
-                readonly subresult?: number | undefined;
-            };
-        } | {
-            readonly $kind: "CoinDenyListError";
-            readonly CoinDenyListError: {
-                readonly coinType: string;
-                readonly name: string;
-                readonly address?: string | undefined;
-            };
-        } | {
-            readonly $kind: "CongestedObjects";
-            readonly CongestedObjects: {
-                readonly name: string;
-                readonly objects: readonly string[];
-            };
-        } | {
-            readonly $kind: "ObjectIdError";
-            readonly ObjectIdError: {
-                readonly objectId: string;
-                readonly name?: string | undefined;
-            };
-        } | {
-            readonly $kind: "Unknown";
-        };
-        readonly at: DateTime.Utc;
-    }>, JournalError, never>;
+    readonly recorded: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never>;
     readonly run: (recipe: Transaction | Recipe, opts: {
         readonly signer: Signer;
         readonly gasOwner?: SuiAddress;
@@ -3567,44 +3172,7 @@ The tags whose entries still need an answer from the network.
 declare const build: (input: Transaction | Recipe, opts: {
     readonly sender: SuiAddress;
     readonly gasOwner?: SuiAddress;
-}) => Effect.Effect<{
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-    readonly gasOwner?: SuiAddress | undefined;
-}, TransportError | SimulationFailed | BuildError, Sui>
+}) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError, Sui>
 ```
 
 Builds a transaction into signable bytes.
@@ -3645,81 +3213,7 @@ Re-exported from `@unconfirmed/sui-effect`.
 ### `cosign` (const)
 
 ```ts
-declare const cosign: (signed: {
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly signatures: readonly Signature[];
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-}, signer: Signer) => Effect.Effect<{
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly signatures: readonly Signature[];
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-}, SigningError, never>
+declare const cosign: (signed: Signed, signer: Signer) => Effect.Effect<Signed, SigningError, never>
 ```
 
 Adds one more signature to already signed bytes, for a sponsored or
@@ -4204,180 +3698,7 @@ the same rule `Tx.submit` follows.
 ### `recorded` (const)
 
 ```ts
-declare const recorded: (digest: Digest => Effect.Effect<Option.Option<{
-    readonly _tag: "Unknown";
-    readonly digest: Digest;
-    readonly signed: {
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    };
-    readonly lastError: string;
-    readonly attempts: number;
-    readonly at: DateTime.Utc;
-} | {
-    readonly _tag: "NotApplied";
-    readonly digest: Digest;
-    readonly evidence: "expired" | "inputConsumed";
-    readonly at: DateTime.Utc;
-} | {
-    readonly _tag: "Signed";
-    readonly digest: Digest;
-    readonly signed: {
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    };
-    readonly signedAt: DateTime.Utc;
-} | {
-    readonly at: DateTime.Utc;
-    readonly digest: Digest;
-    readonly _tag: "Executed";
-    readonly checkpoint?: bigint | undefined;
-} | {
-    readonly _tag: "Failed";
-    readonly digest: Digest;
-    readonly reason: {
-        readonly $kind: "MoveAbort";
-        readonly MoveAbort: {
-            readonly abortCode: bigint;
-            readonly location?: {
-                readonly function?: number | undefined;
-                readonly package?: string | undefined;
-                readonly module?: string | undefined;
-                readonly functionName?: string | undefined;
-                readonly instruction?: number | undefined;
-            } | undefined;
-            readonly cleverError?: {
-                readonly value?: string | undefined;
-                readonly errorCode?: number | undefined;
-                readonly lineNumber?: number | undefined;
-                readonly constantName?: string | undefined;
-                readonly constantType?: string | undefined;
-            } | undefined;
-        };
-    } | {
-        readonly $kind: "SizeError";
-        readonly SizeError: {
-            readonly name: string;
-            readonly size: number;
-            readonly maxSize: number;
-        };
-    } | {
-        readonly $kind: "CommandArgumentError";
-        readonly CommandArgumentError: {
-            readonly argument: number;
-            readonly name: string;
-        };
-    } | {
-        readonly $kind: "TypeArgumentError";
-        readonly TypeArgumentError: {
-            readonly typeArgument: number;
-            readonly name: string;
-        };
-    } | {
-        readonly $kind: "PackageUpgradeError";
-        readonly PackageUpgradeError: {
-            readonly name: string;
-            readonly digest?: string | undefined;
-            readonly packageId?: string | undefined;
-        };
-    } | {
-        readonly $kind: "IndexError";
-        readonly IndexError: {
-            readonly index?: number | undefined;
-            readonly subresult?: number | undefined;
-        };
-    } | {
-        readonly $kind: "CoinDenyListError";
-        readonly CoinDenyListError: {
-            readonly coinType: string;
-            readonly name: string;
-            readonly address?: string | undefined;
-        };
-    } | {
-        readonly $kind: "CongestedObjects";
-        readonly CongestedObjects: {
-            readonly name: string;
-            readonly objects: readonly string[];
-        };
-    } | {
-        readonly $kind: "ObjectIdError";
-        readonly ObjectIdError: {
-            readonly objectId: string;
-            readonly name?: string | undefined;
-        };
-    } | {
-        readonly $kind: "Unknown";
-    };
-    readonly at: DateTime.Utc;
-}>, JournalError, never>
+declare const recorded: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never>
 ```
 
 What the journal recorded for one digest, if anything.
@@ -4490,81 +3811,7 @@ fails the run with nothing sent.
 ### `sign` (const)
 
 ```ts
-declare const sign: (built: {
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-    readonly gasOwner?: SuiAddress | undefined;
-}, signer: Signer) => Effect.Effect<{
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly signatures: readonly Signature[];
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-}, SigningError, never>
+declare const sign: (built: Built, signer: Signer) => Effect.Effect<Signed, SigningError, never>
 ```
 
 Signs built bytes.
@@ -4631,44 +3878,7 @@ charged `ExecutionFailed` would invite a second submission.
 ### `submitVia` (const)
 
 ```ts
-declare const submitVia: <E, R>(signed: {
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly signatures: readonly Signature[];
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-}, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>
+declare const submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>
 ```
 
 Submits through **someone else** — a relay, a sponsorship service, a backend
@@ -6426,21 +5636,11 @@ const SettlementBcs = bcs.struct("Settlement", {
  * needs a real `BcsType` so it can re-serialize what it parsed and reject
  * trailing bytes, and a domain type is not a BCS layout.
  */
-export class Settlement extends Schema.Class<Settlement>("Settlement")({
+export class Settlement extends Schema.Class<Settlement>("escrow/Settlement")({
   escrowId: ObjectId,
   settledAt: Schema.DateTimeUtc,
   claimedBy: SuiAddress
 }) {}
-
-/**
- * The halfway shape the transformation produces: the domain field names, before
- * `Settlement`'s own schema brands the ids.
- */
-interface SettlementParts {
-  readonly escrowId: string
-  readonly settledAt: DateTime.Utc
-  readonly claimedBy: string
-}
 
 /**
  * The composed codec: BCS bytes to `Settlement`, and back.
@@ -6455,10 +5655,11 @@ interface SettlementParts {
  *
  * Two details worth copying:
  *
- * - **`decode` produces the target's field shape, not an instance.** `decodeTo`
- *   sits between the source type and the target schema, which is what lets the
- *   target's own checks — the `ObjectId` and `SuiAddress` brands here — run
- *   afterwards.
+ * - **`decode` produces the target's `Encoded` side, not an instance.**
+ *   `typeof Settlement.Encoded` is exactly that shape, so nothing has to be
+ *   written out by hand and nothing can drift. `decodeTo` sits between the
+ *   source type and the target schema, which is what lets the target's own
+ *   checks — the `ObjectId` and `SuiAddress` brands here — run afterwards.
  * - **`encode` is the inverse mapper and is not optional.** A codec that cannot
  *   encode is one `Schema.encodeUnknownEffect` fails on, and the compiler asks
  *   for it here rather than at the call site.
@@ -6478,7 +5679,7 @@ export const SettlementContent = (typeOrigin: string) =>
   ).pipe(
     Schema.decodeTo(
       Settlement,
-      SchemaTransformation.transformOrFail<SettlementParts, typeof SettlementBcs.$inferType>({
+      SchemaTransformation.transformOrFail<typeof Settlement.Encoded, typeof SettlementBcs.$inferType>({
         decode: (fields, options) =>
           // `transformOrFail`, not `transform`, because one of these mappings can
           // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
@@ -6495,7 +5696,7 @@ export const SettlementContent = (typeOrigin: string) =>
                   options
                 )
             ),
-            (settledAt): SettlementParts => ({
+            (settledAt): typeof Settlement.Encoded => ({
               escrowId: fields.escrow_id,
               settledAt,
               claimedBy: fields.claimed_by
@@ -6527,6 +5728,14 @@ export const SettlementContent = (typeOrigin: string) =>
  *
  * The tags are prefixed with the package name because `EscrowNotFound` is a
  * name two packages could plausibly both want.
+ *
+ * And every one of them has a real `.message`. `Schema.TaggedError` leaves it
+ * empty, so an error that supplies neither an `override get message()` nor a
+ * `message` schema field surfaces an empty string everywhere a consumer
+ * catches it, and `SuiError.toJson` emits no `message` key at all. The getter
+ * is the usual answer — it stays out of the encoding, so it costs nothing at
+ * the constructor — and a `message` schema field is for the case where the
+ * sentence comes from somewhere else, as `EscrowSettlementUnknown`'s does.
  */
 import { Schema } from "effect"
 import { Digest, type Outcome, ObjectId } from "@unconfirmed/sui-effect"
@@ -6542,6 +5751,18 @@ export class EscrowNotFound extends Schema.TaggedError<EscrowNotFound>()(
   { escrowId: ObjectId }
 ) {
   readonly outcome: Outcome = "not_applied"
+
+  /**
+   * `Schema.TaggedError` leaves `.message` empty, so anything surfacing
+   * `error.message` — a log line, a `catch` in a consumer's UI,
+   * `SuiError.toJson` — shows nothing unless the class supplies one. This is
+   * the idiom sui-effect's own errors use, and the reason every error here has
+   * one: define a getter over the fields, never a `message` schema field you
+   * then have to pass to every constructor.
+   */
+  override get message(): string {
+    return `no escrow ${this.escrowId}`
+  }
 }
 
 /**
@@ -6551,6 +5772,10 @@ export class EscrowNotFound extends Schema.TaggedError<EscrowNotFound>()(
  * This is the case the `outcome` field exists for: the transaction applied, the
  * operation as a whole did not finish, and the only safe next step is to
  * reconcile rather than to retry. A script that fails with this exits 3.
+ *
+ * Its `message` is a **schema field** rather than a getter, because the
+ * sentence comes from the settlement service rather than from these fields.
+ * Either way `.message` is a real string and `SuiError.toJson` carries it.
  */
 export class EscrowSettlementUnknown extends Schema.TaggedError<EscrowSettlementUnknown>()(
   "escrow/EscrowSettlementUnknown",
@@ -6575,6 +5800,11 @@ export class EscrowUnsupportedNetwork extends Schema.TaggedError<EscrowUnsupport
   { network: Schema.String }
 ) {
   readonly outcome: Outcome = "not_applied"
+
+  /** See {@link EscrowNotFound.message}: a getter, not a schema field. */
+  override get message(): string {
+    return `this release bundles no escrow deployment for ${this.network}`
+  }
 }
 ```
 
@@ -7440,6 +6670,15 @@ describe("Settlement: a domain class over the BCS bridge", () => {
     claimed_by: bcs.Address
   })
 
+  // The identifier is the class's stable runtime marker and its JSON-Schema
+  // `$ref` key, so it follows the guide's `"<package>/<Name>"` rule: two
+  // extensions with a `Settlement` class must not collide in one document.
+  test("the class identifier is scoped to the package", () => {
+    expect(JSON.stringify(Schema.toJsonSchemaDocument(Settlement))).toContain(
+      "escrow/Settlement"
+    )
+  })
+
   test("snake_case Move fields decode into the camelCase domain class", async () => {
     const bytes = SettlementBcs.serialize({
       escrow_id: ESCROW_ID,
@@ -7816,6 +7055,41 @@ describe("the errors", () => {
     // the instance, so it is in the JSON anyway.
     expect(json["outcome"]).toBe("unknown")
     expect(json["outcome"]).toBe(SuiError.outcome(error))
+  })
+
+  /**
+   * `Schema.TaggedError` leaves `.message` empty, so an error that defines
+   * neither a getter nor a `message` schema field logs as an empty string and
+   * `SuiError.toJson` emits no `message` key at all. Every error here defines
+   * one, and the guide promises a reader that they will.
+   */
+  test("every error has a real message, and toJson carries it", () => {
+    const errors = [
+      new EscrowNotFound({ escrowId: ESCROW_ID }),
+      new EscrowSettlementUnknown({
+        escrowId: ESCROW_ID,
+        digest: "1".repeat(32) as never,
+        message: "the operator never confirmed"
+      }),
+      new EscrowUnsupportedNetwork({ network: "devnet" })
+    ]
+    for (const error of errors) {
+      expect([error._tag, error.message.length > 0]).toEqual([error._tag, true])
+      expect([error._tag, SuiError.toJson(error)["message"]]).toEqual([
+        error._tag,
+        error.message
+      ])
+    }
+    // The getter reads the error's own fields, so the sentence names the thing
+    // that failed rather than repeating the tag.
+    expect(new EscrowNotFound({ escrowId: ESCROW_ID }).message).toBe(`no escrow ${ESCROW_ID}`)
+    expect(new EscrowUnsupportedNetwork({ network: "devnet" }).message).toBe(
+      "this release bundles no escrow deployment for devnet"
+    )
+    // And a getter stays out of the encoding, so it is not a constructor
+    // argument: only `EscrowSettlementUnknown` takes a `message`.
+    expect(Object.keys(SuiError.toJson(new EscrowUnsupportedNetwork({ network: "devnet" }))))
+      .toEqual(["_tag", "network", "outcome", "message"])
   })
 })
 ```

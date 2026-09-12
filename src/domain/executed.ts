@@ -13,8 +13,8 @@
  */
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { fromBase64 } from "@mysten/sui/utils"
-import { Effect, Schema } from "effect"
-import { DecodeError, ExecutionFailed, UnexpectedEffects } from "./errors.ts"
+import { Effect, Predicate, Schema } from "effect"
+import { DecodeError, decodePayload, ExecutionFailed, UnexpectedEffects } from "./errors.ts"
 import {
   BalanceChange,
   ChangedObject,
@@ -118,7 +118,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   balanceChanges: Schema.Array(BalanceChange),
   objectTypes: Schema.Record(Schema.String, Schema.String),
   checkpoint: Schema.NullOr(Schema.BigIntFromString),
-  timestampMs: Schema.NullOr(Schema.Number)
+  timestampMs: Schema.NullOr(Schema.Finite)
 }) {
   /**
    * The type of a changed object, from the `objectTypes` join. A published
@@ -385,7 +385,13 @@ export const EXECUTE_INCLUDE = {
   objectTypes: true
 } as const
 
-const decodeExecuted = Schema.decodeUnknownEffect(Executed)
+const decodeExecutedAst = Schema.decodeUnknownEffect(Executed)
+
+/**
+ * Decodes an `Executed`, reporting **every** issue rather than the first, so
+ * the `DecodeError` an envelope produces can carry one entry per bad field.
+ */
+const decodeExecuted = (input: unknown) => decodeExecutedAst(input, { errors: "all" })
 
 /**
  * Turns an SDK `TransactionResult` read with {@link EXECUTE_INCLUDE} into an
@@ -410,7 +416,7 @@ export const fromTransactionResult = Effect.fn("Executed.fromTransactionResult")
       timestampMs: transaction.timestampMs
     }
     const executed = yield* decodeExecuted(encoded).pipe(
-      Effect.mapError((error) => new DecodeError({ kind: "shape", issue: error.message }))
+      Effect.mapError((error) => new DecodeError({ kind: "shape", ...decodePayload(error) }))
     )
     if (!transaction.status.success) {
       return yield* new ExecutionFailed({
@@ -434,10 +440,10 @@ const NO_GAS = {
   nonRefundableStorageFee: "0"
 } as const
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
-
-const field = (value: unknown, key: string): unknown => (isRecord(value) ? value[key] : undefined)
+// `Predicate.isObject` is the non-null, non-array guard; Effect's own agent
+// guide is explicit that a hand-written `isRecord` is never the right answer.
+const field = (value: unknown, key: string): unknown =>
+  Predicate.isObject(value) ? value[key] : undefined
 
 /** A `u64` in whatever spelling JSON left it in, as the decimal string the schemas take. */
 const u64String = (value: unknown, fallback?: string): string | undefined => {
@@ -552,10 +558,14 @@ const fromPartial = (envelope: unknown): Effect.Effect<Executed, DecodeError> =>
   }
   return decodeExecuted(encoded).pipe(
     Effect.mapError((error) =>
-      new DecodeError({
-        kind: "shape",
-        issue: `this is not an execute envelope Executed can be built from: ${error.message}`
-      })
+      (() => {
+        const payload = decodePayload(error)
+        return new DecodeError({
+          kind: "shape",
+          ...payload,
+          issue: `this is not an execute envelope Executed can be built from: ${payload.issue}`
+        })
+      })()
     )
   )
 }

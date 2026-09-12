@@ -68,8 +68,14 @@ import { Sui } from "./Sui.ts"
 /** A transaction built into bytes, with the expiration the builder settled on. */
 export type { Built } from "../domain/schemas.ts"
 
-/** Signed bytes: everything `executeTransaction` needs, plus what `reconcile` needs. */
-export type Signed = SignedTransaction
+/**
+ * Signed bytes: everything `executeTransaction` needs, plus what `reconcile`
+ * needs.
+ *
+ * An interface rather than a type alias so the name survives into `.d.ts`,
+ * editor hover and `LLMS.md`; structurally it is {@link SignedTransaction}.
+ */
+export interface Signed extends SignedTransaction {}
 /** The schema of {@link Signed}. */
 export const Signed = SignedTransaction
 
@@ -500,6 +506,10 @@ export const build = Effect.fn("Tx.build")(function*(
   input: Recipe | Transaction,
   opts: { readonly sender: SuiAddress; readonly gasOwner?: SuiAddress }
 ): Effect.fn.Return<Built, BuildError | SimulationFailed | TransportError, Sui> {
+  yield* Effect.annotateCurrentSpan({
+    "sui.sender": opts.sender,
+    ...(opts.gasOwner === undefined ? {} : { "sui.gas_owner": opts.gasOwner })
+  })
   const sui = yield* Sui
   const config = yield* SubmitConfig
   const tx = yield* toTransaction(input)
@@ -710,6 +720,7 @@ export const sign = Effect.fn("Tx.sign")(function*(
   built: Built,
   signer: Signer
 ): Effect.fn.Return<Signed, SigningError> {
+  yield* Effect.annotateCurrentSpan({ "sui.digest": built.digest, "sui.signer": signer.address })
   yield* assertSignerAddress(built.bytes, signer)
   const signature = yield* signer.signTransaction(built.bytes)
   return {
@@ -738,6 +749,7 @@ export const cosign = Effect.fn("Tx.cosign")(function*(
   signed: Signed,
   signer: Signer
 ): Effect.fn.Return<Signed, SigningError> {
+  yield* Effect.annotateCurrentSpan({ "sui.digest": signed.digest, "sui.signer": signer.address })
   yield* assertSignerAddress(signed.bytes, signer)
   const signature: Signature = yield* signer.signTransaction(signed.bytes)
   return { ...signed, signatures: [...signed.signatures, signature] }
@@ -932,6 +944,7 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
   ExecutionFailed | NotApplied | SubmissionUnknown | JournalError | TransportError,
   Sui
 > {
+  yield* Effect.annotateCurrentSpan({ "sui.digest": signed.digest })
   const sui = yield* Sui
   const config = yield* SubmitConfig
   yield* journalSigned(signed)
@@ -939,11 +952,15 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
   let attempts = 0
   const once = Effect.suspend(() => {
     attempts += 1
-    return sui.core.executeTransaction({
-      transaction: signed.bytes,
-      signatures: [...signed.signatures],
-      include: EXECUTE_INCLUDE
-    }).pipe(
+    // On the submit span, not on the execute span: the attempt number is what
+    // a trace of a stuck submission is read for, and the execute spans are
+    // one per attempt anyway.
+    return Effect.annotateCurrentSpan({ "sui.attempt": attempts }).pipe(
+      Effect.andThen(sui.core.executeTransaction({
+        transaction: signed.bytes,
+        signatures: [...signed.signatures],
+        include: EXECUTE_INCLUDE
+      })),
       Effect.timeout(config.executeTimeout),
       Effect.mapError(timeoutAsTransport("executeTransaction"))
     )
@@ -1447,6 +1464,12 @@ export const reconcile = Effect.fn("Tx.reconcile")(function*(
   const sui = yield* Sui
   const config = yield* SubmitConfig
   const { digest, signed } = inputOf(input)
+  yield* Effect.annotateCurrentSpan({
+    "sui.digest": digest,
+    // Whether there are bytes to reason about is what decides which evidence
+    // rules can run at all, so it belongs on the span beside the digest.
+    "sui.evidence": signed === undefined ? "digest" : "signed"
+  })
   return yield* recover(sui, config, digest, signed).pipe(
     Effect.catchTag("TransportError", (error) =>
       Effect.fail(
@@ -1733,12 +1756,16 @@ export const run = Effect.fn("Tx.run")(function*(
  *
  * @since 0.1.2
  */
-export const recorded = Effect.fn("Tx.recorded")(function*(
+export const recorded: (
   digest: Digest
-): Effect.fn.Return<Option.Option<JournalEntry>, JournalError> {
-  const journal = yield* Journal
-  return yield* journal.get(digest)
-})
+) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never> = Effect.fn("Tx.recorded")(
+  function*(
+    digest: Digest
+  ): Effect.fn.Return<Option.Option<JournalEntry>, JournalError> {
+    const journal = yield* Journal
+    return yield* journal.get(digest)
+  }
+)
 
 /**
  * Settles every unresolved entry in the journal: the explicit startup call a

@@ -248,3 +248,62 @@ describe("Executed", () => {
     }
   })
 })
+
+/**
+ * NB4: `DecodeError.issue` is one sentence; `issues` is the structured tree,
+ * with every issue reported rather than only the first.
+ */
+describe("DecodeError.issues", () => {
+  test("Executed.fromPartial reports one entry per bad field, with its path", async () => {
+    const result = await Effect.runPromise(
+      Effect.result(
+        Executed.fromPartial({
+          digest: DIGEST,
+          objectTypes: { [RECEIPT]: 5, [ESCROW]: 7 },
+          effects: {}
+        })
+      )
+    )
+    expect(result._tag).toBe("Failure")
+    if (result._tag !== "Failure") return
+    expect(result.failure.kind).toBe("shape")
+    expect(result.failure.issues).toHaveLength(2)
+    expect(result.failure.issues?.map((issue) => issue.path)).toEqual([
+      ["objectTypes", RECEIPT],
+      ["objectTypes", ESCROW]
+    ])
+    // `issue` still describes exactly **one** issue. `{ errors: "all" }` makes
+    // the formatter join every issue into one paragraph, and `issue` is the
+    // sentence a human reads, so it is cut back to the first block: the
+    // message plus the indented `at [...]` line under it, and nothing after.
+    expect(result.failure.issue).toBe(
+      `this is not an execute envelope Executed can be built from: Expected string\n  at ["objectTypes"]["${RECEIPT}"]`
+    )
+    expect(result.failure.issue.split("\n")).toHaveLength(2)
+    expect(result.failure.issue.endsWith(`["${ESCROW}"]`)).toBe(false)
+    // And its first line carries the first entry of `issues`.
+    expect(result.failure.issue.split("\n")[0]).toEndWith(
+      result.failure.issues?.[0]?.message ?? ""
+    )
+  })
+
+  test("a single-issue failure is byte-identical to what 0.1.2 produced", async () => {
+    // The check message NB3 did not touch, so this string can be compared to
+    // 0.1.2's output directly: `{ errors: "all" }` must not have changed it.
+    const result = await Effect.runPromise(
+      Effect.result(Executed.fromPartial({ digest: "zz", effects: {} }))
+    )
+    expect(result._tag).toBe("Failure")
+    if (result._tag !== "Failure") return
+    expect(result.failure.issue).toBe(
+      "this is not an execute envelope Executed can be built from: " +
+        `Expected a base58 32-byte transaction digest\n  at ["digest"]`
+    )
+    // Two fields failed on the same rule, and `issues` says so while `issue`
+    // stays one sentence.
+    expect(result.failure.issues?.map((issue) => issue.path)).toEqual([
+      ["digest"],
+      ["effects", "transactionDigest"]
+    ])
+  })
+})

@@ -11,7 +11,7 @@
 import type { BcsType } from "@mysten/bcs"
 import { normalizeStructTag, parseStructTag } from "@mysten/sui/utils"
 import { Effect, Schema, SchemaAST, SchemaIssue, SchemaTransformation } from "effect"
-import { DecodeError } from "./errors.ts"
+import { DecodeError, decodePayload } from "./errors.ts"
 import type { ObjectId } from "./schemas.ts"
 
 const SUI_TYPE_ANNOTATION = "sui-effect/suiType"
@@ -54,7 +54,10 @@ export const bcs = <T extends Input, Input>(
   // A BCS layout carries no runtime type to test a decoded value against: the
   // parse below is the validation, so the target schema accepts whatever the
   // layout produced.
-  const target = Schema.declare((_u: unknown): _u is T => true)
+  const target = Schema.declare((_u: unknown): _u is T => true, {
+    identifier: label,
+    description: `BCS layout ${label}`
+  })
   return Schema.Uint8Array.pipe(
     Schema.decodeTo(
       target,
@@ -93,7 +96,7 @@ export const bcs = <T extends Input, Input>(
     )
   ).annotate(
     normalized === undefined ? {} : { [SUI_TYPE_ANNOTATION]: normalized }
-  ) as unknown as Schema.Codec<T, Uint8Array>
+  ).pipe(Schema.revealCodec)
 }
 
 /**
@@ -144,7 +147,11 @@ export const decodeWith = <T extends Input, Input, A>(
   expectedType: string | undefined,
   map: (parsed: T) => A
 ): Schema.Codec<A, Uint8Array> => {
-  const target = Schema.declare((_u: unknown): _u is A => true)
+  const label = expectedType ?? bcsType.name
+  const target = Schema.declare((_u: unknown): _u is A => true, {
+    identifier: label,
+    description: `BCS layout ${label}`
+  })
   return bcs(bcsType, expectedType).pipe(
     Schema.decodeTo(
       target,
@@ -155,9 +162,7 @@ export const decodeWith = <T extends Input, Input, A>(
             catch: (cause) =>
               new SchemaIssue.InvalidValue(
                 {
-                  message: `Could not map ${
-                    expectedType ?? bcsType.name
-                  } into its domain value: ${String(cause)}`
+                  message: `Could not map ${label} into its domain value: ${String(cause)}`
                 },
                 parsed,
                 options
@@ -167,17 +172,17 @@ export const decodeWith = <T extends Input, Input, A>(
           Effect.fail(
             new SchemaIssue.Forbidden(
               {
-                message: `${
-                  expectedType ?? bcsType.name
-                } was built with SuiSchema.decodeWith, which has no encoder: serialize with the BCS layout instead`
+                message:
+                  `${label} was built with SuiSchema.decodeWith, which has no encoder: serialize with the BCS layout instead`
               },
               value,
               options
             )
           )
       })
-    )
-  ) as unknown as Schema.Codec<A, Uint8Array>
+    ),
+    Schema.revealCodec
+  )
 }
 
 const MAX_ENCODING_DEPTH = 32
@@ -310,7 +315,9 @@ export const decodeContent = <T>(
       })
     )
   }
-  return Schema.decodeUnknownEffect(schema)(content).pipe(
+  // `{ errors: "all" }` so a value that is wrong in three places reports three
+  // paths on `DecodeError.issues`, not just the first sentence.
+  return Schema.decodeUnknownEffect(schema)(content, { errors: "all" }).pipe(
     Effect.mapError(
       (error) =>
         new DecodeError({
@@ -320,7 +327,7 @@ export const decodeContent = <T>(
           // themselves did not parse: a layout mismatch or a corrupt object,
           // never something to swallow.
           kind: "bytes",
-          issue: error.message
+          ...decodePayload(error)
         })
     )
   )

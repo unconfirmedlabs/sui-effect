@@ -658,9 +658,18 @@ describe("every error carries a readable message (app verification a, b)", () =>
     expect(typeof SuiError.describe({ _tag: "Foreign", message: "m" } as never)).toBe("string")
   })
 
-  test("toJson still encodes through the schema, without the message getter", () => {
+  test("toJson encodes through the schema, and adds the sentence (NB8, 0.1.3)", () => {
+    // The getter is still not a schema field — the *encoding* is unchanged —
+    // but `toJson` puts the sentence back in the same key for every class, so
+    // an operator reading JSON logs stops special-casing the three tags that
+    // have a `message` schema field.
     const json = SuiError.toJson(new NetworkMismatch({ expected: "a", actual: "b" }))
-    expect(json).toEqual({ _tag: "NetworkMismatch", expected: "a", actual: "b" })
+    expect(json).toEqual({
+      _tag: "NetworkMismatch",
+      expected: "a",
+      actual: "b",
+      message: SuiError.describe(new NetworkMismatch({ expected: "a", actual: "b" }))
+    })
   })
 })
 

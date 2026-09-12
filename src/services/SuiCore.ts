@@ -14,7 +14,7 @@ import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
 import { isSuiGrpcClient, SuiGrpcClient } from "@mysten/sui/grpc"
 import type { TransactionPlugin } from "@mysten/sui/transactions"
-import { Config, ConfigProvider, Context, Effect, Layer, Schedule, Schema } from "effect"
+import { Config, ConfigProvider, Context, Effect, Layer, Predicate, Schedule, Schema } from "effect"
 import {
   ObjectDeleted,
   ObjectNotFound,
@@ -72,7 +72,7 @@ const asDigest = (value: string): Digest => {
 export const DefectMarker: unique symbol = Symbol.for("sui-effect/DefectMarker")
 
 const rethrowDefects = (cause: unknown): void => {
-  if (typeof cause === "object" && cause !== null && DefectMarker in cause) throw cause
+  if (Predicate.hasProperty(cause, DefectMarker)) throw cause
 }
 
 const transportError = (method: string, cause: unknown): TransportError => {
@@ -760,27 +760,38 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
     onError: (cause: unknown) => E
   ): Effect.Effect<A, E> => retryReads(call(method, run, onError))
 
+  /**
+   * The attribute every span this client makes carries, known at construction.
+   *
+   * A trace that crosses two networks — a mainnet read beside a testnet
+   * submission in one process — is otherwise indistinguishable in the span
+   * names, which are the same on both.
+   */
+  const spanOptions = { attributes: { "sui.network": client.network } } as const
+
   return {
     network: client.network,
-    getObjects: Effect.fn("SuiCore.getObjects")(function*<Include extends ObjectInclude = {}>(
+    getObjects: Effect.fn("SuiCore.getObjects", spanOptions)(function*<Include extends ObjectInclude = {}>(
       options: SuiClientTypes.GetObjectsOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.GetObjectsResponse<Include>, TransportError> {
+      yield* Effect.annotateCurrentSpan({ "sui.object_count": options.objectIds.length })
       return yield* read(
         "getObjects",
         (core, signal) => core.getObjects({ ...options, signal }),
         onlyTransportError("getObjects")
       )
     }),
-    getObject: Effect.fn("SuiCore.getObject")(function*<Include extends ObjectInclude = {}>(
+    getObject: Effect.fn("SuiCore.getObject", spanOptions)(function*<Include extends ObjectInclude = {}>(
       options: SuiClientTypes.GetObjectOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.GetObjectResponse<Include>, ObjectLookupError> {
+      yield* Effect.annotateCurrentSpan({ "sui.object_id": options.objectId })
       return yield* read(
         "getObject",
         (core, signal) => core.getObject({ ...options, signal }),
         objectError("getObject")
       )
     }),
-    listOwnedObjects: Effect.fn("SuiCore.listOwnedObjects")(function*<Include extends ObjectInclude = {}>(
+    listOwnedObjects: Effect.fn("SuiCore.listOwnedObjects", spanOptions)(function*<Include extends ObjectInclude = {}>(
       options: SuiClientTypes.ListOwnedObjectsOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.ListOwnedObjectsResponse<Include>, TransportError> {
       return yield* read(
@@ -789,7 +800,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("listOwnedObjects")
       )
     }),
-    listCoins: Effect.fn("SuiCore.listCoins")(function*(
+    listCoins: Effect.fn("SuiCore.listCoins", spanOptions)(function*(
       options: SuiClientTypes.ListCoinsOptions
     ): Effect.fn.Return<SuiClientTypes.ListCoinsResponse, TransportError> {
       return yield* read(
@@ -798,7 +809,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("listCoins")
       )
     }),
-    listDynamicFields: Effect.fn("SuiCore.listDynamicFields")(function*(
+    listDynamicFields: Effect.fn("SuiCore.listDynamicFields", spanOptions)(function*(
       options: SuiClientTypes.ListDynamicFieldsOptions
     ): Effect.fn.Return<SuiClientTypes.ListDynamicFieldsResponse, TransportError> {
       return yield* read(
@@ -807,16 +818,17 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("listDynamicFields")
       )
     }),
-    getDynamicField: Effect.fn("SuiCore.getDynamicField")(function*(
+    getDynamicField: Effect.fn("SuiCore.getDynamicField", spanOptions)(function*(
       options: SuiClientTypes.GetDynamicFieldOptions
     ): Effect.fn.Return<SuiClientTypes.GetDynamicFieldResponse, ObjectLookupError> {
+      yield* Effect.annotateCurrentSpan({ "sui.object_id": options.parentId })
       return yield* read(
         "getDynamicField",
         (core, signal) => core.getDynamicField({ ...options, signal }),
         objectError("getDynamicField")
       )
     }),
-    getDynamicObjectField: Effect.fn("SuiCore.getDynamicObjectField")(function*<Include extends ObjectInclude = {}>(
+    getDynamicObjectField: Effect.fn("SuiCore.getDynamicObjectField", spanOptions)(function*<Include extends ObjectInclude = {}>(
       options: SuiClientTypes.GetDynamicObjectFieldOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.GetDynamicObjectFieldResponse<Include>, ObjectLookupError> {
       return yield* read(
@@ -825,7 +837,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         objectError("getDynamicObjectField")
       )
     }),
-    getBalance: Effect.fn("SuiCore.getBalance")(function*(
+    getBalance: Effect.fn("SuiCore.getBalance", spanOptions)(function*(
       options: SuiClientTypes.GetBalanceOptions
     ): Effect.fn.Return<SuiClientTypes.GetBalanceResponse, TransportError> {
       return yield* read(
@@ -834,7 +846,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("getBalance")
       )
     }),
-    listBalances: Effect.fn("SuiCore.listBalances")(function*(
+    listBalances: Effect.fn("SuiCore.listBalances", spanOptions)(function*(
       options: SuiClientTypes.ListBalancesOptions
     ): Effect.fn.Return<SuiClientTypes.ListBalancesResponse, TransportError> {
       return yield* read(
@@ -843,7 +855,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("listBalances")
       )
     }),
-    getCoinMetadata: Effect.fn("SuiCore.getCoinMetadata")(function*(
+    getCoinMetadata: Effect.fn("SuiCore.getCoinMetadata", spanOptions)(function*(
       options: SuiClientTypes.GetCoinMetadataOptions
     ): Effect.fn.Return<SuiClientTypes.GetCoinMetadataResponse, TransportError> {
       return yield* read(
@@ -852,25 +864,27 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("getCoinMetadata")
       )
     }),
-    getTransaction: Effect.fn("SuiCore.getTransaction")(function*<Include extends TransactionInclude = {}>(
+    getTransaction: Effect.fn("SuiCore.getTransaction", spanOptions)(function*<Include extends TransactionInclude = {}>(
       options: SuiClientTypes.GetTransactionOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransactionLookupError> {
+      yield* Effect.annotateCurrentSpan({ "sui.digest": options.digest })
       return yield* read(
         "getTransaction",
         (core, signal) => core.getTransaction({ ...options, signal }),
         transactionError("getTransaction")
       )
     }),
-    executeTransaction: Effect.fn("SuiCore.executeTransaction")(function*<Include extends TransactionInclude = {}>(
+    executeTransaction: Effect.fn("SuiCore.executeTransaction", spanOptions)(function*<Include extends TransactionInclude = {}>(
       options: SuiClientTypes.ExecuteTransactionOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransportError> {
+      yield* Effect.annotateCurrentSpan({ "sui.signature_count": options.signatures.length })
       return yield* call(
         "executeTransaction",
         (core, signal) => core.executeTransaction({ ...options, signal }),
         onlyTransportError("executeTransaction")
       )
     }),
-    signAndExecuteTransaction: Effect.fn("SuiCore.signAndExecuteTransaction")(function*<Include extends TransactionInclude = {}>(
+    signAndExecuteTransaction: Effect.fn("SuiCore.signAndExecuteTransaction", spanOptions)(function*<Include extends TransactionInclude = {}>(
       options: SuiClientTypes.SignAndExecuteTransactionOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransportError> {
       return yield* call(
@@ -879,7 +893,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("signAndExecuteTransaction")
       )
     }),
-    getObjectAtVersion: Effect.fn("SuiCore.getObjectAtVersion")(function*(
+    getObjectAtVersion: Effect.fn("SuiCore.getObjectAtVersion", spanOptions)(function*(
       options: { readonly objectId: string; readonly version: string | bigint }
     ): Effect.fn.Return<VersionedObject, TransportError> {
       return yield* retryReads(
@@ -890,16 +904,17 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         })
       )
     }),
-    waitForTransaction: Effect.fn("SuiCore.waitForTransaction")(function*<Include extends TransactionInclude = {}>(
+    waitForTransaction: Effect.fn("SuiCore.waitForTransaction", spanOptions)(function*<Include extends TransactionInclude = {}>(
       options: SuiClientTypes.WaitForTransactionOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransactionLookupError> {
+      yield* Effect.annotateCurrentSpan({ "sui.digest": options.digest })
       return yield* read(
         "waitForTransaction",
         (core, signal) => core.waitForTransaction({ ...options, signal }),
         transactionError("waitForTransaction")
       )
     }),
-    simulateTransaction: Effect.fn("SuiCore.simulateTransaction")(function*<Include extends SimulateInclude = {}>(
+    simulateTransaction: Effect.fn("SuiCore.simulateTransaction", spanOptions)(function*<Include extends SimulateInclude = {}>(
       options: SuiClientTypes.SimulateTransactionOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.SimulateTransactionResult<Include>, SimulationLookupError> {
       return yield* read(
@@ -908,7 +923,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         simulationError("simulateTransaction")
       )
     }),
-    listTransactions: Effect.fn("SuiCore.listTransactions")(function*<Include extends TransactionInclude = {}>(
+    listTransactions: Effect.fn("SuiCore.listTransactions", spanOptions)(function*<Include extends TransactionInclude = {}>(
       options: SuiClientTypes.ListTransactionsOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.ListTransactionsResponse<Include>, TransportError> {
       return yield* read(
@@ -917,7 +932,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("listTransactions")
       )
     }),
-    listEvents: Effect.fn("SuiCore.listEvents")(function*(
+    listEvents: Effect.fn("SuiCore.listEvents", spanOptions)(function*(
       options: SuiClientTypes.ListEventsOptions
     ): Effect.fn.Return<SuiClientTypes.ListEventsResponse, TransportError> {
       return yield* read(
@@ -926,7 +941,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("listEvents")
       )
     }),
-    getReferenceGasPrice: Effect.fn("SuiCore.getReferenceGasPrice")(function*(
+    getReferenceGasPrice: Effect.fn("SuiCore.getReferenceGasPrice", spanOptions)(function*(
       options?: SuiClientTypes.GetReferenceGasPriceOptions
     ): Effect.fn.Return<SuiClientTypes.GetReferenceGasPriceResponse, TransportError> {
       return yield* read(
@@ -935,7 +950,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("getReferenceGasPrice")
       )
     }),
-    getCurrentSystemState: Effect.fn("SuiCore.getCurrentSystemState")(function*(
+    getCurrentSystemState: Effect.fn("SuiCore.getCurrentSystemState", spanOptions)(function*(
       options?: SuiClientTypes.GetCurrentSystemStateOptions
     ): Effect.fn.Return<SuiClientTypes.GetCurrentSystemStateResponse, TransportError> {
       return yield* read(
@@ -944,7 +959,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("getCurrentSystemState")
       )
     }),
-    getProtocolConfig: Effect.fn("SuiCore.getProtocolConfig")(function*(
+    getProtocolConfig: Effect.fn("SuiCore.getProtocolConfig", spanOptions)(function*(
       options?: SuiClientTypes.GetProtocolConfigOptions
     ): Effect.fn.Return<SuiClientTypes.GetProtocolConfigResponse, TransportError> {
       return yield* read(
@@ -953,7 +968,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("getProtocolConfig")
       )
     }),
-    getChainIdentifier: Effect.fn("SuiCore.getChainIdentifier")(function*(
+    getChainIdentifier: Effect.fn("SuiCore.getChainIdentifier", spanOptions)(function*(
       options?: SuiClientTypes.GetChainIdentifierOptions
     ): Effect.fn.Return<SuiClientTypes.GetChainIdentifierResponse, TransportError> {
       return yield* read(
@@ -962,7 +977,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("getChainIdentifier")
       )
     }),
-    getMoveFunction: Effect.fn("SuiCore.getMoveFunction")(function*(
+    getMoveFunction: Effect.fn("SuiCore.getMoveFunction", spanOptions)(function*(
       options: SuiClientTypes.GetMoveFunctionOptions
     ): Effect.fn.Return<SuiClientTypes.GetMoveFunctionResponse, TransportError> {
       return yield* read(
@@ -971,7 +986,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("getMoveFunction")
       )
     }),
-    verifyZkLoginSignature: Effect.fn("SuiCore.verifyZkLoginSignature")(function*(
+    verifyZkLoginSignature: Effect.fn("SuiCore.verifyZkLoginSignature", spanOptions)(function*(
       options: SuiClientTypes.VerifyZkLoginSignatureOptions
     ): Effect.fn.Return<SuiClientTypes.ZkLoginVerifyResponse, TransportError> {
       return yield* read(
@@ -980,7 +995,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("verifyZkLoginSignature")
       )
     }),
-    resolveNameServiceAddress: Effect.fn("SuiCore.resolveNameServiceAddress")(function*(
+    resolveNameServiceAddress: Effect.fn("SuiCore.resolveNameServiceAddress", spanOptions)(function*(
       options: SuiClientTypes.ResolveNameServiceAddressOptions
     ): Effect.fn.Return<SuiClientTypes.ResolveNameServiceAddressResponse, TransportError> {
       return yield* read(
@@ -989,7 +1004,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         onlyTransportError("resolveNameServiceAddress")
       )
     }),
-    defaultNameServiceName: Effect.fn("SuiCore.defaultNameServiceName")(function*(
+    defaultNameServiceName: Effect.fn("SuiCore.defaultNameServiceName", spanOptions)(function*(
       options: SuiClientTypes.DefaultNameServiceNameOptions
     ): Effect.fn.Return<SuiClientTypes.DefaultNameServiceNameResponse, TransportError> {
       return yield* read(
@@ -999,7 +1014,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
       )
     }),
     mvr: {
-      resolvePackage: Effect.fn("SuiCore.mvr.resolvePackage")(function*(
+      resolvePackage: Effect.fn("SuiCore.mvr.resolvePackage", spanOptions)(function*(
         options: SuiClientTypes.MvrResolvePackageOptions
       ): Effect.fn.Return<SuiClientTypes.MvrResolvePackageResponse, TransportError> {
         return yield* read(
@@ -1008,7 +1023,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
           onlyTransportError("mvr.resolvePackage")
         )
       }),
-      resolveType: Effect.fn("SuiCore.mvr.resolveType")(function*(
+      resolveType: Effect.fn("SuiCore.mvr.resolveType", spanOptions)(function*(
         options: SuiClientTypes.MvrResolveTypeOptions
       ): Effect.fn.Return<SuiClientTypes.MvrResolveTypeResponse, TransportError> {
         return yield* read(
@@ -1017,7 +1032,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
           onlyTransportError("mvr.resolveType")
         )
       }),
-      resolve: Effect.fn("SuiCore.mvr.resolve")(function*(
+      resolve: Effect.fn("SuiCore.mvr.resolve", spanOptions)(function*(
         options: SuiClientTypes.MvrResolveOptions
       ): Effect.fn.Return<SuiClientTypes.MvrResolveResponse, TransportError> {
         return yield* read(
@@ -1027,12 +1042,12 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         )
       })
     },
-    resolveTransactionPlugin: Effect.fn("SuiCore.resolveTransactionPlugin")(
+    resolveTransactionPlugin: Effect.fn("SuiCore.resolveTransactionPlugin", spanOptions)(
       function*(): Effect.fn.Return<TransactionPlugin> {
         return yield* Effect.sync(() => client.core.resolveTransactionPlugin())
       }
     ),
-    use: Effect.fn("SuiCore.use")(function*<A>(
+    use: Effect.fn("SuiCore.use", spanOptions)(function*<A>(
       run: (client: ClientWithCoreApi, signal: AbortSignal) => Promise<A>
     ): Effect.fn.Return<A, SuiCoreError> {
       return yield* Effect.tryPromise({
