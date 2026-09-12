@@ -1593,7 +1593,7 @@ even for a peer a local dependency already satisfies, and an unpublished name
 
 Put both halves of the swap on the release checklist:
 
-1. replace the tarball with the published range (`"@unconfirmed/sui-effect": "^0.1.0"`);
+1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.1.0 <0.3.0"`, which is what the template ships since 0.2.0 — a range rather than a caret, because 0.x carets do not span a minor and the 0.1 and 0.2 surfaces differ only in the `optionalKey` rule of §2);
 2. **delete the `peerDependenciesMeta` entry.** Left in, it turns a genuinely
    missing peer into a silent `undefined` at import time;
 3. re-run the isolated-consumer check against the published package.

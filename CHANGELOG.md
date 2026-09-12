@@ -3,6 +3,86 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
+## 0.2.0
+
+One breaking change, from the same audit of this package against Effect v4
+rc.112's documentation that produced 0.1.3. Nothing else changed: no name was
+added or removed, no signature moved, and runtime JSON is byte for byte what
+0.1.x produced.
+
+### Breaking
+
+- **Every optional field on a shape this library constructs itself is now
+  `Schema.optionalKey` rather than `Schema.optional`.** The rule: a shape
+  sui-effect produces uses `optionalKey`, so the key is either absent or
+  carries a value its schema accepts; a shape that mirrors the SDK keeps
+  `optional`, because an object built by `@mysten/sui` really can carry a key
+  set to an explicit `undefined`.
+
+  The fields that changed: `SignedTransaction.expiration`, `SignedTransaction.chain`,
+  `Built.gasOwner`, `Built.expiration`, `Built.chain`, `JournalEntry.Executed.checkpoint`,
+  `TransportError.status`, `ObjectNotFound.version`, `ObjectDeleted.version`,
+  `ObjectUnavailable.version`, `DecodeError.objectId`, `DecodeError.expectedType`,
+  `ExecutionFailed.command` and `SubmissionUnknown.signed`.
+  (`DecodeError.issues` was already `optionalKey`, from 0.1.3.)
+
+  The fields that deliberately did **not**: `DynamicFieldEntry.childId`,
+  `DynamicField.childId`, `Event.json`, every field of `MoveLocation` and
+  `CleverError`, and every optional payload field of `ExecutionReason`
+  (`MoveAbort.location`/`cleverError`, `PackageUpgradeError.packageId`/`digest`,
+  `IndexError.index`/`subresult`, `CoinDenyListError.address`,
+  `ObjectIdError.name`). These are decoded straight from the SDK or from gRPC,
+  where `undefined` can appear.
+
+  **Why.** Effect's "optional and default keys" page says to use
+  `Schema.optionalKey` when a field may be omitted but, when present, must hold
+  a value the schema accepts — which is exactly the case for a shape whose only
+  producer is this library. Under `exactOptionalPropertyTypes` (this package's
+  own setting, and every converted consumer's) `optional` types a field
+  `status?: string | undefined` and accepts `{ status: undefined }` at compile
+  time and at decode; `optionalKey` types it `status?: string` and refuses the
+  explicit `undefined` in both places. The JSON Schema loses a spurious `null`
+  branch with it: `Schema.toJsonSchemaDocument(Built)` now renders `chain` as
+  `{ "type": "string" }`.
+
+  **The symptom.** A consumer that passes an explicit `undefined` stops
+  compiling, with `Type 'undefined' is not assignable to type 'string'` (or the
+  field's type) on the property, and `new DecodeError({ objectId: undefined,
+  … })` additionally throws at construction. A consumer that omits the key, or
+  spreads it conditionally, is unaffected.
+
+  **The fix, everywhere:** omit the key instead of setting it to `undefined` —
+  `...(version === undefined ? {} : { version })`, which is what
+  `TransportError.fromUnknown` and `Executed.refOf` have always done.
+
+  | Consumer | Grep for | Change to |
+  |---|---|---|
+  | **platform** | `new DecodeError({` in `read/receipts.ts` and the other decode boundaries, for `objectId: undefined` / `expectedType: undefined` | drop the key, or spread it conditionally: `new DecodeError({ ...(objectId === undefined ? {} : { objectId }), issue })` |
+  | **musicos** | `new (TransportError\|DecodeError\|ObjectNotFound\|ObjectDeleted\|ObjectUnavailable\|SubmissionUnknown)\(` for an explicit `undefined` field value | expected: no hits — the guide already tells authors to use `TransportError.fromUnknown`; if there are any, spread conditionally |
+  | **partyos** | the same constructor grep, plus `status: undefined` and `version: undefined` | the same: omit the key |
+  | **app** | `chain: undefined` / `expiration: undefined` / `gasOwner: undefined` on a `Built` or `Signed` rebuilt from a relay's wire form | build the object with the keys it actually has, conditionally spread |
+  | **cli** | the same relay path, plus `checkpoint: undefined` on a hand-built `JournalEntry.Executed` | omit the key |
+
+  **Runtime JSON is unaffected.** JSON cannot carry `undefined`, so a journal
+  line, a `SuiError.toJson` payload or a relay envelope persisted by 0.1.x
+  decodes unchanged — `test/journal.test.ts` asserts it on a literal persisted
+  line.
+
+  **For skill maintainers** (the `effect-ts` and extension-authoring skills live
+  in another repo): the rule to port is *"a shape the library constructs itself
+  uses `Schema.optionalKey`; a shape mirroring an external producer keeps
+  `Schema.optional`"*, with conditional spreads at the construction sites.
+
+### Documentation
+
+- `DESIGN.md` §10 states the rule beside the error table whose `?` fields it
+  governs, and §9 says what it means for a persisted journal line.
+- `docs/extensions.tpl.md` states it for extension authors twice: §2 for an
+  error's fields, §3 for a codec's own struct or domain class.
+- The extension template's peer range on `@unconfirmed/sui-effect` is
+  `>=0.1.0 <0.3.0` rather than `^0.1.0`: a 0.x caret does not span a minor, and
+  the only difference between the two surfaces is this rule.
+
 ## 0.1.3
 
 Unreleased. Sixteen ergonomics changes from an audit of this package against

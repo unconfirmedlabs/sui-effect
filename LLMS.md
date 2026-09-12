@@ -7125,7 +7125,7 @@ describe("the errors", () => {
     "@mysten/bcs": "^2.1.1",
     "@mysten/sui": "^2.28",
     "effect": "4.0.0-rc.112",
-    "@unconfirmed/sui-effect": "^0.1.0"
+    "@unconfirmed/sui-effect": ">=0.1.0 <0.3.0"
   },
   "peerDependenciesMeta": {
     "@unconfirmed/sui-effect": {
