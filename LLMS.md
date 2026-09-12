@@ -4984,6 +4984,299 @@ Every member requires `SuiCoreFake`, which `layerTest` and
 Every file below is typechecked, and each one is exercised by a test against
 the in-memory fake.
 
+### `examples/compare-read.effect.ts`
+
+```ts
+/**
+ * Reads one Escrow object and its optional note through sui-effect.
+ *
+ * Compare with `examples/compare-read.sdk.ts`, which reads the same two
+ * things with the canonical SDK client. Both print identical output.
+ *
+ * Run with `SUI_NETWORK=testnet ESCROW_ID=0x… bun examples/compare-read.effect.ts`.
+ * Every failure this program can produce is in the generator's inferred error
+ * type: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable` and
+ * `DecodeError` (the last one is what a wrong Move type becomes, because
+ * `getObject`'s tag check runs before a byte is parsed), plus `TransportError`
+ * from both reads and, from the layer, `ConfigError` and `NetworkMismatch`.
+ */
+import { bcs } from "@mysten/sui/bcs"
+import { Config, Console, Effect, Option } from "effect"
+import { ObjectId, Sui, SuiSchema } from "../src/index.ts"
+
+const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
+
+const Escrow = SuiSchema.bcs(
+  bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() }),
+  `${PKG}::escrow::Escrow`
+)
+// The note's value has no struct tag of its own, so its codec carries none;
+// the key is a primitive `u64`, which is why nothing here reaches for
+// `normalizeStructTag` on it.
+const Note = SuiSchema.bcs(bcs.u64())
+const NOTE_NAME = { type: "u64", bcs: bcs.u64().serialize(0).toBytes() }
+
+/** The program itself, exported so a test can run it against the fake. */
+export const program = Effect.gen(function*() {
+  const sui = yield* Sui
+  const id = yield* Config.schema(ObjectId, "ESCROW_ID")
+  // No `ObjectError.reason` switch and no manual type comparison: a missing
+  // or deleted escrow and a wrong Move type are already three different tags
+  // in the type this line returns.
+  const escrow = yield* sui.getObject(id, { schema: Escrow })
+  const field = yield* sui.getDynamicFieldOption(id, NOTE_NAME)
+  const note = yield* Option.match(field, {
+    onNone: () => Effect.void,
+    onSome: (entry) => SuiSchema.decode(Note, entry.value.bcs)
+  })
+  yield* Console.log(`${escrow.id} holds ${escrow.content.amount}, note: ${note ?? "none"}`)
+})
+
+if (import.meta.main) {
+  // Imported here rather than at the top so that a test can import `program`
+  // without pulling a platform package into the test process.
+  const { BunRuntime } = await import("@effect/platform-bun")
+  BunRuntime.runMain(program.pipe(Effect.provide(Sui.layerConfig)))
+}
+```
+
+### `examples/compare-read.sdk.ts`
+
+```ts
+/**
+ * Reads one Escrow object and an optional dynamic field on it, written
+ * against the canonical 2.30 SDK: a gRPC client, the Core API, manual BCS.
+ *
+ * Compare with `examples/compare-read.effect.ts`. Both print identical
+ * output for the same id.
+ *
+ * Run with `SUI_NETWORK=testnet ESCROW_ID=0x… bun examples/compare-read.sdk.ts`.
+ */
+import { bcs } from "@mysten/sui/bcs"
+import type { ClientWithCoreApi } from "@mysten/sui/client"
+import { ObjectError } from "@mysten/sui/client"
+import { SuiGrpcClient } from "@mysten/sui/grpc"
+
+const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
+const ESCROW_TYPE = `${PKG}::escrow::Escrow`
+const EscrowBcs = bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() })
+// A note some escrows carry, keyed by the literal index 0. The key is a
+// primitive `u64`, not a struct tag, so nothing here parses it as one.
+const NOTE_NAME = { type: "u64", bcs: bcs.u64().serialize(0).toBytes() }
+
+/** Reads the escrow at `id` plus its optional note. */
+export const readEscrow = async (
+  client: ClientWithCoreApi,
+  id: string
+): Promise<{ id: string; amount: string; note: string | undefined }> => {
+  let object
+  try {
+    ;({ object } = await client.core.getObject({ objectId: id, include: { content: true } }))
+  } catch (error) {
+    // `getObject` throws rather than returning a value that says which of
+    // "missing", "deleted" or "unreachable" happened; that three-way split
+    // is `ObjectError.reason`, read by hand.
+    if (error instanceof ObjectError) {
+      if (error.reason === "notFound") throw new Error(`escrow ${id} does not exist`)
+      if (error.reason === "deleted") throw new Error(`escrow ${id} was deleted`)
+      throw new Error(`escrow ${id}: node could not say what happened to it`, { cause: error })
+    }
+    throw error
+  }
+  // No type parameters on this tag, so a plain string comparison is honest;
+  // a generic type would need to be parsed and compared piece by piece,
+  // which is what sui-effect's bridge does for every caller.
+  if (object.type !== ESCROW_TYPE) {
+    throw new Error(`${id} is a ${object.type}, not ${ESCROW_TYPE}`)
+  }
+  const { id: escrowId, amount } = EscrowBcs.parse(object.content)
+
+  let note: string | undefined
+  try {
+    const { dynamicField } = await client.core.getDynamicField({ parentId: id, name: NOTE_NAME })
+    note = bcs.u64().parse(dynamicField.value.bcs)
+  } catch (error) {
+    // Absence is normal here; only a reason other than "notFound"/"deleted"
+    // is a real problem.
+    if (!(error instanceof ObjectError) || error.reason === "unknown") throw error
+  }
+
+  return { id: escrowId, amount, note }
+}
+
+if (import.meta.main) {
+  const id = process.env.ESCROW_ID
+  if (!id) throw new Error("ESCROW_ID is required")
+  const client = new SuiGrpcClient({
+    network: (process.env.SUI_NETWORK ?? "testnet") as "testnet",
+    baseUrl: process.env.SUI_RPC_URL ?? "https://fullnode.testnet.sui.io:443"
+  })
+  const escrow = await readEscrow(client, id)
+  console.log(`${escrow.id} holds ${escrow.amount}, note: ${escrow.note ?? "none"}`)
+}
+```
+
+### `examples/compare-write.effect.ts`
+
+```ts
+/**
+ * Claims an escrow through `Tx.run`, sui-effect's write path.
+ *
+ * Compare with `examples/compare-write.sdk.ts`, which does the same thing
+ * against the canonical SDK client. Both sign with `SUI_PRIVATE_KEY` and
+ * print the created receipt's object id.
+ *
+ * What `Tx.run` adds over the SDK file: a default expiration bounded to the
+ * current epoch, a journal entry written before the first execute so a crash
+ * mid-flight leaves a record, resending the identical signed bytes rather
+ * than rebuilding on a transient failure, `reconcile` when a submission's
+ * outcome is unknown, and a sender lock so two concurrent claims from one
+ * address cannot pick the same gas coin. What it costs is the Effect
+ * vocabulary below.
+ *
+ * Run with:
+ * SUI_NETWORK=testnet SUI_PRIVATE_KEY=suiprivkey1… ESCROW_ID=0x… bun examples/compare-write.effect.ts
+ */
+import { bcs } from "@mysten/sui/bcs"
+import { Config, Console, Effect } from "effect"
+import { ObjectId, SuiSchema } from "../src/index.ts"
+import { Script } from "../src/script.ts"
+import { Tx } from "../src/tx.ts"
+
+const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
+
+const Escrow = SuiSchema.bcs(
+  bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() }),
+  `${PKG}::escrow::Escrow`
+)
+
+/**
+ * The program itself, exported so a test can run it against the fake. Every
+ * failure it can produce is in the generator's inferred error type, with no
+ * handling lines anywhere in this file: `ObjectNotFound`, `ObjectDeleted`,
+ * `ObjectUnavailable`, `DecodeError`, `TransportError`, `BuildError`,
+ * `SimulationFailed`, `SigningError`, `PolicyDenied`, `NotApplied`,
+ * `JournalError`, `UnexpectedEffects`, `ExecutionFailed`, `SubmissionUnknown`,
+ * plus `ConfigError` and `NetworkMismatch` from the layer.
+ */
+export const program = Effect.gen(function*() {
+  const { signer, sui } = yield* Script
+  const id = yield* Config.schema(ObjectId, "ESCROW_ID")
+  const escrow = yield* sui.getObject(id, { schema: Escrow })
+  const executed = yield* Tx.run((tx) => {
+    tx.moveCall({
+      target: `${PKG}::escrow::claim`,
+      arguments: [tx.object(id), tx.pure.u64(escrow.content.amount)]
+    })
+  }, { signer })
+  const receipt = yield* executed.expectCreated(`${PKG}::escrow::Receipt`)
+  yield* Console.log(receipt.id)
+})
+
+if (import.meta.main) {
+  await Script.run(program)
+}
+```
+
+### `examples/compare-write.sdk.ts`
+
+```ts
+/**
+ * Claims an escrow through a PTB, written against the canonical 2.30 SDK.
+ *
+ * Compare with `examples/compare-write.effect.ts`, which does the same thing
+ * through `Tx.run` and notes what that adds over this file. Both sign with
+ * `SUI_PRIVATE_KEY` and print the created receipt's object id.
+ *
+ * Run with:
+ * SUI_NETWORK=testnet SUI_PRIVATE_KEY=suiprivkey1… ESCROW_ID=0x… bun examples/compare-write.sdk.ts
+ */
+import { bcs } from "@mysten/sui/bcs"
+import type { ClientWithCoreApi } from "@mysten/sui/client"
+import type { Keypair } from "@mysten/sui/cryptography"
+import { decodeSuiPrivateKey } from "@mysten/sui/cryptography"
+import { SuiGrpcClient } from "@mysten/sui/grpc"
+import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
+import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
+import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
+import { Transaction } from "@mysten/sui/transactions"
+
+const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
+const RECEIPT_TYPE = `${PKG}::escrow::Receipt`
+const EscrowBcs = bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() })
+
+// The scheme flag on a Bech32 key names one of three keypair classes;
+// nothing else decodes it, and a fourth scheme has no keypair class at all.
+const KEYPAIR_FOR: Record<string, undefined | ((secretKey: Uint8Array) => Keypair)> = {
+  ED25519: Ed25519Keypair.fromSecretKey,
+  Secp256k1: Secp256k1Keypair.fromSecretKey,
+  Secp256r1: Secp256r1Keypair.fromSecretKey
+}
+
+/**
+ * Reads the escrow, claims it, and returns the created receipt's object id.
+ *
+ * Builds, signs and executes as three explicit steps rather than the
+ * one-call `signAndExecuteTransaction`, so this can run against an in-memory
+ * client with no live network or signer behind it.
+ */
+export const claimEscrow = async (
+  client: ClientWithCoreApi,
+  escrowId: string,
+  keypair: Keypair
+): Promise<string> => {
+  const { object } = await client.core.getObject({ objectId: escrowId, include: { content: true } })
+  const { amount } = EscrowBcs.parse(object.content)
+
+  const tx = new Transaction()
+  tx.setSenderIfNotSet(keypair.toSuiAddress())
+  tx.moveCall({ target: `${PKG}::escrow::claim`, arguments: [tx.object(escrowId), tx.pure.u64(amount)] })
+  const bytes = await tx.build({ client })
+  const { signature } = await keypair.signTransaction(bytes)
+
+  const result = await client.core.executeTransaction({
+    transaction: bytes,
+    signatures: [signature],
+    include: { effects: true, objectTypes: true }
+  })
+  const digest = (result.Transaction ?? result.FailedTransaction).digest
+  await client.core.waitForTransaction({ digest })
+
+  if (result.$kind === "FailedTransaction") {
+    const { error } = result.FailedTransaction.status
+    if (error?.$kind === "MoveAbort") {
+      const { abortCode, cleverError } = error.MoveAbort
+      throw new Error(`claim aborted: code ${abortCode}${cleverError?.constantName ? ` (${cleverError.constantName})` : ""}`)
+    }
+    throw new Error(`claim failed: ${error?.message}`)
+  }
+
+  // Effects list every changed object by id; only the `objectTypes` join
+  // says which one is the receipt. sui-effect's `expectCreated` is this join,
+  // plus a check that exactly one match exists.
+  const { changedObjects } = result.Transaction.effects
+  const created = changedObjects.find(
+    (change) => change.idOperation === "Created" && result.Transaction.objectTypes[change.objectId] === RECEIPT_TYPE
+  )
+  if (created === undefined) throw new Error(`claim applied (${digest}) but created no ${RECEIPT_TYPE}`)
+  return created.objectId
+}
+
+if (import.meta.main) {
+  const escrowId = process.env.ESCROW_ID
+  const key = process.env.SUI_PRIVATE_KEY
+  if (!escrowId || !key) throw new Error("ESCROW_ID and SUI_PRIVATE_KEY are required")
+  const parsed = decodeSuiPrivateKey(key)
+  const fromSecretKey = KEYPAIR_FOR[parsed.scheme]
+  if (!fromSecretKey) throw new Error(`${parsed.scheme} has no keypair class here (use a remote signer)`)
+  const client = new SuiGrpcClient({
+    network: (process.env.SUI_NETWORK ?? "testnet") as "testnet",
+    baseUrl: process.env.SUI_RPC_URL ?? "https://fullnode.testnet.sui.io:443"
+  })
+  console.log(await claimEscrow(client, escrowId, fromSecretKey(parsed.secretKey)))
+}
+```
+
 ### `examples/extension-consumer.ts`
 
 ```ts
