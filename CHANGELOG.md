@@ -30,6 +30,7 @@ changed: an extension or an application built against 0.1.2 compiles unchanged.
 
 - **Extension authors:** the guide's claim that the halfway shape of a `Schema.decodeTo` into a domain class "must be an explicit interface" was wrong. `typeof Settlement.Encoded` is exactly that shape and compiles; only `typeof Settlement.Type` — the instance side — inverts the transformation. The template drops its hand-written `SettlementParts` for it, so there is one fewer interface per domain class and nothing left to drift.
 - **Extension authors:** `outcome: Schema.tag("not_applied")` is documented beside the class-field form as the schema-visible way to declare an outcome — it is encoded without a patch-back, decodable back into an error, and visible to `Schema.is`. The class-field form keeps working and the template still uses it.
+- **Extension authors:** every error in the template now defines a real `.message` — a getter over its own fields for two of them, the existing `message` schema field for the third — and the guide says plainly that `SuiError.toJson` emits a `message` key only for an error that has one. `Schema.TaggedError` leaves `.message` empty, so an error that defines neither logs as an empty string.
 - The template's `Settlement` class identifier is `"escrow/Settlement"`, following the guide's own `"<package>/<Name>"` rule: an identifier is the class's runtime marker and its JSON-Schema `$ref` key, and two extensions with a `Settlement` class collided.
 - README: the `SubmitConfig` override section shows `SubmitConfig.with` / `SubmitConfig.layer`.
 

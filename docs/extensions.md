@@ -168,6 +168,18 @@ export class EscrowNotFound extends Schema.TaggedError<EscrowNotFound>()(
   { escrowId: ObjectId }
 ) {
   readonly outcome: Outcome = "not_applied"
+
+  /**
+   * `Schema.TaggedError` leaves `.message` empty, so anything surfacing
+   * `error.message` — a log line, a `catch` in a consumer's UI,
+   * `SuiError.toJson` — shows nothing unless the class supplies one. This is
+   * the idiom sui-effect's own errors use, and the reason every error here has
+   * one: define a getter over the fields, never a `message` schema field you
+   * then have to pass to every constructor.
+   */
+  override get message(): string {
+    return `no escrow ${this.escrowId}`
+  }
 }
 ```
 
@@ -181,6 +193,15 @@ export class EscrowSettlementUnknown extends Schema.TaggedError<EscrowSettlement
   readonly outcome: Outcome = "unknown"
 }
 ```
+
+**Every error needs a real `.message`.** `Schema.TaggedError` leaves it empty,
+so `error.message` is `""` for a class that supplies nothing — in a log line, in
+a consumer's `catch`, and in `SuiError.toJson`, which emits no `message` key at
+all for such an error. An `override get message()` over the fields is the usual
+answer and is what sui-effect's own eighteen classes do: it is a getter, so it
+stays out of the encoding and out of the constructor. A `message` **schema**
+field is for the case where the sentence comes from somewhere else, as
+`EscrowSettlementUnknown`'s comes from the settlement service.
 
 `outcome` is the axis a wrapper script acts on: `"applied"` (it is on chain, gas
 was charged, do not retry), `"unknown"` (reconcile before doing anything else),
@@ -969,6 +990,11 @@ export class EscrowUnsupportedNetwork extends Schema.TaggedError<EscrowUnsupport
   { network: Schema.String }
 ) {
   readonly outcome: Outcome = "not_applied"
+
+  /** See {@link EscrowNotFound.message}: a getter, not a schema field. */
+  override get message(): string {
+    return `this release bundles no escrow deployment for ${this.network}`
+  }
 }
 ```
 
@@ -1849,8 +1875,14 @@ encodes through the taxonomy's schema; **anything else that is a
 off the instance and added, a `Schema.tag("not_applied")` field is simply
 encoded — but only the `Schema.tag` form survives a
 `Schema.decodeUnknownSync(YourError)` of that line back into an error, because
-only it is part of the schema. `message` is added from the error's own
-`.message` when the encoding produced none.
+only it is part of the schema.
+
+`message` is there **only if your error has one.** `Schema.TaggedError` leaves
+`.message` empty, so an error that defines neither an `override get message()`
+nor a `message` schema field logs as an empty string and `toJson` emits no
+`message` key at all. Give every error one — the getter is the usual answer,
+because it stays out of the encoding and so costs nothing at the constructor,
+and `src/errors.ts` shows both forms.
 
 **`outcome` is in that JSON even though it is a class field.** Declaring it the
 way the template does — `readonly outcome: Outcome = "unknown"` beside the

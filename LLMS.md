@@ -5728,6 +5728,14 @@ export const SettlementContent = (typeOrigin: string) =>
  *
  * The tags are prefixed with the package name because `EscrowNotFound` is a
  * name two packages could plausibly both want.
+ *
+ * And every one of them has a real `.message`. `Schema.TaggedError` leaves it
+ * empty, so an error that supplies neither an `override get message()` nor a
+ * `message` schema field surfaces an empty string everywhere a consumer
+ * catches it, and `SuiError.toJson` emits no `message` key at all. The getter
+ * is the usual answer — it stays out of the encoding, so it costs nothing at
+ * the constructor — and a `message` schema field is for the case where the
+ * sentence comes from somewhere else, as `EscrowSettlementUnknown`'s does.
  */
 import { Schema } from "effect"
 import { Digest, type Outcome, ObjectId } from "@unconfirmed/sui-effect"
@@ -5743,6 +5751,18 @@ export class EscrowNotFound extends Schema.TaggedError<EscrowNotFound>()(
   { escrowId: ObjectId }
 ) {
   readonly outcome: Outcome = "not_applied"
+
+  /**
+   * `Schema.TaggedError` leaves `.message` empty, so anything surfacing
+   * `error.message` — a log line, a `catch` in a consumer's UI,
+   * `SuiError.toJson` — shows nothing unless the class supplies one. This is
+   * the idiom sui-effect's own errors use, and the reason every error here has
+   * one: define a getter over the fields, never a `message` schema field you
+   * then have to pass to every constructor.
+   */
+  override get message(): string {
+    return `no escrow ${this.escrowId}`
+  }
 }
 
 /**
@@ -5752,6 +5772,10 @@ export class EscrowNotFound extends Schema.TaggedError<EscrowNotFound>()(
  * This is the case the `outcome` field exists for: the transaction applied, the
  * operation as a whole did not finish, and the only safe next step is to
  * reconcile rather than to retry. A script that fails with this exits 3.
+ *
+ * Its `message` is a **schema field** rather than a getter, because the
+ * sentence comes from the settlement service rather than from these fields.
+ * Either way `.message` is a real string and `SuiError.toJson` carries it.
  */
 export class EscrowSettlementUnknown extends Schema.TaggedError<EscrowSettlementUnknown>()(
   "escrow/EscrowSettlementUnknown",
@@ -5776,6 +5800,11 @@ export class EscrowUnsupportedNetwork extends Schema.TaggedError<EscrowUnsupport
   { network: Schema.String }
 ) {
   readonly outcome: Outcome = "not_applied"
+
+  /** See {@link EscrowNotFound.message}: a getter, not a schema field. */
+  override get message(): string {
+    return `this release bundles no escrow deployment for ${this.network}`
+  }
 }
 ```
 
@@ -7026,6 +7055,41 @@ describe("the errors", () => {
     // the instance, so it is in the JSON anyway.
     expect(json["outcome"]).toBe("unknown")
     expect(json["outcome"]).toBe(SuiError.outcome(error))
+  })
+
+  /**
+   * `Schema.TaggedError` leaves `.message` empty, so an error that defines
+   * neither a getter nor a `message` schema field logs as an empty string and
+   * `SuiError.toJson` emits no `message` key at all. Every error here defines
+   * one, and the guide promises a reader that they will.
+   */
+  test("every error has a real message, and toJson carries it", () => {
+    const errors = [
+      new EscrowNotFound({ escrowId: ESCROW_ID }),
+      new EscrowSettlementUnknown({
+        escrowId: ESCROW_ID,
+        digest: "1".repeat(32) as never,
+        message: "the operator never confirmed"
+      }),
+      new EscrowUnsupportedNetwork({ network: "devnet" })
+    ]
+    for (const error of errors) {
+      expect([error._tag, error.message.length > 0]).toEqual([error._tag, true])
+      expect([error._tag, SuiError.toJson(error)["message"]]).toEqual([
+        error._tag,
+        error.message
+      ])
+    }
+    // The getter reads the error's own fields, so the sentence names the thing
+    // that failed rather than repeating the tag.
+    expect(new EscrowNotFound({ escrowId: ESCROW_ID }).message).toBe(`no escrow ${ESCROW_ID}`)
+    expect(new EscrowUnsupportedNetwork({ network: "devnet" }).message).toBe(
+      "this release bundles no escrow deployment for devnet"
+    )
+    // And a getter stays out of the encoding, so it is not a constructor
+    // argument: only `EscrowSettlementUnknown` takes a `message`.
+    expect(Object.keys(SuiError.toJson(new EscrowUnsupportedNetwork({ network: "devnet" }))))
+      .toEqual(["_tag", "network", "outcome", "message"])
   })
 })
 ```
