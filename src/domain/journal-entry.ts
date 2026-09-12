@@ -33,7 +33,7 @@ export const JournalEntry = Schema.TaggedUnion({
   },
   Executed: {
     digest: Digest,
-    checkpoint: Schema.optional(Schema.BigIntFromString),
+    checkpoint: Schema.optionalKey(Schema.BigIntFromString),
     at: Schema.DateTimeUtcFromMillis
   },
   Failed: {
