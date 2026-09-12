@@ -44,6 +44,23 @@ describe("LLMS.md", () => {
     }
   )
 
+  test.skipIf(missing !== undefined)(
+    "prints the lifecycle shapes by name in the `Tx` block (NB2)",
+    () => {
+      const lines = readFileSync("LLMS.md", "utf8").split("\n")
+      const start = lines.findIndex((line) => line.startsWith("### `Tx` (const)"))
+      expect(start).toBeGreaterThan(-1)
+      const rest = lines.slice(start + 1)
+      const end = rest.findIndex((line) => line.startsWith("### "))
+      const block = rest.slice(0, end === -1 ? rest.length : end)
+
+      expect(block.some((line) => line.includes("=> Effect.Effect<Built,"))).toBe(true)
+      expect(block.some((line) => line.includes("=> Effect.Effect<Signed,"))).toBe(true)
+      // The struct was expanded inline before NB2; the name is what a reader wants.
+      expect(block.filter((line) => /readonly \$kind: "ValidDuring"/.test(line))).toEqual([])
+    }
+  )
+
   if (missing !== undefined) {
     test("skipped: the emitted declarations are not built", () => {
       console.warn(

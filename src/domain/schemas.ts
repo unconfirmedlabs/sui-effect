@@ -247,7 +247,15 @@ export const ObjectRef = Schema.Struct({
   digest: Schema.String,
   owner: Owner
 })
-export type ObjectRef = typeof ObjectRef.Type
+type ObjectRefType = typeof ObjectRef.Type
+/**
+ * The decoded shape of {@link ObjectRef}.
+ *
+ * Declared as an interface rather than as `typeof ObjectRef.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface ObjectRef extends ObjectRefType {}
 
 /** A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`. */
 export const Balance = Schema.Struct({
@@ -256,14 +264,30 @@ export const Balance = Schema.Struct({
   coinBalance: Mist,
   addressBalance: Mist
 })
-export type Balance = typeof Balance.Type
+type BalanceType = typeof Balance.Type
+/**
+ * The decoded shape of {@link Balance}.
+ *
+ * Declared as an interface rather than as `typeof Balance.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface Balance extends BalanceType {}
 
 /** The BCS-encoded name of a dynamic field. Mirrors `SuiClientTypes.DynamicFieldName`. */
 export const DynamicFieldName = Schema.Struct({
   type: Schema.String,
   bcs: Schema.Uint8Array
 })
-export type DynamicFieldName = typeof DynamicFieldName.Type
+type DynamicFieldNameType = typeof DynamicFieldName.Type
+/**
+ * The decoded shape of {@link DynamicFieldName}.
+ *
+ * Declared as an interface rather than as `typeof DynamicFieldName.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface DynamicFieldName extends DynamicFieldNameType {}
 
 /** One entry of a dynamic-field listing. Mirrors `SuiClientTypes.DynamicFieldEntry`. */
 export const DynamicFieldEntry = Schema.Struct({
@@ -274,7 +298,15 @@ export const DynamicFieldEntry = Schema.Struct({
   $kind: Schema.Literals(["DynamicField", "DynamicObject"]),
   childId: Schema.optional(ObjectId)
 })
-export type DynamicFieldEntry = typeof DynamicFieldEntry.Type
+type DynamicFieldEntryType = typeof DynamicFieldEntry.Type
+/**
+ * The decoded shape of {@link DynamicFieldEntry}.
+ *
+ * Declared as an interface rather than as `typeof DynamicFieldEntry.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface DynamicFieldEntry extends DynamicFieldEntryType {}
 
 /** A dynamic field with its value. Mirrors `SuiClientTypes.DynamicField`. */
 export const DynamicField = Schema.Struct({
@@ -288,7 +320,15 @@ export const DynamicField = Schema.Struct({
   version: Version,
   digest: Schema.String
 })
-export type DynamicField = typeof DynamicField.Type
+type DynamicFieldType = typeof DynamicField.Type
+/**
+ * The decoded shape of {@link DynamicField}.
+ *
+ * Declared as an interface rather than as `typeof DynamicField.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface DynamicField extends DynamicFieldType {}
 
 /** Gas cost breakdown. Mirrors `SuiClientTypes.GasCostSummary`. */
 export const GasCostSummary = Schema.Struct({
@@ -651,7 +691,15 @@ export const SignedTransaction = Schema.Struct({
    */
   chain: Schema.optional(Schema.String)
 })
-export type SignedTransaction = typeof SignedTransaction.Type
+type SignedTransactionType = typeof SignedTransaction.Type
+/**
+ * The decoded shape of {@link SignedTransaction}.
+ *
+ * Declared as an interface rather than as `typeof SignedTransaction.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface SignedTransaction extends SignedTransactionType {}
 
 /**
  * Why a transaction provably never applied, and never will.
@@ -682,7 +730,15 @@ export const Built = Schema.Struct({
   /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
   chain: Schema.optional(Schema.String)
 })
-export type Built = typeof Built.Type
+type BuiltType = typeof Built.Type
+/**
+ * The decoded shape of {@link Built}.
+ *
+ * Declared as an interface rather than as `typeof Built.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface Built extends BuiltType {}
 
 /**
  * The last epoch in which a transaction can still be applied, or `undefined`
@@ -772,7 +828,15 @@ export const ObjectEnvelope = Schema.Struct({
   owner: Owner,
   type: ObjectType
 })
-export type ObjectEnvelope = typeof ObjectEnvelope.Type
+type ObjectEnvelopeType = typeof ObjectEnvelope.Type
+/**
+ * The decoded shape of {@link ObjectEnvelope}.
+ *
+ * Declared as an interface rather than as `typeof ObjectEnvelope.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface ObjectEnvelope extends ObjectEnvelopeType {}
 
 /**
  * An object read through `Sui`, with its BCS content already decoded to `S` and
@@ -824,7 +888,15 @@ export const Simulation = Schema.Struct({
   objectTypes: Schema.Record(Schema.String, Schema.String),
   commandResults: Schema.Array(CommandResult)
 })
-export type Simulation = typeof Simulation.Type
+type SimulationType = typeof Simulation.Type
+/**
+ * The decoded shape of {@link Simulation}.
+ *
+ * Declared as an interface rather than as `typeof Simulation.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface Simulation extends SimulationType {}
 
 const UNKNOWN_REASON = ExecutionReason.cases.Unknown.make({ $kind: "Unknown" })
 

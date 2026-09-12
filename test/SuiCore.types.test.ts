@@ -1,7 +1,20 @@
 import { expect, test } from "bun:test"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import type { Effect } from "effect"
+import { Schema } from "effect"
+import type {
+  Built,
+  ObjectRef,
+  Simulation
+} from "../src/domain/schemas.ts"
+import {
+  Built as BuiltSchema,
+  ObjectRef as ObjectRefSchema,
+  SignedTransaction,
+  Simulation as SimulationSchema
+} from "../src/domain/schemas.ts"
 import type { SuiCoreService } from "../src/services/SuiCore.ts"
+import type { Signed } from "../src/services/Tx.ts"
 
 /** Compile-time assertion helper. */
 const assertNever = <_T extends never>(): true => true
@@ -84,4 +97,25 @@ test("Include generics are preserved", () => {
   const bareContentIsUndefined: BareResult["object"]["content"] extends undefined ? true : false =
     true
   expect(bareContentIsUndefined).toBe(true)
+})
+
+/**
+ * NB2: the lifecycle shapes are declared as interfaces so their names survive
+ * into `.d.ts`, editor hover and `LLMS.md`. An interface over
+ * `typeof Schema.Type` is structurally identical to the type alias it replaced,
+ * which is what makes the change non-breaking — assignable in both directions.
+ */
+test("the named lifecycle interfaces are structurally their schema's Type", () => {
+  expect(assignable<Built, typeof BuiltSchema.Type>()).toBe(true)
+  expect(assignable<typeof BuiltSchema.Type, Built>()).toBe(true)
+  expect(assignable<Signed, typeof SignedTransaction.Type>()).toBe(true)
+  expect(assignable<typeof SignedTransaction.Type, Signed>()).toBe(true)
+  expect(assignable<Simulation, typeof SimulationSchema.Type>()).toBe(true)
+  expect(assignable<typeof SimulationSchema.Type, Simulation>()).toBe(true)
+  expect(assignable<ObjectRef, typeof ObjectRefSchema.Type>()).toBe(true)
+  expect(assignable<typeof ObjectRefSchema.Type, ObjectRef>()).toBe(true)
+
+  // Schema-derived helpers still accept the interface where the alias was used.
+  const isBuilt: (input: unknown) => input is Built = Schema.is(BuiltSchema)
+  expect(isBuilt(null)).toBe(false)
 })

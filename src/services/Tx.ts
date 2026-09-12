@@ -68,8 +68,14 @@ import { Sui } from "./Sui.ts"
 /** A transaction built into bytes, with the expiration the builder settled on. */
 export type { Built } from "../domain/schemas.ts"
 
-/** Signed bytes: everything `executeTransaction` needs, plus what `reconcile` needs. */
-export type Signed = SignedTransaction
+/**
+ * Signed bytes: everything `executeTransaction` needs, plus what `reconcile`
+ * needs.
+ *
+ * An interface rather than a type alias so the name survives into `.d.ts`,
+ * editor hover and `LLMS.md`; structurally it is {@link SignedTransaction}.
+ */
+export interface Signed extends SignedTransaction {}
 /** The schema of {@link Signed}. */
 export const Signed = SignedTransaction
 
@@ -1733,12 +1739,16 @@ export const run = Effect.fn("Tx.run")(function*(
  *
  * @since 0.1.2
  */
-export const recorded = Effect.fn("Tx.recorded")(function*(
+export const recorded: (
   digest: Digest
-): Effect.fn.Return<Option.Option<JournalEntry>, JournalError> {
-  const journal = yield* Journal
-  return yield* journal.get(digest)
-})
+) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never> = Effect.fn("Tx.recorded")(
+  function*(
+    digest: Digest
+  ): Effect.fn.Return<Option.Option<JournalEntry>, JournalError> {
+    const journal = yield* Journal
+    return yield* journal.get(digest)
+  }
+)
 
 /**
  * Settles every unresolved entry in the journal: the explicit startup call a
