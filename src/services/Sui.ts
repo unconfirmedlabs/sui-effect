@@ -22,6 +22,7 @@ import {
   Option,
   RcMap,
   Result,
+  type Schedule,
   Schema,
   Semaphore,
   Stream
@@ -208,6 +209,28 @@ export interface SuiService {
    *
    * Fails with: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`,
    * `DecodeError`, `TransportError`.
+   *
+   * @since 0.1.2
+   */
+  readonly getObjectsStrict: {
+    <S>(
+      ids: ReadonlyArray<ObjectId>,
+      opts: { readonly schema: Schema.Codec<S, Uint8Array>; readonly expectedType?: string }
+    ): Effect.Effect<ReadonlyArray<SuiObject<S>>, BatchItemError | TransportError>
+    (
+      ids: ReadonlyArray<ObjectId>,
+      opts?: { readonly schema?: undefined; readonly expectedType?: string }
+    ): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>
+  }
+
+  /**
+   * {@link getObjectsStrict} under its 0.1.0 name.
+   *
+   * `getObjectsOrFail` reads, out of context, as though failing were the point
+   * — `getObjects(ids).orFail()` — rather than as the strictness of the read.
+   * The two are the same function.
+   *
+   * @deprecated Use `getObjectsStrict`. This alias stays for 0.1.x.
    */
   readonly getObjectsOrFail: {
     <S>(
@@ -384,6 +407,7 @@ const makeSui = (
         return yield* new DecodeError({
           objectId: envelope.objectId,
           expectedType: expected,
+          kind: "type",
           issue: `object ${envelope.objectId} has type ${envelope.type}`
         })
       }
@@ -504,7 +528,7 @@ const makeSui = (
     return results
   })
 
-  const getObjectsOrFail = Effect.fn("Sui.getObjectsOrFail")(function*<S>(
+  const getObjectsStrict = Effect.fn("Sui.getObjectsStrict")(function*<S>(
     ids: ReadonlyArray<ObjectId>,
     opts?: ReadOptions<S>
   ): Effect.fn.Return<
@@ -652,12 +676,16 @@ const makeSui = (
     const index = opts?.command ?? simulation.commandResults.length - 1
     const command = simulation.commandResults[index]
     if (command === undefined) {
-      return yield* new DecodeError({ issue: `the simulation has no command ${index}` })
+      return yield* new DecodeError({
+        kind: "shape",
+        issue: `the simulation has no command ${index}`
+      })
     }
     const position = opts?.result ?? 0
     const value = command.returnValues[position]
     if (value === undefined) {
       return yield* new DecodeError({
+        kind: "shape",
         issue: `command ${index} has no return value ${position}`
       })
     }
@@ -746,6 +774,7 @@ const makeSui = (
             () =>
               new DecodeError({
                 expectedType: CLOCK_TYPE,
+                kind: "shape",
                 issue: `the clock reported ${clock.timestamp_ms}, which is not a time`
               })
           )
@@ -773,7 +802,9 @@ const makeSui = (
     getObject: getObject as SuiService["getObject"],
     getObjectOption: getObjectOption as SuiService["getObjectOption"],
     getObjects: getObjects as SuiService["getObjects"],
-    getObjectsOrFail: getObjectsOrFail as SuiService["getObjectsOrFail"],
+    getObjectsStrict: getObjectsStrict as SuiService["getObjectsStrict"],
+    // The same function under its 0.1.0 name, so a 0.1.1 extension compiles.
+    getObjectsOrFail: getObjectsStrict as SuiService["getObjectsOrFail"],
     getBalance,
     getDynamicFieldOption,
     getTransaction,
@@ -804,6 +835,26 @@ export interface SuiLayerOptions {
    * network are regenerated, so set this when the program must pin one.
    */
   readonly chainId?: string
+  /**
+   * How to retry the one `getChainIdentifier` this layer makes, when it fails
+   * with a **retryable** `TransportError`.
+   *
+   * It matters more than one round trip usually would, because of what holds
+   * the result: a `ManagedRuntime` — which is how a browser app, a Worker or a
+   * Durable Object keeps one runtime per isolate — **memoizes the layer build,
+   * failure included, for its whole lifetime**. One unlucky request at boot and
+   * every later use of that runtime fails with the same stale
+   * `TransportError`, until something disposes it. A short schedule here is the
+   * cheap half of the cure; disposing the runtime when its build failed is the
+   * other half (see the guide's "Application consumers" section), and
+   * `layerNoDepsPinned` avoids the read altogether when the chain id is already
+   * known.
+   *
+   * Unset, the read is made once, as it always was.
+   *
+   * @since 0.1.2
+   */
+  readonly retry?: Schedule.Schedule<unknown, TransportError>
 }
 
 /**
@@ -834,7 +885,15 @@ export class Sui extends Context.Service<Sui, SuiService>()("@unconfirmed/sui-ef
       Sui,
       Effect.gen(function*() {
         const core = yield* SuiCore
-        const { chainIdentifier } = yield* core.getChainIdentifier()
+        const read = core.getChainIdentifier()
+        const { chainIdentifier } = yield* (options.retry === undefined
+          ? read
+          : read.pipe(
+            Effect.retry({
+              schedule: options.retry,
+              while: (error: TransportError) => error.retryable
+            })
+          ))
         const expected = options.chainId ?? KNOWN_CHAIN_IDS[core.network]
         if (expected !== undefined && expected !== chainIdentifier) {
           return yield* new NetworkMismatch({ expected, actual: chainIdentifier })

@@ -98,7 +98,16 @@ describe("docs/extensions.md", () => {
     // marker, the two shapes for a standalone function that needs a sibling
     // extension, the harness's `extra` option, `normalize`, `decodeWith`, and a
     // sketch of one codec serving every instantiation of a generic Move type.
-    expect(inlineBlocks.length).toBeLessThanOrEqual(10)
+    //
+    // 0.1.2 added six more, and all six are **consumer** code: an application's
+    // `ManagedRuntime` module, its HMR dispose, its vitest double, a Durable
+    // Object's `KeyValueStore` adapter, a Worker's `ConfigProvider`, and the
+    // sponsored-by-a-service sequence — plus a signer double, which is the one
+    // thing a template full of real keypairs deliberately does not have. The
+    // template is an extension package and
+    // cannot host any of them; the rule they are an exception to is about the
+    // extension examples, which are all still quoted from it.
+    expect(inlineBlocks.length).toBeLessThanOrEqual(17)
   })
 
   test("every code block names the template file it came from", () => {

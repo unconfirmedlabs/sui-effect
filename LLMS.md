@@ -17,7 +17,7 @@ contract for building an extension package on top of it.
 ## `@unconfirmed/sui-effect`
 
 
-82 exported symbols.
+84 exported symbols.
 
 ### `Balance` (const)
 
@@ -229,13 +229,42 @@ The return values and mutated references of one command. Mirrors `SuiClientTypes
 
 ```ts
 export declare class DecodeError extends DecodeError_base {
-  readonly issue: string
-  readonly objectId: ObjectId | undefined
-  readonly expectedType: string | undefined
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
 BCS content or a schema boundary did not decode.
+
+`kind` says which of the three (`"type"`, `"bytes"`, `"shape"`) and is what a
+consumer branches on; `issue` is the sentence for a human and is not stable.
+It defaults to `"shape"` when neither a constructor nor an encoded value
+carries one, so an extension that builds a `DecodeError` with no `kind` still
+compiles and still answers the question conservatively.
+
+### `DecodeKind` (const)
+
+```ts
+declare const DecodeKind: Schema
+// decodes to: "bytes" | "type" | "shape"
+```
+
+Which of the three things that can go wrong at a decode boundary went wrong.
+
+- `"type"`: the object, the field or the event **is not of the expected Move
+  type**. The bytes were never parsed. This is the one a caller answers with
+  "that is not one of mine" — a 404 for a foreign object, a `filter` over a
+  heterogeneous list — and the one it is safe to swallow.
+- `"bytes"`: the type matched and the **BCS parse failed**, or left trailing
+  bytes. Either the layout this package was built with is not the layout the
+  package on chain writes, or the object is corrupt. Never safe to swallow.
+- `"shape"`: a **domain schema** refused a value that was already parsed or
+  that came from the node as JSON — a missing field in a node response, a
+  number that is not a timestamp, a simulation with no such command. A bug
+  here is in this library, the node, or the caller's expectations.
+
+Branch on this, never on `DecodeError`'s `issue`: `issue` is a human
+sentence and its wording changes between releases.
 
 ### `Digest` (const)
 
@@ -258,8 +287,8 @@ declare const DynamicField: Schema
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
 //     };
-//     readonly fieldId: ObjectId;
 //     readonly type: string;
+//     readonly fieldId: ObjectId;
 //     readonly name: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
@@ -279,8 +308,8 @@ declare const DynamicFieldEntry: Schema
 // decodes to:
 // {
 //     readonly $kind: "DynamicField" | "DynamicObject";
-//     readonly fieldId: ObjectId;
 //     readonly type: string;
+//     readonly fieldId: ObjectId;
 //     readonly name: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
@@ -305,10 +334,18 @@ The BCS-encoded name of a dynamic field. Mirrors `SuiClientTypes.DynamicFieldNam
 
 ```ts
 declare const Event: Schema
-// decodes to: { readonly packageId: ObjectId; readonly module: string; readonly sender: SuiAddress; readonly eventType: string; readonly bcs: Uint8Array<ArrayBufferLike>; }
+// decodes to: { readonly sender: SuiAddress; readonly bcs: Uint8Array<ArrayBufferLike>; readonly packageId: ObjectId; readonly module: string; readonly eventType: string; readonly json?: unknown; }
 ```
 
-An emitted Move event. Mirrors `SuiClientTypes.Event`; `json` is dropped on purpose.
+An emitted Move event. Mirrors `SuiClientTypes.Event` with the branded ids
+this package uses.
+
+The decode a caller wants is `SuiSchema.decode(codec, event.bcs)`, which
+gives a typed value; `json` is the node's own rendering and is **not**
+something to build on — it is absent on most transports and its shape follows
+whatever the node feels like. It is kept only when the source carried it,
+which in practice means a relay or sponsor envelope decoded through
+`Executed.fromPartial`, where it may be the only form of the event there is.
 
 ### `Executed` (class)
 
@@ -365,6 +402,16 @@ export declare class Executed extends Executed_base {
      */
     wrapped(): ReadonlyArray<ChangedRef>;
     /**
+     * Whether this change wrote an object, treating `Unknown` as "the envelope
+     * did not say".
+     *
+     * A node always reports the output state; a reduced envelope from a relay or
+     * a sponsor often reports nothing but the id and the id operation, and
+     * {@link Executed.fromPartial} leaves what it was not told as `Unknown`
+     * rather than inventing `ObjectWrite`. Reading `Unknown` as "not an object
+     * write" would make `created()` silently empty for exactly those envelopes.
+     */
+    /**
      * Packages this transaction published (`PackageWrite` plus `Created`), as
      * full refs like every other accessor. A package's `type` is the literal
      * `package` when the node reports one, and the ref falls back to it when the
@@ -376,6 +423,53 @@ export declare class Executed extends Executed_base {
     balanceChange(address: SuiAddress, coinType: CoinType): bigint;
     /** Computation plus storage less the storage rebate, in MIST. Can be negative. Never fails. */
     get gasUsedTotal(): bigint;
+    /**
+     * An `Executed` from the SDK's own `TransactionResult`, read with
+     * {@link EXECUTE_INCLUDE}.
+     *
+     * This is what `Tx.submit` uses, exported so a caller holding a result from
+     * somewhere else — `client.core.executeTransaction`, a sponsor's SDK call —
+     * can get the accessors without re-implementing the decode.
+     *
+     * Fails with: `ExecutionFailed` (the transaction applied and failed),
+     * `DecodeError` (the response does not carry the include set).
+     *
+     * @since 0.1.2
+     */
+    static readonly fromTransactionResult: (result: SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>) => Effect.Effect<Executed, ExecutionFailed | DecodeError>;
+    /**
+     * An `Executed` from a **reduced** execute envelope: what a relay, a sponsor
+     * or another service hands back, over JSON, after submitting on your behalf.
+     *
+     * Such an envelope is rarely the SDK's full include set. Everything optional
+     * is filled in with "the node did not say" rather than refused:
+     *
+     * - `changedObjects` entries need only `objectId` and `idOperation`; the
+     *   version, digest and owner on either side default to `null`, and
+     *   `outputState` defaults to `ObjectWrite` (`DoesNotExist` for a
+     *   `Deleted`), so {@link created} and {@link deleted} classify correctly
+     *   from the id operation alone.
+     * - `objectTypes` defaults to `{}`. **The type filters need it**:
+     *   `created(type)`, `mutated(type)` and `expectCreated(type)` can only
+     *   match a change whose type the envelope carried, so without
+     *   `objectTypes` they return nothing. `created()` with no argument, and
+     *   {@link createdWhere}, still list every created id.
+     * - `balanceChanges` and `events` default to `[]`, `checkpoint` and
+     *   `timestampMs` to `null`, `gasUsed` to zeros, and `effects.status` to
+     *   success.
+     * - **JSON spellings are accepted** where the SDK's types are not JSON:
+     *   `bcs` as base64 or as an array of byte values as well as a
+     *   `Uint8Array`, and every `u64` (versions, balances, gas, `checkpoint`)
+     *   as a number or a `bigint` as well as the decimal string the wire uses.
+     *
+     * An envelope with no usable digest, or whose values are the wrong shape
+     * rather than merely absent, fails: absence is filled in, nonsense is not.
+     *
+     * Fails with: `DecodeError`.
+     *
+     * @since 0.1.2
+     */
+    static readonly fromPartial: (envelope: unknown) => Effect.Effect<Executed, DecodeError>;
     /**
      * The single object of this type the transaction created.
      *
@@ -389,220 +483,22 @@ export declare class Executed extends Executed_base {
 A transaction the network executed, built from the fixed execute include set:
 effects, events, balance changes and object types.
 
+**`events` is `ReadonlyArray<Event>`, not `SuiClientTypes.Event[]`.** It is
+that type minus `json`: `packageId`, `module`, `sender`, `eventType` and
+`bcs`, with the branded ids this package uses. The SDK's `json` is dropped on
+purpose — it is the node's own rendering, it is absent on most transports,
+and the decode a caller wants is `SuiSchema.decode(codec, event.bcs)`, which
+gives a typed value rather than a shape that changes with the node. Code
+typed against the SDK's `Event[]` therefore does not accept these; take
+`ReadonlyArray<Event>` from `@unconfirmed/sui-effect`, or map the fields you
+need.
+
 ### `ExecutionFailed` (class)
 
 ```ts
 export declare class ExecutionFailed extends ExecutionFailed_base {
-  readonly digest: Digest
-  readonly reason: {
-      readonly $kind: "MoveAbort";
-      readonly MoveAbort: {
-          readonly abortCode: bigint;
-          readonly location?: {
-              readonly function?: number | undefined;
-              readonly module?: string | undefined;
-              readonly package?: string | undefined;
-              readonly functionName?: string | undefined;
-              readonly instruction?: number | undefined;
-          } | undefined;
-          readonly cleverError?: {
-              readonly errorCode?: number | undefined;
-              readonly lineNumber?: number | undefined;
-              readonly constantName?: string | undefined;
-              readonly constantType?: string | undefined;
-              readonly value?: string | undefined;
-          } | undefined;
-      };
-  } | {
-      readonly $kind: "SizeError";
-      readonly SizeError: {
-          readonly name: string;
-          readonly size: number;
-          readonly maxSize: number;
-      };
-  } | {
-      readonly $kind: "CommandArgumentError";
-      readonly CommandArgumentError: {
-          readonly argument: number;
-          readonly name: string;
-      };
-  } | {
-      readonly $kind: "TypeArgumentError";
-      readonly TypeArgumentError: {
-          readonly typeArgument: number;
-          readonly name: string;
-      };
-  } | {
-      readonly $kind: "PackageUpgradeError";
-      readonly PackageUpgradeError: {
-          readonly name: string;
-          readonly digest?: string | undefined;
-          readonly packageId?: string | undefined;
-      };
-  } | {
-      readonly $kind: "IndexError";
-      readonly IndexError: {
-          readonly index?: number | undefined;
-          readonly subresult?: number | undefined;
-      };
-  } | {
-      readonly $kind: "CoinDenyListError";
-      readonly CoinDenyListError: {
-          readonly coinType: string;
-          readonly name: string;
-          readonly address?: string | undefined;
-      };
-  } | {
-      readonly $kind: "CongestedObjects";
-      readonly CongestedObjects: {
-          readonly name: string;
-          readonly objects: readonly string[];
-      };
-  } | {
-      readonly $kind: "ObjectIdError";
-      readonly ObjectIdError: {
-          readonly objectId: string;
-          readonly name?: string | undefined;
-      };
-  } | {
-      readonly $kind: "Unknown";
-  }
-  readonly effects: {
-      readonly version: number;
-      readonly status: {
-          readonly success: boolean;
-      };
-      readonly gasUsed: {
-          readonly computationCost: Mist;
-          readonly storageCost: Mist;
-          readonly storageRebate: Mist;
-          readonly nonRefundableStorageFee: Mist;
-      };
-      readonly transactionDigest: Digest;
-      readonly gasObject: {
-          readonly objectId: ObjectId;
-          readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
-          readonly inputVersion: Version | null;
-          readonly inputDigest: string | null;
-          readonly inputOwner: {
-              readonly $kind: "AddressOwner";
-              readonly AddressOwner: SuiAddress;
-          } | {
-              readonly $kind: "ObjectOwner";
-              readonly ObjectOwner: ObjectId;
-          } | {
-              readonly $kind: "Shared";
-              readonly Shared: {
-                  readonly initialSharedVersion: Version;
-              };
-          } | {
-              readonly $kind: "Immutable";
-              readonly Immutable: true;
-          } | {
-              readonly $kind: "ConsensusAddressOwner";
-              readonly ConsensusAddressOwner: {
-                  readonly startVersion: Version;
-                  readonly owner: SuiAddress;
-              };
-          } | {
-              readonly $kind: "Unknown";
-          } | null;
-          readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
-          readonly outputVersion: Version | null;
-          readonly outputDigest: string | null;
-          readonly outputOwner: {
-              readonly $kind: "AddressOwner";
-              readonly AddressOwner: SuiAddress;
-          } | {
-              readonly $kind: "ObjectOwner";
-              readonly ObjectOwner: ObjectId;
-          } | {
-              readonly $kind: "Shared";
-              readonly Shared: {
-                  readonly initialSharedVersion: Version;
-              };
-          } | {
-              readonly $kind: "Immutable";
-              readonly Immutable: true;
-          } | {
-              readonly $kind: "ConsensusAddressOwner";
-              readonly ConsensusAddressOwner: {
-                  readonly startVersion: Version;
-                  readonly owner: SuiAddress;
-              };
-          } | {
-              readonly $kind: "Unknown";
-          } | null;
-          readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
-      } | null;
-      readonly eventsDigest: string | null;
-      readonly dependencies: readonly string[];
-      readonly lamportVersion: Version | null;
-      readonly changedObjects: readonly {
-          readonly objectId: ObjectId;
-          readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
-          readonly inputVersion: Version | null;
-          readonly inputDigest: string | null;
-          readonly inputOwner: {
-              readonly $kind: "AddressOwner";
-              readonly AddressOwner: SuiAddress;
-          } | {
-              readonly $kind: "ObjectOwner";
-              readonly ObjectOwner: ObjectId;
-          } | {
-              readonly $kind: "Shared";
-              readonly Shared: {
-                  readonly initialSharedVersion: Version;
-              };
-          } | {
-              readonly $kind: "Immutable";
-              readonly Immutable: true;
-          } | {
-              readonly $kind: "ConsensusAddressOwner";
-              readonly ConsensusAddressOwner: {
-                  readonly startVersion: Version;
-                  readonly owner: SuiAddress;
-              };
-          } | {
-              readonly $kind: "Unknown";
-          } | null;
-          readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
-          readonly outputVersion: Version | null;
-          readonly outputDigest: string | null;
-          readonly outputOwner: {
-              readonly $kind: "AddressOwner";
-              readonly AddressOwner: SuiAddress;
-          } | {
-              readonly $kind: "ObjectOwner";
-              readonly ObjectOwner: ObjectId;
-          } | {
-              readonly $kind: "Shared";
-              readonly Shared: {
-                  readonly initialSharedVersion: Version;
-              };
-          } | {
-              readonly $kind: "Immutable";
-              readonly Immutable: true;
-          } | {
-              readonly $kind: "ConsensusAddressOwner";
-              readonly ConsensusAddressOwner: {
-                  readonly startVersion: Version;
-                  readonly owner: SuiAddress;
-              };
-          } | {
-              readonly $kind: "Unknown";
-          } | null;
-          readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
-      }[];
-      readonly unchangedConsensusObjects: readonly {
-          readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
-          readonly objectId: ObjectId;
-          readonly version: Version | null;
-          readonly digest: string | null;
-      }[];
-      readonly auxiliaryDataDigest: string | null;
-  }
-  readonly command: number | undefined
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -710,8 +606,8 @@ representation of an on-chain failure.
 
 ```ts
 export declare class ExtensionNotReady extends ExtensionNotReady_base {
-  readonly extension: string
-  readonly member: string
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -749,8 +645,8 @@ What can go wrong reading one object with a schema.
 
 ```ts
 export declare class GraphQLUnavailable extends GraphQLUnavailable_base {
-  readonly method: string
-  readonly reason: string
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -786,7 +682,8 @@ the documented retry idiom to send again on no evidence at all.
 
 ```ts
 export declare class JournalError extends JournalError_base {
-  readonly cause: unknown
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -854,8 +751,8 @@ The network a client is pointed at. Mirrors `SuiClientTypes.Network`.
 
 ```ts
 export declare class NetworkMismatch extends NetworkMismatch_base {
-  readonly expected: string
-  readonly actual: string
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -865,8 +762,8 @@ The chain identifier the node reported is not the one the layer was built for.
 
 ```ts
 export declare class NotApplied extends NotApplied_base {
-  readonly digest: Digest
-  readonly evidence: "expired" | "inputConsumed"
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -900,8 +797,8 @@ cannot drift.
 
 ```ts
 export declare class ObjectDeleted extends ObjectDeleted_base {
-  readonly objectId: ObjectId
-  readonly version: Version | undefined
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -967,8 +864,17 @@ The failures of an object lookup.
 
 ```ts
 export declare class ObjectNotFound extends ObjectNotFound_base {
-  readonly objectId: ObjectId
-  readonly version: Version | undefined
+    /**
+     * The one actionable line `SuiError.describe` produces for this error.
+     *
+     * `Schema.TaggedError` gives every class the `Error` constructor and no
+     * message of its own, so `error.message` was the empty string — and a
+     * consumer that surfaces `.message` (a log line, a UI, another library's
+     * error formatter) showed nothing at all. A getter rather than a schema
+     * field, so it is always in step with `describe`, costs nothing to
+     * construct, and stays out of `SuiError.toJson`'s encoding.
+     */
+    get message(): string;
 }
 ```
 
@@ -1029,8 +935,8 @@ readable object like any other.
 
 ```ts
 export declare class ObjectUnavailable extends ObjectUnavailable_base {
-  readonly objectId: ObjectId
-  readonly version: Version | undefined
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -1044,6 +950,22 @@ export type Outcome = "applied" | "not_applied" | "unknown";
 
 What a failure says about the transaction it came from, on the axis a caller
 or a wrapper script acts on.
+
+### `OutcomePhase` (type)
+
+```ts
+export type OutcomePhase = "pre-submit" | "post-submit";
+```
+
+Where in the lifecycle a failure was caught, which is the only thing that
+can classify an error the taxonomy does not own.
+
+`"post-submit"` (the default, and the 0.1.1 behaviour) is "bytes may have
+gone out": a tag nobody here recognises proves nothing, so the answer is
+`"unknown"`. `"pre-submit"` is a failure caught while **building, simulating
+or signing** — an extension's own `PriceTooLow`, a validation error from the
+caller's code — where nothing has been sent by construction and the honest
+answer is `"not_applied"`.
 
 ### `Owner` (const)
 
@@ -1178,7 +1100,8 @@ The expiration the transaction was built with rides along, because it is what
 
 ```ts
 export declare class SigningError extends SigningError_base {
-  readonly cause: unknown
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -1327,11 +1250,12 @@ declare const Simulation: Schema
 //         readonly auxiliaryDataDigest: string | null;
 //     };
 //     readonly events: readonly {
+//         readonly sender: SuiAddress;
+//         readonly bcs: Uint8Array<ArrayBufferLike>;
 //         readonly packageId: ObjectId;
 //         readonly module: string;
-//         readonly sender: SuiAddress;
 //         readonly eventType: string;
-//         readonly bcs: Uint8Array<ArrayBufferLike>;
+//         readonly json?: unknown;
 //     }[];
 //     readonly balanceChanges: readonly {
 //         readonly coinType: CoinType;
@@ -1460,46 +1384,8 @@ decode so `0x2::sui::SUI` and its padded form compare equal.
 
 ```ts
 export declare class SubmissionUnknown extends SubmissionUnknown_base {
-  readonly cause: unknown
-  readonly digest: Digest
-  readonly signed: {
-      readonly digest: Digest;
-      readonly bytes: Uint8Array<ArrayBufferLike>;
-      readonly sender: SuiAddress;
-      readonly signatures: readonly Signature[];
-      readonly expiration?: {
-          readonly $kind: "None";
-          readonly None: true;
-      } | {
-          readonly $kind: "Epoch";
-          readonly Epoch: bigint;
-      } | {
-          readonly $kind: "ValidDuring";
-          readonly ValidDuring: {
-              readonly minEpoch: bigint | null;
-              readonly maxEpoch: bigint | null;
-              readonly minTimestamp: bigint | null;
-              readonly maxTimestamp: bigint | null;
-              readonly chain: string;
-              readonly nonce: number;
-          };
-      } | {
-          readonly $kind: "Validity";
-          readonly Validity: {
-              readonly allowedProposers: {
-                  readonly epoch: bigint;
-                  readonly proposers: readonly number[];
-              } | null;
-              readonly minEpoch: bigint | null;
-              readonly maxEpoch: bigint | null;
-              readonly minTimestamp: bigint | null;
-              readonly maxTimestamp: bigint | null;
-              readonly chain: string;
-              readonly nonce: number;
-          };
-      } | undefined;
-      readonly chain?: string | undefined;
-  } | undefined
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -1826,6 +1712,26 @@ export interface SuiLayerOptions {
      * network are regenerated, so set this when the program must pin one.
      */
     readonly chainId?: string;
+    /**
+     * How to retry the one `getChainIdentifier` this layer makes, when it fails
+     * with a **retryable** `TransportError`.
+     *
+     * It matters more than one round trip usually would, because of what holds
+     * the result: a `ManagedRuntime` — which is how a browser app, a Worker or a
+     * Durable Object keeps one runtime per isolate — **memoizes the layer build,
+     * failure included, for its whole lifetime**. One unlucky request at boot and
+     * every later use of that runtime fails with the same stale
+     * `TransportError`, until something disposes it. A short schedule here is the
+     * cheap half of the cure; disposing the runtime when its build failed is the
+     * other half (see the guide's "Application consumers" section), and
+     * `layerNoDepsPinned` avoids the read altogether when the chain id is already
+     * known.
+     *
+     * Unset, the read is made once, as it always was.
+     *
+     * @since 0.1.2
+     */
+    readonly retry?: Schedule.Schedule<unknown, TransportError>;
 }
 ```
 
@@ -2063,6 +1969,27 @@ export interface SuiService {
      *
      * Fails with: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`,
      * `DecodeError`, `TransportError`.
+     *
+     * @since 0.1.2
+     */
+    readonly getObjectsStrict: {
+        <S>(ids: ReadonlyArray<ObjectId>, opts: {
+            readonly schema: Schema.Codec<S, Uint8Array>;
+            readonly expectedType?: string;
+        }): Effect.Effect<ReadonlyArray<SuiObject<S>>, BatchItemError | TransportError>;
+        (ids: ReadonlyArray<ObjectId>, opts?: {
+            readonly schema?: undefined;
+            readonly expectedType?: string;
+        }): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>;
+    };
+    /**
+     * {@link getObjectsStrict} under its 0.1.0 name.
+     *
+     * `getObjectsOrFail` reads, out of context, as though failing were the point
+     * — `getObjects(ids).orFail()` — rather than as the strictness of the read.
+     * The two are the same function.
+     *
+     * @deprecated Use `getObjectsStrict`. This alias stays for 0.1.x.
      */
     readonly getObjectsOrFail: {
         <S>(ids: ReadonlyArray<ObjectId>, opts: {
@@ -2357,7 +2284,8 @@ The failures of a transaction lookup.
 
 ```ts
 export declare class TransactionNotFound extends TransactionNotFound_base {
-  readonly digest: Digest
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -2398,6 +2326,8 @@ export declare class TransportError extends TransportError_base {
      * ```
      */
     static readonly fromUnknown: (method: string, cause: unknown, retryable?: boolean) => TransportError;
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -2428,9 +2358,8 @@ Mirrors `SuiClientTypes.UnchangedConsensusObject`.
 
 ```ts
 export declare class UnexpectedEffects extends UnexpectedEffects_base {
-  readonly digest: Digest
-  readonly expected: string
-  readonly found: readonly ObjectId[]
+    /** The one actionable line `SuiError.describe` produces for this error. */
+    get message(): string;
 }
 ```
 
@@ -2577,7 +2506,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-37 exported symbols.
+42 exported symbols.
 
 ### `Built` (const)
 
@@ -2873,13 +2802,43 @@ export type ReconcileInput = Digest | Signed | SubmissionUnknown;
 
 What `Tx.reconcile` can be asked about.
 
-### `Reconciled` (type)
+### `Reconciled` (const)
 
 ```ts
-export type Reconciled = Executed | ExecutionFailed | NotApplied | SubmissionUnknown;
+declare const Reconciled: Schema
+// decodes to:
+// {
+//     readonly _tag: "NotApplied";
+//     readonly error: NotApplied;
+// } | {
+//     readonly _tag: "Executed";
+//     readonly executed: Executed;
+// } | {
+//     readonly _tag: "ExecutionFailed";
+//     readonly error: ExecutionFailed;
+// } | {
+//     readonly _tag: "SubmissionUnknown";
+//     readonly error: SubmissionUnknown;
+// }
 ```
 
-What one entry of `Tx.reconcileAll` settled to.
+What one entry of `Tx.reconcileAll` settled to, as a tagged union.
+
+Every case carries **one** discriminator in the same place: `_tag` is
+`"Executed"`, `"ExecutionFailed"`, `"NotApplied"` or `"SubmissionUnknown"`,
+and the payload is `executed` for the first and `error` for the other three.
+Before 0.1.2 this was a bare union of an `Executed` (which has no `_tag`) and
+three errors (which do), so the only way to tell a success from a failure was
+`"_tag" in entry` — a shape nothing could `Schema.match` or serialize.
+
+### `ReconciledOutcome` (type)
+
+```ts
+export type ReconciledOutcome = Executed | ExecutionFailed | NotApplied | SubmissionUnknown;
+```
+
+The shape `Tx.reconcileAll` returned in 0.1.0 and 0.1.1: the four outcomes as
+a bare union, with the successful one carrying no discriminator at all.
 
 ### `RemoteSigner` (interface)
 
@@ -3094,13 +3053,37 @@ Every decision `Tx.build`, `Tx.submit` and `Tx.reconcile` read from context.
 ### `SubmitError` (type)
 
 ```ts
-export type SubmitError = ExecutionFailed | NotApplied | SubmissionUnknown | JournalError;
+export type SubmitError = ExecutionFailed | NotApplied | SubmissionUnknown | JournalError | TransportError;
 ```
 
 Everything `submit` can fail with, as one name.
 
 An extension that wraps a submission spells its own errors plus this, rather
 than repeating four tags that will grow with the taxonomy.
+
+### `SubmitViaError` (type)
+
+```ts
+export type SubmitViaError = ExecutionFailed | NotApplied | SubmissionUnknown | JournalError;
+```
+
+Everything `submitVia` can fail with, before the sender's own errors.
+
+### `SubmitViaReply` (type)
+
+```ts
+export type SubmitViaReply = unknown;
+```
+
+What a third party answers when it has submitted your bytes.
+
+Three shapes are understood, in this order: an SDK `TransactionResult` (the
+service ran `executeTransaction` and passed the whole thing on), a reduced
+execute envelope (anything with a `digest` or an `effects`, decoded through
+`Executed.fromPartial`), and a bare digest string. Anything else — a
+`void`, an acknowledgement with no digest — means "ask the chain", and
+`submitVia` reconciles by the digest it already has, which is the digest of
+the bytes it handed over.
 
 ### `TransactionExpiration` (const)
 
@@ -3306,7 +3289,219 @@ declare const Tx: {
         readonly gasOwner: SuiAddress;
     }) => (recipe: Recipe) => Recipe;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
+    readonly submitVia: <E, R>(signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    }, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
     readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, TransportError | ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
+    readonly recorded: (digest: Digest => Effect.Effect<Option.Option<{
+        readonly _tag: "Unknown";
+        readonly digest: Digest;
+        readonly signed: {
+            readonly digest: Digest;
+            readonly sender: SuiAddress;
+            readonly signatures: readonly Signature[];
+            readonly bytes: Uint8Array<ArrayBufferLike>;
+            readonly chain?: string | undefined;
+            readonly expiration?: {
+                readonly $kind: "None";
+                readonly None: true;
+            } | {
+                readonly $kind: "Epoch";
+                readonly Epoch: bigint;
+            } | {
+                readonly $kind: "ValidDuring";
+                readonly ValidDuring: {
+                    readonly minEpoch: bigint | null;
+                    readonly maxEpoch: bigint | null;
+                    readonly minTimestamp: bigint | null;
+                    readonly maxTimestamp: bigint | null;
+                    readonly chain: string;
+                    readonly nonce: number;
+                };
+            } | {
+                readonly $kind: "Validity";
+                readonly Validity: {
+                    readonly allowedProposers: {
+                        readonly epoch: bigint;
+                        readonly proposers: readonly number[];
+                    } | null;
+                    readonly minEpoch: bigint | null;
+                    readonly maxEpoch: bigint | null;
+                    readonly minTimestamp: bigint | null;
+                    readonly maxTimestamp: bigint | null;
+                    readonly chain: string;
+                    readonly nonce: number;
+                };
+            } | undefined;
+        };
+        readonly lastError: string;
+        readonly attempts: number;
+        readonly at: DateTime.Utc;
+    } | {
+        readonly _tag: "NotApplied";
+        readonly digest: Digest;
+        readonly evidence: "expired" | "inputConsumed";
+        readonly at: DateTime.Utc;
+    } | {
+        readonly _tag: "Signed";
+        readonly digest: Digest;
+        readonly signed: {
+            readonly digest: Digest;
+            readonly sender: SuiAddress;
+            readonly signatures: readonly Signature[];
+            readonly bytes: Uint8Array<ArrayBufferLike>;
+            readonly chain?: string | undefined;
+            readonly expiration?: {
+                readonly $kind: "None";
+                readonly None: true;
+            } | {
+                readonly $kind: "Epoch";
+                readonly Epoch: bigint;
+            } | {
+                readonly $kind: "ValidDuring";
+                readonly ValidDuring: {
+                    readonly minEpoch: bigint | null;
+                    readonly maxEpoch: bigint | null;
+                    readonly minTimestamp: bigint | null;
+                    readonly maxTimestamp: bigint | null;
+                    readonly chain: string;
+                    readonly nonce: number;
+                };
+            } | {
+                readonly $kind: "Validity";
+                readonly Validity: {
+                    readonly allowedProposers: {
+                        readonly epoch: bigint;
+                        readonly proposers: readonly number[];
+                    } | null;
+                    readonly minEpoch: bigint | null;
+                    readonly maxEpoch: bigint | null;
+                    readonly minTimestamp: bigint | null;
+                    readonly maxTimestamp: bigint | null;
+                    readonly chain: string;
+                    readonly nonce: number;
+                };
+            } | undefined;
+        };
+        readonly signedAt: DateTime.Utc;
+    } | {
+        readonly at: DateTime.Utc;
+        readonly digest: Digest;
+        readonly _tag: "Executed";
+        readonly checkpoint?: bigint | undefined;
+    } | {
+        readonly _tag: "Failed";
+        readonly digest: Digest;
+        readonly reason: {
+            readonly $kind: "MoveAbort";
+            readonly MoveAbort: {
+                readonly abortCode: bigint;
+                readonly location?: {
+                    readonly function?: number | undefined;
+                    readonly package?: string | undefined;
+                    readonly module?: string | undefined;
+                    readonly functionName?: string | undefined;
+                    readonly instruction?: number | undefined;
+                } | undefined;
+                readonly cleverError?: {
+                    readonly value?: string | undefined;
+                    readonly errorCode?: number | undefined;
+                    readonly lineNumber?: number | undefined;
+                    readonly constantName?: string | undefined;
+                    readonly constantType?: string | undefined;
+                } | undefined;
+            };
+        } | {
+            readonly $kind: "SizeError";
+            readonly SizeError: {
+                readonly name: string;
+                readonly size: number;
+                readonly maxSize: number;
+            };
+        } | {
+            readonly $kind: "CommandArgumentError";
+            readonly CommandArgumentError: {
+                readonly argument: number;
+                readonly name: string;
+            };
+        } | {
+            readonly $kind: "TypeArgumentError";
+            readonly TypeArgumentError: {
+                readonly typeArgument: number;
+                readonly name: string;
+            };
+        } | {
+            readonly $kind: "PackageUpgradeError";
+            readonly PackageUpgradeError: {
+                readonly name: string;
+                readonly digest?: string | undefined;
+                readonly packageId?: string | undefined;
+            };
+        } | {
+            readonly $kind: "IndexError";
+            readonly IndexError: {
+                readonly index?: number | undefined;
+                readonly subresult?: number | undefined;
+            };
+        } | {
+            readonly $kind: "CoinDenyListError";
+            readonly CoinDenyListError: {
+                readonly coinType: string;
+                readonly name: string;
+                readonly address?: string | undefined;
+            };
+        } | {
+            readonly $kind: "CongestedObjects";
+            readonly CongestedObjects: {
+                readonly name: string;
+                readonly objects: readonly string[];
+            };
+        } | {
+            readonly $kind: "ObjectIdError";
+            readonly ObjectIdError: {
+                readonly objectId: string;
+                readonly name?: string | undefined;
+            };
+        } | {
+            readonly $kind: "Unknown";
+        };
+        readonly at: DateTime.Utc;
+    }>, JournalError, never>;
     readonly run: (recipe: Transaction | Recipe, opts: {
         readonly signer: Signer;
         readonly gasOwner?: SuiAddress;
@@ -3315,8 +3510,42 @@ declare const Tx: {
          * the bytes name a gas owner that is not the sender.
          */
         readonly sponsor?: Signer;
+        /**
+         * Called with the signed bytes **after every signature is on them and
+         * before the first `executeTransaction`**, which is the one moment a
+         * consumer's own record has to be written: the digest is final from here
+         * on, and anything that happens next may have reached the network.
+         *
+         * `Tx.submit` already writes its `Signed` journal entry at this point; this
+         * is for the record the journal does not hold — a domain row joining the
+         * digest to a batch, an outbox, a log line an operator greps. It runs
+         * inside the sender lock, so it is ordered with the submission it belongs
+         * to.
+         *
+         * Failing it fails the run **before anything is sent**, which is why its
+         * error is a `JournalError`: that is the taxonomy's "the record could not
+         * be written and nothing has gone out yet", it is already in `Tx.run`'s
+         * union, and it is `not_applied`, so the documented retry idiom is correct.
+         * Map your own persistence failure into it
+         * (`Effect.mapError((cause) => new JournalError({ cause }))`).
+         *
+         * @since 0.1.2
+         */
+        readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
     }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>;
-    readonly reconcileAll: () => Effect.Effect<readonly Reconciled[], TransportError | JournalError, Sui>;
+    readonly reconcileAll: () => Effect.Effect<readonly ({
+        readonly _tag: "ExecutionFailed";
+        readonly error: ExecutionFailed;
+    } | {
+        readonly _tag: "SubmissionUnknown";
+        readonly error: SubmissionUnknown;
+    } | {
+        readonly _tag: "NotApplied";
+        readonly error: NotApplied;
+    } | {
+        readonly _tag: "Executed";
+        readonly executed: Executed;
+    })[], TransportError | JournalError, Sui>;
 }
 ```
 
@@ -3526,15 +3755,23 @@ be a security bug, not a convenience.
 declare const fromConfig: (name?: string) => Effect.Effect<Signer, Config.ConfigError>
 ```
 
-Reads a Bech32 `suiprivkey1…` secret key from configuration and builds the
-signer for whichever of the three schemes its flag names.
+Reads a secret key from configuration and builds its signer.
+
+Two spellings, told apart by the text itself:
+
+- a **Bech32 `suiprivkey1…`**, whose flag names one of the three schemes;
+- a **32-byte hex seed** (64 hex characters, `0x` optional), which carries no
+  scheme and is read as **Ed25519** — the default every Sui tool uses for a
+  raw seed. This is what a secret manager or another language's SDK hands
+  over, and reading it here is what keeps `fromHex` and the decoded bytes out
+  of application code.
 
 The key is read with `Config.redacted`, and the decoded bytes never leave
 this function. Neither does anything derived from them: the failure carries
 one fixed sentence and no `cause`, because the decoder's own message quotes
 the input it rejected.
 
-**Fails with: `ConfigError` when the variable is missing, is not a Bech32 Sui private key, or names a scheme that has no keypair class (`MultiSig`, `ZkLogin`, `Passkey` — use {@link remote} for those).**
+**Fails with: `ConfigError` when the variable is missing, is neither spelling, or names a scheme that has no keypair class (`MultiSig`, `ZkLogin`, `Passkey` — use {@link remote} for those).**
 
 ### `fromKeypair` (const)
 
@@ -3563,12 +3800,29 @@ and `signPersonalMessage`. Nothing here needs the secret, so nothing here
 needs a keypair, and the `Signer` this returns exposes no secret material
 either.
 
+**`toSuiAddress()` and `getKeyScheme()` are read here, synchronously**, and
+the address and scheme of the returned `Signer` are whatever they answered at
+this moment: a credential that changes accounts later is a different
+`Signer`, built again. A test double therefore needs both of those methods,
+not only `signTransaction` — a double without `getKeyScheme` used to produce
+`scheme: undefined` and nothing complained until a validator did.
+
+**Clear-signing inputs are the SDK signer's own concern.** The Ledger signer
+takes `signTransaction(bytes, bcsObjects?, resolution?)` and resolves those
+extra arguments through the client it was constructed with; this passes only
+the bytes, which is the whole of the base `Signer` contract. A device that
+needs more than the bytes gets it from its own client, or from
+`remote`.
+
 For a credential that is not an SDK `Signer` at all — a remote service, a
 hardware device behind your own protocol — use `remote`, which takes
 Effects and the address to sign as.
 
-Never fails: a bad address or signature surfaces as a `SigningError` from the
-member that produced it, not from construction.
+**Throws** a `TypeError` naming the missing member when the argument is not
+an SDK signer — that is a wiring mistake in the caller, not a runtime
+failure a program recovers from. Otherwise never fails: a bad address or
+signature surfaces as a `SigningError` from the member that produced it, not
+from construction.
 
 ### `isUnresolved` (const)
 
@@ -3909,11 +4163,28 @@ always `SubmissionUnknown`. Pass the `Signed` bytes (or the
 ### `reconcileAll` (const)
 
 ```ts
-declare const reconcileAll: () => Effect.Effect<readonly Reconciled[], TransportError | JournalError, Sui>
+declare const reconcileAll: () => Effect.Effect<readonly ({
+    readonly _tag: "ExecutionFailed";
+    readonly error: ExecutionFailed;
+} | {
+    readonly _tag: "SubmissionUnknown";
+    readonly error: SubmissionUnknown;
+} | {
+    readonly _tag: "NotApplied";
+    readonly error: NotApplied;
+} | {
+    readonly _tag: "Executed";
+    readonly executed: Executed;
+})[], TransportError | JournalError, Sui>
 ```
 
 Settles every unresolved entry in the journal: the explicit startup call a
 long-lived application makes after building a durable `Journal`.
+
+**Only unresolved entries come back.** `Signed` and `Unknown` are the tags
+that still need an answer; a digest that already settled is not in the
+journal's unresolved index and is not in this array. Ask about one of those
+with `recorded`.
 
 Nothing here fails per entry: each one settles to an `Executed`, an
 `ExecutionFailed`, a `NotApplied` or a `SubmissionUnknown`, in the order the
@@ -3929,6 +4200,201 @@ that fails after an entry has been settled is logged and the answer stands,
 the same rule `Tx.submit` follows.
 
 **Fails with: `JournalError`, `TransportError`.**
+
+### `recorded` (const)
+
+```ts
+declare const recorded: (digest: Digest => Effect.Effect<Option.Option<{
+    readonly _tag: "Unknown";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly lastError: string;
+    readonly attempts: number;
+    readonly at: DateTime.Utc;
+} | {
+    readonly _tag: "NotApplied";
+    readonly digest: Digest;
+    readonly evidence: "expired" | "inputConsumed";
+    readonly at: DateTime.Utc;
+} | {
+    readonly _tag: "Signed";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly signedAt: DateTime.Utc;
+} | {
+    readonly at: DateTime.Utc;
+    readonly digest: Digest;
+    readonly _tag: "Executed";
+    readonly checkpoint?: bigint | undefined;
+} | {
+    readonly _tag: "Failed";
+    readonly digest: Digest;
+    readonly reason: {
+        readonly $kind: "MoveAbort";
+        readonly MoveAbort: {
+            readonly abortCode: bigint;
+            readonly location?: {
+                readonly function?: number | undefined;
+                readonly package?: string | undefined;
+                readonly module?: string | undefined;
+                readonly functionName?: string | undefined;
+                readonly instruction?: number | undefined;
+            } | undefined;
+            readonly cleverError?: {
+                readonly value?: string | undefined;
+                readonly errorCode?: number | undefined;
+                readonly lineNumber?: number | undefined;
+                readonly constantName?: string | undefined;
+                readonly constantType?: string | undefined;
+            } | undefined;
+        };
+    } | {
+        readonly $kind: "SizeError";
+        readonly SizeError: {
+            readonly name: string;
+            readonly size: number;
+            readonly maxSize: number;
+        };
+    } | {
+        readonly $kind: "CommandArgumentError";
+        readonly CommandArgumentError: {
+            readonly argument: number;
+            readonly name: string;
+        };
+    } | {
+        readonly $kind: "TypeArgumentError";
+        readonly TypeArgumentError: {
+            readonly typeArgument: number;
+            readonly name: string;
+        };
+    } | {
+        readonly $kind: "PackageUpgradeError";
+        readonly PackageUpgradeError: {
+            readonly name: string;
+            readonly digest?: string | undefined;
+            readonly packageId?: string | undefined;
+        };
+    } | {
+        readonly $kind: "IndexError";
+        readonly IndexError: {
+            readonly index?: number | undefined;
+            readonly subresult?: number | undefined;
+        };
+    } | {
+        readonly $kind: "CoinDenyListError";
+        readonly CoinDenyListError: {
+            readonly coinType: string;
+            readonly name: string;
+            readonly address?: string | undefined;
+        };
+    } | {
+        readonly $kind: "CongestedObjects";
+        readonly CongestedObjects: {
+            readonly name: string;
+            readonly objects: readonly string[];
+        };
+    } | {
+        readonly $kind: "ObjectIdError";
+        readonly ObjectIdError: {
+            readonly objectId: string;
+            readonly name?: string | undefined;
+        };
+    } | {
+        readonly $kind: "Unknown";
+    };
+    readonly at: DateTime.Utc;
+}>, JournalError, never>
+```
+
+What the journal recorded for one digest, if anything.
+
+`Tx.reconcileAll` returns **only the entries that were still unresolved**,
+because those are the ones it had work to do about; a transaction that had
+already settled — executed, failed, or proven never applied — is not in its
+answer and never will be. This is how to ask about one of those: the entry is
+`Executed`, `Failed` or `NotApplied` for a settled digest, `Signed` or
+`Unknown` for one still in flight, and `None` for a digest this journal has
+never seen (including every digest at all, when the journal is the in-memory
+default and the process restarted).
+
+It is exactly `(yield* Journal).get(digest)`, named so that the recovery path
+does not have to reach for the reference.
+
+**Fails with: `JournalError`.**
 
 ### `remote` (const)
 
@@ -3957,6 +4423,28 @@ declare const run: (recipe: Transaction | Recipe, opts: {
      * the bytes name a gas owner that is not the sender.
      */
     readonly sponsor?: Signer;
+    /**
+     * Called with the signed bytes **after every signature is on them and
+     * before the first `executeTransaction`**, which is the one moment a
+     * consumer's own record has to be written: the digest is final from here
+     * on, and anything that happens next may have reached the network.
+     *
+     * `Tx.submit` already writes its `Signed` journal entry at this point; this
+     * is for the record the journal does not hold — a domain row joining the
+     * digest to a batch, an outbox, a log line an operator greps. It runs
+     * inside the sender lock, so it is ordered with the submission it belongs
+     * to.
+     *
+     * Failing it fails the run **before anything is sent**, which is why its
+     * error is a `JournalError`: that is the taxonomy's "the record could not
+     * be written and nothing has gone out yet", it is already in `Tx.run`'s
+     * union, and it is `not_applied`, so the documented retry idiom is correct.
+     * Map your own persistence failure into it
+     * (`Effect.mapError((cause) => new JournalError({ cause }))`).
+     *
+     * @since 0.1.2
+     */
+    readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
 }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>
 ```
 
@@ -3988,6 +4476,14 @@ missing, before anything is built when the gas owner was given as an option
 and immediately after the build when it came out of the recipe. Use the
 explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
 two parties cannot both sign in one process.
+
+**`onSigned` is the hook between signing and sending.** A program with its
+own record to keep — a batch row, an outbox, an idempotency key — has to
+write the digest before the first send, and that used to mean giving up
+`Tx.run` and reassembling `withSenderLock(build → sign → record → submit)` by
+hand. Pass `onSigned` instead: it runs inside the sender lock, after the last
+signature and before `Tx.submit`'s first `executeTransaction`, and failing it
+fails the run with nothing sent.
 
 **Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`).**
 
@@ -4113,9 +4609,16 @@ the transaction that was already signed. When the retries run out it runs
 `Tx.reconcile`, which either finds the transaction, proves it never applied,
 or says it does not know.
 
-`TransportError` never escapes: once bytes may have been sent, "the network
-was unreachable" is not an answer a caller can act on, so it becomes
-`SubmissionUnknown` carrying the signed bytes.
+`TransportError` almost never escapes: once bytes may have been sent, "the
+network was unreachable" is not an answer a caller can act on, so it becomes
+`SubmissionUnknown` carrying the signed bytes. **The one exception is a node
+that refused the request outright** — gRPC `INVALID_ARGUMENT`, which is what
+a validator answers for malformed bytes or for a sponsored transaction
+carrying one signature. That answer came from the node, it is final, and
+nothing was executed, so it is reported as the `TransportError` it is rather
+than reconciled: a reconcile would go on to ask "is this digest on chain?",
+a question about a transaction that was never sent, and a lagging or scripted
+node can answer it yes.
 
 `JournalError` can only come from the `Signed` write, before anything has
 been sent. Once the network has answered, a journal write that fails is
@@ -4123,7 +4626,77 @@ logged with `Effect.logError` and the answer stands, because "the journal is
 broken" is not a thing a caller can act on and reporting it in place of a
 charged `ExecutionFailed` would invite a second submission.
 
-**Fails with: `ExecutionFailed` (applied on chain and failed; gas was charged), `NotApplied` (provably never applied), `SubmissionUnknown` (the outcome is not known and the bytes are in the error), `JournalError` (only before the first send).**
+**Fails with: `ExecutionFailed` (applied on chain and failed; gas was charged), `NotApplied` (provably never applied), `SubmissionUnknown` (the outcome is not known and the bytes are in the error), `JournalError` (only before the first send), `TransportError` (only `INVALID_ARGUMENT`: the node refused the submission and nothing was executed).**
+
+### `submitVia` (const)
+
+```ts
+declare const submitVia: <E, R>(signed: {
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly signatures: readonly Signature[];
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+}, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>
+```
+
+Submits through **someone else** — a relay, a sponsorship service, a backend
+that holds the only key allowed to talk to the node — and keeps the journal
+and the evidence rules that `Tx.submit` would have kept.
+
+The bytes never reach `executeTransaction` here; `send` does whatever the
+service needs (an HTTP POST, a queue, another process) and answers with
+whatever the service returns. What this owns is everything around it:
+
+- a `Signed` journal entry is written **before** `send` is called, so a crash
+  between here and the service leaves the same record a direct submit leaves;
+- `send` is called **once**. A third party's submit is not known to be
+  idempotent and re-sending is not this function's decision;
+- the reply is turned into an `Executed` when it carries one (see
+  `SubmitViaReply`), and otherwise the chain is asked — by the digest
+  of the bytes that were handed over, which a co-signature does not change;
+- a failure from `send` is **ambiguous** unless it says otherwise, so it ends
+  in `Tx.reconcile` with the full evidence rules: the ordered expiry check,
+  the chain-identity guard, the versioned consumer check. A sender error that
+  **declares** `outcome: "not_applied"` on the instance — a 400 from the
+  service, a refusal before anything went out — is taken at its word and
+  fails straight through without spending a reconcile. A `TransportError` is
+  not that: the taxonomy calls it `not_applied`, but a transport failure
+  *talking to the relay* is exactly the ambiguous case, so it reconciles;
+- every terminal answer is journalled, exactly as `Tx.submit` journals it.
+
+**Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown` (carrying the signed bytes, with the sender's failure as its `cause`), `JournalError` (only from the write before `send`), and `E` — whatever `send` fails with — when that error declares `outcome: "not_applied"`.**
 
 ## `@unconfirmed/sui-effect/journal`
 
@@ -4488,7 +5061,28 @@ added to the value itself.
 ## `@unconfirmed/sui-effect/script`
 
 
-9 exported symbols.
+11 exported symbols.
+
+### `ReportOptions` (interface)
+
+```ts
+export interface ReportOptions {
+    /** Where the lines go, one at a time. Defaults to `process.stderr`. */
+    readonly stderr?: (line: string) => void;
+    /**
+     * The journal the program ran with, for the unresolved entries.
+     *
+     * A program with its own `ManagedRuntime` has to hand it over — reading the
+     * bare `Journal` reference here would look in the process-wide in-memory
+     * default and find nothing, which is precisely wrong for the program that
+     * provided a durable one. Left out, the default reference is read, which is
+     * right for a program that never provided a journal at all.
+     */
+    readonly journal?: JournalService;
+}
+```
+
+What `report` needs beyond the `Exit`.
 
 ### `Script` (class)
 
@@ -4537,6 +5131,8 @@ export declare class Script extends Script_base {
     static readonly exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number;
     /** See {@link run}. */
     static readonly run: <A, E>(effect: Effect.Effect<A, E, Script | Sui | SuiCore>, options?: ScriptRunOptions) => Promise<number>;
+    /** See {@link report}. */
+    static readonly report: <A, E>(exit: Exit.Exit<A, E>, options?: ReportOptions) => Promise<number>;
 }
 ```
 
@@ -4663,6 +5259,26 @@ script that means mainnet has to say so twice, in `SUI_NETWORK` and in
 
 **Fails with: `ConfigError`.**
 
+### `report` (const)
+
+```ts
+declare const report: <A, E>(exit: Exit.Exit<A, E>, options?: ReportOptions) => Promise<number>
+```
+
+Prints what `run` prints, and answers the exit code, for a program that
+owns its own process.
+
+`Script.run` is a whole entrypoint: it builds the layer, forks the root
+fiber, installs signal handlers and exits. A CLI with its own argv parser and
+twenty subcommands has all of that already and still wants the two things
+`run` does at the end — one diagnostic line per failure (with the bytes of a
+`SubmissionUnknown`), and every unresolved journal entry on a non-zero exit —
+plus the code itself. That is this: hand it the `Exit` of whatever you ran,
+get the lines on stderr and the number back, and call `process.exitCode = …`
+yourself rather than `process.exit`, so buffered output still flushes.
+
+**Never fails.**
+
 ### `run` (const)
 
 ```ts
@@ -4699,7 +5315,7 @@ Returns the exit code as well as passing it to `exit`, so a test can inject
 ## `@unconfirmed/sui-effect/testing`
 
 
-16 exported symbols.
+17 exported symbols.
 
 ### `CLOCK_TYPE` (const)
 
@@ -4727,6 +5343,19 @@ declare const DEFAULT_EPOCH = 100n
 ```
 
 The epoch the fake reports when a script does not set one.
+
+### `FakeBalance` (interface)
+
+```ts
+export interface FakeBalance extends SuiClientTypes.Balance {
+    readonly owner?: string;
+}
+```
+
+A balance the fake serves, optionally for one owner.
+
+`owner` is the address this balance belongs to. Left out, the entry answers
+for **any** owner, which is what every script written before 0.1.2 assumed.
 
 ### `FakeChange` (interface)
 
@@ -4860,7 +5489,29 @@ export interface FakeScript {
     readonly coins?: ReadonlyArray<SuiClientTypes.Coin>;
     /** The gas budget the resolve plugin sets when a transaction has none. */
     readonly gasBudget?: bigint;
-    readonly balances?: ReadonlyArray<SuiClientTypes.Balance>;
+    /**
+     * The balances `getBalance` and `listBalances` serve.
+     *
+     * Keyed by **owner and coin type**: an entry with an `owner` answers only for
+     * that address, and one without answers for any, which is what a script
+     * written before 0.1.2 meant. A `getBalance` for an owner and coin type no
+     * entry names answers zero, the way a node does for an address that holds
+     * none of that coin.
+     */
+    readonly balances?: ReadonlyArray<FakeBalance>;
+    /**
+     * Scripted outcomes for `getObject`, oldest first; the last repeats forever.
+     *
+     * This is transport-error injection on a **read**: `FakeOutcome.transportError`
+     * and `FakeOutcome.timeoutThen` are what it is for, and they are how a test
+     * drives `SuiCore`'s read retry policy or an extension's own fallback.
+     * `FakeOutcome.notFound` answers the way a missing object does
+     * (`ObjectNotFound`). A `succeed` entry — and an empty or exhausted script —
+     * means "serve the object map", which is the normal behaviour.
+     *
+     * @since 0.1.2
+     */
+    readonly getObject?: ReadonlyArray<FakeOutcome>;
     /**
      * What `getCoinMetadata` answers, keyed by coin type.
      *
@@ -5021,7 +5672,7 @@ export interface SuiCoreFakeState {
      */
     readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void>;
     /** Replaces the remaining scripted outcomes of a method. */
-    readonly setOutcomes: (method: "simulate" | "execute" | "getTransaction" | "buildSimulate", outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void>;
+    readonly setOutcomes: (method: "simulate" | "execute" | "getTransaction" | "buildSimulate" | "getObject", outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void>;
 }
 ```
 
@@ -5043,6 +5694,7 @@ declare const SuiTest: {
     readonly scriptExecute: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
     readonly scriptSimulate: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
     readonly scriptGetTransaction: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
+    readonly scriptGetObject: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
     readonly calls: (method?: string) => Effect.Effect<ReadonlyArray<RecordedCall>, never, SuiCoreFake>;
 }
 ```
@@ -6144,7 +6796,7 @@ const make = (
         Effect.flatMap((raw) =>
           decodeAddress(raw).pipe(
             Effect.mapError((issue) =>
-              new DecodeError({ expectedType: "SuiAddress", issue: issue.message })
+              new DecodeError({ expectedType: "SuiAddress", kind: "shape", issue: issue.message })
             )
           )
         ),

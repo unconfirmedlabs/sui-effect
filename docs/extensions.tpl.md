@@ -89,6 +89,36 @@ nothing happened — answering `"not_applied"` would tell the documented retry
 idiom to send again. The `"not_applied"` default is for @unconfirmed/sui-effect's own
 taxonomy, not for yours.
 
+**Tag strings are namespaced by whoever defined them, and sui-effect's are
+not.** @unconfirmed/sui-effect's own tags are bare — `TransportError`,
+`ObjectNotFound`, `DecodeError` — while an extension prefixes its own, so a
+platform's tag is `partyos/PartyNotFound` or `EscrowNotFound` depending on the
+convention that package chose. `Effect.catchTag` matches the string exactly, so
+**copy the tag from the installed package**, never from a migration note or
+from memory: a `catchTag("PartyNotFound")` against a package that ships
+`partyos/PartyNotFound` compiles (the union is open at the string level in
+neither direction you expect) or silently never fires, and a README that
+disagrees with the class is the single most common conversion bug. When you
+rename or re-prefix a tag, that is a breaking change and belongs in your
+changelog with the old and the new string side by side.
+
+**`DecodeError` carries a `kind`, and that is what to branch on.** `"type"` is
+"this object is not of the type I asked for" — the one a read service answers
+with a 404 or a `filter`. `"bytes"` is "the type matched and the BCS did not
+parse", which is a layout mismatch between your package and the chain and must
+never be swallowed. `"shape"` is a domain schema refusing an already-parsed
+value. The `issue` string is for a human and its wording changes between
+releases; branching on it is how a foreign-object 404 quietly starts hiding a
+real decode bug.
+
+**`SuiError.outcome` takes a phase.** The default (`"post-submit"`) answers
+`"unknown"` for a tag it does not recognise, because after a submission an
+unfamiliar error is not evidence that nothing was sent. In a `catchAll` that can
+only be reached **before** a submission — validation, a build, a signature —
+pass `{ phase: "pre-submit" }` and an unrecognised tag becomes `"not_applied"`,
+which is true by construction there. `SuiError.isTaxonomy(error)` is the same
+question one level lower.
+
 Do not invent an error for something the taxonomy already names. A node that
 could not be reached is a `TransportError`; bytes that did not decode are a
 `DecodeError`; a transaction that aborted on chain is an `ExecutionFailed`; a
@@ -347,7 +377,8 @@ out of fifty is not a failed read. Two idioms, and you should pick deliberately:
   `results.filter(Result.isSuccess).map((result) => result.success)`, or
   `Result.getOrElse(result, () => fallback)` per item, or a `Map` keyed by id so
   a caller can ask about one;
-- **hard** — every id must be there: `sui.getObjectsOrFail(ids, opts)`, which
+- **hard** — every id must be there: `sui.getObjectsStrict(ids, opts)` (named
+  `getObjectsOrFail` before 0.1.2, and still reachable under that name), which
   fails with the first item's error (`ObjectNotFound`, `ObjectDeleted`,
   `ObjectUnavailable` or `DecodeError`) and otherwise hands back the objects in
   the order of the ids.
@@ -438,6 +469,66 @@ that set its own gas owner (anything built with `Tx.sponsored`) is caught too.
 An extension whose two parties cannot both sign in one process — the sponsor is
 a remote service, the sender is a wallet — uses the explicit lifecycle instead:
 `Tx.build`, `Tx.sign`, hand the bytes over, `Tx.cosign`, `Tx.submit`.
+
+### A signer double, for tests
+
+`Signer.fromSdkSigner` reads `toSuiAddress()` and `getKeyScheme()` **at
+construction** and rejects a value that has neither, so a partial double is a
+`TypeError` where it used to be `scheme: undefined` and silence. A double is
+`Signer.remote`, which takes exactly what a signer is:
+
+<!-- inline -->
+
+```ts
+const doubleSigner = (address: SuiAddress): Signer =>
+  Signer.remote({
+    address,
+    scheme: "ED25519",
+    signTransaction: () => Effect.succeed("AAAA…" as string) // any non-empty string decodes
+  })
+```
+
+For a test that actually submits, use a real keypair
+(`Signer.fromKeypair(Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(7)))`):
+the fake checks that the signatures cover the addresses the bytes name, and a
+fabricated signature only passes the count check.
+
+### Sponsored by an external service
+
+`Tx.run`'s `sponsor` and `Tx.cosign` both want a local `Signer`. A service that
+co-signs **and submits** on your behalf — a relayer, a sponsorship API — has
+neither, and `Tx.submit` is not the last step either, because the service sends
+the bytes. The supported sequence is:
+
+<!-- inline -->
+
+```ts
+const built = yield* Tx.build(Tx.sponsored({ sender, gasOwner })(recipe), {
+  sender,
+  gasOwner
+})
+const signed = yield* Tx.sign(built, signer)
+// The wire form: base64 bytes, and the serialized signature string the SDK
+// produces. `signed.signatures[0]` is the sender's; the service adds its own.
+const envelope = {
+  transactionBlockBytes: toBase64(signed.bytes),
+  signature: signed.signatures[0]!
+}
+const reply = yield* callTheSponsor(envelope)
+// Two ways to end, and both are supported:
+//   the service returned an execute envelope — decode it and keep the accessors
+const executed = yield* Executed.fromPartial(reply)
+//   or it returned only a digest — ask the chain yourself
+const settled = yield* Tx.reconcile(signed)
+```
+
+Three things to know. The digest does not change when the sponsor adds its
+signature, so `signed.digest` is the digest to record and to reconcile by.
+`Tx.reconcile(signed)` — passing the `Signed`, not the bare digest — is what
+gets the evidence rules, so a service that never sent the bytes ends as
+`NotApplied` rather than as an eternal `SubmissionUnknown`. And whatever the
+service returns is a **reduced** envelope: see "Relay and sponsor envelopes"
+below, and use `Executed.fromPartial` rather than `Schema.decodeUnknownSync`.
 
 ## 6. Layers
 
@@ -589,6 +680,35 @@ check the identifier. So a `warm` registration never detects a node on another
 chain. What catches it is the chain itself: `Tx.build` stamps that id on the
 transaction's expiration and a validator refuses bytes signed for another chain.
 Register lazily when the assertion is what you want.
+
+**Do not over-invest in testing the mismatch checks.** A consumer that reads
+both from one deployment manifest — `network: deployment.network` on the client
+and `chainId: deployment.chainIdentifier` on the registration — cannot make the
+network check and the chain-id check fire except by supplying an inconsistent
+pair on purpose. One test that a wrong `chainId` throws is worth having; a
+matrix over the combinations is testing the manifest, not the code.
+
+**In a browser, `warm` throws into your import graph.** The natural place for a
+registration in an SPA is module scope, and a throw there takes down the whole
+module — no error boundary, no console line a user can act on, just a blank
+page. Two patterns work: register lazily and `await client.ext.$ready()` in a
+boot step that has somewhere to put the failure; or keep the `warm`
+registration and wrap it, exporting the error instead of throwing it:
+
+<!-- inline -->
+
+```ts
+// sui-client.ts
+export let bootError: unknown
+export const client = (() => {
+  try {
+    return baseClient.$extend(escrow({ warm: { chainId } }))
+  } catch (cause) {
+    bootError = cause
+    return baseClient.$extend(escrow({})) // lazy: every call rejects, nothing throws
+  }
+})()
+```
 
 **Thread the chain id through your registration options**, the way
 `src/extension.ts` and `src/Platform.ts` both do, rather than relying on the
@@ -908,6 +1028,91 @@ a test that submits provides its own to stay isolated.
 
 @@ test/escrow.test.ts :: test("a retryable transport failure re-sends the identical bytes", async () => { :: })
 
+### Scripting a submit, and the traps in it
+
+Four things about the fake decide whether a submit test means anything.
+
+**`Tx.submit` asks `getTransaction` when it cannot get a clean answer.** A
+retryable transport failure, a timeout, anything that leaves the outcome open
+ends in `Tx.reconcile`, and `reconcile`'s first move is a `getTransaction` for
+the digest. So a script whose `getTransaction` is a `succeed` is saying "this
+transaction is on chain" — and a submit test that did not mean that gets a
+**success** out of a path it was trying to prove fails. Unless the test is
+modelling a landed transaction, script `getTransaction: [FakeOutcome.notFound()]`
+and let the evidence rules run.
+
+**A sponsored submit needs `Tx.cosign` first.** The fake refuses a submission
+whose signatures do not cover the addresses the bytes name — by count, and by
+the addresses recovered from the signatures themselves — the way a validator
+does, with a gRPC `INVALID_ARGUMENT`. `Tx.submit` reports that one outright as a
+`TransportError { retryable: false, status: "INVALID_ARGUMENT" }` rather than
+reconciling it, because the node refused the request and nothing was executed.
+So a sponsored-flow test builds with `Tx.sponsored`, signs with the sender,
+**`Tx.cosign`s with the sponsor**, and only then submits; `Tx.run(recipe, {
+signer, sponsor })` does all of that itself. Assert it, too — the signature
+count is on the recorded call:
+
+<!-- inline -->
+
+```ts
+const sent = yield* SuiTest.calls("executeTransaction")
+expect(sent).toHaveLength(1)
+expect((sent[0]!.options as { signatures: ReadonlyArray<string> }).signatures)
+  .toHaveLength(2)
+```
+
+**`FakeOutcome.failWith` takes either reason shape.** The SDK's
+`SuiClientTypes.ExecutionError` is the wire shape — a top-level `message` and an
+`abortCode` **string** — and sui-effect's decoded `ExecutionReason` has a
+`bigint` `abortCode` and no `message`. Both are accepted and the second is
+encoded for you; anything that is neither throws where the fixture is written,
+naming both shapes, instead of failing a decode several calls later on an
+unrelated method.
+
+**Which script slot drives the build's simulate.** `Tx.build` always simulates,
+and on the fake that simulate is the **resolver's**: it is recorded (so
+`SuiTest.calls("simulateTransaction")` counts it) and it is answered by
+`buildSimulate` when that script has entries, and otherwise by the ordered
+`simulate` script. So `simulate: [FakeOutcome.failWith(...)]` makes `Tx.build`
+and `Tx.run` fail with `SimulationFailed` the way a node would, and
+`buildSimulate` is the slot to use when a test needs the build's simulate and
+an explicit `sui.simulate` to answer differently.
+
+**`layerTest` asserts the built-in chain id for `mainnet` and `testnet`.**
+It is `Sui.layerNoDeps`, the production layer, so a script that says
+`network: "mainnet"` and a `chainId` of its own fails to build with
+`NetworkMismatch`. Use `network: "localnet"` (the default, which asserts
+nothing) in fixtures, or the real bundled identifier for the network you named.
+
+**The fake writes nothing to standard error, ever.** If your test output has a
+line in it, it came from your code or from Effect's logger, not from here.
+
+### Injecting a read failure
+
+`FakeScript.getObject` is a list of `FakeOutcome`s consumed one per `getObject`,
+for the retry and fallback paths a script of *objects* cannot express:
+`FakeOutcome.transportError("UNAVAILABLE")` to drive `SuiCore`'s read retry,
+`FakeOutcome.notFound()` for an `ObjectNotFound`, `FakeOutcome.timeoutThen` for
+an interruption. A `succeed` entry — and an absent or exhausted script — serves
+the object map as usual. `SuiTest.scriptGetObject(outcomes)` sets it mid-test.
+
+`FakeScript.balances` is keyed by **owner and coin type**: an entry with an
+`owner` answers only for that address, one without answers for any (which is
+what a pre-0.1.2 script meant), and an owner with no entry gets zero, the way a
+node answers.
+
+### The fixture package's `node_modules` is not your source
+
+An isolated-consumer fixture — a directory with its own `package.json` that
+installs a packed tarball, the way `scripts/check-package.ts` builds one — is
+typechecked against **whatever tarball it last installed** the moment `test` is
+in the package `tsconfig`'s `include`. So a fixture left over from a previous
+release quietly typechecks your new code against the old library, and the
+checklist item "put `test` in `include`" turns into a stale pin. Either exclude
+the fixture directory from `include` (it has its own `tsconfig`), or re-pack and
+re-install it as a step of `check`, with `bun install --force` when the filename
+did not change.
+
 ### Your own fake beside the harness
 
 `layerExtensionTest` composes: the first argument is *your* layer, and your
@@ -925,6 +1130,9 @@ the harness's.
 
 ### What the fake does and does not do
 
+- **`getObject` can be scripted to fail.** `FakeScript.getObject` /
+  `SuiTest.scriptGetObject` inject a transport failure, a miss or a timeout into
+  a read; the object map serves everything else.
 - **Its client supports `$extend`.** `SuiCoreFake`'s handle exposes `client`, a
   `ClientWithCoreApi` that implements `$extend`, so a derived Promise face can
   be tested exactly the way a consumer writes it — `fake.client.$extend(escrow(options))`
@@ -1000,6 +1208,28 @@ field; there is nothing to change in your errors. That is
 what makes a structured log of a failed run useful, and it is a reason to give
 every field of an error a schema rather than stuffing detail into a string.
 
+**A wrapper error must carry what it wrapped.** `Script.exitCode` honours a
+declared `outcome` **before** the tag, which is what makes an extension's errors
+land on the right exit code — and what makes an error that wraps one and forgets
+to copy the `outcome` land on the wrong one. `catchAll(cause => new MyError({
+cause }))` around a `Tx.run` turns a charged `ExecutionFailed` (exit 5, do not
+retry) into an unclassified error (exit 1) or, worse, into a default
+`not_applied` (exit 4, "safe to retry") and the wrapper retries a transaction
+that already ran. Copy both fields: `outcome: SuiError.outcome(cause)` and the
+digest from `digestOf(cause)`, or do not wrap at all. The same applies to a CLI
+that catches at the command boundary and re-raises its own error type.
+
+**A CLI with its own argv parser does not need `Script.run`.** `Script.run` is a
+whole entrypoint — it builds the layer, forks the root fiber, installs signal
+handlers and exits — and a commander program with twenty subcommands has all of
+that. What it still wants is the two things `run` does at the end:
+`Script.report(exit, { stderr?, journal? })` writes one diagnostic line per
+failure (with a `SubmissionUnknown`'s bytes) plus every unresolved journal
+entry, and returns the exit code. Assign it to `process.exitCode` rather than
+calling `process.exit`, so buffered output flushes, and pass the journal the
+program actually ran with — reading the default reference would look in the
+process-wide in-memory journal and find nothing.
+
 Two of those deserve a second look. `UnexpectedEffects` — what
 `executed.expectCreated(type)` fails with — is **applied**, exit 5: it can only
 come from an `Executed`, so the transaction ran and gas was charged and only the
@@ -1020,6 +1250,18 @@ functions beside it is a different job, and the order that works is this.
    your service interface, and a group is a member on it — an `interface` is
    fine, the face maps it either way. Write the interface before you move any
    code: it is the only artefact the conversion is reviewed against.
+
+   **Grep for the shapes the library replaces, not only for names.** Two are
+   worth a pattern each. `\.find\(.*type\??\.includes\(` followed by a
+   `throw` — "find the created object whose type contains `::Receipt`, or blow
+   up" — is exactly `executed.expectCreated(type)`, which compares normalized
+   struct tags and fails with `UnexpectedEffects { digest, expected, found }`.
+   And `@<scope>/` imports resolved against the **published `exports` map**
+   rather than against remembered call sites: regenerate the consumer-edit
+   table with `grep -rn "@scope/" <consumer>/src` and one row per removed
+   subpath export, because a re-export dropped from a subpath (`/party` no
+   longer re-exporting `TxThunk`) breaks every importer while no facade call
+   site changed at all.
 
    **Grep for captured aliases, not only for dotted calls.** A consumer that
    writes `const party = client.miso.party` and then `party.join(...)` does not
@@ -1066,13 +1308,13 @@ conversion is mechanical except where the behaviour deliberately changed.
 | `GraphQLUnavailableError` | `GraphQLUnavailable { method, reason }`, in the taxonomy, outcome `not_applied` — what `SuiGraphQL.layerUnavailable` rejects every call with |
 | `DeploymentError` | your own `<pkg>/DeploymentError` (the template's `EscrowUnsupportedNetwork`), a `Schema.TaggedError` declaring `outcome: "not_applied"`, failed from a `Layer.unwrap` that reads `sui.network` (section 6) |
 | `ObjectNotFoundError` | `ObjectNotFound`, plus `ObjectDeleted` and `ObjectUnavailable` from the SDK's own `reason` |
-| `ObjectTypeMismatchError` | `DecodeError { objectId, expectedType, issue }` from the bridge's tag check |
+| `ObjectTypeMismatchError` | `DecodeError { objectId, expectedType, kind: "type", issue }` from the bridge's tag check. Branch on `kind`, which is `"type"` here and `"bytes"` for a BCS failure, so a consumer that used to catch a type mismatch to 404 a foreign object keeps doing exactly that and stops swallowing real decode bugs |
 | `SuiRpcError { operation }` | `TransportError { method }`. For your own HTTP or GraphQL calls, `TransportError.fromUnknown(method, cause, retryable?)` classifies the status and the retryability the way `SuiCore` does — do not hand-build the three fields |
 | `BcsDecodeError` | `DecodeError` |
 | `TransactionFailedError { digest, status }` | `ExecutionFailed { digest, reason, command, effects }` |
 | `getObjectContent` | `sui.getObject(id)` — with no schema, `content` is the raw bytes |
 | `getOptionalObjectContent` | `sui.getObjectOption` — `None` for missing and deleted, which is also the blessed way to express domain absence |
-| `getObjectsContent` | `sui.getObjects` — chunked, integrity-checked, a per-item `Result` instead of silently dropping errored ids; `sui.getObjectsOrFail` when every id must be there |
+| `getObjectsContent` | `sui.getObjects` — chunked, integrity-checked, a per-item `Result` instead of silently dropping errored ids; `sui.getObjectsStrict` (the deprecated `getObjectsOrFail`) when every id must be there |
 | `listDynamicFields` | `sui.streamDynamicFields` |
 | filtering dynamic fields by key type | filter entries on `name.type` with `SuiSchema.matchesType` (never `normalizeStructTag`, which throws on the primitive key types), then decode `name.bcs` with `SuiSchema.decode(keyCodec, entry.name.bcs)`; the entry carries both |
 | `deriveDynamicFieldID` + `getObjectOption` for existence | `sui.getDynamicFieldOption(parent, name)` — one call, `None` for absent |
@@ -1086,12 +1328,21 @@ conversion is mechanical except where the behaviour deliberately changed.
 | `ParallelTransactionExecutor` | `Tx.run` per PTB, under the sender lock. Parallel submission from one address needs distinct gas owners (`Tx.sponsored`) and is otherwise deferred: the lock is what stops two transactions picking the same gas coin |
 | `ExecResult` and its extractors | `Executed` with `created(type)`, `createdWhere(predicate)`, `packagesPublished()`, `balanceChange(address, coinType)`, `expectCreated` |
 | a `register(client)` building a class of Promise methods | the service above plus `SuiExtension.fromService`, with `warm` when the surface has synchronous members |
+| a hand-rolled idempotent submitter (persist the signed bytes, execute, wait, re-poll by digest on error, resubmit the identical bytes) | `Tx.build` → `Tx.sign` → `Tx.submit` with a durable `Journal` (`@unconfirmed/sui-effect/journal`), and `Tx.reconcileAll()` at startup. The journal write before the first send, the verbatim resubmit and the reconcile are all in `Tx.submit`; what stays yours is the domain record, which goes in `Tx.run`'s `onSigned` hook |
+| `client.core.getTransaction(digest)` on a transaction that may have failed | `sui.core.getTransaction` — **not** `sui.getTransaction`, which fails with `ExecutionFailed` for a `FailedTransaction` (that is the point of it). Reach for the core tier when what you need is the failed transaction's own events or effects |
+| a `ready()` that checks the genesis digest before anything else | `Sui.layerNoDepsWith({ chainId: deployment.chainIdentifier })`. `Sui.layerNoDeps` asserts the **built-in table's** id for the client's network, which is not the same claim as "this is the chain my deployment manifest was generated against"; `layerNoDepsPinned(chainId)` asserts nothing and makes no call, for a consumer that has already checked |
+| a standalone read function the predecessor exported (`getReleaseById(client, id)`) | a member on the service taking the branded id and returning decoded content. Grep the consumer for the **function name**, not for a facade call site: a removed standalone export does not appear in any `client.*` search |
 
 Five behaviour changes to put in the conversion issues:
 
 1. `getObjects` returns a per-item `Result`; ids that failed are no longer
-   silently dropped. `getObjectsOrFail` is the fail-first variant.
-2. `balanceChange` and `gasUsedTotal` are `bigint`, not `number`.
+   silently dropped. `getObjectsStrict` is the fail-first variant.
+2. `balanceChange` and `gasUsedTotal` are `bigint`, not `number` — and a
+   `bigint` **throws** in `JSON.stringify`. Anything that logs, persists or
+   returns one over HTTP needs `value.toString()` or a replacer
+   (`(_, v) => typeof v === "bigint" ? v.toString() : v`). Decimal strings are
+   what the wire uses and what every schema here decodes from, so a string is
+   the right thing to store.
 3. `created(type)` compares normalized struct tags; the substring matching of
    `createdByType` / `allCreatedByType` is `createdWhere(predicate)`.
 4. `Tx.run` replaces sign-and-execute plus wait, and a transport failure once
@@ -1158,7 +1409,13 @@ Reject an extension that:
   `SuiExtension.Leaf<T>` / `SuiExtension.leaf(value)`;
 - calls `.make` on a branded schema with a value that came from outside;
 - promises a `ConfigError` for an empty environment variable it reads with
-  `Config.option`.
+  `Config.option`;
+- has a test double for a signer that is not a real SDK `Signer`
+  (`Signer.fromSdkSigner` now rejects a value with no `toSuiAddress`,
+  `getKeyScheme` or `signTransaction`; use `Signer.remote` for a double);
+- branches on a `DecodeError`'s `issue` text instead of its `kind`;
+- typechecks its tests against an isolated-consumer fixture's installed
+  `node_modules` (see section 10) rather than against the source under test.
 
 The effect-ts skill's own checklist still applies underneath: v3 names,
 `Effect.gen` returned from a plain arrow, throwing inside an Effect, mutable
@@ -1279,7 +1536,250 @@ Put both halves of the swap on the release checklist:
 Say in the PR which form was used while the branch was in flight. A `link:` that
 reaches `main` is a build that works on one machine.
 
-## 17. What extension authors must know
+## 17. Application consumers
+
+The sections above are for the package that *is* an extension. This one is for
+the application that consumes one — a React or Svelte SPA, a Next route, a test
+suite on vitest — because none of its problems are the extension's and all of
+them are recurring.
+
+**One runtime per process, at module scope.** An Effect program at the edge of a
+browser app wants exactly one `ManagedRuntime`, built once and imported
+everywhere:
+
+<!-- inline -->
+
+```ts
+// sui-client.ts
+import { SuiGrpcClient } from "@mysten/sui/grpc"
+import { Sui, SuiCore } from "@unconfirmed/sui-effect"
+import { Effect, Layer, ManagedRuntime } from "effect"
+
+const client = new SuiGrpcClient({ network: deployment.network, url: deployment.url })
+
+// `layerNoDepsWith({ chainId })` over the client you already have: the chain id
+// asserted is the deployment's, not the built-in table's entry for the network.
+const layer = Sui.layerNoDepsWith({ chainId: deployment.chainIdentifier }).pipe(
+  Layer.provide(SuiCore.layerFromClient(client))
+)
+
+export const runtime = ManagedRuntime.make(layer)
+export const runSui = <A, E>(effect: Effect.Effect<A, E, Sui | SuiCore>): Promise<A> =>
+  runtime.runPromise(effect)
+
+// Vite / webpack HMR: dispose the old runtime, or every edit leaks one.
+if (import.meta.hot) import.meta.hot.dispose(() => void runtime.dispose())
+```
+
+**A `ManagedRuntime` memoizes its layer build, including a failure.** The build
+here makes one `getChainIdentifier` call, and if that call fails — a flaky
+network on the first paint, a proxy still waking up — the runtime caches the
+failed build and **every** later use fails with the same stale `TransportError`,
+forever. Three cures, and a browser app usually wants two of them: pass
+`retry` (`Sui.layerNoDepsWith({ chainId, retry: Schedule.exponential("200 millis") })`)
+so a transient failure does not decide the runtime's life; dispose and rebuild
+the runtime when a use fails at the layer (it is a module-level `let`, not a
+`const`, in that design); or use `Sui.layerNoDepsPinned(chainId)`, which makes no
+call at all when the deployment manifest has already told you the chain id.
+
+**`Journal`'s default is process-wide memory, and in a browser that means
+nothing survives.** "A journal entry written before the first execute, so a
+crash mid-flight leaves a record" is true of a server process and false of a
+tab: a refresh is a new process with an empty `Map`, and two tabs are two
+journals and two sender locks. What an app actually has is the
+`SubmissionUnknown` in its hands — it carries the signed bytes, and
+`SuiError.describe` prints them — so persist *that* (IndexedDB, `localStorage`,
+your own backend) at the moment you catch it, and reconcile it on the next boot
+with `Tx.reconcile(signed)`. `@unconfirmed/sui-effect/journal` over a
+`KeyValueStore` is the durable version of the same idea when you want the
+library to do it; see the Workers section for the adapter shape.
+
+**Mapping failures onto UI states.** `SuiError.outcome(error)` is the axis:
+`"applied"` means it happened and the UI must not offer "try again",
+`"unknown"` means show the digest and a reconcile action, `"not_applied"` means
+the button can be re-enabled. Two caveats. In a `catchAll` that only wraps a
+build, a simulate or a signature, pass `{ phase: "pre-submit" }`, or an
+extension error the taxonomy does not own comes back `"unknown"` and the UI
+offers a reconcile for a transaction that was never built. And
+`SuiError.describe(error)` is safe to show in a debug panel for **any** error,
+including one of your own — since 0.1.2 it falls back to the tag and message
+rather than returning nothing.
+
+**Signing with an external cosigner, from an app.** A wallet signs as the
+sender, a sponsorship service signs as the gas owner and submits. That is not
+`Tx.run`: see "Sponsored by an external service" in section 5 for the exact
+sequence, and note that the digest to record is the one `Tx.sign` already
+returned.
+
+**Testing an app on vitest.** The harness does not assume `bun:test`: it is
+`layerTest`/`layerExtensionTest` plus `SuiTest`, all ordinary Effect values.
+Give the app's own `runSui` a test double built on the same layer and the app's
+components are testable with no network at all:
+
+<!-- inline -->
+
+```ts
+// test/sui-client.ts
+import { layerTest } from "@unconfirmed/sui-effect/testing"
+import { Effect, Layer, ManagedRuntime } from "effect"
+import { Journal } from "@unconfirmed/sui-effect/tx"
+
+export const testRuntime = (script: Parameters<typeof layerTest>[0] = {}) => {
+  const runtime = ManagedRuntime.make(
+    Layer.mergeAll(layerTest(script), Journal.layerMemory)
+  )
+  return { runSui: runtime.runPromise.bind(runtime), dispose: () => runtime.dispose() }
+}
+```
+
+Dispose it in an `afterEach`, keep `Journal.layerMemory` in the layer (the
+default journal is process-wide and leaks entries between tests), and script
+`getTransaction: [FakeOutcome.notFound()]` on anything that submits unless the
+test means "this landed" — section 10 has the rest.
+
+**Keep Effect out of the first paint if bundle size matters.** The runtime
+module above is a fine dynamic `import()`: nothing in it runs until something
+awaits it, and a lazy `$extend` registration costs nothing at module scope.
+
+## 18. Workers and Durable Objects
+
+Cloudflare Workers, Durable Objects and every other isolate runtime work, with
+four differences that are not obvious.
+
+**There is no `process`.** `Script` (and `Script.run`) is a Node entrypoint and
+does not belong here; build the layer directly. Configuration comes from the
+Worker's `env` argument, not from `process.env`, which means providing a
+`ConfigProvider` per request rather than relying on the default one:
+
+<!-- inline -->
+
+```ts
+const provider = ConfigProvider.fromEnvRecord(env as Record<string, string>)
+const program = effect.pipe(Effect.provideService(ConfigProvider.ConfigProvider, provider))
+```
+
+**One runtime per isolate, never one per request.** `Effect.provide(effect,
+Sui.layerNoDeps)` inside a `fetch` handler rebuilds the layer — and its chain-id
+round trip — on every request. Cache a `ManagedRuntime` in module scope (a
+Worker isolate is reused across requests) or on the Durable Object instance, and
+read the "memoizes its failure" warning in section 17 (Application consumers): in an isolate that lives
+for hours, a cached failed build is a much longer outage than in a tab.
+
+**The sender lock does not cross isolates.** `sui.withSenderLock` is a
+semaphore in one runtime's memory. Two isolates, two Durable Objects, two
+regions — two locks, and nothing stops both picking the same gas coin. Either
+serialize submissions for an address through one Durable Object (which is what
+DOs are for), or stop depending on the lock: with `tx.setGasPayment([])` there is
+no gas coin to equivocate on, the node picks from the address balance, and
+`SubmitConfig.lockSender: false` is then correct rather than reckless. A
+sponsored transaction built with `Tx.sponsored` already has an empty gas
+payment, and `Tx.build` preserves it through the resolver.
+
+**Time is not wall-clock time in a DO alarm.** `Tx.submit`'s resubmit schedule
+and `visibilityTimeout` are Effect sleeps inside one invocation; a Durable
+Object that wants to retry across hours uses an alarm and calls
+`Tx.reconcileAll()` (or `Tx.reconcile(signed)`) when it wakes, with a durable
+`Journal` underneath. That is the split: sleeps for seconds, alarms plus the
+journal for anything longer.
+
+### A `KeyValueStore` over Durable Object storage
+
+`@unconfirmed/sui-effect/journal` needs a `KeyValueStore`, and Effect ships
+memory, filesystem, SQL and Web Storage layers — none of which exist in a DO.
+`KeyValueStore.makeStringOnly({ get, set, remove, clear, size })` is the whole
+adapter: five members over strings, and the journal uses nothing else (its
+entries are JSON and its unresolved index is one more key).
+
+<!-- inline -->
+
+```ts
+import { KeyValueStore } from "effect/unstable/persistence"
+import { Effect, Layer } from "effect"
+import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
+
+const durableStore = (storage: DurableObjectStorage) =>
+  KeyValueStore.makeStringOnly({
+    get: (key) =>
+      Effect.map(
+        Effect.promise(() => storage.get<string>(key)),
+        Option.fromNullishOr
+      ),
+    set: (key, value) => Effect.promise(() => storage.put(key, value)),
+    remove: (key) => Effect.asVoid(Effect.promise(() => storage.delete(key))),
+    clear: Effect.promise(() => storage.deleteAll()),
+    size: Effect.map(Effect.promise(() => storage.list()), (map) => map.size)
+  })
+
+const journal = (storage: DurableObjectStorage) =>
+  layerKeyValueStore({ onUnresolved: "ignore" }).pipe(
+    Layer.provide(Layer.succeed(KeyValueStore.KeyValueStore, durableStore(storage)))
+  )
+```
+
+Build it once per DO instance, alongside the runtime. `onUnresolved: "fail"`
+refuses to build while the store still holds unsettled entries, which is the
+right setting for a process whose startup is allowed to demand attention and
+the wrong one for a DO that must answer the next request.
+
+## 19. Relay and sponsor envelopes
+
+`Executed` describes the SDK's own execute include set: effects, events, balance
+changes and the `objectTypes` join. A relay, a sponsor or any service that
+submitted on your behalf sends back whatever *it* asked the node for, which is
+usually less — `changedObjects` with an `objectId` and an `idOperation` and
+nothing else, no `objectTypes`, no `balanceChanges`, no checkpoint, events as
+JSON with no BCS.
+
+`Executed.fromPartial(envelope)` decodes exactly that. What it was not told
+stays "not told": the input and output states are `Unknown` rather than a
+guessed `ObjectWrite`, versions and digests are `null`, and the accessors read
+`Unknown` as "the envelope did not say" so `created()` and `deleted()` still
+classify from the id operation alone. JSON spellings are accepted where the
+SDK's types are not JSON — `bcs` as base64 or a byte array, every `u64` as a
+number or a `bigint` as well as the decimal string.
+
+Two things it cannot invent:
+
+- **the types.** `created(type)`, `mutated(type)` and `expectCreated(type)`
+  match against the `objectTypes` join, so without one they match nothing. Ask
+  your relay for `objectTypes`; failing that, use `created()` unfiltered or
+  `createdWhere(predicate)` and read the ids.
+- **the gas.** `gasUsedTotal` is `0n` for an envelope that reported no gas.
+  That means "not reported", not "free".
+
+`Executed.fromTransactionResult(result)` is the other constructor: the strict
+one, for an SDK `TransactionResult` read with the full include set, which is
+what to use when the service handed you a real execute response.
+
+### `Tx.submitVia`: the journal, for a submission you do not make
+
+`Tx.submit` is what writes journal entries, and a consumer that hands its bytes
+to a relay never calls it — so the crash window between "signed" and "the
+service answered" had no record at all. `Tx.submitVia` is that path:
+
+<!-- inline -->
+
+```ts
+const executed = yield* Tx.submitVia(signed, (bytes, signatures) =>
+  postToTheRelay({ bytes: toBase64(bytes), signature: signatures[0]! }))
+```
+
+It writes the `Signed` entry **before** calling `send`, calls `send` exactly
+once (a third party's submit is not known to be idempotent, and re-sending is
+not the library's decision), turns the reply into an `Executed` when it carries
+one — an SDK `TransactionResult`, a reduced envelope, or nothing at all, in
+which case it asks the chain by the digest it already has — and journals the
+terminal answer. A failure from `send` is ambiguous, so it ends in
+`Tx.reconcile` with the full evidence rules; an error whose instance declares
+`outcome: "not_applied"` is taken at its word and fails straight through
+without spending a reconcile, which is how a service says "I refused this and
+sent nothing". Declare that field on your relay-refusal error.
+
+It fails with `ExecutionFailed`, `NotApplied`, `SubmissionUnknown` (carrying the
+bytes, with the sender's failure as its `cause`), `JournalError` from the write
+before the send, and your own error when it declared itself not-applied.
+
+## 20. What extension authors must know
 
 The short list an independent verification of v0.1.0 said a downstream
 conversion has to carry. Everything here is documented somewhere above; this is
@@ -1353,3 +1853,28 @@ the page to read before the conversion rather than after it.
   not, and never will, because it validates without decoding.
 - **`bun install --force` after re-packing a vendored tarball** with the same
   filename and version, or bun keeps the old extraction.
+- **`DecodeError` carries a `kind`** — `"type"`, `"bytes"`, `"shape"`. Branch on
+  it, never on `issue`.
+- **Every taxonomy error has a real `.message`** since 0.1.2 (it is
+  `SuiError.describe`), so anything that surfaces `.message` shows a line
+  instead of an empty string, and `SuiError.describe` accepts a foreign error
+  rather than returning `undefined` for it.
+- **`Tx.reconcileAll` returns a tagged union** — `{ _tag: "Executed", executed }`
+  or `{ _tag, error }` — not a bare `Executed | error`. It returns **only what
+  was unresolved**; `Tx.recorded(digest)` is how to ask about a settled one.
+- **`Tx.submit` fails outright on a gRPC `INVALID_ARGUMENT`** instead of
+  reconciling: the node refused the request, nothing executed, and reconciling
+  it would ask a question about a transaction that was never sent. That is the
+  only `TransportError` that escapes `Tx.submit`.
+- **A sponsored submission needs both signatures before `Tx.submit`**, on the
+  fake as on a node. `Tx.cosign`, or `Tx.run`'s `sponsor`.
+- **`Signer.fromSdkSigner` validates its argument** and reads `toSuiAddress()`
+  and `getKeyScheme()` **at construction**. A test double needs all three
+  members, or use `Signer.remote`.
+- **`Signer.fromConfig` takes a 32-byte hex seed** as well as a Bech32
+  `suiprivkey`, defaulting to Ed25519.
+- **`Tx.run` has an `onSigned` hook** between the last signature and the first
+  send, for a consumer's own record; `Tx.submitVia` is the same lifecycle when
+  somebody else does the sending.
+- **`bigint` throws in `JSON.stringify`.** Gas, balances and versions are all
+  `bigint`; use `.toString()` or a replacer at every JSON boundary.

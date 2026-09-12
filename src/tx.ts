@@ -41,10 +41,12 @@ export {
   build,
   cosign,
   type Built,
-  type Reconciled,
+  Reconciled,
+  type ReconciledOutcome,
   type ReconcileInput,
   type RunError,
   type SubmitError,
+  recorded,
   reconcile,
   reconcileAll,
   run,
@@ -52,6 +54,9 @@ export {
   Signed,
   sponsored,
   submit,
+  type SubmitViaError,
+  type SubmitViaReply,
+  submitVia,
   Tx
 } from "./services/Tx.ts"
 

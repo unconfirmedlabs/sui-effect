@@ -13,10 +13,22 @@
  *
  * @since 0.1.0
  */
-import { Cause, Config, ConfigProvider, Context, Effect, Exit, Fiber, Layer, Logger } from "effect"
+import {
+  Cause,
+  Config,
+  ConfigProvider,
+  Context,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Logger,
+  Result,
+  Schema
+} from "effect"
 import type { NetworkMismatch, SuiError, TransportError } from "../domain/errors.ts"
 import { digestOf, SuiError as SuiErrorHelpers } from "../domain/errors.ts"
-import type { JournalEntry } from "../domain/journal-entry.ts"
+import { JournalEntry } from "../domain/journal-entry.ts"
 import type { JournalService } from "./Journal.ts"
 import { Journal } from "./Journal.ts"
 import type { Signer } from "./Signer.ts"
@@ -217,6 +229,76 @@ export class Script extends Context.Service<Script, ScriptService>()("@unconfirm
     effect: Effect.Effect<A, E, Script | Sui | SuiCore>,
     options?: ScriptRunOptions
   ): Promise<number> => run(effect, options)
+
+  /** See {@link report}. */
+  static readonly report = <A, E>(
+    exit: Exit.Exit<A, E>,
+    options?: ReportOptions
+  ): Promise<number> => report(exit, options)
+}
+
+/** What {@link report} needs beyond the `Exit`. */
+export interface ReportOptions {
+  /** Where the lines go, one at a time. Defaults to `process.stderr`. */
+  readonly stderr?: (line: string) => void
+  /**
+   * The journal the program ran with, for the unresolved entries.
+   *
+   * A program with its own `ManagedRuntime` has to hand it over — reading the
+   * bare `Journal` reference here would look in the process-wide in-memory
+   * default and find nothing, which is precisely wrong for the program that
+   * provided a durable one. Left out, the default reference is read, which is
+   * right for a program that never provided a journal at all.
+   */
+  readonly journal?: JournalService
+}
+
+/**
+ * Prints what {@link run} prints, and answers the exit code, for a program that
+ * owns its own process.
+ *
+ * `Script.run` is a whole entrypoint: it builds the layer, forks the root
+ * fiber, installs signal handlers and exits. A CLI with its own argv parser and
+ * twenty subcommands has all of that already and still wants the two things
+ * `run` does at the end — one diagnostic line per failure (with the bytes of a
+ * `SubmissionUnknown`), and every unresolved journal entry on a non-zero exit —
+ * plus the code itself. That is this: hand it the `Exit` of whatever you ran,
+ * get the lines on stderr and the number back, and call `process.exitCode = …`
+ * yourself rather than `process.exit`, so buffered output still flushes.
+ *
+ * Never fails.
+ *
+ * @example
+ * ```ts
+ * const exit = await runtime.runPromiseExit(command())
+ * process.exitCode = await Script.report(exit, { journal })
+ * ```
+ *
+ * @since 0.1.2
+ */
+export const report = async <A, E>(
+  exit: Exit.Exit<A, E>,
+  options?: ReportOptions
+): Promise<number> => {
+  const write = options?.stderr ?? ((line: string) => {
+    process.stderr.write(`${line}\n`)
+  })
+  if (Exit.isSuccess(exit)) return exitCode(exit)
+  if (Cause.hasDies(exit.cause)) {
+    write(Cause.pretty(exit.cause))
+  } else {
+    const failure = Cause.findErrorOption(exit.cause)
+    if (failure._tag === "Some") {
+      for (const line of describeFailure(failure.value)) write(line)
+    } else if (Cause.hasInterrupts(exit.cause)) {
+      write("interrupted")
+    } else {
+      write(Cause.pretty(exit.cause))
+    }
+  }
+  const unresolved = await readUnresolved(options?.journal)
+  for (const line of unresolvedLines(unresolved)) write(line)
+  return exitCode(exit, { unresolved: unresolved.length })
 }
 
 /** Exit codes, on the axis a wrapper script acts on. */
@@ -460,7 +542,19 @@ const stderrLogger = (write: (line: string) => void) =>
     write(line)
   })
 
-/** The lines describing what this process left on the wire, if anything. */
+const encodeJournalEntry = Schema.encodeUnknownResult(JournalEntry)
+
+/**
+ * The lines describing what this process left on the wire, if anything.
+ *
+ * Three lines per entry: the digest and tag for a human, the raw base64 bytes
+ * for someone about to resubmit by hand, and the **whole entry encoded through
+ * the `JournalEntry` schema** — which is the same JSON a durable journal
+ * stores, bytes base64 and timestamps included. That last line is what lets a
+ * wrapper pipe stderr into a file and hand it back to a recovery process
+ * verbatim, instead of scraping two lines and losing `attempts`, `lastError`
+ * and the expiration the bytes carry.
+ */
 const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<string> => {
   if (entries.length === 0) return []
   const lines = [
@@ -471,6 +565,8 @@ const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<st
     if (entry._tag === "Signed" || entry._tag === "Unknown") {
       lines.push(`bytes: ${toBase64(entry.signed.bytes)}`)
     }
+    const encoded = encodeJournalEntry(entry)
+    if (Result.isSuccess(encoded)) lines.push(`entry: ${JSON.stringify(encoded.success)}`)
   }
   return lines
 }

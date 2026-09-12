@@ -416,7 +416,8 @@ need a field or a method the tier above does not expose, and through
 code reads through: fixed include sets, BCS content decoded through `Schema`
 with the object's Move type checked first, `Option` where absence is normal,
 batch reads chunked to 50 and checked for missing or duplicated ids — per-item
-`Result` from `getObjects`, first-error-wins from `getObjectsOrFail` — pagination
+`Result` from `getObjects`, first-error-wins from `getObjectsStrict` (the same
+function as the deprecated `getObjectsOrFail`) — pagination
 as `Stream`, one lock per sender so two transactions from one address cannot
 pick the same gas coin, and the chain's own clock. A Move type with no type
 arguments matches every instantiation of it, wherever a type is compared, so one
@@ -427,7 +428,8 @@ was built over as `sui.core`, which is why every `Tx.*` function needs only
 ## The transaction lifecycle
 
 `Tx` is the lifecycle as functions — `build`, `sign`, `cosign`, `sponsored`,
-`submit`, `reconcile`, `run`, `reconcileAll` — each with a closed error union
+`submit`, `submitVia`, `reconcile`, `recorded`, `run`, `reconcileAll` — each
+with a closed error union
 and `R = Sui`. `Tx.run` holds the sender lock from build through submit, builds
 (which always simulates before anything is signed — the SDK's resolver does it
 when there is anything to resolve, and `Tx.build` runs one explicitly when
@@ -438,7 +440,12 @@ timeout, waits for the execution to be visible to reads before it releases the
 lock, and if it still does not know what happened, reconciles: `Executed`,
 `ExecutionFailed`, `NotApplied { evidence }`, or `SubmissionUnknown` carrying
 the bytes. A `TransportError` never escapes once bytes may have been sent —
-from `submit`, and from `reconcile` and `reconcileAll` too. `Signer` is a
+from `submit`, and from `reconcile` and `reconcileAll` too — with one exception:
+a gRPC **`INVALID_ARGUMENT`**, which is the node refusing the request outright
+(malformed bytes, or a sponsored transaction carrying one signature). Nothing
+was executed, so `Tx.submit` reports that error as it is rather than
+reconciling, because a reconcile would go on to ask whether that digest is on
+chain — a question about a transaction that was never sent. `Signer` is a
 value, not a service, so one process can hold two credentials; `SubmitConfig`
 and `Journal` are `Context.Reference`s with working defaults, so none of this
 needs wiring, and `@unconfirmed/sui-effect/journal` swaps the memory journal for a durable
@@ -468,6 +475,30 @@ older than the gas coin. Plan an operator path or a `reconcileAll` at startup;
 do not build a retry loop that expects `NotApplied { inputConsumed }`. Before
 any of this, reconcile compares the chain the bytes were built for with
 `sui.chainId` and refuses to reason across chains.
+
+**`Tx.run` has a hook between signing and sending.** `onSigned(signed)` runs
+inside the sender lock, after the last signature and before the first
+`executeTransaction`, for the record the journal does not hold — a domain row
+joining the digest to a batch, an outbox, an idempotency key. Failing it fails
+the run with nothing sent; its error is `JournalError`, which is already in
+`Tx.run`'s union and already means "the record could not be written and nothing
+has gone out".
+
+**`Tx.submitVia(signed, send)` is the lifecycle when someone else submits.** A
+relay or a sponsorship service that holds the only key allowed to talk to the
+node gets the bytes from you; this keeps everything around that. It journals
+`Signed` before calling `send`, calls it exactly once, turns the reply into an
+`Executed` when it carries one (an SDK `TransactionResult`, a reduced envelope,
+or a bare digest, in which case it asks the chain), reconciles an ambiguous
+`send` failure with the full evidence rules, and journals the terminal answer.
+A `send` error whose instance declares `outcome: "not_applied"` is taken at its
+word and fails straight through.
+
+**`Tx.reconcileAll()` returns only what was unresolved**, as a tagged union —
+`{ _tag: "Executed", executed }`, `{ _tag: "ExecutionFailed", error }`,
+`{ _tag: "NotApplied", error }`, `{ _tag: "SubmissionUnknown", error }`. A
+digest that had already settled is not in it; `Tx.recorded(digest)` answers with
+that entry (`Option<JournalEntry>`).
 
 **A sponsored `Tx.run` needs both signatures.** When the gas owner is not the
 sender, pass `sponsor`: `Tx.run(recipe, { signer, gasOwner, sponsor })`. Without
@@ -532,7 +563,7 @@ no error inheritance to match on.
 | `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | `objectId`, `version?` | The three `ObjectError.reason` values |
 | `TransactionNotFound` | `digest` | No transaction with that digest is known |
 | `NetworkMismatch` | `expected`, `actual` | The node is on another chain than the layer was built for |
-| `DecodeError` | `objectId?`, `expectedType?`, `issue` | BCS content or a schema boundary did not decode |
+| `DecodeError` | `objectId?`, `expectedType?`, `kind`, `issue` | BCS content or a schema boundary did not decode. `kind` is `"type"` (the Move type was not the one expected — nothing was parsed, and the one a caller may answer with a 404), `"bytes"` (the BCS parse failed: a layout mismatch, never safe to swallow) or `"shape"` (a domain schema refused a parsed or JSON value). Branch on `kind`, never on `issue`, whose wording changes between releases |
 | `SimulationFailed` | `reason`, `message` | Simulation reported an execution failure. No gas charged |
 | `ExecutionFailed` | `digest`, `reason`, `command?`, `effects` | Applied on chain and failed. Gas charged |
 | `SubmissionUnknown` | `digest`, `signed?`, `cause` | Bytes may have been sent; the outcome is unknown. Carries them, unless it came from reconciling a bare digest |
@@ -547,8 +578,15 @@ no error inheritance to match on.
 
 `ExecutionReason` mirrors the SDK's `ExecutionError` variant for variant, with
 `MoveAbort.abortCode` as a `bigint` and clever-error constant names decoded.
-`SuiError.isRetryable`, `SuiError.outcome`, `SuiError.describe` and
-`SuiError.toJson` are the four helpers every repo otherwise hand-rolls;
+**Every one of them has a readable `.message`**: for the classes that carry no
+`message` field of their own it is a getter returning `SuiError.describe(this)`,
+so anything that surfaces `error.message` — a log line, a UI, another library's
+formatter — shows the actionable line instead of an empty string. It is not a
+schema field and does not appear in `SuiError.toJson`'s output.
+
+`SuiError.isRetryable`, `SuiError.outcome`, `SuiError.isTaxonomy`,
+`SuiError.describe` and `SuiError.toJson` are the helpers every repo otherwise
+hand-rolls;
 `outcome` puts every failure on the `"applied" | "not_applied" | "unknown"`
 axis, and an extension error may declare its own. An error that is neither a tag
 above nor declares an `outcome` is *unclassified*: `outcome` answers `"unknown"`,
@@ -556,7 +594,23 @@ because an unrecognised tag is no evidence that nothing happened, and
 `Script.exitCode` exits 1 rather than 3, because it is no evidence that anything
 was sent either. Declare `outcome` on every error your extension defines — as a
 class field is fine, `toJson` reads it off the instance and serializes it either
-way.
+way, and the check duck-types the field, so an existing `Error` subclass with an
+`outcome` property lands on the axis without becoming a `Schema.TaggedError`
+first.
+
+`SuiError.outcome(error, { phase: "pre-submit" })` changes exactly one answer:
+an unrecognised tag caught **before** anything could have been sent — in a
+`catchAll` around a build, a simulate or a signature — is `"not_applied"`
+rather than `"unknown"`, which is true there by construction. The default stays
+`"post-submit"`. `SuiError.isTaxonomy(error)` answers the question underneath
+it, and `SuiError.describe` accepts a foreign error too, falling back to its tag
+and message rather than returning nothing.
+
+**A wrapper error must carry what it wrapped.** `Script.exitCode` honours a
+declared `outcome` before the tag, so a `catchAll` that re-raises its own error
+type around a `Tx.run` must copy `outcome: SuiError.outcome(cause)` and the
+digest, or a charged `ExecutionFailed` becomes exit 1 or, worse, exit 4 — and
+the wrapper retries a transaction that already ran.
 
 ## Scripts
 
@@ -567,7 +621,7 @@ way.
 | `SUI_NETWORK` | yes, no default | `mainnet`, `testnet`, `devnet`, `localnet` or your own |
 | `SUI_ALLOW_MAINNET` | only for mainnet | `1` or `true`; a script that means mainnet has to say so twice |
 | `SUI_RPC_URL` | no | The gRPC endpoint; defaulted per known network |
-| `SUI_PRIVATE_KEY` | `Script` only | A Bech32 `suiprivkey1…` key, read through `Config.redacted`. A key that does not decode fails with one fixed sentence and no cause: the Bech32 decoder quotes the whole input it rejected, so nothing derived from it is ever printed |
+| `SUI_PRIVATE_KEY` | `Script` only | A Bech32 `suiprivkey1…` key **or a 32-byte hex seed** (64 hex characters, `0x` optional, read as Ed25519), through `Config.redacted`. A key that does not decode fails with one fixed sentence and no cause: the Bech32 decoder quotes the whole input it rejected, so nothing derived from it is ever printed |
 
 `Script.layerReadOnly` provides `ScriptReadOnly`, which has no signer at all —
 a separate service key, so a script written to sign cannot silently build over a
@@ -591,9 +645,106 @@ bytes finish.
 | 5 | applied on chain: `ExecutionFailed` (gas charged) or `UnexpectedEffects` (it ran; the receipt is missing) |
 | 130 | interrupted, with nothing outstanding in the journal |
 
+**`Script.report(exit, { stderr?, journal? })`** is those last two steps on
+their own — the diagnostic lines and the unresolved entries, with the exit code
+as the answer — for a CLI that owns its own argv parsing and process. Assign it
+to `process.exitCode` rather than calling `process.exit`.
+
 A timeout or an interrupt asks the journal: with an unresolved submission in it
 the exit is 3, not 4 or 130, because an `Effect.timeout` wrapped around a
-submission interrupts it from the outside and the bytes may be on the wire.
+submission interrupts it from the outside and the bytes may be on the wire. Each
+unresolved entry is printed three ways: the digest and tag, the raw base64
+bytes, and the whole entry encoded through the `JournalEntry` schema — the same
+JSON a durable journal stores — so a wrapper can hand stderr to a recovery
+process verbatim.
+
+**Every `SubmitConfig` field is overridable, and one of them usually should be.**
+`SubmitConfig` is a `Context.Reference` with the spec's defaults, including a
+`maxGasBudget` of **50 SUI** — a ceiling, not a budget, but far above what a
+sponsor policy typically allows. Narrow it once, where the runtime is built:
+
+```ts
+Effect.provideService(program, SubmitConfig, {
+  ...SubmitConfig.defaults,
+  maxGasBudget: 1_000_000_000n, // 1 SUI
+  lockSender: false             // see below
+})
+```
+
+`lockSender` is the other one worth a decision. The lock exists because two
+concurrent builds from one address can pick the same gas coin; with
+`tx.setGasPayment([])` there is no coin to pick — the node pays from the address
+balance — and the lock buys nothing. That is the case for every transaction
+built with `Tx.sponsored`, whose empty gas payment `Tx.build` preserves through
+the resolver, and it is the only setting that makes sense across isolates
+(Workers, Durable Objects), where a per-runtime semaphore is not a lock at all.
+
+## Relay and sponsor envelopes
+
+`Executed` describes the SDK's own execute include set. A relay, a sponsor or
+any service that submitted on your behalf returns whatever *it* asked the node
+for, which is usually less: `changedObjects` with an `objectId` and an
+`idOperation` and nothing else, no `objectTypes`, no `balanceChanges`, no
+checkpoint, events as JSON with no BCS.
+
+`Executed.fromPartial(envelope)` decodes exactly that, and what it was not told
+stays "not told": input and output states are `Unknown` rather than a guessed
+`ObjectWrite`, versions and digests are `null`, and the accessors read `Unknown`
+as "the envelope did not say", so `created()` and `deleted()` still classify
+from the id operation alone. JSON spellings are accepted where the SDK's types
+are not JSON — `bcs` as base64 or a byte array, every `u64` as a number or a
+`bigint` as well as the decimal string the wire uses. Two things it cannot
+invent: the **types** (`created(type)` and `expectCreated(type)` match against
+the `objectTypes` join, so without one they match nothing — use `created()` or
+`createdWhere(predicate)`), and the **gas** (`gasUsedTotal` is `0n` for an
+envelope that reported none, which means "not reported", not "free").
+
+`Executed.fromTransactionResult(result)` is the strict constructor, for an SDK
+`TransactionResult` read with the full include set.
+
+The whole sequence, for a service that co-signs and submits: `Tx.build` with
+`Tx.sponsored`, `Tx.sign`, hand `toBase64(signed.bytes)` and `signed.signatures[0]`
+to the service, and then either `Executed.fromPartial(reply)` or — through
+`Tx.submitVia`, which keeps the journal — `Tx.reconcile(signed)`. The digest
+does not change when the sponsor adds its signature, so `signed.digest` is what
+to record. `docs/extensions.md` has the section.
+
+**`Executed.events` is `ReadonlyArray<Event>`, not `SuiClientTypes.Event[]`**:
+the same fields with branded ids, and `json` present only when whatever produced
+the `Executed` carried one (a relay envelope, never a gRPC execute). Decode an
+event with `SuiSchema.decode(codec, event.bcs)`. Code typed against the SDK's
+`Event[]` does not accept these.
+
+**`bigint` throws in `JSON.stringify`.** Gas, balances, versions and
+`checkpoint` are all `bigint`; anything that logs, persists or returns one over
+HTTP needs `.toString()` or a replacer. Decimal strings are what the wire uses
+and what every schema here decodes from.
+
+## Applications, Workers and Durable Objects
+
+An application that consumes this library — an SPA, a Worker, a Durable Object —
+wants one `ManagedRuntime` at module scope over
+`Sui.layerNoDepsWith({ chainId })` and `SuiCore.layerFromClient(client)`, and
+should know four things:
+
+- **a `ManagedRuntime` memoizes its layer build, failure included.** One flaky
+  `getChainIdentifier` at boot and every later use of that runtime fails with the
+  same stale `TransportError`. Pass `SuiLayerOptions.retry` (a `Schedule` for
+  that one read), dispose and rebuild on a build failure, or use
+  `Sui.layerNoDepsPinned(chainId)`, which makes no call at all;
+- **the default `Journal` is process-wide memory.** In a browser tab a refresh
+  is a new process and two tabs are two journals and two sender locks; what an
+  app actually holds is the `SubmissionUnknown` and its bytes, so persist that
+  and reconcile it on the next boot, or provide the durable journal;
+- **the sender lock does not cross isolates**, so correctness there rests on
+  address-balance gas (`tx.setGasPayment([])`, `lockSender: false`) or on
+  serializing an address through one Durable Object;
+- **there is no `process`** in a Worker: `Script` is a Node entrypoint, and
+  configuration comes from `ConfigProvider.fromEnvRecord(env)`.
+
+`docs/extensions.md` sections 17 and 18 have the runtime module, the HMR
+dispose, the vitest double and the `KeyValueStore.makeStringOnly` adapter over
+Durable Object storage.
 
 ## Testing
 
@@ -604,6 +755,17 @@ real `Sui` over the fake, so tests exercise the production high tier),
 else the extension's layer requires), and `SuiTest`
 for driving the fake's state and reading back what it was sent. No test in this
 repository touches the network, and neither should yours.
+
+Four things a test on the fake has to know. `layerTest` is the production layer,
+so a script naming `mainnet` or `testnet` must report that network's real chain
+identifier — use `localnet` (the default) in fixtures. `Tx.submit` reconciles
+through `getTransaction`, so a submit test that does not mean "this landed"
+scripts `getTransaction: [FakeOutcome.notFound()]`. A **sponsored** submit needs
+`Tx.cosign` first: the fake refuses an under-signed or wrongly-signed submission
+with a gRPC `INVALID_ARGUMENT`, the way a validator does. And the build's
+simulate is the resolver's — recorded, so `SuiTest.calls("simulateTransaction")`
+sees it, and answered by `FakeScript.buildSimulate` if there is one and by the
+ordered `simulate` script otherwise.
 
 ## Versions
 

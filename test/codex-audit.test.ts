@@ -869,7 +869,12 @@ describe("14. building always simulates", () => {
         return yield* SuiTest.calls("simulateTransaction")
       })
     )
-    expect(simulates).toHaveLength(0)
+    // Exactly one, and it is the **resolver's** — the budget simulation the
+    // SDK's resolve plugin makes, which `Tx.build` does not duplicate. Since
+    // 0.1.2 the fake records it, so "building always simulates" is visible on
+    // the harness instead of being a claim a test could not check.
+    expect(simulates).toHaveLength(1)
+    expect((simulates[0]!.options as { resolver?: boolean }).resolver).toBe(true)
   })
 })
 

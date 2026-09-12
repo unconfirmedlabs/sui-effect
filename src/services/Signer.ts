@@ -10,10 +10,11 @@
  * @since 0.1.0
  */
 import type { Keypair, Signer as SdkSigner } from "@mysten/sui/cryptography"
-import { decodeSuiPrivateKey } from "@mysten/sui/cryptography"
+import { decodeSuiPrivateKey, SUI_PRIVATE_KEY_PREFIX } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
 import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
+import { fromHex } from "@mysten/sui/utils"
 import { Config, ConfigProvider, Effect, Redacted, Schema } from "effect"
 import { SigningError } from "../domain/errors.ts"
 import { Signature, SuiAddress } from "../domain/schemas.ts"
@@ -54,6 +55,13 @@ const signatureOf = (signature: string): Effect.Effect<Signature, SigningError> 
     Effect.mapError((issue) => new SigningError({ cause: `the signer returned a signature this version cannot read: ${issue.message}` }))
   )
 
+/** The members {@link fromSdkSigner} reads, and what it does with each. */
+const SDK_SIGNER_MEMBERS = [
+  "toSuiAddress",
+  "getKeyScheme",
+  "signTransaction"
+] as const
+
 /**
  * Wraps any `@mysten/sui/cryptography` `Signer`.
  *
@@ -64,14 +72,43 @@ const signatureOf = (signature: string): Effect.Effect<Signature, SigningError> 
  * needs a keypair, and the `Signer` this returns exposes no secret material
  * either.
  *
+ * **`toSuiAddress()` and `getKeyScheme()` are read here, synchronously**, and
+ * the address and scheme of the returned `Signer` are whatever they answered at
+ * this moment: a credential that changes accounts later is a different
+ * `Signer`, built again. A test double therefore needs both of those methods,
+ * not only `signTransaction` — a double without `getKeyScheme` used to produce
+ * `scheme: undefined` and nothing complained until a validator did.
+ *
+ * **Clear-signing inputs are the SDK signer's own concern.** The Ledger signer
+ * takes `signTransaction(bytes, bcsObjects?, resolution?)` and resolves those
+ * extra arguments through the client it was constructed with; this passes only
+ * the bytes, which is the whole of the base `Signer` contract. A device that
+ * needs more than the bytes gets it from its own client, or from
+ * {@link remote}.
+ *
  * For a credential that is not an SDK `Signer` at all — a remote service, a
  * hardware device behind your own protocol — use {@link remote}, which takes
  * Effects and the address to sign as.
  *
- * Never fails: a bad address or signature surfaces as a `SigningError` from the
- * member that produced it, not from construction.
+ * **Throws** a `TypeError` naming the missing member when the argument is not
+ * an SDK signer — that is a wiring mistake in the caller, not a runtime
+ * failure a program recovers from. Otherwise never fails: a bad address or
+ * signature surfaces as a `SigningError` from the member that produced it, not
+ * from construction.
  */
 export const fromSdkSigner = (keypair: SdkSigner): Signer => {
+  const missing = SDK_SIGNER_MEMBERS.filter(
+    (member) => typeof (keypair as unknown as Record<string, unknown>)?.[member] !== "function"
+  )
+  if (missing.length > 0) {
+    throw new TypeError(
+      `Signer.fromSdkSigner: this value is not a @mysten/sui Signer — it has no ${
+        missing.join(", no ")
+      }. An SDK signer answers toSuiAddress(), getKeyScheme() and signTransaction(bytes);` +
+        " for a test double or a credential that is not an SDK signer, use Signer.remote({" +
+        " address, scheme, signTransaction })."
+    )
+  }
   const address = keypair.toSuiAddress()
   return {
     // `toSuiAddress` returns the normalized form the SDK derived from the
@@ -129,20 +166,50 @@ const keypairOf = (parsed: { scheme: string; secretKey: Uint8Array }): Keypair |
  * a `cause` on the error would serialize through `SuiError.toJson` too.
  */
 const KEY_ERROR = "is not a Bech32 Sui private key (scheme or checksum), " +
+  "is not a 32-byte hex seed (64 hex characters, 0x optional), " +
   "or names a scheme with no keypair class (MultiSig, ZkLogin, Passkey — use Signer.remote for those)"
 
+/** A raw 32-byte secret as hexadecimal, with or without the `0x`. */
+const HEX_SEED = /^(?:0x)?[0-9a-fA-F]{64}$/
+
 /**
- * Reads a Bech32 `suiprivkey1…` secret key from configuration and builds the
- * signer for whichever of the three schemes its flag names.
+ * The keypair a configured secret names: a Bech32 `suiprivkey1…` for whichever
+ * of the three schemes its flag carries, or a **32-byte hex seed**, which has
+ * no scheme flag and is therefore read as Ed25519.
+ *
+ * Hex is here because that is how a raw seed comes out of a secret manager, a
+ * `.env` written by hand, or another language's SDK, and the alternative every
+ * caller reached for was `Ed25519Keypair.fromSecretKey(fromHex(...))` in
+ * application code — which is the one place the decoded bytes should never
+ * appear. `undefined` when the text is neither.
+ */
+const keypairFromSecret = (value: string): Keypair | undefined => {
+  const text = value.trim()
+  if (text.startsWith(SUI_PRIVATE_KEY_PREFIX)) return keypairOf(decodeSuiPrivateKey(text))
+  if (HEX_SEED.test(text)) return Ed25519Keypair.fromSecretKey(fromHex(text))
+  return undefined
+}
+
+/**
+ * Reads a secret key from configuration and builds its signer.
+ *
+ * Two spellings, told apart by the text itself:
+ *
+ * - a **Bech32 `suiprivkey1…`**, whose flag names one of the three schemes;
+ * - a **32-byte hex seed** (64 hex characters, `0x` optional), which carries no
+ *   scheme and is read as **Ed25519** — the default every Sui tool uses for a
+ *   raw seed. This is what a secret manager or another language's SDK hands
+ *   over, and reading it here is what keeps `fromHex` and the decoded bytes out
+ *   of application code.
  *
  * The key is read with `Config.redacted`, and the decoded bytes never leave
  * this function. Neither does anything derived from them: the failure carries
  * one fixed sentence and no `cause`, because the decoder's own message quotes
  * the input it rejected.
  *
- * Fails with: `ConfigError` when the variable is missing, is not a Bech32 Sui
- * private key, or names a scheme that has no keypair class (`MultiSig`,
- * `ZkLogin`, `Passkey` — use {@link remote} for those).
+ * Fails with: `ConfigError` when the variable is missing, is neither spelling,
+ * or names a scheme that has no keypair class (`MultiSig`, `ZkLogin`,
+ * `Passkey` — use {@link remote} for those).
  */
 export const fromConfig = (
   name = "SUI_PRIVATE_KEY"
@@ -151,8 +218,7 @@ export const fromConfig = (
     Effect.flatMap((redacted) =>
       Effect.try({
         try: () => {
-          const parsed = decodeSuiPrivateKey(Redacted.value(redacted))
-          const keypair = keypairOf(parsed)
+          const keypair = keypairFromSecret(Redacted.value(redacted))
           if (keypair === undefined) {
             throw new Error("unsupported key scheme")
           }

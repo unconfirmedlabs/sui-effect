@@ -213,7 +213,7 @@ const make = (
         Effect.flatMap((raw) =>
           decodeAddress(raw).pipe(
             Effect.mapError((issue) =>
-              new DecodeError({ expectedType: "SuiAddress", issue: issue.message })
+              new DecodeError({ expectedType: "SuiAddress", kind: "shape", issue: issue.message })
             )
           )
         ),

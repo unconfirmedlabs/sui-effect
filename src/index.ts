@@ -16,6 +16,7 @@
 export {
   BuildError,
   DecodeError,
+  DecodeKind,
   ExecutionFailed,
   ExtensionNotReady,
   GraphQLUnavailable,
@@ -27,6 +28,7 @@ export {
   ObjectNotFound,
   ObjectUnavailable,
   type Outcome,
+  type OutcomePhase,
   PolicyDenied,
   SigningError,
   SimulationFailed,
