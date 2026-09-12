@@ -3,7 +3,7 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
-## 0.1.3
+## 0.1.3 (2026-09-12)
 
 Unreleased. Sixteen ergonomics changes from an audit of this package against
 Effect v4 rc.112's own documentation. Nothing was removed and no signature
