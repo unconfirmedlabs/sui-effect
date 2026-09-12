@@ -773,6 +773,7 @@ const makeSui = (
     Effect.fn("Sui.withSenderLock")(function*<A, E, R>(
       effect: Effect.Effect<A, E, R>
     ): Effect.fn.Return<A, E, R> {
+      yield* Effect.annotateCurrentSpan({ "sui.sender": address })
       // The semaphore is reference counted: whoever is inside the lock holds a
       // reference, so a sender's semaphore cannot be dropped while it is in
       // use, and an idle one is released a minute after the last holder leaves
