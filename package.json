@@ -53,7 +53,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/unconfirmedlabs/sui-effect"
+    "url": "git+https://github.com/unconfirmedlabs/sui-effect.git"
   },
   "keywords": [
     "sui",
