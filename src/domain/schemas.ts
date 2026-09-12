@@ -34,7 +34,10 @@ const normalizeStructTagSafe = (value: string): string => {
  * `SuiAddress.make("0x1")` throws. `SuiAddress.normalize("0x1")` is the one
  * that accepts every spelling a human writes, because it decodes first.
  */
-const SuiAddressSchema = Schema.String.pipe(
+const SuiAddressSchema = Schema.String.annotate({
+  identifier: "SuiAddress",
+  description: "A 32-byte Sui account address in the padded lowercase 0x form"
+}).pipe(
   Schema.decode({
     decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
     encode: SchemaGetter.passthrough()
@@ -90,7 +93,10 @@ export type SuiAddress = typeof SuiAddressSchema.Type
  * `ObjectId.make` validates without decoding; `ObjectId.normalize` decodes
  * first and is what takes `"0x6"`.
  */
-const ObjectIdSchema = Schema.String.pipe(
+const ObjectIdSchema = Schema.String.annotate({
+  identifier: "ObjectId",
+  description: "A 32-byte Sui object id in the padded lowercase 0x form"
+}).pipe(
   Schema.decode({
     decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
     encode: SchemaGetter.passthrough()
@@ -130,7 +136,10 @@ export const ObjectId = Object.assign(ObjectIdSchema, { normalize: normalizeObje
 export type ObjectId = typeof ObjectIdSchema.Type
 
 /** A base58 transaction digest. Not normalized; rejected when not 32 bytes. */
-export const Digest = Schema.String.pipe(
+export const Digest = Schema.String.annotate({
+  identifier: "Digest",
+  description: "A base58 32-byte transaction digest"
+}).pipe(
   Schema.check(
     Schema.makeFilter((value: string) =>
       isValidTransactionDigest(value) ? undefined : "Expected a base58 32-byte transaction digest"
@@ -144,7 +153,10 @@ export type Digest = typeof Digest.Type
  * A fully qualified Move struct tag, normalized with `normalizeStructTag` on
  * decode so `0x2::sui::SUI` and its padded form compare equal.
  */
-export const StructTag = Schema.String.pipe(
+export const StructTag = Schema.String.annotate({
+  identifier: "StructTag",
+  description: "A fully qualified Move struct tag, normalized"
+}).pipe(
   Schema.decode({
     decode: SchemaGetter.transform(normalizeStructTagSafe),
     encode: SchemaGetter.passthrough()
@@ -159,7 +171,10 @@ export const StructTag = Schema.String.pipe(
 export type StructTag = typeof StructTag.Type
 
 /** A coin type: a struct tag used as the type argument of `0x2::coin::Coin`. */
-export const CoinType = Schema.String.pipe(
+export const CoinType = Schema.String.annotate({
+  identifier: "CoinType",
+  description: "A struct tag used as the type argument of 0x2::coin::Coin"
+}).pipe(
   Schema.decode({
     decode: SchemaGetter.transform(normalizeStructTagSafe),
     encode: SchemaGetter.passthrough()
@@ -183,21 +198,30 @@ export const ObjectType = Schema.Union([StructTag, Schema.Literal("package")])
 export type ObjectType = typeof ObjectType.Type
 
 /** An amount in MIST. Encoded as the decimal string every SDK response uses. */
-export const Mist = Schema.BigIntFromString.pipe(
+export const Mist = Schema.BigIntFromString.annotate({
+  identifier: "Mist",
+  description: "An amount in MIST, encoded as a decimal string"
+}).pipe(
   Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n)),
   Schema.brand("Mist")
 )
 export type Mist = typeof Mist.Type
 
 /** A Move object version. Encoded as the decimal string the SDK returns. */
-export const Version = Schema.BigIntFromString.pipe(
+export const Version = Schema.BigIntFromString.annotate({
+  identifier: "Version",
+  description: "A Move object version, encoded as a decimal string"
+}).pipe(
   Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n)),
   Schema.brand("Version")
 )
 export type Version = typeof Version.Type
 
 /** The network a client is pointed at. Mirrors `SuiClientTypes.Network`. */
-export const Network = Schema.String.pipe(Schema.brand("Network"))
+export const Network = Schema.String.annotate({
+  identifier: "Network",
+  description: "The network a client is pointed at"
+}).pipe(Schema.brand("Network"))
 export type Network = typeof Network.Type
 
 /** The four networks with a built-in default gRPC endpoint. */
@@ -246,6 +270,9 @@ export const ObjectRef = Schema.Struct({
   version: Version,
   digest: Schema.String,
   owner: Owner
+}).annotate({
+  identifier: "ObjectRef",
+  description: "Everything the transaction builder needs to consume an object again"
 })
 type ObjectRefType = typeof ObjectRef.Type
 /**
@@ -263,6 +290,9 @@ export const Balance = Schema.Struct({
   balance: Mist,
   coinBalance: Mist,
   addressBalance: Mist
+}).annotate({
+  identifier: "Balance",
+  description: "A coin balance for one coin type"
 })
 type BalanceType = typeof Balance.Type
 /**
@@ -278,6 +308,9 @@ export interface Balance extends BalanceType {}
 export const DynamicFieldName = Schema.Struct({
   type: Schema.String,
   bcs: Schema.Uint8Array
+}).annotate({
+  identifier: "DynamicFieldName",
+  description: "The BCS-encoded name of a dynamic field"
 })
 type DynamicFieldNameType = typeof DynamicFieldName.Type
 /**
@@ -297,6 +330,9 @@ export const DynamicFieldEntry = Schema.Struct({
   valueType: Schema.String,
   $kind: Schema.Literals(["DynamicField", "DynamicObject"]),
   childId: Schema.optional(ObjectId)
+}).annotate({
+  identifier: "DynamicFieldEntry",
+  description: "One entry of a dynamic-field listing"
 })
 type DynamicFieldEntryType = typeof DynamicFieldEntry.Type
 /**
@@ -319,6 +355,9 @@ export const DynamicField = Schema.Struct({
   value: Schema.Struct({ type: Schema.String, bcs: Schema.Uint8Array }),
   version: Version,
   digest: Schema.String
+}).annotate({
+  identifier: "DynamicField",
+  description: "A dynamic field with its value"
 })
 type DynamicFieldType = typeof DynamicField.Type
 /**
@@ -540,7 +579,10 @@ export type TransactionEffects = typeof TransactionEffects.Type
  * flag, signature and public key bytes. Branded so a signature cannot be passed
  * where a digest or an address is expected.
  */
-export const Signature = Schema.String.pipe(
+export const Signature = Schema.String.annotate({
+  identifier: "Signature",
+  description: "A serialized transaction signature"
+}).pipe(
   Schema.check(Schema.isNonEmpty()),
   Schema.brand("Signature")
 )
@@ -690,6 +732,9 @@ export const SignedTransaction = Schema.Struct({
    * one of them against the other's epoch.
    */
   chain: Schema.optional(Schema.String)
+}).annotate({
+  identifier: "SignedTransaction",
+  description: "The signed bytes of a transaction, with what reconciling needs"
 })
 type SignedTransactionType = typeof SignedTransaction.Type
 /**
@@ -729,6 +774,9 @@ export const Built = Schema.Struct({
   expiration: Schema.optional(TransactionExpiration),
   /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
   chain: Schema.optional(Schema.String)
+}).annotate({
+  identifier: "Built",
+  description: "A transaction built into bytes and ready to sign"
 })
 type BuiltType = typeof Built.Type
 /**
@@ -827,6 +875,9 @@ export const ObjectEnvelope = Schema.Struct({
   digest: Schema.String,
   owner: Owner,
   type: ObjectType
+}).annotate({
+  identifier: "ObjectEnvelope",
+  description: "The fixed set of object fields sui-effect always requests"
 })
 type ObjectEnvelopeType = typeof ObjectEnvelope.Type
 /**
@@ -887,6 +938,9 @@ export const Simulation = Schema.Struct({
   balanceChanges: Schema.Array(BalanceChange),
   objectTypes: Schema.Record(Schema.String, Schema.String),
   commandResults: Schema.Array(CommandResult)
+}).annotate({
+  identifier: "Simulation",
+  description: "The result of a successful simulation"
 })
 type SimulationType = typeof Simulation.Type
 /**

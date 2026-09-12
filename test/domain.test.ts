@@ -29,6 +29,7 @@ import {
   Digest,
   Mist,
   ObjectId,
+  ObjectRef,
   ObjectType,
   Owner,
   Signature,
@@ -37,6 +38,8 @@ import {
   TransactionEffects,
   Version
 } from "../src/domain/schemas.ts"
+import * as SuiSchema from "../src/domain/bcs.ts"
+import { bcs as suiBcs } from "@mysten/sui/bcs"
 
 const DIGEST = "7YcE7X6LmUcbqHcRYMRT8vBTxtnCbfGJkH6yZPFpTFwn"
 const ADDRESS = `0x${"ab".repeat(32)}`
@@ -493,5 +496,48 @@ describe("TransportError.fromUnknown", () => {
     const error = TransportError.fromUnknown("operator.status", cause)
     expect(error.cause).toBe(cause)
     expect(SuiError.describe(error)).toContain("connection refused")
+  })
+})
+
+/**
+ * NB3: `identifier` and `description` on the reusable schemas.
+ *
+ * The annotation has to sit on the node that *reports* — the string underneath
+ * the brand — because annotating after `Schema.check` targets the last check
+ * instead, which is the trap the docs warn about.
+ */
+describe("schema annotations", () => {
+  test("a non-string reports the identifier, not `Expected string`", () => {
+    const result = Schema.decodeUnknownResult(ObjectId)(5)
+    expect(result._tag).toBe("Failure")
+    if (result._tag === "Failure") {
+      expect(String(result.failure)).toContain("Expected ObjectId")
+    }
+    // The filter message still wins for a string of the wrong shape.
+    const badString = Schema.decodeUnknownResult(ObjectId)("zz")
+    expect(badString._tag).toBe("Failure")
+    if (badString._tag === "Failure") {
+      expect(String(badString.failure)).toContain("Expected a 32-byte Sui object id")
+    }
+  })
+
+  test("a BCS bridge names its Move type instead of `<Declaration>`", () => {
+    const layout = suiBcs.struct("Escrow", { id: suiBcs.Address, amount: suiBcs.u64() })
+    const type = `0x${"0".repeat(63)}2::escrow::Escrow`
+    const result = Schema.decodeUnknownResult(SuiSchema.bcs(layout, type))(
+      new Uint8Array([1, 2, 3])
+    )
+    expect(result._tag).toBe("Failure")
+    if (result._tag === "Failure") {
+      expect(String(result.failure)).toContain("escrow::Escrow")
+      expect(String(result.failure)).not.toContain("<Declaration>")
+    }
+  })
+
+  test("a JSON Schema document names its definitions", () => {
+    const document = JSON.stringify(Schema.toJsonSchemaDocument(ObjectRef))
+    expect(document).toContain("\"ObjectRef\"")
+    expect(document).toContain("\"ObjectId\"")
+    expect(document).toContain("\"StructTag\"")
   })
 })

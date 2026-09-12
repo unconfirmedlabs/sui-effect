@@ -54,7 +54,10 @@ export const bcs = <T extends Input, Input>(
   // A BCS layout carries no runtime type to test a decoded value against: the
   // parse below is the validation, so the target schema accepts whatever the
   // layout produced.
-  const target = Schema.declare((_u: unknown): _u is T => true)
+  const target = Schema.declare((_u: unknown): _u is T => true, {
+    identifier: label,
+    description: `BCS layout ${label}`
+  })
   return Schema.Uint8Array.pipe(
     Schema.decodeTo(
       target,
@@ -144,7 +147,11 @@ export const decodeWith = <T extends Input, Input, A>(
   expectedType: string | undefined,
   map: (parsed: T) => A
 ): Schema.Codec<A, Uint8Array> => {
-  const target = Schema.declare((_u: unknown): _u is A => true)
+  const label = expectedType ?? bcsType.name
+  const target = Schema.declare((_u: unknown): _u is A => true, {
+    identifier: label,
+    description: `BCS layout ${label}`
+  })
   return bcs(bcsType, expectedType).pipe(
     Schema.decodeTo(
       target,
@@ -155,9 +162,7 @@ export const decodeWith = <T extends Input, Input, A>(
             catch: (cause) =>
               new SchemaIssue.InvalidValue(
                 {
-                  message: `Could not map ${
-                    expectedType ?? bcsType.name
-                  } into its domain value: ${String(cause)}`
+                  message: `Could not map ${label} into its domain value: ${String(cause)}`
                 },
                 parsed,
                 options
@@ -167,9 +172,8 @@ export const decodeWith = <T extends Input, Input, A>(
           Effect.fail(
             new SchemaIssue.Forbidden(
               {
-                message: `${
-                  expectedType ?? bcsType.name
-                } was built with SuiSchema.decodeWith, which has no encoder: serialize with the BCS layout instead`
+                message:
+                  `${label} was built with SuiSchema.decodeWith, which has no encoder: serialize with the BCS layout instead`
               },
               value,
               options
