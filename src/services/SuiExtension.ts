@@ -25,12 +25,93 @@ import { Sui as SuiService } from "./Sui.ts"
 import { SuiCore } from "./SuiCore.ts"
 
 /**
+ * A member the Promise face must pass through **whole**, however it is typed.
+ *
+ * The face recurses into object-typed members — that is what makes
+ * `client.miso.protocol.get(id)` work — and the recursion is by *type*, not by
+ * declaration style, because an interface-typed namespace is the common case
+ * and the old `Record<string, unknown>` bound skipped every one of them while
+ * the runtime mapped them anyway. `Uint8Array`, `Date`, `Promise`, arrays and
+ * BCS codecs (anything with both `parse` and `serialize`) are recognised
+ * leaves. Everything else that is a class instance — a `Schema.Class`, a
+ * domain object with Effect-returning methods — is marked by the extension
+ * with {@link leaf}, which is the one way to say "this is a value, not a
+ * namespace".
+ *
+ * @since 0.1.1
+ */
+export declare const LeafTypeId: unique symbol
+
+/** The marker {@link Leaf} carries. Not constructible; {@link leaf} applies it. */
+export interface LeafBrand {
+  readonly [LeafTypeId]: true
+}
+
+/**
+ * `T`, marked as a leaf of the Promise face: it is handed to a Promise consumer
+ * exactly as the Effect service holds it.
+ *
+ * Declare the member as `Leaf<MyClass>` and build it with {@link leaf}. A
+ * `Leaf<T>` is still a `T` — every consumer of the Effect face is unaffected.
+ *
+ * @since 0.1.1
+ *
+ * @example
+ * ```ts
+ * import { SuiExtension } from "@unconfirmed/sui-effect/extension"
+ *
+ * interface MyService {
+ *   readonly policy: SuiExtension.Leaf<Policy>
+ * }
+ * // in the layer:
+ * const service: MyService = { policy: SuiExtension.leaf(new Policy()) }
+ * ```
+ */
+export type Leaf<T> = T & LeafBrand
+
+const LEAVES = new WeakSet<object>()
+
+/**
+ * Marks a value as a {@link Leaf}: the Promise face passes it through untouched
+ * instead of walking into it.
+ *
+ * The registry is a `WeakSet`, so a frozen value can be marked and nothing is
+ * added to the value itself. Never fails.
+ *
+ * @since 0.1.1
+ */
+export const leaf = <T>(value: T): Leaf<T> => {
+  if (typeof value === "object" && value !== null) LEAVES.add(value)
+  return value as Leaf<T>
+}
+
+const isLeafValue = (value: unknown): boolean =>
+  typeof value === "object" && value !== null && LEAVES.has(value)
+
+/**
+ * A BCS codec, recognised the way the runtime recognises one: both `parse` and
+ * `serialize`. `BcsType` is a class instance and has no other stable marker,
+ * and a namespace of members never has both of those names.
+ */
+interface CodecLike {
+  readonly parse: (...args: ReadonlyArray<never>) => unknown
+  readonly serialize: (...args: ReadonlyArray<never>) => unknown
+}
+
+/**
+ * The object-typed members the face passes through instead of recursing into:
+ * a marked {@link Leaf}, a `Uint8Array`, a `Date`, a `Promise`, an array, and a
+ * BCS codec.
+ */
+type FaceLeaf = LeafBrand | Uint8Array | Date | Promise<unknown> | ReadonlyArray<unknown> | CodecLike
+
+/**
  * The Promise face of a service interface.
  *
  * An `Effect` member becomes a zero-argument method returning a Promise, a
  * function returning an `Effect` keeps its arguments and returns a Promise, a
- * `Stream` member becomes an `AsyncIterable`, a nested plain object of members
- * is mapped the same way (platform SDKs namespace their surface as
+ * `Stream` member becomes an `AsyncIterable`, a nested object of members is
+ * mapped the same way (platform SDKs namespace their surface as
  * `client.miso.protocol.*`), and anything else passes through untouched.
  *
  * **A synchronous member stays synchronous**: a recipe builder
@@ -39,11 +120,22 @@ import { SuiCore } from "./SuiCore.ts"
  * runtime agrees — see `warm` and `$ready` on {@link fromService} for the
  * window before it does.
  *
- * **A class instance is a leaf.** The recursion is into plain object literals
- * only, which is what the runtime maps; a `BcsType`, a `Schema.Class` instance,
- * a `Date`, anything with a prototype of its own passes through whole, in the
- * type and at runtime alike. (An interface or class type is not assignable to
- * `Record<string, unknown>`, which is what keeps the two in step.)
+ * **The recursion is by type, not by declaration style.** Every object-typed
+ * member that is not a function, an array, an `Effect`, a `Stream`, a
+ * `Uint8Array`, a `Date`, a `Promise`, a BCS codec (both `parse` and
+ * `serialize`) or a {@link Leaf} is mapped as a namespace — an `interface`
+ * exactly like a type alias. Before 0.1.1 the bound was
+ * `Record<string, unknown>`, which an interface is not assignable to, so an
+ * interface-typed namespace (`readonly protocol: ProtocolService`) kept its
+ * `Effect` members **in the type** while the runtime mapped them to Promises.
+ * The type lied; it no longer does.
+ *
+ * **A class instance that is a value, not a namespace, is marked.** The runtime
+ * maps plain-prototype objects and passes class instances through, so a class
+ * whose methods return `Effect`s would be typed as mapped and arrive unmapped.
+ * Declare such a member `Leaf<T>` and build it with {@link leaf}: the type and
+ * the runtime then agree that it is a value. `Uint8Array`, `Date`, `Promise`,
+ * arrays and BCS codecs need no marker.
  *
  * **A plain-object *value* member is the one place the two faces cannot agree.**
  * `{ packageId: "0x…" }` is indistinguishable from a namespace of members, so
@@ -62,7 +154,9 @@ export type PromiseFace<S> = {
       ? (...args: Args) => AsyncIterable<A>
     : S[K] extends (...args: infer Args) => Effect.Effect<infer A, infer _E4, infer _R4>
       ? (...args: Args) => Promise<A>
-    : S[K] extends Record<string, unknown> ? PromiseFace<S[K]>
+    : S[K] extends FaceLeaf ? S[K]
+    : S[K] extends (...args: ReadonlyArray<never>) => unknown ? S[K]
+    : S[K] extends object ? PromiseFace<S[K]>
     : S[K]
 }
 
@@ -130,6 +224,16 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
    * package id, a codec — that a consumer expects to read the moment it
    * registers. Every member is then the real thing immediately, and
    * `$ready()` has nothing left to do.
+   *
+   * **Every failure of the layer becomes a synchronous throw.** The whole
+   * layer is built inside `register`, so a missing deployment, a bad
+   * configuration, a `NetworkMismatch` — anything the layer can fail with —
+   * comes out of `client.$extend(...)` as a thrown value rather than as the
+   * rejection of a first call. That is the trade `warm` makes, and a consumer
+   * has to catch it where it registers.
+   *
+   * After `$dispose()`, the next use re-runs this same build rather than
+   * degrading to a cold registration.
    *
    * Two conditions, both enforced:
    *
@@ -306,7 +410,52 @@ interface Bridge {
   readonly iterate: <A>(stream: Stream.Stream<A, unknown, never>) => AsyncIterable<A>
 }
 
+/**
+ * The placeholder a **cold** member call returns.
+ *
+ * It is a real `Promise` subclass — `instanceof Promise` holds, and `bun:test`'s
+ * `expect(...).rejects` recognises it — that also implements
+ * `Symbol.asyncIterator`, because until the runtime exists nothing knows
+ * whether the member was an `Effect` (a Promise) or a `Stream` (an
+ * `AsyncIterable`). `Symbol.species` is `Promise`, so `.then`, `.catch` and
+ * `.finally` produce plain Promises rather than more of these.
+ */
+class ColdCall<A> extends Promise<A> {
+  static override get [Symbol.species](): PromiseConstructor {
+    return Promise
+  }
+}
+
+/**
+ * The cold placeholder, with its rejection **pre-handled**.
+ *
+ * A cold call that nobody awaits — `client.ext.doThing()` as a statement —
+ * still rejects with `ExtensionNotReady`, and an unhandled rejection aborts the
+ * process under Bun and Node. Attaching a no-op `catch` marks it handled
+ * without changing what `await` does: the caller's own `await` still throws.
+ * Never fails.
+ */
+const coldCall = (
+  settled: Promise<unknown>,
+  iterate: () => AsyncGenerator<unknown, void, undefined>
+): Promise<unknown> & AsyncIterable<unknown> => {
+  const placeholder = new ColdCall<unknown>((resolve, reject) => {
+    settled.then(resolve, reject)
+  })
+  // Handled, so an un-awaited cold call is a no-op rather than a process abort.
+  void placeholder.catch(() => {})
+  Object.defineProperty(placeholder, Symbol.asyncIterator, {
+    value: iterate,
+    enumerable: false,
+    configurable: true
+  })
+  return placeholder as Promise<unknown> & AsyncIterable<unknown>
+}
+
 const mapMember = (value: unknown, bridge: Bridge): unknown => {
+  // A marked leaf is a value, whatever it looks like: the one way an extension
+  // says "do not walk into this".
+  if (isLeafValue(value)) return value
   if (isStream(value)) return bridge.iterate(value as Stream.Stream<unknown, unknown, never>)
   if (isEffect(value)) return () => bridge.runPromise(value as Effect.Effect<unknown, unknown, never>)
   if (typeof value === "function") {
@@ -361,7 +510,10 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  * Two lifetimes worth knowing:
  *
  * - **`$dispose()` is not final.** It releases everything the layer acquired
- *   and forgets the runtime; the next call builds a fresh one. That is what a
+ *   and forgets the runtime; the next call builds a fresh one — and a `warm`
+ *   registration re-runs its **warm** build, with the same options, on the next
+ *   use, so it does not silently degrade to cold with every synchronous member
+ *   throwing `ExtensionNotReady`. That is what a
  *   long-lived page wants (a disposed extension is usable again after a
  *   reconnect) and it does mean a `$dispose()` that races an in-flight call can
  *   leave the caller's Promise rejected while a new runtime starts behind it.
@@ -372,10 +524,22 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  *   copies of whatever the layer holds (a cache, a connection). Register once
  *   per client and keep the extended client.
  *
- * Never fails, except a `warm` registration, which throws out of `register`
- * when the layer needs an asynchronous step or when the network has no known
- * chain identifier and none was given. Otherwise the layer's own failures
- * surface as rejections of the first call that needs it.
+ * **A cold call is a real `Promise`.** The placeholder a member call returns
+ * before the runtime exists is a `Promise` subclass that also implements
+ * `Symbol.asyncIterator`, so `instanceof Promise` holds and `bun:test`'s
+ * `expect(...).rejects` recognises it. Its rejection is **pre-handled** (a
+ * no-op `catch` is attached at creation), so a cold call nobody awaits —
+ * `client.ext.doThing()` as a statement — cannot abort the process with an
+ * unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
+ *
+ * Never fails, except a `warm` registration. A warm registration builds the
+ * **whole layer** synchronously inside `register`, so **any** failure of that
+ * layer — a missing deployment for the network, a configuration error, a
+ * `NetworkMismatch`, not only an asynchronous step or an unknown chain
+ * identifier — is thrown synchronously out of `register`, which means out of
+ * `client.$extend(...)`. Catch it where you register. A lazy registration has
+ * nowhere to put such a failure at registration time, so it surfaces as the
+ * rejection of the first call that needs the layer.
  */
 export const fromService = <Self, Shape, E, const Name extends string>(
   service: Context.Key<Self, Shape>,
@@ -521,27 +685,16 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         // method as `Promise` and a `Stream`-returning one as `AsyncIterable`;
         // a bare Promise of an `AsyncIterable` satisfies neither `for await`
         // nor the declared type, which is what a cold Stream call used to hand
-        // back. So the returned value is a thenable **and** an async iterable:
-        // awaited it is the Promise, iterated it awaits the runtime and then
-        // delegates to the real stream.
-        return {
-          then: <A, B>(
-            onFulfilled?: ((value: unknown) => A | PromiseLike<A>) | null,
-            onRejected?: ((reason: unknown) => B | PromiseLike<B>) | null
-          ) => settled.then(onFulfilled, onRejected),
-          catch: <B>(onRejected?: ((reason: unknown) => B | PromiseLike<B>) | null) =>
-            settled.catch(onRejected),
-          finally: (onFinally?: (() => void) | null) => settled.finally(onFinally),
-          [Symbol.asyncIterator]: async function*() {
-            const value = await settled
-            if (
-              typeof value !== "object" || value === null || !(Symbol.asyncIterator in value)
-            ) {
-              throw notReady(path)
-            }
-            yield* value as AsyncIterable<unknown>
+        // back. So the returned value is a **real `Promise`** and an async
+        // iterable: awaited it is the Promise, iterated it awaits the runtime
+        // and then delegates to the real stream.
+        return coldCall(settled, async function*() {
+          const value = await settled
+          if (typeof value !== "object" || value === null || !(Symbol.asyncIterator in value)) {
+            throw notReady(path)
           }
-        }
+          yield* value as AsyncIterable<unknown>
+        })
       }
       // Every synchronous use of a placeholder — a plain value read as a
       // string, a number, a JSON payload — lands on one of these, and each one
@@ -584,6 +737,26 @@ export const fromService = <Self, Shape, E, const Name extends string>(
 
     if (options.warm !== undefined) warmUp(options.warm)
 
+    /**
+     * A warm registration stays warm across `$dispose()`.
+     *
+     * `$dispose()` releases the runtime and forgets the service; a lazy
+     * registration builds a fresh one on the next call, which is what it does
+     * from the start. A **warm** one used to degrade to cold instead — every
+     * synchronous member throwing `ExtensionNotReady` forever after, which is
+     * exactly what `warm` was chosen to avoid. So the next use re-runs the same
+     * warm build, with the same options: synchronous inside this read, over the
+     * shared base, taking the same pinned chain id.
+     *
+     * It throws what `register` would have thrown, at the property read rather
+     * than at registration, for the same two reasons (an asynchronous layer, an
+     * unknown chain id) — neither of which can appear here without having
+     * appeared at `register` already.
+     */
+    const ensureWarm = (): void => {
+      if (instance === undefined && options.warm !== undefined) warmUp(options.warm)
+    }
+
     const own = (key: string): unknown => {
       if (key === "$ready") return ready
       if (key === "$dispose" || key === "dispose") return dispose
@@ -595,25 +768,39 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         if (typeof key !== "string") return undefined
         const reserved = own(key)
         if (reserved !== undefined) return reserved
+        ensureWarm()
         if (instance !== undefined) {
           const member = (instance as Record<string, unknown>)[key]
           return member === undefined ? undefined : mapMember(member, bridge)
         }
         return lazy([key])
       },
-      has: (_target, key) =>
-        key === "$ready" || key === "$dispose" || key === "dispose" ||
-        (instance !== undefined && typeof key === "string" && key in (instance as object)),
-      ownKeys: () =>
+      has: (_target, key) => {
+        if (key === "$ready" || key === "$dispose" || key === "dispose") return true
+        ensureWarm()
+        return instance !== undefined && typeof key === "string" && key in (instance as object)
+      },
+      ownKeys: () => (
+        ensureWarm(),
         instance === undefined
           ? [...RESERVED]
           // A `Proxy` refuses duplicate keys, so a service member that happens
           // to be called `dispose` must not be listed twice.
-          : [...new Set([...Object.keys(instance as object), ...RESERVED])],
+          : [...new Set([...Object.keys(instance as object), ...RESERVED])]
+      ),
       getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true })
     }) as PromiseFace<Shape> & ExtensionFace
   }
 })
 
-/** The namespace the spec spells: `SuiExtension.fromService(...)`. */
-export const SuiExtension = { fromService } as const
+/**
+ * The namespace the spec spells: `SuiExtension.fromService(...)`, plus the
+ * leaf marker a service uses to say "this member is a value, not a namespace"
+ * (`SuiExtension.leaf(value)`, typed `SuiExtension.Leaf<T>`).
+ */
+export const SuiExtension = { fromService, leaf } as const
+
+export declare namespace SuiExtension {
+  /** {@link Leaf} under the namespace the spec spells. */
+  export type Leaf<T> = T & LeafBrand
+}

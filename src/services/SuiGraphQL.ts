@@ -39,6 +39,19 @@ const unavailableClient = (reason: string): SuiGraphQLClient =>
  * The SDK's GraphQL client as a service, so an extension can require it
  * without constructing one.
  *
+ * **The service value *is* the client.** `yield* SuiGraphQL` hands back the
+ * `SuiGraphQLClient` that was passed to `SuiGraphQL.layer(client)` — not a
+ * wrapper with `client` on it, not an interface of methods this package
+ * defines. `SuiGraphQL["Service"]` is therefore `SuiGraphQLClient`, which is
+ * the type to write when a function takes the service as a parameter:
+ *
+ * ```ts
+ * const names = (graphql: SuiGraphQL["Service"]) => graphql.query({ query, variables })
+ * ```
+ *
+ * The requirement is spelled `SuiGraphQL` in an `Effect`'s `R`, as with every
+ * other tag here.
+ *
  * @example
  * ```ts
  * import { Effect } from "effect"

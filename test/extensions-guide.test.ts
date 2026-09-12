@@ -91,7 +91,11 @@ describe("docs/extensions.md", () => {
   test("the inline illustrations stay few", () => {
     // They are the exception. A guide whose examples have drifted away from the
     // package they document is the failure mode this file exists to prevent.
-    expect(inlineBlocks.length).toBeLessThanOrEqual(6)
+    // The 0.1.1 additions are idioms with no home in the template — the `leaf`
+    // marker, the two shapes for a standalone function that needs a sibling
+    // extension, the harness's `extra` option, `normalize`, `decodeWith`, and a
+    // sketch of one codec serving every instantiation of a generic Move type.
+    expect(inlineBlocks.length).toBeLessThanOrEqual(10)
   })
 
   test("every code block names the template file it came from", () => {

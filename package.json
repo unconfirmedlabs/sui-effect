@@ -1,6 +1,6 @@
 {
   "name": "@unconfirmed/sui-effect",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "An opinionated Effect v4 layer over @mysten/sui: two client tiers, closed error unions, and a typed transaction lifecycle.",
   "license": "MIT",
   "type": "module",
@@ -33,6 +33,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "LLMS.md",
     "AGENTS.md",

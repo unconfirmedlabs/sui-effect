@@ -133,6 +133,28 @@ So a codec that maps into your own domain types is a `BcsType` **composed with
 
 @@ src/schema.ts :: export const SettlementContent = (typeOrigin: string) => :: )
 
+When the mapping is a plain function that may throw — a constructor, a
+`BigInt(...)`, a branding call — `SuiSchema.decodeWith(layout, type, map)` is
+that composition in one call:
+
+<!-- inline -->
+
+```ts
+const EscrowContent = (typeOrigin: string) =>
+  SuiSchema.decodeWith(
+    EscrowLayout,
+    escrowType(typeOrigin),
+    (raw) => new Escrow(ObjectId.normalize(raw.id), BigInt(raw.amount))
+  )
+```
+
+A throw inside `map` becomes the `DecodeError` the caller already handles,
+carrying the expected type — which is the part that gets forgotten when the same
+thing is written as `Effect.try` around `Schema.decodeUnknownEffect`, where the
+throw arrives as a defect instead. The codec still carries the Move type, so
+`sui.getObject(id, { schema })` checks the tag before it parses. There is no
+encoder: a mapping function has no inverse, so serialize with the layout itself.
+
 The domain class is an ordinary `Schema.Class`:
 
 @@ src/schema.ts :: export class Settlement extends Schema.Class<Settlement>("Settlement")({ :: }) {}
@@ -164,6 +186,39 @@ instantiation. Give the bridge the **bare** tag —
 comparing `address::module::name` only. Give it a tag that *carries* type
 arguments and it is compared in full, after normalization, so
 `Coin<0x2::sui::SUI>` does not accept `Coin<…::usdc::USDC>`.
+
+Worked, on owned objects, because that is where it pays: one codec and one bare
+tag serve every instantiation a wallet holds, including on the fake.
+
+<!-- inline -->
+
+```ts
+// One codec for every `Composition<T>`, built from the type origin.
+const compositionType = (typeOrigin: string) => `${typeOrigin}::composition::Composition`
+const CompositionContent = (typeOrigin: string) =>
+  SuiSchema.bcs(CompositionLayout, compositionType(typeOrigin))
+
+// Every composition an address owns, whatever it is parameterized by.
+const owned = (owner: SuiAddress) =>
+  sui.streamOwnedObjects(owner, {
+    type: compositionType(typeOrigin),
+    schema: CompositionContent(typeOrigin)
+  })
+
+// In a test, the fake filters with the same rule, so objects whose `type` is
+// the instantiated tag are served for the bare one:
+const script = {
+  objects: [
+    { objectId: FIRST, type: `${ORIGIN}::composition::Composition<${ORIGIN}::share::Share>`, … },
+    { objectId: SECOND, type: `${ORIGIN}::composition::Composition<0x2::sui::SUI>`, … }
+  ]
+}
+// `owned(address)` yields both, each decoded by the one codec.
+```
+
+The instantiation is not lost: each object keeps its own tag on
+`SuiObject.type`, so a member that cares which one it read still can. What the
+bare tag does is stop you writing a codec per type argument.
 
 The same rule holds everywhere a Move type is compared: the `expectedType`
 option of `getObject` / `getObjectOption` / `getObjects`, `SuiSchema.decode`'s
@@ -223,8 +278,23 @@ becomes a typed `DecodeError`; `.make` on it is a defect in a member whose error
 union says it cannot fail.
 
 They also validate rather than normalize: `SuiAddress.make("0x1")` throws,
-because `0x1` is not a 32-byte address. Normalize first
-(`normalizeSuiAddress`) or write the padded form.
+because `0x1` is not a 32-byte address. **`SuiAddress.normalize` and
+`ObjectId.normalize` are the pair that take the shorthand**: they run the
+schema's own decode (`normalizeSuiAddress`) and then brand, so `"0x1"`, an
+unpadded hex string and the padded form all produce the same branded value.
+
+<!-- inline -->
+
+```ts
+const treasury = SuiAddress.normalize("0x2") // 0x0000…0002, branded
+const clock = ObjectId.normalize("0x6")
+```
+
+They throw, exactly like `.make`, so they are still for literals and
+configuration **you** control — a deployment constant, a CLI flag you already
+validated. Anything that arrived from a node, a user or an upstream package goes
+through `Schema.decodeUnknownEffect(ObjectId)` and becomes a typed
+`DecodeError`.
 
 When the error you would build *needs a field you do not have* — a `DecodeError`
 wants an `objectId` and you are decoding an event payload with no object — that
@@ -458,7 +528,8 @@ different extensions on the same client. After that:
 - an `Effect` member is a zero-argument method returning a `Promise`;
 - a function returning an `Effect` keeps its arguments and returns a `Promise`;
 - a `Stream` is an `AsyncIterable`, usable in `for await`;
-- a nested namespace is mapped recursively;
+- a nested namespace is mapped recursively, **including one typed as an
+  `interface`** — the recursion is by type, not by how the member was declared;
 - a plain value passes through;
 - a rejection is **the same tagged error instance**, so a Promise consumer can
   still switch on `_tag` and read `outcome`;
@@ -494,6 +565,15 @@ broke in production.) Two cures, both yours to choose:
 
 @@ src/Platform.ts :: export const platform = (options: PlatformRegistrationOptions) => ::   })
 
+**A `warm` registration runs the whole layer synchronously, so every failure of
+that layer is thrown out of `$extend`.** Not only an asynchronous step and not
+only a missing chain id: a deployment your bundle does not have for this
+network, a `ConfigError`, a `NetworkMismatch`, anything the layer declares.
+There is no first call to reject, because the layer is built before `register`
+returns. Catch it where you register, and say so in your registration's JSDoc.
+The mirror image is the lazy default, where the layer's failure surfaces as the
+rejection of whatever call needed it first.
+
 `warm` has two conditions and both are enforced. The layer must not perform an
 asynchronous step — a layer that reads the network at build cannot be built
 synchronously and `register` throws. And the chain identifier is **taken, not
@@ -517,26 +597,81 @@ it is what lets every registration on one client agree — see the next
 paragraph. The template has a test for the warm face on a network with no
 built-in chain id; a conversion should have one too.
 
+**What a cold call actually is.** The value a member call returns before the
+runtime exists is a real `Promise` subclass that also implements
+`Symbol.asyncIterator`, because nothing yet knows whether the member was an
+`Effect` (a Promise) or a `Stream` (an `AsyncIterable`). So `instanceof Promise`
+holds, `for await` works, and in `bun:test`
+`await expect(client.ext.thing()).rejects.toBeInstanceOf(ExtensionNotReady)`
+does what it looks like. (In 0.1.0 it was a bare thenable and `.rejects` did not
+recognise it; `await ... .catch()` was the workaround and is no longer needed.)
+
+Its rejection is also **pre-handled**: a cold call nobody awaits —
+`client.ext.doThing()` written as a statement — rejects with
+`ExtensionNotReady` into a no-op catch rather than aborting the process on an
+unhandled rejection. Your own `await` still throws. Write the test that proves
+this for your own face; it is the one failure mode that kills a test run rather
+than failing a test.
+
+And **`$dispose()` keeps a warm registration warm**: the next use re-runs the
+same warm build rather than leaving every synchronous member throwing
+`ExtensionNotReady` forever after.
+
 If your extension's surface is entirely `Effect` and `Stream` members, none of
 this applies: the lazy default is right and the first `await` builds everything.
 
-### Non-plain values are leaves, and plain ones are not
+### Namespaces, leaves, and the one member that still lies
 
-The face maps plain object literals recursively and passes everything else
-through: a `BcsType`, a `Schema.Class` instance, a `Date` — anything with a
-prototype of its own — arrives whole, in the type and at runtime alike. So
-exposing a codec or a domain class as a member is safe, and a "namespace" must
-be a plain object literal to be mapped as one.
+The face recurses into object-typed members — that is what makes
+`client.platform.escrow.get(id)` work — and **the recursion is by type, not by
+declaration style**. An `interface`-typed namespace (`readonly escrow:
+EscrowService`) is mapped exactly like an inline object literal. In 0.1.0 it was
+not: the type's bound was `Record<string, unknown>`, which an interface is not
+assignable to, so an interface-typed namespace kept its `Effect` members **in
+the type** while the runtime mapped them to Promises. If you carried a local
+type alias to work around that, delete it.
 
-The other half of that rule is the trap. A **plain-object value** member —
-`deployment: { packageId }` — is indistinguishable from a namespace of members,
-so the type maps it as the value while the **cold** face treats it as a
-namespace and hands back a placeholder for `deployment.packageId`. Reading that
-placeholder throws `ExtensionNotReady` naming the path, so the disagreement is
-typed and named rather than silent, but it is still a disagreement. Either
-register `warm` (or `await $ready()`), or expose the value through an `Effect`
-member, or give it a prototype of its own. Do not put a plain-object value
-member on a service that consumers will register lazily.
+These are the leaves — passed through whole, in the type and at runtime alike:
+functions, arrays, `Uint8Array`, `Date`, `Promise`, and a BCS codec (anything
+with both `parse` and `serialize`, which is every `BcsType`). Exposing a codec
+as a member is safe.
+
+For **any other class instance** — a `Schema.Class` instance, a policy object,
+anything with methods of its own — say so:
+
+<!-- inline -->
+
+```ts
+import { SuiExtension } from "@unconfirmed/sui-effect/extension"
+
+interface MyService {
+  readonly policy: SuiExtension.Leaf<Policy>
+}
+// in the layer:
+return { policy: SuiExtension.leaf(new Policy()) }
+```
+
+`Leaf<T>` **is** a `T`, so the Effect face is unaffected; what it does is tell
+the Promise face that this member is a value rather than a namespace of members.
+Without it the type would recurse into the class while the runtime passes class
+instances through untouched, and for a class whose methods return `Effect`s that
+is the same lie in the other direction.
+
+The remaining disagreement is the one that cannot be resolved by types at all. A
+**plain-object value** member — `deployment: { packageId }` — is
+indistinguishable from a namespace of members, so the type maps it as the value
+while the **cold** face treats it as a namespace and hands back a placeholder
+for `deployment.packageId`. Reading that placeholder throws `ExtensionNotReady`
+naming the path, so it is typed and named rather than silent, but it is still a
+disagreement. Either register `warm` (or `await $ready()`), or expose the value
+through an `Effect` member. Do not put a plain-object value member on a service
+that consumers will register lazily.
+
+**Write a `PromiseFace<Service>` type test per namespace.** It is four lines, it
+is the only thing that catches a face type that has drifted from the runtime,
+and the template has one to copy:
+
+@@ test/escrow.test.ts :: describe("the Promise face type", () => { :: })
 
 ### The rest of the contract
 
@@ -612,6 +747,51 @@ The same shape holds for a dependency that is not an extension at all — a
 `SuiGraphQL` client, an `HttpClient`, your own operator service: yield it in
 `make`, provide its layer in `layer`.
 
+#### A standalone function that needs a sibling extension
+
+A service member yields its dependencies; a **standalone exported function**
+has no layer of its own, and the temptation is to build the sibling's layer
+inside it on every call or, worse, to keep a module-level `ManagedRuntime`.
+Neither is sanctioned. There are exactly two shapes, and the first is the
+default:
+
+<!-- inline -->
+
+```ts
+// 1. Take the sibling's service as a parameter. The caller already holds it —
+//    it is in a member's `Effect.gen`, or in a script that provided the layer —
+//    and the function stays `R = Sui`, testable with the sibling's test layer
+//    and nothing else.
+export const settleAll = Effect.fn("settleAll")(function*(
+  escrow: EscrowService,
+  ids: ReadonlyArray<ObjectId>,
+  opts: { readonly signer: Signer }
+) {
+  const settled: Array<ChangedRef> = []
+  for (const id of ids) settled.push(yield* escrow.claimFor(id, opts))
+  return settled
+})
+
+// 2. Require it, and let the caller provide it once. Use this when the function
+//    is part of a surface whose consumers already hold the layer.
+export const settleAllOwned = Effect.fn("settleAllOwned")(function*(
+  owner: SuiAddress,
+  opts: { readonly signer: Signer }
+) {
+  const escrow = yield* Escrow // R = Sui | Escrow
+  …
+})
+```
+
+What not to do: `Layer.build` (or `Effect.provide(Escrow.layer(options))`)
+**inside** the function body. It is one layer build per call — a fresh cache, a
+fresh connection, a fresh sender lock for whatever the sibling holds — and the
+options have to come from somewhere, which is how a package id ends up read from
+`process.env` three files away from the service that owns it. If a function
+genuinely needs to build the sibling itself, build it **once** in the function
+that builds the registration and close over the service, the way `Platform.layer`
+does with `Layer.provide`.
+
 ## 9. Wrapping an upstream Promise package
 
 For upstream SDKs we do not own (suins, deepbook, whatever comes next) we do not
@@ -640,9 +820,12 @@ release.
 
 ### If your extension reads GraphQL
 
-`SuiGraphQL` is a tag over the SDK's own client, not a wrapper, and
-`SuiGraphQL.query(run, method?)` is the one call that sorts out the two
-failures:
+`SuiGraphQL` is a tag over the SDK's own client, not a wrapper: `yield*
+SuiGraphQL` hands back the `SuiGraphQLClient` that was passed to
+`SuiGraphQL.layer(client)`, so the service type is `SuiGraphQL["Service"]`
+(which *is* `SuiGraphQLClient`) and that is what a helper taking it as a
+parameter should be typed with. `SuiGraphQL.query(run, method?)` is the one call
+that sorts out the two failures:
 
 <!-- inline -->
 
@@ -674,10 +857,36 @@ else: no network, no HTTP mock, no hand-rolled client.
 So a test exercises the production high tier: the include sets, the BCS bridge,
 the chunked batch reads, the sender lock and every `Tx` step.
 
+It also provides **`SuiGraphQL.layerUnavailable`**, so an extension that reads
+GraphQL builds in a test with no endpoint and every GraphQL call fails with
+`GraphQLUnavailable` — the failure it already handles. Anything else your layer
+requires that the client could not have given it goes in the third argument:
+
+<!-- inline -->
+
+```ts
+const layer = layerExtensionTest(Escrow.layerTest(), script, {
+  extra: SuiGraphQL.layer(scriptedClient) // or an HttpClient, an operator service…
+})
+```
+
 The `script` is what the fake serves — objects with real BCS content, gas coins,
 and scripted outcomes for simulate, execute and `getTransaction`:
 
 @@ test/escrow.test.ts :: const script = { :: }
+
+**`waitForTransaction` is scripted through `getTransaction`.** There is no
+separate knob: `Tx.submit` waits by polling `getTransaction`, so the ordered
+`FakeScript.getTransaction` outcomes (and `FakeScript.transactions` / 
+`SuiTest.recordTransaction` for answers keyed by digest) are what decide whether
+a wait succeeds, times out or reports the transaction missing. A test that wants
+"executed, then not visible for two polls, then visible" scripts exactly that
+list.
+
+`FakeScript.coinMetadata` is the same idea for `getCoinMetadata`: a record keyed
+by coin type, with an unscripted type answering `{ coinMetadata: null }` the way
+a node does. Unscripted entirely, the method dies naming itself, like every
+other method the script does not cover.
 
 `SuiTest` drives the fake from inside an `Effect`: `putObject`, `bumpVersion`,
 `deleteObject`, `setClock` (the chain's clock, which is what `Tx.build` bounds a
@@ -780,7 +989,14 @@ extension exits with the code a wrapper can act on — 5 applied, 4 not applied,
 `SuiError.toJson` serializes your errors too. A tag in @unconfirmed/sui-effect's own taxonomy
 encodes through the taxonomy's schema; **anything else that is a
 `Schema.TaggedError` encodes through its own**, so an extension error arrives as
-`{ _tag, escrowId, outcome }` rather than a bare `{ _tag, message }`. That is
+`{ _tag, escrowId, outcome }` rather than a bare `{ _tag, message }`.
+
+**`outcome` is in that JSON even though it is a class field.** Declaring it the
+way the template does — `readonly outcome: Outcome = "unknown"` beside the
+schema fields — keeps the call site clean, and a class field is not part of the
+schema, so encoding alone would drop exactly the field a wrapper script acts on.
+`toJson` reads it off the instance and puts it back. Keep declaring it as a
+field; there is nothing to change in your errors. That is
 what makes a structured log of a failed run useful, and it is a reason to give
 every field of an error a schema rather than stuffing detail into a string.
 
@@ -801,9 +1017,15 @@ functions beside it is a different job, and the order that works is this.
 
 1. **Inventory the namespaces first.** List what consumers actually call,
    grouped the way they call it (`ids`, `tx`, `protocol`, `party`). That list is
-   your service interface, and a group is a plain object member on it. Write the
-   interface before you move any code: it is the only artefact the conversion is
-   reviewed against.
+   your service interface, and a group is a member on it — an `interface` is
+   fine, the face maps it either way. Write the interface before you move any
+   code: it is the only artefact the conversion is reviewed against.
+
+   **Grep for captured aliases, not only for dotted calls.** A consumer that
+   writes `const party = client.miso.party` and then `party.join(...)` does not
+   appear in a search for `client.miso.party.join`, and a namespace that looks
+   unused gets dropped from the interface. Search for the namespace name on its
+   own (`\bclient\.\w+\.party\b`, `= .*\.party\b`) as well as for the calls.
 2. **Keep the standalone functions.** An existing `Effect<A, E, Sui>` function
    that is exported and used outside the facade stays exported and keeps its
    signature. Do not make consumers hold a service to call something that never
@@ -930,6 +1152,10 @@ Reject an extension that:
   carries, prefix included;
 - leaves `tests` out of the package `tsconfig`'s `include`, so its type-level
   pins never compile;
+- has no `PromiseFace<Service>` type test per namespace, or has one that only
+  checks the top level;
+- exposes a class instance with `Effect`-returning methods without
+  `SuiExtension.Leaf<T>` / `SuiExtension.leaf(value)`;
 - calls `.make` on a branded schema with a value that came from outside;
 - promises a `ConfigError` for an empty environment variable it reads with
   `Config.option`.
@@ -1024,6 +1250,19 @@ old one) before installing: a file that stopped shipping is caught there rather
 than in a consumer. Record the sui-effect commit or tag the vendor copy came
 from.
 
+**And re-install with `--force`.** bun keys a file dependency by name and
+version, not by content, so re-packing over `vendor/unconfirmed-sui-effect-0.1.1.tgz`
+and running `bun install` again leaves the *old* extraction in `node_modules` —
+silently, and for as long as it takes you to notice that a fix you just made is
+not there. Either bump the filename (`…-0.1.1+2.tgz`) or:
+
+```bash
+bun install --force
+```
+
+Verify it took: `cat node_modules/@unconfirmed/sui-effect/package.json | grep version`, or
+grep the shipped `dist` for the change you are looking for.
+
 **Until the first publish, bun probes the registry for every peer.** It does so
 even for a peer a local dependency already satisfies, and an unpublished name
 404s the install. The escape is
@@ -1091,3 +1330,26 @@ the page to read before the conversion rather than after it.
   `ConfigProvider` service.
 - **`SuiError.describe` covers `GraphQLUnavailable` and `ExtensionNotReady`**,
   and `Script.run` prints them like any other tag.
+- **Write a `PromiseFace<Service>` type test per namespace**, and put `test` in
+  the package `tsconfig`'s `include` so those pins actually compile. A namespace
+  may be an `interface`; since 0.1.1 the face maps it the same as a type alias,
+  so the local aliases a 0.1.0 conversion carried for this are unnecessary.
+- **A class instance with `Effect`-returning methods needs
+  `SuiExtension.leaf`.** `Uint8Array`, `Date`, `Promise`, arrays and BCS codecs
+  are leaves already; everything else with a prototype of its own is passed
+  through by the runtime and must say so in the type.
+- **A cold call is a real `Promise`** that is also an `AsyncIterable`, and its
+  rejection is pre-handled, so `expect(...).rejects` works and an un-awaited
+  cold call cannot abort the test run.
+- **`outcome` survives `SuiError.toJson`** even as a class field; keep declaring
+  it as one.
+- **`warm` throws *any* layer failure synchronously out of `$extend`**, not only
+  an asynchronous step or a missing chain id.
+- **Two copies of `@mysten/sui` are still a bug**, but `mapSdkError` duck-types
+  the SDK's error classes now, so `ObjectNotFound` survives it and one warning
+  names the real problem. Fix the duplication anyway: BCS codecs and
+  `Transaction` inputs have no such fallback.
+- **`SuiAddress.normalize` / `ObjectId.normalize`** take `"0x1"`; `.make` does
+  not, and never will, because it validates without decoding.
+- **`bun install --force` after re-packing a vendored tarball** with the same
+  filename and version, or bun keeps the old extraction.

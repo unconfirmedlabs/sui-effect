@@ -28,8 +28,13 @@ const normalizeStructTagSafe = (value: string): string => {
 /**
  * A 32-byte Sui account address, normalized to the padded lowercase `0x` form on
  * decode. Rejects anything `isValidSuiAddress` rejects with a `SchemaError`.
+ *
+ * `SuiAddress.make(value)` is the branding constructor: it **validates without
+ * decoding**, so it takes the padded 32-byte spelling and nothing else —
+ * `SuiAddress.make("0x1")` throws. `SuiAddress.normalize("0x1")` is the one
+ * that accepts every spelling a human writes, because it decodes first.
  */
-export const SuiAddress = Schema.String.pipe(
+const SuiAddressSchema = Schema.String.pipe(
   Schema.decode({
     decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
     encode: SchemaGetter.passthrough()
@@ -41,13 +46,51 @@ export const SuiAddress = Schema.String.pipe(
   ),
   Schema.brand("SuiAddress")
 )
-export type SuiAddress = typeof SuiAddress.Type
+
+/**
+ * A branded {@link SuiAddress} from **any** spelling the SDK accepts: `"0x1"`,
+ * an unpadded hex string, a mixed-case one, the padded form itself.
+ *
+ * This is the caller-facing shorthand, and it exists because `.make` is not it:
+ * a brand constructor validates the value it is given and the check is
+ * `isValidSuiAddress`, which only the padded 32-byte form passes, so
+ * `SuiAddress.make("0x1")` throws while `"0x1"` is what every deployment
+ * document, every CLI flag and every human writes. `normalize` runs the
+ * schema's own decode — `normalizeSuiAddress` — and then the check.
+ *
+ * **It throws** (an `Error` whose cause is the schema issue), like `.make`, so
+ * it is for literals and configuration a caller controls. Anything that arrived
+ * from outside goes through `Schema.decodeUnknownEffect(SuiAddress)`, which
+ * puts the failure in the error channel where a caller can handle it.
+ *
+ * @since 0.1.1
+ *
+ * @example
+ * ```ts
+ * import { SuiAddress } from "@unconfirmed/sui-effect"
+ *
+ * const treasury = SuiAddress.normalize("0x2")
+ * // "0x0000000000000000000000000000000000000000000000000000000000000002"
+ * ```
+ */
+const normalizeSuiAddressValue: (input: string) => typeof SuiAddressSchema.Type = Schema.decodeSync(
+  SuiAddressSchema
+)
+
+/** The schema, plus {@link normalizeSuiAddressValue} as `SuiAddress.normalize`. */
+export const SuiAddress = Object.assign(SuiAddressSchema, {
+  normalize: normalizeSuiAddressValue
+})
+export type SuiAddress = typeof SuiAddressSchema.Type
 
 /**
  * A 32-byte object id. Same encoding rules as {@link SuiAddress}; the brand is
  * separate so an address cannot be passed where an object id is expected.
+ *
+ * `ObjectId.make` validates without decoding; `ObjectId.normalize` decodes
+ * first and is what takes `"0x6"`.
  */
-export const ObjectId = Schema.String.pipe(
+const ObjectIdSchema = Schema.String.pipe(
   Schema.decode({
     decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
     encode: SchemaGetter.passthrough()
@@ -59,7 +102,32 @@ export const ObjectId = Schema.String.pipe(
   ),
   Schema.brand("ObjectId")
 )
-export type ObjectId = typeof ObjectId.Type
+
+/**
+ * A branded {@link ObjectId} from any spelling the SDK accepts, decoding first
+ * and branding after — the object-id twin of `SuiAddress.normalize`, and the
+ * answer to `ObjectId.make("0x6")` throwing.
+ *
+ * **It throws**, like `.make`, so it is for literals and configuration a caller
+ * controls; anything from outside goes through
+ * `Schema.decodeUnknownEffect(ObjectId)`.
+ *
+ * @since 0.1.1
+ *
+ * @example
+ * ```ts
+ * import { ObjectId } from "@unconfirmed/sui-effect"
+ *
+ * const clock = ObjectId.normalize("0x6")
+ * ```
+ */
+const normalizeObjectIdValue: (input: string) => typeof ObjectIdSchema.Type = Schema.decodeSync(
+  ObjectIdSchema
+)
+
+/** The schema, plus {@link normalizeObjectIdValue} as `ObjectId.normalize`. */
+export const ObjectId = Object.assign(ObjectIdSchema, { normalize: normalizeObjectIdValue })
+export type ObjectId = typeof ObjectIdSchema.Type
 
 /** A base58 transaction digest. Not normalized; rejected when not 32 bytes. */
 export const Digest = Schema.String.pipe(

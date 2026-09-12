@@ -1018,8 +1018,7 @@ declare const ObjectId: Schema
 // decodes to: ObjectId
 ```
 
-A 32-byte object id. Same encoding rules as `SuiAddress`; the brand is
-separate so an address cannot be passed where an object id is expected.
+The schema, plus `normalizeObjectIdValue` as `ObjectId.normalize`.
 
 ### `ObjectLookupError` (type)
 
@@ -1675,8 +1674,7 @@ declare const SuiAddress: Schema
 // decodes to: SuiAddress
 ```
 
-A 32-byte Sui account address, normalized to the padded lowercase `0x` form on
-decode. Rejects anything `isValidSuiAddress` rejects with a `SchemaError`.
+The schema, plus `normalizeSuiAddressValue` as `SuiAddress.normalize`.
 
 ### `SuiCore` (class)
 
@@ -1892,6 +1890,19 @@ export declare class SuiGraphQL extends SuiGraphQL_base {
 The SDK's GraphQL client as a service, so an extension can require it
 without constructing one.
 
+**The service value *is* the client.** `yield* SuiGraphQL` hands back the
+`SuiGraphQLClient` that was passed to `SuiGraphQL.layer(client)` — not a
+wrapper with `client` on it, not an interface of methods this package
+defines. `SuiGraphQL["Service"]` is therefore `SuiGraphQLClient`, which is
+the type to write when a function takes the service as a parameter:
+
+```ts
+const names = (graphql: SuiGraphQL["Service"]) => graphql.query({ query, variables })
+```
+
+The requirement is spelled `SuiGraphQL` in an `Effect`'s `R`, as with every
+other tag here.
+
 ### `SuiGrpcLayerOptions` (interface)
 
 ```ts
@@ -1996,6 +2007,36 @@ give it and the same tag check `getObject` does runs here, under the
 the error so an operator knows which object did not decode.
 
 **Fails with: `DecodeError`.**
+
+#### `decodeWith` (const)
+
+```ts
+declare const decodeWith: <T extends Input, Input, A>(bcsType: BcsType<T, Input>, expectedType: string | undefined, map: (parsed: T) => A) => Schema.Codec<A, Uint8Array>
+```
+
+A BCS layout plus the mapping into a domain value, as one codec.
+
+This is the shape every extension writes by hand and writes slightly
+differently: parse the bytes with a layout, then hand the raw struct to a
+constructor or a mapping function that may throw (an id that has to be
+branded, a `bigint` that has to be range-checked, a discriminant that has to
+become a union). Written out it is `SuiSchema.bcs(...)` piped into a
+`Schema.decodeTo` with a `transformOrFail` and an `Effect.try`, and the part
+that gets forgotten is turning the thrown value into a schema issue, so the
+failure arrives as a defect instead of a `DecodeError`.
+
+`map` is called with whatever the layout parsed. Returning a value decodes
+it; **throwing** fails the decode, and the thrown value's message becomes the
+`DecodeError.issue` the caller sees, with the expected type already on it.
+The result is a `Schema.Codec<A, Uint8Array>` like any other: pass it as
+`sui.getObject(id, { schema })`, and the Move type check still runs first
+because the annotation `bcs` leaves behind survives the composition.
+
+Encoding is not supported: a mapping function has no inverse, and inventing
+one silently is worse than saying so. Encode with the layout itself when you
+need bytes back.
+
+**Fails with: `DecodeError` (through the schema), when the bytes do not parse or `map` throws.**
 
 #### `matchesType` (const)
 
@@ -4167,7 +4208,7 @@ Every member fails with `JournalError` and nothing else.
 ## `@unconfirmed/sui-effect/extension`
 
 
-5 exported symbols.
+7 exported symbols.
 
 ### `ExtensionFace` (interface)
 
@@ -4237,7 +4278,10 @@ the *second* call, when the member has become real. Two cures:
 Two lifetimes worth knowing:
 
 - **`$dispose()` is not final.** It releases everything the layer acquired
-  and forgets the runtime; the next call builds a fresh one. That is what a
+  and forgets the runtime; the next call builds a fresh one — and a `warm`
+  registration re-runs its **warm** build, with the same options, on the next
+  use, so it does not silently degrade to cold with every synchronous member
+  throwing `ExtensionNotReady`. That is what a
   long-lived page wants (a disposed extension is usable again after a
   reconnect) and it does mean a `$dispose()` that races an in-flight call can
   leave the caller's Promise rejected while a new runtime starts behind it.
@@ -4248,16 +4292,54 @@ Two lifetimes worth knowing:
   copies of whatever the layer holds (a cache, a connection). Register once
   per client and keep the extended client.
 
-Never fails, except a `warm` registration, which throws out of `register`
-when the layer needs an asynchronous step or when the network has no known
-chain identifier and none was given. Otherwise the layer's own failures
-surface as rejections of the first call that needs it.
+**A cold call is a real `Promise`.** The placeholder a member call returns
+before the runtime exists is a `Promise` subclass that also implements
+`Symbol.asyncIterator`, so `instanceof Promise` holds and `bun:test`'s
+`expect(...).rejects` recognises it. Its rejection is **pre-handled** (a
+no-op `catch` is attached at creation), so a cold call nobody awaits —
+`client.ext.doThing()` as a statement — cannot abort the process with an
+unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
+
+Never fails, except a `warm` registration. A warm registration builds the
+**whole layer** synchronously inside `register`, so **any** failure of that
+layer — a missing deployment for the network, a configuration error, a
+`NetworkMismatch`, not only an asynchronous step or an unknown chain
+identifier — is thrown synchronously out of `register`, which means out of
+`client.$extend(...)`. Catch it where you register. A lazy registration has
+nowhere to put such a failure at registration time, so it surfaces as the
+rejection of the first call that needs the layer.
+
+### `leaf` (const)
+
+```ts
+declare const leaf: <T>(value: T) => Leaf<T>
+```
+
+Marks a value as a `Leaf`: the Promise face passes it through untouched
+instead of walking into it.
+
+The registry is a `WeakSet`, so a frozen value can be marked and nothing is
+added to the value itself.
+
+**Never fails.**
+
+### `Leaf` (type)
+
+```ts
+export type Leaf<T> = T & LeafBrand;
+```
+
+`T`, marked as a leaf of the Promise face: it is handed to a Promise consumer
+exactly as the Effect service holds it.
+
+Declare the member as `Leaf<MyClass>` and build it with `leaf`. A
+`Leaf<T>` is still a `T` — every consumer of the Effect face is unaffected.
 
 ### `PromiseFace` (type)
 
 ```ts
 export type PromiseFace<S> = {
-    readonly [K in keyof S]: S[K] extends Stream.Stream<infer A, infer _E, infer _R> ? AsyncIterable<A> : S[K] extends Effect.Effect<infer A, infer _E2, infer _R2> ? () => Promise<A> : S[K] extends (...args: infer Args) => Stream.Stream<infer A, infer _E3, infer _R3> ? (...args: Args) => AsyncIterable<A> : S[K] extends (...args: infer Args) => Effect.Effect<infer A, infer _E4, infer _R4> ? (...args: Args) => Promise<A> : S[K] extends Record<string, unknown> ? PromiseFace<S[K]> : S[K];
+    readonly [K in keyof S]: S[K] extends Stream.Stream<infer A, infer _E, infer _R> ? AsyncIterable<A> : S[K] extends Effect.Effect<infer A, infer _E2, infer _R2> ? () => Promise<A> : S[K] extends (...args: infer Args) => Stream.Stream<infer A, infer _E3, infer _R3> ? (...args: Args) => AsyncIterable<A> : S[K] extends (...args: infer Args) => Effect.Effect<infer A, infer _E4, infer _R4> ? (...args: Args) => Promise<A> : S[K] extends FaceLeaf ? S[K] : S[K] extends (...args: ReadonlyArray<never>) => unknown ? S[K] : S[K] extends object ? PromiseFace<S[K]> : S[K];
 };
 ```
 
@@ -4265,8 +4347,8 @@ The Promise face of a service interface.
 
 An `Effect` member becomes a zero-argument method returning a Promise, a
 function returning an `Effect` keeps its arguments and returns a Promise, a
-`Stream` member becomes an `AsyncIterable`, a nested plain object of members
-is mapped the same way (platform SDKs namespace their surface as
+`Stream` member becomes an `AsyncIterable`, a nested object of members is
+mapped the same way (platform SDKs namespace their surface as
 `client.miso.protocol.*`), and anything else passes through untouched.
 
 **A synchronous member stays synchronous**: a recipe builder
@@ -4275,11 +4357,22 @@ value is still that value. The type says so and, once the runtime exists, the
 runtime agrees — see `warm` and `$ready` on `fromService` for the
 window before it does.
 
-**A class instance is a leaf.** The recursion is into plain object literals
-only, which is what the runtime maps; a `BcsType`, a `Schema.Class` instance,
-a `Date`, anything with a prototype of its own passes through whole, in the
-type and at runtime alike. (An interface or class type is not assignable to
-`Record<string, unknown>`, which is what keeps the two in step.)
+**The recursion is by type, not by declaration style.** Every object-typed
+member that is not a function, an array, an `Effect`, a `Stream`, a
+`Uint8Array`, a `Date`, a `Promise`, a BCS codec (both `parse` and
+`serialize`) or a `Leaf` is mapped as a namespace — an `interface`
+exactly like a type alias. Before 0.1.1 the bound was
+`Record<string, unknown>`, which an interface is not assignable to, so an
+interface-typed namespace (`readonly protocol: ProtocolService`) kept its
+`Effect` members **in the type** while the runtime mapped them to Promises.
+The type lied; it no longer does.
+
+**A class instance that is a value, not a namespace, is marked.** The runtime
+maps plain-prototype objects and passes class instances through, so a class
+whose methods return `Effect`s would be typed as mapped and arrive unmapped.
+Declare such a member `Leaf<T>` and build it with `leaf`: the type and
+the runtime then agree that it is a value. `Uint8Array`, `Date`, `Promise`,
+arrays and BCS codecs need no marker.
 
 **A plain-object *value* member is the one place the two faces cannot agree.**
 `{ packageId: "0x…" }` is indistinguishable from a namespace of members, so
@@ -4296,10 +4389,13 @@ through an `Effect` member instead.
 ```ts
 declare const SuiExtension: {
     readonly fromService: <Self, Shape, E, const Name extends string>(service: Context.Key<Self, Shape>, options: SuiExtensionOptions<Self, E, Name>) => SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & ExtensionFace>;
+    readonly leaf: <T>(value: T) => Leaf<T>;
 }
 ```
 
-The namespace the spec spells: `SuiExtension.fromService(...)`.
+The namespace the spec spells: `SuiExtension.fromService(...)`, plus the
+leaf marker a service uses to say "this member is a value, not a namespace"
+(`SuiExtension.leaf(value)`, typed `SuiExtension.Leaf<T>`).
 
 ### `SuiExtensionOptions` (interface)
 
@@ -4343,6 +4439,16 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
      * package id, a codec — that a consumer expects to read the moment it
      * registers. Every member is then the real thing immediately, and
      * `$ready()` has nothing left to do.
+     *
+     * **Every failure of the layer becomes a synchronous throw.** The whole
+     * layer is built inside `register`, so a missing deployment, a bad
+     * configuration, a `NetworkMismatch` — anything the layer can fail with —
+     * comes out of `client.$extend(...)` as a thrown value rather than as the
+     * rejection of a first call. That is the trade `warm` makes, and a consumer
+     * has to catch it where it registers.
+     *
+     * After `$dispose()`, the next use re-runs this same build rather than
+     * degrading to a cold registration.
      *
      * Two conditions, both enforced:
      *
@@ -4763,6 +4869,18 @@ export interface FakeScript {
     /** The gas budget the resolve plugin sets when a transaction has none. */
     readonly gasBudget?: bigint;
     readonly balances?: ReadonlyArray<SuiClientTypes.Balance>;
+    /**
+     * What `getCoinMetadata` answers, keyed by coin type.
+     *
+     * Unscripted, the method dies naming itself the way every uncovered method
+     * does. Scripted, a coin type the record does not name answers
+     * `{ coinMetadata: null }` — which is what a node says about a type that has
+     * no metadata object, and the case an extension that formats balances has to
+     * handle.
+     *
+     * @since 0.1.1
+     */
+    readonly coinMetadata?: Readonly<Record<string, SuiClientTypes.CoinMetadata>>;
     readonly dynamicFields?: Readonly<Record<string, ReadonlyArray<SuiClientTypes.DynamicFieldEntry>>>;
     readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>;
     /** How many items a list method returns per page. Defaults to 50. */
@@ -4825,7 +4943,9 @@ Thrown, and re-thrown as a defect, when a test reaches an unscripted method.
 ### `layerExtensionTest` (const)
 
 ```ts
-declare const layerExtensionTest: <Self, E>(layer: Layer.Layer<Self, E, Sui | SuiCore>, script?: FakeScript) => Layer.Layer<Self | Sui | SuiCore | SuiCoreFake, E | NetworkMismatch | TransportError>
+declare const layerExtensionTest: <Self, E, RExtra = never, EExtra = never>(layer: Layer.Layer<Self, E, Sui | SuiCore | SuiGraphQL | RExtra>, script?: FakeScript, options?: {
+    readonly extra?: Layer.Layer<RExtra, EExtra>;
+}) => Layer.Layer<Self | Sui | SuiCore | SuiCoreFake, E | EExtra | NetworkMismatch | TransportError>
 ```
 
 An extension's own layer over `layerTest`, which is the whole wiring an
@@ -4838,7 +4958,16 @@ require `Sui | SuiCore` and nothing else — the same requirement
 the recipe, and everything the extension's layer provides plus the fake's
 handle comes out the other side.
 
-**Fails with: whatever the extension's layer fails with, plus `NetworkMismatch` and `TransportError` when the script asks for them.**
+**`SuiGraphQL` is provided too**, as `SuiGraphQL.layerUnavailable`: an
+extension that reads GraphQL requires the tag, its layer would otherwise not
+build in a test, and "there is no endpoint" is the answer a test wants by
+default — every GraphQL call fails with `GraphQLUnavailable`, which is a
+failure the extension already handles. Pass `extra` to override it with a
+real or scripted client, or to provide anything else the extension's layer
+requires that the client could not have given it (an `HttpClient`, an
+operator service, a sibling extension's test layer).
+
+**Fails with: whatever the extension's layer fails with, whatever `extra` fails with, plus `NetworkMismatch` and `TransportError` when the script asks for them.**
 
 ### `layerTest` (const)
 
@@ -6120,13 +6249,16 @@ import {
   Stream
 } from "effect"
 import { TestClock } from "effect/testing"
-import type { Sui, SuiCore } from "@unconfirmed/sui-effect"
-import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiSchema } from "@unconfirmed/sui-effect"
+import type { ChangedRef, Recipe, Sui, SuiCore } from "@unconfirmed/sui-effect"
+import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiError, SuiSchema } from "@unconfirmed/sui-effect"
+import type { PromiseFace } from "@unconfirmed/sui-effect/extension"
 import { FakeOutcome, layerExtensionTest, layerTest, SuiCoreFake, SuiTest } from "@unconfirmed/sui-effect/testing"
 import { Journal, Signer } from "@unconfirmed/sui-effect/tx"
+import type { EscrowObject, EscrowService } from "../src/Escrow.ts"
 import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
 import { escrow as escrowRegistration } from "../src/extension.ts"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "../src/errors.ts"
+import type { PlatformService } from "../src/Platform.ts"
 import { Platform, platform as platformRegistration } from "../src/Platform.ts"
 import { ESCROW_PACKAGE, receiptType, Settlement, SettlementContent } from "../src/schema.ts"
 
@@ -6653,6 +6785,92 @@ describe("layerConfig validates through the typed deployment path", () => {
     expect(Exit.isFailure(exit)).toBe(true)
     expect(String(exit)).toContain("PACKAGE_ID")
     expect(String(exit)).toContain("32-byte Sui object id")
+  })
+})
+
+/**
+ * The face's **type**, asserted rather than described.
+ *
+ * This is the test every extension copies. `PromiseFace<Service>` is what a
+ * Promise consumer actually holds, and it is derived, so nothing in the service
+ * says out loud what it produced: an `Effect` member has to become a
+ * Promise-returning method, a `Stream` member an `AsyncIterable`, a synchronous
+ * member has to stay synchronous, and a **namespace has to be mapped all the
+ * way down** — `PlatformService.escrow` is an interface, and until 0.1.1 an
+ * interface-typed namespace kept its `Effect` members in the type while the
+ * runtime handed back Promises.
+ *
+ * Write one of these per namespace. It costs four lines and it is the only
+ * thing that catches a face type that has quietly stopped matching the runtime.
+ */
+describe("the Promise face type", () => {
+  /** Compile-time assignability, as a value a test can assert on. */
+  const assignableTo = <_A extends _B, _B>(): true => true
+
+  type EscrowFace = PromiseFace<EscrowService>
+  type PlatformFace = PromiseFace<PlatformService>
+
+  test("an Effect member becomes a Promise-returning method", () => {
+    expect(assignableTo<EscrowFace["get"], (id: ObjectId) => Promise<EscrowObject>>()).toBe(true)
+    expect(assignableTo<EscrowFace["feeCollector"], () => Promise<SuiAddress>>()).toBe(true)
+  })
+
+  test("a Stream member becomes an AsyncIterable", () => {
+    expect(
+      assignableTo<EscrowFace["owned"]["stream"], (owner: SuiAddress) => AsyncIterable<EscrowObject>>()
+    ).toBe(true)
+  })
+
+  test("a synchronous member stays synchronous", () => {
+    expect(assignableTo<EscrowFace["packageId"], string>()).toBe(true)
+    expect(assignableTo<EscrowFace["claim"], (escrow: EscrowObject) => Recipe>()).toBe(true)
+  })
+
+  test("an interface-typed namespace is mapped all the way down", () => {
+    // `PlatformService.escrow` is `EscrowService`, an interface. The members
+    // reached through it must be the mapped ones, not the Effect ones.
+    expect(assignableTo<PlatformFace["escrow"]["get"], (id: ObjectId) => Promise<EscrowObject>>())
+      .toBe(true)
+    expect(
+      assignableTo<
+        PlatformFace["escrow"]["owned"]["count"],
+        (owner: SuiAddress) => Promise<number>
+      >()
+    ).toBe(true)
+    expect(assignableTo<PlatformFace["escrow"]["packageId"], string>()).toBe(true)
+  })
+
+  test("the composition's own member is mapped too", () => {
+    expect(
+      assignableTo<
+        PlatformFace["claimEverything"],
+        (ids: ReadonlyArray<ObjectId>, opts: { readonly signer: Signer }) => Promise<
+          ReadonlyArray<ChangedRef>
+        >
+      >()
+    ).toBe(true)
+  })
+})
+
+/**
+ * The errors serialize with their `outcome`, which is what a wrapper script
+ * acts on and what an operator reads out of a log line.
+ */
+describe("the errors", () => {
+  test("SuiError.toJson keeps the outcome, though it is a class field", () => {
+    const error = new EscrowSettlementUnknown({
+      escrowId: ESCROW_ID,
+      digest: "1".repeat(32) as never,
+      message: "the operator never confirmed"
+    })
+    const json = SuiError.toJson(error)
+    expect(json["_tag"]).toBe("escrow/EscrowSettlementUnknown")
+    expect(json["escrowId"]).toBe(ESCROW_ID)
+    // `outcome` is declared as a class field — not a schema field — because
+    // that is the shape that reads well at the call site. `toJson` reads it off
+    // the instance, so it is in the JSON anyway.
+    expect(json["outcome"]).toBe("unknown")
+    expect(json["outcome"]).toBe(SuiError.outcome(error))
   })
 })
 ```

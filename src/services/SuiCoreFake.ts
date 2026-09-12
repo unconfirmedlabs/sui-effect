@@ -167,6 +167,18 @@ export interface FakeScript {
   /** The gas budget the resolve plugin sets when a transaction has none. */
   readonly gasBudget?: bigint
   readonly balances?: ReadonlyArray<SuiClientTypes.Balance>
+  /**
+   * What `getCoinMetadata` answers, keyed by coin type.
+   *
+   * Unscripted, the method dies naming itself the way every uncovered method
+   * does. Scripted, a coin type the record does not name answers
+   * `{ coinMetadata: null }` — which is what a node says about a type that has
+   * no metadata object, and the case an extension that formats balances has to
+   * handle.
+   *
+   * @since 0.1.1
+   */
+  readonly coinMetadata?: Readonly<Record<string, SuiClientTypes.CoinMetadata>>
   readonly dynamicFields?: Readonly<Record<string, ReadonlyArray<SuiClientTypes.DynamicFieldEntry>>>
   readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>
   /** How many items a list method returns per page. Defaults to 50. */
@@ -1137,7 +1149,11 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     getCoinMetadata: async (options: SuiClientTypes.GetCoinMetadataOptions) => {
       record("getCoinMetadata", options)
-      return unimplemented("getCoinMetadata")
+      if (script.coinMetadata === undefined) return unimplemented("getCoinMetadata")
+      const metadata = script.coinMetadata[options.coinType]
+      // A node answers `null` for a coin type with no metadata object, so the
+      // fake does too rather than dying: "there is none" is an answer.
+      return { coinMetadata: metadata ?? null }
     },
     getTransaction: async (options: SuiClientTypes.GetTransactionOptions) => {
       record("getTransaction", options)

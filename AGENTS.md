@@ -26,7 +26,13 @@ the work plan. Where this file and the spec disagree, fix this file.
   edges: the Promise facade of `SuiExtension.fromService`, and `Script.run`,
   which is a process entrypoint and whose whole job is to fork the root fiber,
   await its `Exit` and exit.
-- No `any`. No `unknown` in an error channel. No `console.log` in `src/`.
+- No `any`. No `unknown` in an error channel. No `console.log` in `src/`. The
+  one `console.warn` is `SuiCore.mapSdkError`'s duplicate-SDK warning, which
+  fires at most once per process and is documented where it lives.
+- **A branded id from a shorthand spelling** comes from `SuiAddress.normalize`
+  / `ObjectId.normalize` (decode, then brand); `.make` validates without
+  decoding and is for the padded form only. Neither is for a value that came
+  from outside: that goes through `Schema.decodeUnknownEffect`.
 - **One Move type rule.** `typeMatches(expected, actual)` (`src/domain/bcs.ts`)
   is the only comparison: a bare expected tag matches every instantiation of the
   generic, a parameterized one is compared in full after normalization. The
@@ -83,7 +89,7 @@ and nothing else.
 | `SubmitConfig` | A `Context.Reference` holding expiration policy, the optional `validFor` wall-clock bound, the gas-budget ceiling, `preflight`, the sender lock, the resubmit schedule, attempts, timeout and expiry margin, plus `expiryEvidence`, `reconcileRecheck`, `awaitVisibility`, `visibilityTimeout` and `nonce`. |
 | `Journal` | A `Context.Reference` with an in-memory default. `@unconfirmed/sui-effect/journal` swaps in a durable one over `KeyValueStore`; `Tx.reconcileAll()` is the explicit startup call. |
 | `Script` | `{ sui, core, signer, network }` plus `Script.run` and `Script.exitCode`. `ScriptReadOnly` is the signer-less variant, a separate key on purpose. |
-| `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. Options: `sui` (chain pinning), `warm` (build the runtime synchronously in `register`). The face carries `$ready()` and `$dispose()`; a synchronous member called before the runtime exists fails with `ExtensionNotReady`, while `Effect` and `Stream` members work cold. Every registration on one client shares one base `Sui`/`SuiCore` — one chain-id read and one sender-lock map — reference counted, so `$dispose()` releases it only when the last registration does. |
+| `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. Options: `sui` (chain pinning), `warm` (build the runtime synchronously in `register`, which throws **any** layer failure out of `$extend`). The face carries `$ready()` and `$dispose()`; a synchronous member called before the runtime exists fails with `ExtensionNotReady`, while `Effect` and `Stream` members work cold — a cold call is a real `Promise` subclass that is also an `AsyncIterable`, with its rejection pre-handled. `PromiseFace` recurses by **type**, so an interface-typed namespace is mapped; the leaves are functions, arrays, `Uint8Array`, `Date`, `Promise`, BCS codecs and anything marked `SuiExtension.Leaf<T>` / `SuiExtension.leaf(value)`. Every registration on one client shares one base `Sui`/`SuiCore` — one chain-id read and one sender-lock map — reference counted, so `$dispose()` releases it only when the last registration does; a `warm` registration re-warms on the next use after `$dispose()`. |
 | `SuiGraphQL` | A bare tag over the SDK's `SuiGraphQLClient` (`layer`, `layerConfig`, `layerUnavailable`). @unconfirmed/sui-effect wraps no GraphQL API; the tag exists so extensions share one client. |
 
 ## Extensions
@@ -165,20 +171,24 @@ Every failure is one flat tag; there is no error inheritance.
 anything that is neither one of those tags nor declares an `outcome`.
 `Script.exitCode` exits 1 for that last case rather than 3. An extension error
 may declare its own `outcome`, and should. `SuiError.isRetryable`, `SuiError.describe` (one actionable line) and
-`SuiError.toJson` round it out.
+`SuiError.toJson` round it out — and `toJson` adds `outcome` from the instance
+when the error declares one, which is almost always a class field rather than a
+schema field.
 
 ## Testing
 
 `@unconfirmed/sui-effect/testing` ships `SuiCoreFake.layer(script)`, `layerTest(script)`
-(the real `Sui` over the fake `SuiCore`), `layerExtensionTest(layer, script)`
-(an extension's own layer over that) and `SuiTest` (`putObject`, `bumpVersion`,
+(the real `Sui` over the fake `SuiCore`), `layerExtensionTest(layer, script, { extra })`
+(an extension's own layer over that, with `SuiGraphQL.layerUnavailable` provided
+by default and `extra` for any other dependency the layer requires) and `SuiTest` (`putObject`, `bumpVersion`,
 `recordTransaction`, `deleteObject`, `setClock`, `setEpoch`, `scriptExecute`,
 `scriptSimulate`, `scriptGetTransaction`, `calls`), which is the whole harness
 an extension's tests need. Call recording is reached through `SuiTest.calls`,
 not off the fake handle. The fake serves in-memory objects with
 BCS content, the Clock object `0x6`, and scripted outcomes
 (`FakeOutcome.succeed`, `failWith`, `transportError`, `notFound`, `timeoutThen`)
-for simulate, execute, `getTransaction` and the resolver's budget simulation
+for simulate, execute, `getTransaction` — which is also what drives every
+`waitForTransaction` outcome — `coinMetadata`, and the resolver's budget simulation
 (`buildSimulate`, which is how a test makes `Tx.build` fail with
 `SimulationFailed`). It records every call so a test can
 assert the include set that was sent. It also implements

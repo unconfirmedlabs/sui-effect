@@ -172,7 +172,12 @@ pattern. A Promise face's **synchronous** members (recipe builders, a package
 id) are real only once the runtime exists, so either `await client.<name>.$ready()`
 once or register with `warm`; calling one before that fails with
 `ExtensionNotReady` rather than returning a Promise the type does not mention
-(`Effect` and `Stream` members work cold, as Promises and as async iterables).
+(`Effect` and `Stream` members work cold: a cold call is a real `Promise` that
+is also an `AsyncIterable`, and its rejection is pre-handled so an un-awaited
+one cannot abort the process). A namespace member may be an `interface` — the
+face maps it by type, not by declaration style — while a class instance with
+`Effect`-returning methods is declared `SuiExtension.Leaf<T>` and built with
+`SuiExtension.leaf(value)`.
 Every registration on one client **shares one `Sui`**, and therefore one
 sender-lock map, so two extensions never select gas for the same address at
 once; `$dispose()` releases that shared base only when the last registration on
@@ -214,7 +219,9 @@ axis, and an extension error may declare its own. An error that is neither a tag
 above nor declares an `outcome` is *unclassified*: `outcome` answers `"unknown"`,
 because an unrecognised tag is no evidence that nothing happened, and
 `Script.exitCode` exits 1 rather than 3, because it is no evidence that anything
-was sent either. Declare `outcome` on every error your extension defines.
+was sent either. Declare `outcome` on every error your extension defines — as a
+class field is fine, `toJson` reads it off the instance and serializes it either
+way.
 
 ## Scripts
 
@@ -257,7 +264,9 @@ submission interrupts it from the outside and the bytes may be on the wire.
 
 `@unconfirmed/sui-effect/testing` ships the in-memory `SuiCoreFake`, `layerTest(script)` (the
 real `Sui` over the fake, so tests exercise the production high tier),
-`layerExtensionTest(layer, script)` for an extension's own tests, and `SuiTest`
+`layerExtensionTest(layer, script, { extra })` for an extension's own tests
+(`SuiGraphQL.layerUnavailable` is provided by default; `extra` is for anything
+else the extension's layer requires), and `SuiTest`
 for driving the fake's state and reading back what it was sent. No test in this
 repository touches the network, and neither should yours.
 
