@@ -25,8 +25,16 @@ describe("LLMS.md", () => {
       const committed = readFileSync("LLMS.md", "utf8")
       const generated = render()
       if (committed !== generated) {
+        const a = committed.split("\n")
+        const b = generated.split("\n")
+        let i = 0
+        while (i < a.length && i < b.length && a[i] === b[i]) i++
+        const context = (lines: ReadonlyArray<string>) =>
+          lines.slice(Math.max(0, i - 2), i + 6).map((line, k) => `${Math.max(0, i - 2) + k + 1}: ${line}`).join("\n")
         throw new Error(
-          "LLMS.md is stale. Run `bun run build && bun run llms` and commit the result."
+          "LLMS.md is stale. Run `bun run build && bun run llms` and commit the result.\n" +
+            `First difference at line ${i + 1} (committed ${a.length} lines, generated ${b.length}).\n` +
+            `--- committed\n${context(a)}\n--- generated\n${context(b)}`
         )
       }
       expect(committed.length).toBe(generated.length)
