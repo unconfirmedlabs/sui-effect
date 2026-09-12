@@ -233,6 +233,89 @@ describe("Script.exitCode", () => {
     }
   })
 
+  /**
+   * The whole mapping, as a literal table, over every shape `codeOfError` can
+   * be handed.
+   *
+   * NB1 replaced a per-tag `switch` with `SuiError.isTaxonomy` plus
+   * `SuiError.outcome`, and a rewrite of a mapping is only safe if the mapping
+   * did not move. Every number below was read off 0.1.2's implementation, so a
+   * reordering of the checks — a declared `outcome` losing to the tag list, a
+   * tagless `{ outcome }` falling through to "defect" — fails here rather than
+   * changing what a wrapper script does about a submission.
+   */
+  test("the whole exit-code table is what 0.1.2 produced", async () => {
+    const objectId = SuiAddress.make(ID) as never
+    const configError = await Effect.runPromise(
+      readNetwork.pipe(
+        Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord({}))),
+        Effect.flip
+      )
+    )
+    const schemaError = await Effect.runPromise(
+      Schema.decodeUnknownEffect(Schema.Struct({ id: Schema.String }))({ id: 7 }).pipe(Effect.flip)
+    )
+    const timedOut = await Effect.runPromiseExit(Effect.never.pipe(Effect.timeout("1 milli")))
+    const mismatch = () => new NetworkMismatch({ expected: "a", actual: "b" })
+    // Typed `unknown` so it reaches `exitCode` the way a defect-shaped failure
+    // from outside the taxonomy does.
+    const plainError: unknown = new Error("plain")
+
+    const table: ReadonlyArray<readonly [string, number, number]> = [
+      // Every class in the taxonomy.
+      ["TransportError", 4, exitCode(fail(new TransportError({ method: "m", retryable: true, cause: "c" })))],
+      ["ObjectNotFound", 4, exitCode(fail(new ObjectNotFound({ objectId })))],
+      ["ObjectDeleted", 4, exitCode(fail(new ObjectDeleted({ objectId })))],
+      ["ObjectUnavailable", 4, exitCode(fail(new ObjectUnavailable({ objectId })))],
+      ["TransactionNotFound", 4, exitCode(fail(new TransactionNotFound({ digest: DIGEST })))],
+      ["NetworkMismatch", 2, exitCode(fail(mismatch()))],
+      ["DecodeError", 4, exitCode(fail(new DecodeError({ issue: "x" })))],
+      ["SimulationFailed", 4, exitCode(fail(new SimulationFailed({ reason: UNKNOWN_REASON, message: "n" })))],
+      ["ExecutionFailed", 5, exitCode(fail(new ExecutionFailed({ digest: DIGEST, reason: UNKNOWN_REASON, effects })))],
+      ["SubmissionUnknown", 3, exitCode(fail(new SubmissionUnknown({ digest: DIGEST, signed, cause: "t" })))],
+      ["NotApplied", 4, exitCode(fail(new NotApplied({ digest: DIGEST, evidence: "expired" })))],
+      ["SigningError", 4, exitCode(fail(new SigningError({ cause: "k" })))],
+      ["BuildError", 4, exitCode(fail(new BuildError({ message: "m", cause: "x" })))],
+      ["PolicyDenied", 4, exitCode(fail(new PolicyDenied({ rule: "r", message: "m" })))],
+      ["JournalError", 4, exitCode(fail(new JournalError({ cause: "d" })))],
+      ["UnexpectedEffects", 5, exitCode(fail(new UnexpectedEffects({ digest: DIGEST, expected: "E", found: [] })))],
+      ["GraphQLUnavailable", 4, exitCode(fail(new GraphQLUnavailable({ method: "q", reason: "n" })))],
+      ["ExtensionNotReady", 4, exitCode(fail(new ExtensionNotReady({ extension: "e", member: "m" })))],
+      // A foreign tag, with and without a declared outcome. An outcome this
+      // library does not recognise is "not applied", not "defect".
+      ["foreign tagged, no outcome", 1, exitCode(fail({ _tag: "some-sdk/Foreign" }))],
+      ["foreign tagged, applied", 5, exitCode(fail({ _tag: "some-sdk/Foreign", outcome: "applied" }))],
+      ["foreign tagged, unknown", 3, exitCode(fail({ _tag: "some-sdk/Foreign", outcome: "unknown" }))],
+      ["foreign tagged, not_applied", 4, exitCode(fail({ _tag: "some-sdk/Foreign", outcome: "not_applied" }))],
+      ["foreign tagged, bogus outcome", 4, exitCode(fail({ _tag: "some-sdk/Foreign", outcome: "nonsense" }))],
+      // A declared outcome wins with no tag at all, and with a tag that is not
+      // a string. Both used to reach `codeOfOutcome` and must keep doing so.
+      ["tagless { outcome: applied }", 5, exitCode(fail({ outcome: "applied" }))],
+      ["tagless { outcome: unknown }", 3, exitCode(fail({ outcome: "unknown" }))],
+      ["{ _tag: 7, outcome: applied }", 5, exitCode(fail({ _tag: 7, outcome: "applied" }))],
+      // ...including over a taxonomy tag that would otherwise be exit 2.
+      ["NetworkMismatch + applied", 5, exitCode(fail(Object.assign(mismatch(), { outcome: "applied" })))],
+      ["NetworkMismatch + bogus outcome", 4, exitCode(fail(Object.assign(mismatch(), { outcome: "nonsense" })))],
+      // The two configuration failures Effect itself produces.
+      ["real ConfigError", 2, exitCode(fail(configError))],
+      ["real SchemaError", 2, exitCode(fail(schemaError))],
+      // A timeout and an interrupt both ask the journal.
+      ["TimeoutError, none outstanding", 4, exitCode(timedOut)],
+      ["TimeoutError, one outstanding", 3, exitCode(timedOut, { unresolved: 1 })],
+      ["interrupt, none outstanding", 130, exitCode(Exit.failCause(Cause.interrupt()))],
+      ["interrupt, one outstanding", 3, exitCode(Exit.failCause(Cause.interrupt()), { unresolved: 1 })],
+      // Everything that is not an error value the library can read.
+      ["die", 1, exitCode(Exit.die(new Error("boom")))],
+      ["plain Error", 1, exitCode(fail(plainError))],
+      ["a string", 1, exitCode(fail("a string"))],
+      ["success", 0, exitCode(Exit.succeed(1))]
+    ]
+
+    expect(table.map(([name, , actual]) => [name, actual])).toEqual(
+      table.map(([name, expected]) => [name, expected])
+    )
+  })
+
   test("2 for a SchemaError, which is a person's input not fitting a schema", async () => {
     const error = await Effect.runPromise(
       Schema.decodeUnknownEffect(Schema.Struct({ id: Schema.String }))({ id: 7 }).pipe(Effect.flip)

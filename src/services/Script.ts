@@ -396,15 +396,19 @@ export const exitCode = <A, E>(
  */
 const codeOfError = (error: unknown, unresolved: number): number => {
   if (isConfigError(error)) return EXIT.configuration
+  // **A declared `outcome` wins before anything else, tag or no tag.** That is
+  // the order this function has always had, and it is load-bearing: a wrapper
+  // that puts `outcome` on an error is saying what it knows about the chain,
+  // and nothing below has better information. It applies to a value with no
+  // `_tag` at all and to one whose `_tag` is not a string, which is why this
+  // sits above the tag check rather than inside it.
+  if (hasOutcomeField(error)) return codeOfOutcome(error.outcome)
   if (!hasTag(error)) return EXIT.defect
   // Configuration, not the applied/not-applied axis: no retry fixes any of
   // these, and `NetworkMismatch` means the layer is pointed at the wrong chain.
-  if (
-    error._tag === "SchemaError" || error._tag === "NetworkMismatch"
-  ) {
+  if (error._tag === "SchemaError" || error._tag === "NetworkMismatch") {
     return EXIT.configuration
   }
-  if (hasOutcomeField(error)) return codeOfOutcome(error.outcome)
   // `Effect.timeout` puts a `TimeoutError` in the error channel that is not
   // part of the taxonomy. It used to be mapped unconditionally to "not
   // applied" on the theory that `Tx.submit` turns a timed-out submission into
