@@ -8,7 +8,7 @@
  */
 import { bcs } from "@mysten/sui/bcs"
 import { DateTime, Effect, Schema, SchemaIssue, SchemaTransformation } from "effect"
-import { ObjectId, SuiAddress, SuiSchema } from "sui-effect"
+import { ObjectId, SuiAddress, SuiSchema } from "@unconfirmed/sui-effect"
 
 /**
  * The package the template's example type lives in, and the default this

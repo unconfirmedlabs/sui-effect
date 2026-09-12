@@ -19,7 +19,7 @@ the work plan. Where this file and the spec disagree, fix this file.
 - Everything that is not public API lives in `src/internal.ts`, which is not in
   the `exports` map. `src/index.ts` is exactly the public surface.
 - **Every public name mirrors the SDK name it wraps**, so an agent that knows
-  `@mysten/sui` can guess sui-effect.
+  `@mysten/sui` can guess @unconfirmed/sui-effect.
 - Nothing under `src/` imports `@effect/platform-bun` or `bun:*`. `@effect/platform-bun`
   is a devDependency for tests and examples only.
 - No `Effect.runPromise` / `runSync` under `src/`, except at the two documented
@@ -81,10 +81,10 @@ and nothing else.
 | `Signer` | A credential as a **value**, never a service: `{ address, scheme, signTransaction, signPersonalMessage }`. One process may hold two. Secret material never reaches the value. |
 | `Tx.build/sign/cosign/sponsored/submit/reconcile/run/reconcileAll` | The lifecycle as functions, each with a closed error union, all `R = Sui`. |
 | `SubmitConfig` | A `Context.Reference` holding expiration policy, the optional `validFor` wall-clock bound, the gas-budget ceiling, `preflight`, the sender lock, the resubmit schedule, attempts, timeout and expiry margin, plus `expiryEvidence`, `reconcileRecheck`, `awaitVisibility`, `visibilityTimeout` and `nonce`. |
-| `Journal` | A `Context.Reference` with an in-memory default. `sui-effect/journal` swaps in a durable one over `KeyValueStore`; `Tx.reconcileAll()` is the explicit startup call. |
+| `Journal` | A `Context.Reference` with an in-memory default. `@unconfirmed/sui-effect/journal` swaps in a durable one over `KeyValueStore`; `Tx.reconcileAll()` is the explicit startup call. |
 | `Script` | `{ sui, core, signer, network }` plus `Script.run` and `Script.exitCode`. `ScriptReadOnly` is the signer-less variant, a separate key on purpose. |
 | `SuiExtension.fromService` | The Promise face of an Effect service, and the only place in `src/` allowed to run Effects. Options: `sui` (chain pinning), `warm` (build the runtime synchronously in `register`). The face carries `$ready()` and `$dispose()`; a synchronous member called before the runtime exists fails with `ExtensionNotReady`, while `Effect` and `Stream` members work cold. Every registration on one client shares one base `Sui`/`SuiCore` — one chain-id read and one sender-lock map — reference counted, so `$dispose()` releases it only when the last registration does. |
-| `SuiGraphQL` | A bare tag over the SDK's `SuiGraphQLClient` (`layer`, `layerConfig`, `layerUnavailable`). sui-effect wraps no GraphQL API; the tag exists so extensions share one client. |
+| `SuiGraphQL` | A bare tag over the SDK's `SuiGraphQLClient` (`layer`, `layerConfig`, `layerUnavailable`). @unconfirmed/sui-effect wraps no GraphQL API; the tag exists so extensions share one client. |
 
 ## Extensions
 
@@ -169,7 +169,7 @@ may declare its own `outcome`, and should. `SuiError.isRetryable`, `SuiError.des
 
 ## Testing
 
-`sui-effect/testing` ships `SuiCoreFake.layer(script)`, `layerTest(script)`
+`@unconfirmed/sui-effect/testing` ships `SuiCoreFake.layer(script)`, `layerTest(script)`
 (the real `Sui` over the fake `SuiCore`), `layerExtensionTest(layer, script)`
 (an extension's own layer over that) and `SuiTest` (`putObject`, `bumpVersion`,
 `recordTransaction`, `deleteObject`, `setClock`, `setEpoch`, `scriptExecute`,

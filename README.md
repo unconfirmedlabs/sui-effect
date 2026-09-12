@@ -1,4 +1,4 @@
-# sui-effect
+# @unconfirmed/sui-effect
 
 An opinionated [Effect](https://effect.website) v4 layer over
 [`@mysten/sui`](https://www.npmjs.com/package/@mysten/sui) for building safe
@@ -13,7 +13,7 @@ Effect so tests can drive them.
 ## Install
 
 ```bash
-bun add sui-effect
+bun add @unconfirmed/sui-effect
 bun add -d effect@4.0.0-rc.112 @mysten/sui@2.30.0
 ```
 
@@ -33,9 +33,9 @@ A **library** built on sui-effect puts all three in its own
 ```ts
 import { bcs } from "@mysten/sui/bcs"
 import { Config, Console, Effect } from "effect"
-import { ObjectId, SuiSchema } from "sui-effect"
-import { Script } from "sui-effect/script"
-import { Tx } from "sui-effect/tx"
+import { ObjectId, SuiSchema } from "@unconfirmed/sui-effect"
+import { Script } from "@unconfirmed/sui-effect/script"
+import { Tx } from "@unconfirmed/sui-effect/tx"
 
 const PKG = "0x…"
 
@@ -106,7 +106,7 @@ the bytes. A `TransportError` never escapes once bytes may have been sent —
 from `submit`, and from `reconcile` and `reconcileAll` too. `Signer` is a
 value, not a service, so one process can hold two credentials; `SubmitConfig`
 and `Journal` are `Context.Reference`s with working defaults, so none of this
-needs wiring, and `sui-effect/journal` swaps the memory journal for a durable
+needs wiring, and `@unconfirmed/sui-effect/journal` swaps the memory journal for a durable
 one over `KeyValueStore`.
 
 **`NotApplied` is hard to earn, on purpose.** Saying a transaction never applied
@@ -162,7 +162,7 @@ with an SDK client writes `client.$extend(escrow(options))` and then plain
 **[`docs/extensions.md`](docs/extensions.md) is the contract**, and
 `examples/extension-template/` is a copyable package that implements it — it
 ships inside the published package, so
-`node_modules/sui-effect/examples/extension-template/` is there to copy without
+`node_modules/@unconfirmed/sui-effect/examples/extension-template/` is there to copy without
 a checkout.
 
 Four things an extension author should know before reading the guide. A layer
@@ -255,7 +255,7 @@ submission interrupts it from the outside and the bytes may be on the wire.
 
 ## Testing
 
-`sui-effect/testing` ships the in-memory `SuiCoreFake`, `layerTest(script)` (the
+`@unconfirmed/sui-effect/testing` ships the in-memory `SuiCoreFake`, `layerTest(script)` (the
 real `Sui` over the fake, so tests exercise the production high tier),
 `layerExtensionTest(layer, script)` for an extension's own tests, and `SuiTest`
 for driving the fake's state and reading back what it was sent. No test in this

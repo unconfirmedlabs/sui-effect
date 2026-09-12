@@ -9,7 +9,7 @@
  * the way a consumer will.
  *
  * It runs offline, and it works **after you copy the template out**: the
- * consumer's `sui-effect`, `effect` and `@mysten/*` are symlinked out of this
+ * consumer's `@unconfirmed/sui-effect`, `effect` and `@mysten/*` are symlinked out of this
  * package's own `node_modules` when it has them, which is what a copied-out
  * package has after `bun install`. Only when neither is there does it fall back
  * to the sui-effect repository two directories up, which is how it runs inside
@@ -31,7 +31,7 @@ const templateModules = join(template, "node_modules")
  *
  * Two directories up is only the library when it really is: a copied-out
  * template's grandparent is somebody's `projects/` directory, and symlinking
- * that in as `sui-effect` is how a copier's first `bun run check` failed with a
+ * that in as `@unconfirmed/sui-effect` is how a copier's first `bun run check` failed with a
  * message about a `dist` that was never going to exist.
  */
 const repoOf = (): string | undefined => {
@@ -39,7 +39,7 @@ const repoOf = (): string | undefined => {
   const manifest = join(candidate, "package.json")
   if (!existsSync(manifest)) return undefined
   try {
-    return JSON.parse(readFileSync(manifest, "utf8")).name === "sui-effect" ? candidate : undefined
+    return JSON.parse(readFileSync(manifest, "utf8")).name === "@unconfirmed/sui-effect" ? candidate : undefined
   } catch {
     return undefined
   }
@@ -60,14 +60,14 @@ const sourceOf = (name: string): string | undefined => {
   const own = join(templateModules, name)
   if (existsSync(own)) return own
   if (repo === undefined) return undefined
-  const inRepo = name === "sui-effect" ? repo : join(repo, "node_modules", name)
+  const inRepo = name === "@unconfirmed/sui-effect" ? repo : join(repo, "node_modules", name)
   return existsSync(inRepo) ? inRepo : undefined
 }
 
-const suiEffect = sourceOf("sui-effect")
+const suiEffect = sourceOf("@unconfirmed/sui-effect")
 if (suiEffect === undefined) {
   fail(
-    "no sui-effect to check against: run `bun install` in this package, or run the script " +
+    "no @unconfirmed/sui-effect to check against: run `bun install` in this package, or run the script " +
       "from inside the sui-effect repository"
   )
 }
@@ -75,7 +75,7 @@ if (suiEffect === undefined) {
 // built. A published tarball always is; a repository checkout may not be.
 if (!existsSync(join(suiEffect!, "dist", "index.js"))) {
   fail(
-    `the sui-effect at ${suiEffect} is not built; run \`bun run build\` there first`
+    `the @unconfirmed/sui-effect at ${suiEffect} is not built; run \`bun run build\` there first`
   )
 }
 
@@ -112,7 +112,9 @@ try {
     }
   }
 
-  await symlink(suiEffect!, join(modules, "sui-effect"), "dir")
+  const suiEffectScope = join(modules, "@unconfirmed")
+  await mkdir(suiEffectScope, { recursive: true })
+  await symlink(suiEffect!, join(suiEffectScope, "sui-effect"), "dir")
   for (const peer of ["effect", "@mysten"]) {
     const source = sourceOf(peer)
     if (source === undefined) {

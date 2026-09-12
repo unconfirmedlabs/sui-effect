@@ -119,7 +119,7 @@ describe("A2. every CI job can pass as written", () => {
     const job = jobNamed("isolated-consumer")
     // `../../$GITHUB_WORKSPACE/...` was two directories above an absolute path.
     expect(job).not.toContain("../../$GITHUB_WORKSPACE")
-    expect(job).toContain('TARBALL="$(ls "$GITHUB_WORKSPACE"/sui-effect-*.tgz | head -n 1)"')
+    expect(job).toContain('TARBALL="$(ls "$GITHUB_WORKSPACE"/unconfirmed-sui-effect-*.tgz | head -n 1)"')
     // Not `bunx tsc`, whose version is whatever the registry serves that day.
     expect(job).toContain('"$GITHUB_WORKSPACE/node_modules/.bin/tsc"')
   })
@@ -449,7 +449,7 @@ describe("B3 to B6 and the guide's own rules", () => {
     // It prefers the template's own node_modules...
     expect(source).toContain("join(templateModules, name)")
     // ...and only trusts `../..` when that really is sui-effect.
-    expect(source).toContain('=== "sui-effect"')
+    expect(source).toContain('=== "@unconfirmed/sui-effect"')
   })
 
   test("B4: nothing hand-builds a TransportError outside the constructor's own module", () => {

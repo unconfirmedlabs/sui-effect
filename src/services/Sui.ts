@@ -812,7 +812,7 @@ export interface SuiLayerOptions {
  * @example
  * ```ts
  * import { Effect } from "effect"
- * import { Sui } from "sui-effect"
+ * import { Sui } from "@unconfirmed/sui-effect"
  *
  * const time = Effect.gen(function*() {
  *   const sui = yield* Sui
@@ -820,7 +820,7 @@ export interface SuiLayerOptions {
  * })
  * ```
  */
-export class Sui extends Context.Service<Sui, SuiService>()("sui-effect/Sui") {
+export class Sui extends Context.Service<Sui, SuiService>()("@unconfirmed/sui-effect/Sui") {
   /**
    * Like {@link layerNoDeps}, but refuses to build when the node reports a
    * different chain identifier than `options.chainId`, whatever the network.

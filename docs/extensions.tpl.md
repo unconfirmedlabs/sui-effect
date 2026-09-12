@@ -1,4 +1,4 @@
-# Writing a sui-effect extension
+# Writing a @unconfirmed/sui-effect extension
 
 Every downstream SDK we own is an **extension**: an Effect service built on
 `Sui` and `Tx`, published as its own package, with a derived Promise face for
@@ -15,7 +15,7 @@ names the file it came from.
 
 An extension is one `Context.Service` whose layer requires `Sui` and nothing it
 could have built itself; whose every member returns an `Effect` with a closed
-error union of sui-effect's taxonomy plus its own `Schema.TaggedError` classes;
+error union of @unconfirmed/sui-effect's taxonomy plus its own `Schema.TaggedError` classes;
 whose contributions to a transaction are recipe fragments a consumer composes;
 whose writes go through `Tx`, so the journal, the expiration, the sender lock
 and reconcile apply to every transaction on the platform; whose credentials are
@@ -35,7 +35,7 @@ What to notice:
   an `Effect`, a function returning an `Effect`, a `Stream`, a plain value, or a
   nested object of those. Nothing else.
 - **Every member states its error union in words** in its JSDoc ("Fails
-  with: …"), the convention sui-effect itself follows, so the generated
+  with: …"), the convention @unconfirmed/sui-effect itself follows, so the generated
   documentation and a reading agent agree with the compiler.
 - **A nested namespace is a plain object.** Platform surfaces in the wild group
   dozens of members this way (`client.miso.protocol.*`); the Promise face maps
@@ -58,7 +58,7 @@ the published package name is the one string that already is.
 
 @@ src/Escrow.ts :: export class Escrow extends Context.Service<Escrow, EscrowService>()( :: ) {
 
-Mirror the names of the thing you wrap, the way sui-effect mirrors the SDK: a
+Mirror the names of the thing you wrap, the way @unconfirmed/sui-effect mirrors the SDK: a
 consumer who knows the Move package should be able to guess your method names.
 The property the extension takes on a client (`client.escrow`) is the `name` in
 the registration, and it is part of your API too.
@@ -86,7 +86,7 @@ exit 3 would tell a wrapper there is a digest to reconcile and an unrecognised
 error is not evidence that anything was ever sent. `SuiError.outcome` answers
 `"unknown"`, because a tag it has never heard of is equally not evidence that
 nothing happened — answering `"not_applied"` would tell the documented retry
-idiom to send again. The `"not_applied"` default is for sui-effect's own
+idiom to send again. The `"not_applied"` default is for @unconfirmed/sui-effect's own
 taxonomy, not for yours.
 
 Do not invent an error for something the taxonomy already names. A node that
@@ -243,7 +243,7 @@ string:
 
 ```ts
 import { Stream } from "effect"
-import { SuiSchema } from "sui-effect"
+import { SuiSchema } from "@unconfirmed/sui-effect"
 
 const shares = sui.streamDynamicFields(parentId).pipe(
   Stream.filter((entry) => SuiSchema.matchesType(shareKeyType, entry.name.type)),
@@ -631,7 +631,7 @@ request:
 
 @@ src/Escrow.ts :: const notify = Effect.fn("Escrow.notify")(function*(escrowId: ObjectId, digest: Digest) { :: })
 
-In both cases the upstream answer is **narrowed to a sui-effect schema before
+In both cases the upstream answer is **narrowed to a @unconfirmed/sui-effect schema before
 anything else sees it**. Upstream types are never re-exported: the template's
 `src/upstream.ts` is absent from `src/index.ts`, and `SettlementResponse` never
 reaches a consumer. That narrowing is what makes the wrapper worth having —
@@ -647,7 +647,7 @@ failures:
 <!-- inline -->
 
 ```ts
-import { SuiGraphQL } from "sui-effect"
+import { SuiGraphQL } from "@unconfirmed/sui-effect"
 
 const chainId = SuiGraphQL.query(
   (client) => client.query({ query: "{ chainIdentifier }", variables: {} }),
@@ -664,7 +664,7 @@ configured" arrives as an unclassified transport failure.
 
 ## 10. Testing
 
-`sui-effect/testing` is the whole harness. An extension's tests need nothing
+`@unconfirmed/sui-effect/testing` is the whole harness. An extension's tests need nothing
 else: no network, no HTTP mock, no hand-rolled client.
 
 @@ test/escrow.test.ts :: const provide = <A, E>( ::   )
@@ -777,7 +777,7 @@ Because your errors declare an `outcome`, a script that fails inside your
 extension exits with the code a wrapper can act on — 5 applied, 4 not applied,
 3 unknown — with no handling lines anywhere.
 
-`SuiError.toJson` serializes your errors too. A tag in sui-effect's own taxonomy
+`SuiError.toJson` serializes your errors too. A tag in @unconfirmed/sui-effect's own taxonomy
 encodes through the taxonomy's schema; **anything else that is a
 `Schema.TaggedError` encodes through its own**, so an extension error arrives as
 `{ _tag, escrowId, outcome }` rather than a bare `{ _tag, message }`. That is
@@ -833,14 +833,14 @@ a `Promise`-shaped class has `unknown` in its error channel by construction.
 
 ## 13. Migrating a `@misofm/effect` package
 
-The predecessor library and its consumers map onto sui-effect like this. The
+The predecessor library and its consumers map onto @unconfirmed/sui-effect like this. The
 conversion is mechanical except where the behaviour deliberately changed.
 
-| `@misofm/effect` | sui-effect |
+| `@misofm/effect` | @unconfirmed/sui-effect |
 |---|---|
 | `SuiClient.layer(client)` | `SuiCore.layerFromClient(client)` under `Sui.layerNoDeps`, which does the chain-id check `ready()` did by hand |
 | `yield* SuiClient` then `client.core.x(...)` | `sui.core.x(...)`, or `sui.core.use((client, signal) => ...)` when the SDK client object itself is needed. The reach-through disappears; the error mapping and the `AbortSignal` come with it |
-| `SuiGraphQL` | sui-effect's `SuiGraphQL` — the same tag for everyone, over the SDK's `SuiGraphQLClient`. sui-effect wraps no GraphQL API: you keep your queries and map failures yourself. `SuiGraphQL.layer(client)`, `layerConfig` (`SUI_GRAPHQL_URL`, `SUI_NETWORK`), `layerUnavailable` |
+| `SuiGraphQL` | @unconfirmed/sui-effect's `SuiGraphQL` — the same tag for everyone, over the SDK's `SuiGraphQLClient`. @unconfirmed/sui-effect wraps no GraphQL API: you keep your queries and map failures yourself. `SuiGraphQL.layer(client)`, `layerConfig` (`SUI_GRAPHQL_URL`, `SUI_NETWORK`), `layerUnavailable` |
 | `GraphQLUnavailableError` | `GraphQLUnavailable { method, reason }`, in the taxonomy, outcome `not_applied` — what `SuiGraphQL.layerUnavailable` rejects every call with |
 | `DeploymentError` | your own `<pkg>/DeploymentError` (the template's `EscrowUnsupportedNetwork`), a `Schema.TaggedError` declaring `outcome: "not_applied"`, failed from a `Layer.unwrap` that reads `sui.network` (section 6) |
 | `ObjectNotFoundError` | `ObjectNotFound`, plus `ObjectDeleted` and `ObjectUnavailable` from the SDK's own `reason` |
@@ -916,7 +916,7 @@ Reject an extension that:
   but the derived Promise face;
 - reads `process.env` or `Date.now()` instead of `Config` and `DateTime`;
 - ships a public member whose JSDoc does not state its error union in words;
-- declares `sui-effect`, `effect` or `@mysten/sui` in `dependencies` rather than
+- declares `@unconfirmed/sui-effect`, `effect` or `@mysten/sui` in `dependencies` rather than
   in `peerDependencies` **and** `devDependencies`;
 - hand-builds a `TransportError` instead of using `TransportError.fromUnknown`;
 - registers two extensions on one client with different chain ids, or mixes a
@@ -942,7 +942,7 @@ module-level state, `run*` outside an entrypoint.
 
 @@ package.json :: "peerDependencies": { :: } :: json
 
-`sui-effect`, `effect`, `@mysten/sui` and **`@mysten/bcs`** are peer
+`@unconfirmed/sui-effect`, `effect`, `@mysten/sui` and **`@mysten/bcs`** are peer
 dependencies, with the exact rcs pinned in `devDependencies`. `@mysten/bcs` is
 on that list because your BCS layouts are `BcsType`s from it and they cross the
 boundary into `SuiSchema.bcs`: two copies in one process is two `BcsType`
@@ -952,12 +952,12 @@ layers that silently do not match; two copies of `@mysten/sui` means
 `instanceof` on its error classes fails.
 
 The template is shipped inside the published package, so
-`node_modules/sui-effect/examples/extension-template/` is a directory you can
+`node_modules/@unconfirmed/sui-effect/examples/extension-template/` is a directory you can
 copy even when you have no checkout of this repository.
 
 `examples/extension-template/README.md` has the step by step: rename the
 package, the service identifier and the registration name; drop the `paths`
-blocks that resolve `sui-effect` inside this repository; replace the package id,
+blocks that resolve `@unconfirmed/sui-effect` inside this repository; replace the package id,
 the BCS layouts and the Move targets; keep the shape.
 
 ### The package has to actually build
@@ -982,7 +982,7 @@ publish. Set your own name, version and `publishConfig.access` before you run
 
 ### TypeScript
 
-sui-effect is built with TypeScript 5.9 and its emitted declarations are what a
+@unconfirmed/sui-effect is built with TypeScript 5.9 and its emitted declarations are what a
 consumer typechecks against. **Consumers on TypeScript 7 (`tsgo`) are
 supported** — there is nothing in the shipped `.d.ts` that needs the old
 compiler — and an extension package is free to use it. The `prepare` script in
@@ -993,7 +993,7 @@ consumer.
 
 ## 16. Before the first release
 
-sui-effect is published as `sui-effect` on npm. While a conversion runs ahead of
+@unconfirmed/sui-effect is published as `@unconfirmed/sui-effect` on npm. While a conversion runs ahead of
 a release that has not happened yet — a new peer version, an unpublished
 change — the dependency needs a form that does not exist on the registry.
 
@@ -1001,8 +1001,8 @@ change — the dependency needs a form that does not exist on the registry.
 
 ```bash
 cd /path/to/sui-effect && bun run build && npm pack
-mkdir -p vendor && cp /path/to/sui-effect/sui-effect-0.1.0.tgz vendor/
-cd /path/to/your-package && bun add -d ./vendor/sui-effect-0.1.0.tgz
+mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-0.1.0.tgz vendor/
+cd /path/to/your-package && bun add -d ./vendor/unconfirmed-sui-effect-0.1.0.tgz
 ```
 
 It is also the only form that proves anything: an isolated consumer of the
@@ -1027,12 +1027,12 @@ from.
 **Until the first publish, bun probes the registry for every peer.** It does so
 even for a peer a local dependency already satisfies, and an unpublished name
 404s the install. The escape is
-`"peerDependenciesMeta": { "sui-effect": { "optional": true } }` in your
+`"peerDependenciesMeta": { "@unconfirmed/sui-effect": { "optional": true } }` in your
 `package.json` — which the template ships, because it is copied verbatim.
 
 Put both halves of the swap on the release checklist:
 
-1. replace the tarball with the published range (`"sui-effect": "^0.1.0"`);
+1. replace the tarball with the published range (`"@unconfirmed/sui-effect": "^0.1.0"`);
 2. **delete the `peerDependenciesMeta` entry.** Left in, it turns a genuinely
    missing peer into a silent `undefined` at import time;
 3. re-run the isolated-consumer check against the published package.
@@ -1067,9 +1067,9 @@ the page to read before the conversion rather than after it.
   `Config.string` and `Config.redacted`, so neighbouring release candidates are
   not interchangeable — and two copies of `effect` in one process is a different
   and worse problem (section 16).
-- **Copy `scripts/check-package.ts`.** It resolves `sui-effect`, `effect` and
+- **Copy `scripts/check-package.ts`.** It resolves `@unconfirmed/sui-effect`, `effect` and
   `@mysten/*` from your own `node_modules` first, so it works outside this
-  repository unchanged. `sui-effect` belongs in `devDependencies` and
+  repository unchanged. `@unconfirmed/sui-effect` belongs in `devDependencies` and
   `peerDependencies`, never in `dependencies`.
 - **Use `TransportError.fromUnknown`.** Building the error by hand makes you
   guess `retryable` and throws away the status a caller needs.

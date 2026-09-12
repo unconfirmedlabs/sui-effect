@@ -1,5 +1,5 @@
 {
-  "name": "sui-effect",
+  "name": "@unconfirmed/sui-effect",
   "version": "0.1.0",
   "description": "An opinionated Effect v4 layer over @mysten/sui: two client tiers, closed error unions, and a typed transaction lifecycle.",
   "license": "MIT",

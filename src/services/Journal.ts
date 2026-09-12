@@ -61,7 +61,7 @@ export const makeMemoryUnsafe = (): JournalService => {
 }
 
 /** The reference itself; {@link Journal} is it with the constructors attached. */
-const JournalRef = Context.Reference<JournalService>("sui-effect/Journal", {
+const JournalRef = Context.Reference<JournalService>("@unconfirmed/sui-effect/Journal", {
   defaultValue: makeMemoryUnsafe
 })
 
@@ -82,7 +82,7 @@ const JournalRef = Context.Reference<JournalService>("sui-effect/Journal", {
  * @example
  * ```ts
  * import { Effect } from "effect"
- * import { Journal } from "sui-effect/tx"
+ * import { Journal } from "@unconfirmed/sui-effect/tx"
  *
  * const entries = Effect.gen(function*() {
  *   const journal = yield* Journal

@@ -20,7 +20,7 @@
  * ```ts
  * import { Layer } from "effect"
  * import { KeyValueStore } from "effect/unstable/persistence"
- * import { layerKeyValueStore } from "sui-effect/journal"
+ * import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
  *
  * const layer = layerKeyValueStore({ onUnresolved: "ignore" }).pipe(
  *   Layer.provide(KeyValueStore.layerMemory)

@@ -1,7 +1,7 @@
 /**
  * The extension's tests: the real service, over the real `Sui`, over the
  * in-memory `SuiCore`. No network, no mocks of our own — everything the test
- * needs comes from `sui-effect/testing`.
+ * needs comes from `@unconfirmed/sui-effect/testing`.
  */
 import { describe, expect, test } from "bun:test"
 import { bcs } from "@mysten/sui/bcs"
@@ -22,10 +22,10 @@ import {
   Stream
 } from "effect"
 import { TestClock } from "effect/testing"
-import type { Sui, SuiCore } from "sui-effect"
-import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiSchema } from "sui-effect"
-import { FakeOutcome, layerExtensionTest, layerTest, SuiCoreFake, SuiTest } from "sui-effect/testing"
-import { Journal, Signer } from "sui-effect/tx"
+import type { Sui, SuiCore } from "@unconfirmed/sui-effect"
+import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiSchema } from "@unconfirmed/sui-effect"
+import { FakeOutcome, layerExtensionTest, layerTest, SuiCoreFake, SuiTest } from "@unconfirmed/sui-effect/testing"
+import { Journal, Signer } from "@unconfirmed/sui-effect/tx"
 import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
 import { escrow as escrowRegistration } from "../src/extension.ts"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "../src/errors.ts"
