@@ -82,6 +82,17 @@ stays out of the encoding and out of the constructor. A `message` **schema**
 field is for the case where the sentence comes from somewhere else, as
 `EscrowSettlementUnknown`'s comes from the settlement service.
 
+**An optional field on an error you construct is `Schema.optionalKey`, not
+`Schema.optional`.** `Schema.optional` types the field `T | undefined` and
+accepts the key set to an explicit `undefined`; `optionalKey` types it `T` and
+accepts only the key being absent or carrying a value — which is what you want
+for a shape your own code builds, and what @unconfirmed/sui-effect's own
+eighteen error classes use since 0.2.0. Build the key conditionally
+(`...(version === undefined ? {} : { version })`) rather than assigning
+`undefined`, the way `TransportError.fromUnknown` does. Keep `Schema.optional`
+for a field you decode straight from the SDK or from another transport, where a
+key really can arrive present with no value.
+
 `outcome` is the axis a wrapper script acts on: `"applied"` (it is on chain, gas
 was charged, do not retry), `"unknown"` (reconcile before doing anything else),
 `"not_applied"` (nothing happened, safe to retry). `SuiError.outcome` reads the
@@ -218,6 +229,13 @@ thing is written as `Effect.try` around `Schema.decodeUnknownEffect`, where the
 throw arrives as a defect instead. The codec still carries the Move type, so
 `sui.getObject(id, { schema })` checks the tag before it parses. There is no
 encoder: a mapping function has no inverse, so serialize with the layout itself.
+
+**The same rule applies to a codec's own shape.** A field of a domain class or
+a struct your extension constructs is `Schema.optionalKey(X)`; a field you are
+mirroring from the SDK or from a node's JSON stays `Schema.optional(X)`, because
+only the second can arrive present and `undefined`. The difference is visible in
+the JSON Schema your codec produces — `optional` adds a spurious `null` branch —
+and, under `exactOptionalPropertyTypes`, in every literal a consumer writes.
 
 The domain class is an ordinary `Schema.Class`:
 
@@ -1575,7 +1593,7 @@ even for a peer a local dependency already satisfies, and an unpublished name
 
 Put both halves of the swap on the release checklist:
 
-1. replace the tarball with the published range (`"@unconfirmed/sui-effect": "^0.1.0"`);
+1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.1.0 <0.3.0"`, which is what the template ships since 0.2.0 — a range rather than a caret, because 0.x carets do not span a minor and the 0.1 and 0.2 surfaces differ only in the `optionalKey` rule of §2);
 2. **delete the `peerDependenciesMeta` entry.** Left in, it turns a genuinely
    missing peer into a silent `undefined` at import time;
 3. re-run the isolated-consumer check against the published package.

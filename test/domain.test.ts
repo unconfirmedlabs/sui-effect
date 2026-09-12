@@ -26,6 +26,7 @@ import {
 } from "../src/domain/errors.ts"
 import {
   Balance,
+  Built,
   CoinType,
   Digest,
   Network,
@@ -35,6 +36,7 @@ import {
   ObjectType,
   Owner,
   Signature,
+  SignedTransaction,
   StructTag,
   SuiAddress,
   TransactionEffects,
@@ -735,5 +737,92 @@ describe("Schema.Finite where a JSON number is meant", () => {
     expect(Result.isFailure(decode(SuiErrorSchema, encoded))).toBe(true)
     const { command: _command, ...withoutCommand } = encoded
     expect(Result.isSuccess(decode(SuiErrorSchema, withoutCommand))).toBe(true)
+  })
+})
+
+/**
+ * BR1 (0.2.0): every optional field on a shape this library constructs itself
+ * is `Schema.optionalKey`, so the key is either absent or carries a value the
+ * field's schema accepts. `Schema.optional` — which also accepts the key set to
+ * an explicit `undefined` — is kept only for the fields that mirror the SDK,
+ * where an object built by `@mysten/sui` really can carry one.
+ */
+describe("optionalKey on library-owned shapes (BR1)", () => {
+  test("an explicit undefined no longer type-checks on a library-owned optional", () => {
+    expect(() => {
+      // @ts-expect-error `DecodeError.objectId` is `optionalKey`: omit the key.
+      // The constructor refuses it at runtime too, which `optional` did not.
+      return new DecodeError({ objectId: undefined, issue: "x" })
+    }).toThrow()
+    expect(new DecodeError({ issue: "x" })._tag).toBe("DecodeError")
+
+    // @ts-expect-error `Built.chain` is `optionalKey`: omit the key.
+    const built: Built = {
+      digest: Digest.make(DIGEST),
+      bytes: new Uint8Array([1]),
+      sender: SuiAddress.make(ADDRESS),
+      chain: undefined
+    }
+    expect(built.digest).toBe(Digest.make(DIGEST))
+
+    // @ts-expect-error `SignedTransaction.chain` is `optionalKey`: omit the key.
+    const signed: SignedTransaction = {
+      digest: Digest.make(DIGEST),
+      bytes: new Uint8Array([1]),
+      signatures: [Signature.make("sig")],
+      sender: SuiAddress.make(ADDRESS),
+      chain: undefined
+    }
+    expect(signed.digest).toBe(Digest.make(DIGEST))
+  })
+
+  test("decoding an explicit undefined through SuiErrorSchema fails", () => {
+    const withKey = {
+      _tag: "TransportError",
+      method: "getObject",
+      retryable: true,
+      status: undefined,
+      cause: "x"
+    }
+    expect(Result.isFailure(decode(SuiErrorSchema, withKey))).toBe(true)
+    const { status: _status, ...withoutKey } = withKey
+    expect(Result.isSuccess(decode(SuiErrorSchema, withoutKey))).toBe(true)
+  })
+
+  test("toJson of an error with an absent optional field has no key for it", () => {
+    const json = SuiError.toJson(
+      new TransportError({ method: "getObject", retryable: true, cause: "x" })
+    )
+    expect("status" in json).toBe(false)
+    expect(Object.keys(json)).not.toContain("status")
+
+    const decodeError = SuiError.toJson(new DecodeError({ issue: "bad bytes" }))
+    expect("objectId" in decodeError).toBe(false)
+    expect("expectedType" in decodeError).toBe(false)
+    expect("issues" in decodeError).toBe(false)
+  })
+
+  test("Built's JSON Schema has no null branch for chain", () => {
+    const document = Schema.toJsonSchemaDocument(Built) as unknown as {
+      readonly definitions: Record<string, { readonly properties: Record<string, unknown> }>
+    }
+    const properties = document.definitions["Built"]?.properties
+    expect(properties?.["chain"]).toEqual({ type: "string" })
+    // `Schema.optional` renders as `anyOf: [{ type: "string" }, { type: "null" }]`.
+    expect(JSON.stringify(properties?.["chain"])).not.toContain("null")
+    expect(JSON.stringify(properties?.["gasOwner"])).not.toContain("null")
+  })
+
+  test("a field that mirrors the SDK still accepts an explicit undefined", () => {
+    // `MoveLocation` is decoded straight from the SDK's `ExecutionError`, where
+    // every key can arrive present and undefined.
+    const reason = {
+      $kind: "MoveAbort",
+      MoveAbort: {
+        abortCode: "3",
+        location: { package: `0x${"0".repeat(62)}ab`, module: "escrow", functionName: undefined }
+      }
+    }
+    expect(Result.isSuccess(decode(ExecutionReason, reason))).toBe(true)
   })
 })

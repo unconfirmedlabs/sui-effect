@@ -354,6 +354,9 @@ export const DynamicFieldEntry = Schema.Struct({
   name: DynamicFieldName,
   valueType: Schema.String,
   $kind: Schema.Literals(["DynamicField", "DynamicObject"]),
+  // SDK-mirroring field: an object built by `@mysten/sui` may carry the key with an
+  // explicit `undefined`, so it stays `Schema.optional`. Only shapes this library
+  // constructs itself use `Schema.optionalKey`.
   childId: Schema.optional(ObjectId)
 }).annotate({
   identifier: "DynamicFieldEntry",
@@ -744,7 +747,7 @@ export const SignedTransaction = Schema.Struct({
   bytes: Schema.Uint8ArrayFromBase64,
   signatures: Schema.Array(Signature),
   sender: SuiAddress,
-  expiration: Schema.optional(TransactionExpiration),
+  expiration: Schema.optionalKey(TransactionExpiration),
   /**
    * The chain identifier the bytes were built against, recorded by `Tx.build`
    * so `Tx.reconcile` can refuse to reason about a transaction with a node on
@@ -756,7 +759,7 @@ export const SignedTransaction = Schema.Struct({
    * a process-wide journal holding submissions from two networks cannot settle
    * one of them against the other's epoch.
    */
-  chain: Schema.optional(Schema.String)
+  chain: Schema.optionalKey(Schema.String)
 }).annotate({
   identifier: "SignedTransaction",
   description: "The signed bytes of a transaction, with what reconciling needs"
@@ -795,10 +798,10 @@ export const Built = Schema.Struct({
   digest: Digest,
   bytes: Schema.Uint8ArrayFromBase64,
   sender: SuiAddress,
-  gasOwner: Schema.optional(SuiAddress),
-  expiration: Schema.optional(TransactionExpiration),
+  gasOwner: Schema.optionalKey(SuiAddress),
+  expiration: Schema.optionalKey(TransactionExpiration),
   /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
-  chain: Schema.optional(Schema.String)
+  chain: Schema.optionalKey(Schema.String)
 }).annotate({
   identifier: "Built",
   description: "A transaction built into bytes and ready to sign"

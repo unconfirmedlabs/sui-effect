@@ -30,7 +30,7 @@ export { CleverError, ExecutionReason, MoveLocation } from "./schemas.ts"
 export class TransportError extends Schema.TaggedError<TransportError>()("TransportError", {
   method: Schema.String,
   retryable: Schema.Boolean,
-  status: Schema.optional(Schema.String),
+  status: Schema.optionalKey(Schema.String),
   cause: Schema.Defect()
 }) {
   /**
@@ -133,7 +133,7 @@ export const classifyTransportCause = (
 /** The object does not exist, or has never existed. */
 export class ObjectNotFound extends Schema.TaggedError<ObjectNotFound>()("ObjectNotFound", {
   objectId: ObjectId,
-  version: Schema.optional(Version)
+  version: Schema.optionalKey(Version)
 }) {
   /**
    * The one actionable line `SuiError.describe` produces for this error.
@@ -153,7 +153,7 @@ export class ObjectNotFound extends Schema.TaggedError<ObjectNotFound>()("Object
 /** The object existed and has been deleted or wrapped. */
 export class ObjectDeleted extends Schema.TaggedError<ObjectDeleted>()("ObjectDeleted", {
   objectId: ObjectId,
-  version: Schema.optional(Version)
+  version: Schema.optionalKey(Version)
 }) {
   /** The one actionable line `SuiError.describe` produces for this error. */
   override get message(): string {
@@ -164,7 +164,7 @@ export class ObjectDeleted extends Schema.TaggedError<ObjectDeleted>()("ObjectDe
 /** The node could not say what happened to the object (`ObjectError.reason: "unknown"`). */
 export class ObjectUnavailable extends Schema.TaggedError<ObjectUnavailable>()(
   "ObjectUnavailable",
-  { objectId: ObjectId, version: Schema.optional(Version) }
+  { objectId: ObjectId, version: Schema.optionalKey(Version) }
 ) {
   /** The one actionable line `SuiError.describe` produces for this error. */
   override get message(): string {
@@ -228,8 +228,8 @@ export type DecodeKind = typeof DecodeKind.Type
  * compiles and still answers the question conservatively.
  */
 export class DecodeError extends Schema.TaggedError<DecodeError>()("DecodeError", {
-  objectId: Schema.optional(ObjectId),
-  expectedType: Schema.optional(Schema.String),
+  objectId: Schema.optionalKey(ObjectId),
+  expectedType: Schema.optionalKey(Schema.String),
   /**
    * Which boundary failed. See {@link DecodeKind}.
    *
@@ -330,7 +330,7 @@ export class SimulationFailed extends Schema.TaggedError<SimulationFailed>()("Si
 export class ExecutionFailed extends Schema.TaggedError<ExecutionFailed>()("ExecutionFailed", {
   digest: Digest,
   reason: ExecutionReason,
-  command: Schema.optional(Schema.Finite),
+  command: Schema.optionalKey(Schema.Finite),
   effects: TransactionEffects
 }) {
   /** The one actionable line `SuiError.describe` produces for this error. */
@@ -345,7 +345,7 @@ export class ExecutionFailed extends Schema.TaggedError<ExecutionFailed>()("Exec
  */
 export class SubmissionUnknown extends Schema.TaggedError<SubmissionUnknown>()(
   "SubmissionUnknown",
-  { digest: Digest, signed: Schema.optional(SignedTransaction), cause: Schema.Defect() }
+  { digest: Digest, signed: Schema.optionalKey(SignedTransaction), cause: Schema.Defect() }
 ) {
   /** The one actionable line `SuiError.describe` produces for this error. */
   override get message(): string {
