@@ -37,19 +37,24 @@ added or removed, no signature moved, and runtime JSON is byte for byte what
   **Why.** Effect's "optional and default keys" page says to use
   `Schema.optionalKey` when a field may be omitted but, when present, must hold
   a value the schema accepts — which is exactly the case for a shape whose only
-  producer is this library. Under `exactOptionalPropertyTypes` (this package's
-  own setting, and every converted consumer's) `optional` types a field
-  `status?: string | undefined` and accepts `{ status: undefined }` at compile
-  time and at decode; `optionalKey` types it `status?: string` and refuses the
-  explicit `undefined` in both places. The JSON Schema loses a spurious `null`
+  producer is this library. `optional` types a field
+  `status?: string | undefined` and accepts `{ status: undefined }` at decode;
+  `optionalKey` types it `status?: string` and refuses the explicit `undefined`
+  at decode and at construction, and under `exactOptionalPropertyTypes` (this
+  package's own setting) at compile time as well. The JSON Schema loses a spurious `null`
   branch with it: `Schema.toJsonSchemaDocument(Built)` now renders `chain` as
   `{ "type": "string" }`.
 
-  **The symptom.** A consumer that passes an explicit `undefined` stops
-  compiling, with `Type 'undefined' is not assignable to type 'string'` (or the
-  field's type) on the property, and `new DecodeError({ objectId: undefined,
-  … })` additionally throws at construction. A consumer that omits the key, or
-  spreads it conditionally, is unaffected.
+  **The symptom.** A consumer that passes an explicit `undefined` — for
+  example `new DecodeError({ objectId: maybeId, issue })` where `maybeId` is
+  `string | undefined` — now **throws at construction** (`Schema validation
+  failed`), and `Schema.is`/`decodeUnknown` of such an object fail, where
+  0.1.x accepted it and kept an `undefined`-valued key. A consumer compiled
+  with `exactOptionalPropertyTypes` also gets a compile error, `Type
+  'undefined' is not assignable to type 'string'` (or the field's type); one
+  without it (the misofm SDKs and services today) sees only the throw, so grep
+  before upgrading. A consumer that omits the key, or spreads it conditionally,
+  is unaffected.
 
   **The fix, everywhere:** omit the key instead of setting it to `undefined` —
   `...(version === undefined ? {} : { version })`, which is what
@@ -57,11 +62,9 @@ added or removed, no signature moved, and runtime JSON is byte for byte what
 
   | Consumer | Grep for | Change to |
   |---|---|---|
-  | **platform** | `new DecodeError({` in `read/receipts.ts` and the other decode boundaries, for `objectId: undefined` / `expectedType: undefined` | drop the key, or spread it conditionally: `new DecodeError({ ...(objectId === undefined ? {} : { objectId }), issue })` |
-  | **musicos** | `new (TransportError\|DecodeError\|ObjectNotFound\|ObjectDeleted\|ObjectUnavailable\|SubmissionUnknown)\(` for an explicit `undefined` field value | expected: no hits — the guide already tells authors to use `TransportError.fromUnknown`; if there are any, spread conditionally |
-  | **partyos** | the same constructor grep, plus `status: undefined` and `version: undefined` | the same: omit the key |
-  | **app** | `chain: undefined` / `expiration: undefined` / `gasOwner: undefined` on a `Built` or `Signed` rebuilt from a relay's wire form | build the object with the keys it actually has, conditionally spread |
-  | **cli** | the same relay path, plus `checkpoint: undefined` on a hand-built `JournalEntry.Executed` | omit the key |
+  | **platform, musicos, partyos** | `new (TransportError\|DecodeError\|ObjectNotFound\|ObjectDeleted\|ObjectUnavailable\|SubmissionUnknown\|ExecutionFailed)\(` and any `Built`/`Signed`/`JournalEntry.Executed` literal, for a field whose value can be `undefined` (platform's `DecodeError` sites are in `src/pressing.ts` and `src/read/wallet.ts`; verified: none passes `undefined` today) | omit the key, or spread it conditionally: `new DecodeError({ ...(objectId === undefined ? {} : { objectId }), issue })` |
+  | **platform, musicos, partyos** | `"@unconfirmed/sui-effect": "^0.1.0"` in `peerDependencies` | widen to `>=0.1.0 <0.3.0` (a 0.x caret does not admit 0.2.0; npm consumers get a peer conflict otherwise) and bump the devDependency |
+  | **app, api, cli** | `(chain\|expiration\|gasOwner\|checkpoint\|status\|version\|objectId\|expectedType\|command\|signed): undefined` near a sui-effect type, and any relay path that rebuilds a `Built`/`Signed` from wire form | build the object with the keys it actually has (verified: none of the three constructs these shapes today; they go through the SDKs) |
 
   **Runtime JSON is unaffected.** JSON cannot carry `undefined`, so a journal
   line, a `SuiError.toJson` payload or a relay envelope persisted by 0.1.x
