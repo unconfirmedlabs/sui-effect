@@ -81,6 +81,82 @@ const transportError = (method: string, cause: unknown): TransportError => {
 }
 
 /**
+ * Whether a second copy of `@mysten/sui` has already been reported.
+ *
+ * One line per process, not one per failure: a duplicated SDK produces the same
+ * warning on every read, and a log full of it hides the failure it is about.
+ */
+let duplicateSdkReported = false
+
+/**
+ * Says once, loudly, that the thrown value is one of the SDK's error classes
+ * from a **different copy** of `@mysten/sui` than this package's `instanceof`
+ * knows about.
+ *
+ * It is a real misconfiguration — two copies means two `BcsType` classes, two
+ * `Transaction` classes and a pile of `instanceof` checks that quietly answer
+ * `false` — but it is not a reason to lose the error's own meaning, so the
+ * duck-typed classification below runs regardless. `console.warn` rather than
+ * `Effect.logWarning` because `mapSdkError` is a total pure function reached
+ * from every call site, and the point is that a human sees it at all.
+ */
+const reportDuplicateSdk = (what: string): void => {
+  if (duplicateSdkReported) return
+  duplicateSdkReported = true
+  console.warn(
+    `sui-effect: a ${what} was thrown by a different copy of @mysten/sui than the one ` +
+      "sui-effect imports, so `instanceof` failed and the error was classified by shape. " +
+      "Deduplicate @mysten/sui (one copy per process): two copies also break BCS codecs, " +
+      "Transaction inputs and every other instanceof in the SDK."
+  )
+}
+
+/** The three transport-neutral reasons an `ObjectError` carries. */
+const OBJECT_REASONS: ReadonlySet<string> = new Set(["notFound", "deleted", "unknown"])
+
+/**
+ * An `ObjectError` from another copy of the SDK, recognised by shape: the
+ * transport-neutral `reason` plus an `objectId` property.
+ *
+ * Never fails; `undefined` when the value is not one.
+ */
+const objectErrorLike = (
+  cause: unknown
+): { readonly reason: string; readonly objectId: string | undefined } | undefined => {
+  if (typeof cause !== "object" || cause === null || !("objectId" in cause)) return undefined
+  const record = cause as { readonly reason?: unknown; readonly objectId?: unknown }
+  if (typeof record.reason !== "string" || !OBJECT_REASONS.has(record.reason)) return undefined
+  return {
+    reason: record.reason,
+    objectId: typeof record.objectId === "string" ? record.objectId : undefined
+  }
+}
+
+/**
+ * A `TransactionError` from another copy of the SDK: `reason: "notFound"` plus
+ * a `digest`. Never fails.
+ */
+const transactionErrorLike = (cause: unknown): { readonly digest: string } | undefined => {
+  if (typeof cause !== "object" || cause === null) return undefined
+  const record = cause as { readonly reason?: unknown; readonly digest?: unknown }
+  if (record.reason !== "notFound" || typeof record.digest !== "string") return undefined
+  return { digest: record.digest }
+}
+
+/**
+ * A `SimulationError` from another copy of the SDK: an `Error` named
+ * `SimulationError`, whose `executionError` is the part that matters. Never
+ * fails.
+ */
+const simulationErrorLike = (
+  cause: unknown
+): { readonly executionError: unknown; readonly message: string; readonly cause: unknown } | undefined => {
+  if (!(cause instanceof Error) || cause.name !== "SimulationError") return undefined
+  const record = cause as unknown as { readonly executionError?: unknown; readonly cause?: unknown }
+  return { executionError: record.executionError, message: cause.message, cause: record.cause }
+}
+
+/**
  * The one place an SDK failure becomes a sui-effect failure.
  *
  * `ObjectError` maps by its transport-neutral `reason`, `TransactionError` to
@@ -94,6 +170,18 @@ const transportError = (method: string, cause: unknown): TransportError => {
  * carrying {@link DefectMarker}, which is a bug in the caller or in a test
  * double rather than a transport failure: that is re-thrown so it surfaces as a
  * defect instead of being mislabelled a `TransportError`.
+ *
+ * **`instanceof` is not the only test.** Two copies of `@mysten/sui` in one
+ * process — a vendored tarball beside an installed range, a `link:` to a
+ * checkout — means the class this module imported is not the class the
+ * transport threw, and every `instanceof` here answers `false`. That used to
+ * turn a missing object into `TransportError { status: "notFound" }` instead of
+ * `ObjectNotFound`, silently. So each class has a duck-typed fallback — a
+ * `reason` plus an `objectId` for an object error, a `reason` plus a `digest`
+ * for a transaction error, the name plus `executionError` for a simulation
+ * error — and the first time one of them fires the process gets a single
+ * warning naming the real problem, because two copies of the SDK break far
+ * more than this function.
  */
 export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
   rethrowDefects(cause)
@@ -134,6 +222,48 @@ export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
       reason:
         cause.executionError === undefined ? UNKNOWN_REASON : executionReasonOf(cause.executionError),
       message: cause.message
+    })
+  }
+  // Every `instanceof` above answered `false`. Either this is a genuine
+  // transport failure, or it is one of those same classes from a second copy of
+  // the SDK: try the shapes before giving up on the meaning.
+  const objectLike = objectErrorLike(cause)
+  if (objectLike !== undefined) {
+    reportDuplicateSdk("ObjectError")
+    const objectId = asObjectId(objectLike.objectId)
+    switch (objectLike.reason) {
+      case "notFound":
+        return new ObjectNotFound({ objectId })
+      case "deleted":
+        return new ObjectDeleted({ objectId })
+      default:
+        return new ObjectUnavailable({ objectId })
+    }
+  }
+  const transactionLike = transactionErrorLike(cause)
+  if (transactionLike !== undefined) {
+    reportDuplicateSdk("TransactionError")
+    return new TransactionNotFound({ digest: asDigest(transactionLike.digest) })
+  }
+  const simulationLike = simulationErrorLike(cause)
+  if (simulationLike !== undefined) {
+    reportDuplicateSdk("SimulationError")
+    if (simulationLike.executionError === undefined) {
+      const transport = transportCauseOf({ cause: simulationLike.cause })
+      if (transport !== undefined) {
+        return new TransportError({
+          method,
+          retryable: transport.retryable,
+          ...(transport.status === undefined ? {} : { status: transport.status }),
+          cause: simulationLike.cause ?? cause
+        })
+      }
+    }
+    return new SimulationFailed({
+      reason: simulationLike.executionError === undefined
+        ? UNKNOWN_REASON
+        : executionReasonOf(simulationLike.executionError as SuiClientTypes.ExecutionError),
+      message: simulationLike.message
     })
   }
   return transportError(method, cause)

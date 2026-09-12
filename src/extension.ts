@@ -6,6 +6,8 @@
 export {
   type ExtensionFace,
   fromService,
+  type Leaf,
+  leaf,
   type PromiseFace,
   SuiExtension,
   type SuiExtensionOptions

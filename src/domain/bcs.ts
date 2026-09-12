@@ -96,6 +96,90 @@ export const bcs = <T extends Input, Input>(
   ) as unknown as Schema.Codec<T, Uint8Array>
 }
 
+/**
+ * A BCS layout plus the mapping into a domain value, as one codec.
+ *
+ * This is the shape every extension writes by hand and writes slightly
+ * differently: parse the bytes with a layout, then hand the raw struct to a
+ * constructor or a mapping function that may throw (an id that has to be
+ * branded, a `bigint` that has to be range-checked, a discriminant that has to
+ * become a union). Written out it is `SuiSchema.bcs(...)` piped into a
+ * `Schema.decodeTo` with a `transformOrFail` and an `Effect.try`, and the part
+ * that gets forgotten is turning the thrown value into a schema issue, so the
+ * failure arrives as a defect instead of a `DecodeError`.
+ *
+ * `map` is called with whatever the layout parsed. Returning a value decodes
+ * it; **throwing** fails the decode, and the thrown value's message becomes the
+ * `DecodeError.issue` the caller sees, with the expected type already on it.
+ * The result is a `Schema.Codec<A, Uint8Array>` like any other: pass it as
+ * `sui.getObject(id, { schema })`, and the Move type check still runs first
+ * because the annotation {@link bcs} leaves behind survives the composition.
+ *
+ * Encoding is not supported: a mapping function has no inverse, and inventing
+ * one silently is worse than saying so. Encode with the layout itself when you
+ * need bytes back.
+ *
+ * Fails with: `DecodeError` (through the schema), when the bytes do not parse
+ * or `map` throws.
+ *
+ * @since 0.1.1
+ *
+ * @example
+ * ```ts
+ * import { ObjectId, SuiSchema } from "@unconfirmed/sui-effect"
+ *
+ * class Escrow {
+ *   constructor(readonly id: ObjectId, readonly amount: bigint) {}
+ * }
+ *
+ * const EscrowContent = SuiSchema.decodeWith(
+ *   EscrowLayout,
+ *   `${packageId}::escrow::Escrow`,
+ *   (raw) => new Escrow(ObjectId.normalize(raw.id), BigInt(raw.amount))
+ * )
+ * ```
+ */
+export const decodeWith = <T extends Input, Input, A>(
+  bcsType: BcsType<T, Input>,
+  expectedType: string | undefined,
+  map: (parsed: T) => A
+): Schema.Codec<A, Uint8Array> => {
+  const target = Schema.declare((_u: unknown): _u is A => true)
+  return bcs(bcsType, expectedType).pipe(
+    Schema.decodeTo(
+      target,
+      SchemaTransformation.transformOrFail<A, T>({
+        decode: (parsed, options) =>
+          Effect.try({
+            try: () => map(parsed),
+            catch: (cause) =>
+              new SchemaIssue.InvalidValue(
+                {
+                  message: `Could not map ${
+                    expectedType ?? bcsType.name
+                  } into its domain value: ${String(cause)}`
+                },
+                parsed,
+                options
+              )
+          }),
+        encode: (value, options) =>
+          Effect.fail(
+            new SchemaIssue.Forbidden(
+              {
+                message: `${
+                  expectedType ?? bcsType.name
+                } was built with SuiSchema.decodeWith, which has no encoder: serialize with the BCS layout instead`
+              },
+              value,
+              options
+            )
+          )
+      })
+    )
+  ) as unknown as Schema.Codec<A, Uint8Array>
+}
+
 const MAX_ENCODING_DEPTH = 32
 
 /**

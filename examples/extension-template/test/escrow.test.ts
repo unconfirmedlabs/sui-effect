@@ -22,13 +22,16 @@ import {
   Stream
 } from "effect"
 import { TestClock } from "effect/testing"
-import type { Sui, SuiCore } from "@unconfirmed/sui-effect"
-import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiSchema } from "@unconfirmed/sui-effect"
+import type { ChangedRef, Recipe, Sui, SuiCore } from "@unconfirmed/sui-effect"
+import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiError, SuiSchema } from "@unconfirmed/sui-effect"
+import type { PromiseFace } from "@unconfirmed/sui-effect/extension"
 import { FakeOutcome, layerExtensionTest, layerTest, SuiCoreFake, SuiTest } from "@unconfirmed/sui-effect/testing"
 import { Journal, Signer } from "@unconfirmed/sui-effect/tx"
+import type { EscrowObject, EscrowService } from "../src/Escrow.ts"
 import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
 import { escrow as escrowRegistration } from "../src/extension.ts"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "../src/errors.ts"
+import type { PlatformService } from "../src/Platform.ts"
 import { Platform, platform as platformRegistration } from "../src/Platform.ts"
 import { ESCROW_PACKAGE, receiptType, Settlement, SettlementContent } from "../src/schema.ts"
 
@@ -555,5 +558,91 @@ describe("layerConfig validates through the typed deployment path", () => {
     expect(Exit.isFailure(exit)).toBe(true)
     expect(String(exit)).toContain("PACKAGE_ID")
     expect(String(exit)).toContain("32-byte Sui object id")
+  })
+})
+
+/**
+ * The face's **type**, asserted rather than described.
+ *
+ * This is the test every extension copies. `PromiseFace<Service>` is what a
+ * Promise consumer actually holds, and it is derived, so nothing in the service
+ * says out loud what it produced: an `Effect` member has to become a
+ * Promise-returning method, a `Stream` member an `AsyncIterable`, a synchronous
+ * member has to stay synchronous, and a **namespace has to be mapped all the
+ * way down** — `PlatformService.escrow` is an interface, and until 0.1.1 an
+ * interface-typed namespace kept its `Effect` members in the type while the
+ * runtime handed back Promises.
+ *
+ * Write one of these per namespace. It costs four lines and it is the only
+ * thing that catches a face type that has quietly stopped matching the runtime.
+ */
+describe("the Promise face type", () => {
+  /** Compile-time assignability, as a value a test can assert on. */
+  const assignableTo = <_A extends _B, _B>(): true => true
+
+  type EscrowFace = PromiseFace<EscrowService>
+  type PlatformFace = PromiseFace<PlatformService>
+
+  test("an Effect member becomes a Promise-returning method", () => {
+    expect(assignableTo<EscrowFace["get"], (id: ObjectId) => Promise<EscrowObject>>()).toBe(true)
+    expect(assignableTo<EscrowFace["feeCollector"], () => Promise<SuiAddress>>()).toBe(true)
+  })
+
+  test("a Stream member becomes an AsyncIterable", () => {
+    expect(
+      assignableTo<EscrowFace["owned"]["stream"], (owner: SuiAddress) => AsyncIterable<EscrowObject>>()
+    ).toBe(true)
+  })
+
+  test("a synchronous member stays synchronous", () => {
+    expect(assignableTo<EscrowFace["packageId"], string>()).toBe(true)
+    expect(assignableTo<EscrowFace["claim"], (escrow: EscrowObject) => Recipe>()).toBe(true)
+  })
+
+  test("an interface-typed namespace is mapped all the way down", () => {
+    // `PlatformService.escrow` is `EscrowService`, an interface. The members
+    // reached through it must be the mapped ones, not the Effect ones.
+    expect(assignableTo<PlatformFace["escrow"]["get"], (id: ObjectId) => Promise<EscrowObject>>())
+      .toBe(true)
+    expect(
+      assignableTo<
+        PlatformFace["escrow"]["owned"]["count"],
+        (owner: SuiAddress) => Promise<number>
+      >()
+    ).toBe(true)
+    expect(assignableTo<PlatformFace["escrow"]["packageId"], string>()).toBe(true)
+  })
+
+  test("the composition's own member is mapped too", () => {
+    expect(
+      assignableTo<
+        PlatformFace["claimEverything"],
+        (ids: ReadonlyArray<ObjectId>, opts: { readonly signer: Signer }) => Promise<
+          ReadonlyArray<ChangedRef>
+        >
+      >()
+    ).toBe(true)
+  })
+})
+
+/**
+ * The errors serialize with their `outcome`, which is what a wrapper script
+ * acts on and what an operator reads out of a log line.
+ */
+describe("the errors", () => {
+  test("SuiError.toJson keeps the outcome, though it is a class field", () => {
+    const error = new EscrowSettlementUnknown({
+      escrowId: ESCROW_ID,
+      digest: "1".repeat(32) as never,
+      message: "the operator never confirmed"
+    })
+    const json = SuiError.toJson(error)
+    expect(json["_tag"]).toBe("escrow/EscrowSettlementUnknown")
+    expect(json["escrowId"]).toBe(ESCROW_ID)
+    // `outcome` is declared as a class field — not a schema field — because
+    // that is the shape that reads well at the call site. `toJson` reads it off
+    // the instance, so it is in the JSON anyway.
+    expect(json["outcome"]).toBe("unknown")
+    expect(json["outcome"]).toBe(SuiError.outcome(error))
   })
 })

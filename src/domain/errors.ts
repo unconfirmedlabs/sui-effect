@@ -519,25 +519,57 @@ const encodeThroughOwnSchema = (error: unknown): Record<string, unknown> | undef
 }
 
 /**
+ * The `outcome` of an error that declares one, when the encoded JSON has lost
+ * it.
+ *
+ * `outcome` is almost always a **class field** on an extension error —
+ * `readonly outcome: Outcome = "unknown"` beside a `Schema.TaggedError`'s
+ * schema fields — and a class field is not part of the schema, so encoding
+ * through the error's own schema drops it. It is also the one field a wrapper
+ * script and an operator read first. So it is put back: `toJson` reads the
+ * instance, not the schema, and adds `outcome` when the instance has one and
+ * the encoding did not produce it. Never fails.
+ */
+const withOutcome = (
+  error: unknown,
+  json: Record<string, unknown>
+): Record<string, unknown> => {
+  if ("outcome" in json) return json
+  const value = (error as { readonly outcome?: unknown })?.outcome
+  return typeof value === "string" && (value === "applied" || value === "not_applied" ||
+      value === "unknown")
+    ? { ...json, outcome: value }
+    : json
+}
+
+/**
  * The JSON an operator or a log line gets for a failure.
  *
  * A tag in the taxonomy encodes through {@link SuiErrorSchema}. **Anything
  * else that is a `Schema.TaggedError` encodes through its own schema**, which
- * is how an extension's errors serialize with their fields — including the
- * `outcome` a wrapper script reads — rather than arriving as a bare
- * `{ _tag, message }`. Only a value that is neither falls back to that.
+ * is how an extension's errors serialize with their fields rather than arriving
+ * as a bare `{ _tag, message }`. Only a value that is neither falls back to
+ * that.
+ *
+ * **`outcome` is always there when the error declares one**, including the
+ * usual case where it is a class field rather than a schema field: it is read
+ * off the instance and added to the encoded object. That is the field a
+ * wrapper script acts on, and losing it in the log while `Script.exitCode` saw
+ * it was the one inconsistency in the serialization.
  *
  * Never fails.
  */
 const toJson = (error: SuiError | { readonly _tag: string }): Record<string, unknown> => {
   const encoded = encode(error)
-  if (Result.isSuccess(encoded)) return encoded.success as Record<string, unknown>
+  if (Result.isSuccess(encoded)) {
+    return withOutcome(error, encoded.success as Record<string, unknown>)
+  }
   const own = encodeThroughOwnSchema(error)
-  if (own !== undefined) return own
+  if (own !== undefined) return withOutcome(error, own)
   const message = TAXONOMY_TAGS.has(error._tag)
     ? describe(error as SuiError)
     : causeLine(error) ?? error._tag
-  return { _tag: error._tag, message }
+  return withOutcome(error, { _tag: error._tag, message })
 }
 
 /**
