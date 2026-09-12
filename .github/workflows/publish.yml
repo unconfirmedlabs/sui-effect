@@ -1,6 +1,6 @@
 name: Publish to npm
 
-# Publishes on a version tag (v0.1.0, ...), never on merge, with npm provenance.
+# Publishes on a version tag (v0.1.0, ...), never on merge, via npm trusted publishing (OIDC).
 # One-time setup on npmjs.com after the first publish: Settings -> Trusted
 # Publisher -> GitHub Actions, naming this repo and this workflow file.
 on:
@@ -35,4 +35,7 @@ jobs:
         run: |
           npm pack --dry-run > /tmp/pack.txt 2>&1
           grep -q 'dist/' /tmp/pack.txt && grep -q 'LLMS.md' /tmp/pack.txt
-      - run: npm publish --provenance --access public
+      # --provenance is omitted while the repository is private: npm only accepts
+      # a provenance attestation from a public source repository. Add the flag
+      # back the day the repository goes public.
+      - run: npm publish --access public
