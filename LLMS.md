@@ -1746,8 +1746,12 @@ export interface SuiCoreService {
      *
      * `previousTransaction` on the *current* object names the latest mutation,
      * which is not necessarily the consumer of an older version: T can consume
-     * version 3 and U version 4, and the live object then names U. The consumer
-     * of version `v` is named by the object at version `v + 1`.
+     * version 3 and U version 4, and the live object then names U. Sui assigns
+     * outputs the transaction's Lamport version, so the consumer of version `v`
+     * is *not* generally the object at `v + 1`; `Tx.reconcile` identifies it by
+     * walking the live object's `previousTransaction` and its effects'
+     * `inputVersion` instead. This read stays public as a primitive for callers
+     * that know a specific historical version exists.
      *
      * The SDK's `GetObjectOptions` carries no version, so this is not a wrap of a
      * Core method: it reaches the transport's own historical read — the gRPC
