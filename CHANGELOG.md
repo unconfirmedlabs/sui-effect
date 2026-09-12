@@ -88,7 +88,7 @@ added or removed, no signature moved, and runtime JSON is byte for byte what
 
 ## 0.1.3
 
-Unreleased. Sixteen ergonomics changes from an audit of this package against
+Released the same day as 0.2.0. Sixteen ergonomics changes from an audit of this package against
 Effect v4 rc.112's own documentation. Nothing was removed and no signature
 changed: an extension or an application built against 0.1.2 compiles unchanged.
 
