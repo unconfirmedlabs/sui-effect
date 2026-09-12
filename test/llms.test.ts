@@ -8,7 +8,10 @@
  * `bun test` before `bun run build` must not have its whole run killed by one
  * missing directory, which is what the generator's `process.exit(1)` used to do.
  */
-import { describe, expect, test } from "bun:test"
+import { describe, expect, setDefaultTimeout, test } from "bun:test"
+
+// The generators shell out to the TypeScript checker over dist/; five seconds is tight on a CI runner.
+setDefaultTimeout(120_000)
 import { existsSync, readFileSync } from "node:fs"
 import { missingDeclaration, render } from "../scripts/llms.ts"
 

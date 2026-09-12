@@ -13,7 +13,10 @@
  * declared rather than assumed, so "this block is not checked" is a visible
  * choice in the template and not an accident.
  */
-import { describe, expect, test } from "bun:test"
+import { describe, expect, setDefaultTimeout, test } from "bun:test"
+
+// The generators shell out to the TypeScript checker over dist/; five seconds is tight on a CI runner.
+setDefaultTimeout(120_000)
 import { readFileSync } from "node:fs"
 
 const GUIDE = "docs/extensions.md"
