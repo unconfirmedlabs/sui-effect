@@ -566,3 +566,102 @@ describe("DecodeError.issues round-trips (NB4)", () => {
     expect(Schema.decodeUnknownSync(SuiErrorSchema)(json)._tag).toBe("DecodeError")
   })
 })
+
+/**
+ * NB8: every JSON log line carries a human sentence in the same key, whether or
+ * not the class has a `message` schema field.
+ */
+describe("SuiError.toJson message (NB8)", () => {
+  const ID = `0x${"ab".repeat(32)}`
+  const DIGEST_VALUE = Digest.make("7YcE7X6LmUcbqHcRYMRT8vBTxtnCbfGJkH6yZPFpTFwn")
+  const objectId = SuiAddress.make(ID) as never
+  const UNKNOWN = ExecutionReason.cases.Unknown.make({ $kind: "Unknown" })
+  const instances = [
+    new TransportError({ method: "getObject", retryable: true, cause: "down" }),
+    new ObjectNotFound({ objectId }),
+    new ObjectDeleted({ objectId }),
+    new ObjectUnavailable({ objectId }),
+    new TransactionNotFound({ digest: DIGEST_VALUE }),
+    new NetworkMismatch({ expected: "a", actual: "b" }),
+    new DecodeError({ issue: "bad bytes" }),
+    new SimulationFailed({ reason: UNKNOWN, message: "no" }),
+    new ExecutionFailed({
+      digest: DIGEST_VALUE,
+      reason: UNKNOWN,
+      effects: Schema.decodeUnknownSync(TransactionEffects)(effects(false))
+    }),
+    new SubmissionUnknown({ digest: DIGEST_VALUE, cause: "timeout" }),
+    new NotApplied({ digest: DIGEST_VALUE, evidence: "expired" }),
+    new SigningError({ cause: "no key" }),
+    new BuildError({ message: "no gas", cause: "x" }),
+    new PolicyDenied({ rule: "spend", message: "too much" }),
+    new JournalError({ cause: "disk full" }),
+    new UnexpectedEffects({ digest: DIGEST_VALUE, expected: "0x2::a::B", found: [] }),
+    new GraphQLUnavailable({ method: "query", reason: "no endpoint" }),
+    new ExtensionNotReady({ extension: "escrow", member: "status" })
+  ] as const
+
+  test("every taxonomy class gets the same sentence in the same key", () => {
+    expect(instances).toHaveLength(
+      Object.keys(SuiErrorSchema.pipe(Schema.toTaggedUnion("_tag")).cases).length
+    )
+    for (const error of instances) {
+      const json = SuiError.toJson(error)
+      expect([error._tag, typeof json["message"]]).toEqual([error._tag, "string"])
+      expect((json["message"] as string).length).toBeGreaterThan(0)
+      // The same sentence `.message` gives: `describe` for the fifteen classes
+      // that carry it as a getter, the field's own value for the three that
+      // declare `message` in their schema.
+      expect([error._tag, json["message"]]).toEqual([error._tag, (error as Error).message])
+      // The excess key is ignored on decode, so nothing round-trips differently.
+      expect(Schema.decodeUnknownSync(SuiErrorSchema)(json)._tag).toBe(error._tag)
+    }
+  })
+
+  test("an extension error keeps its own message", () => {
+    class Denied extends Schema.TaggedError<Denied>()("escrow/Denied", { rule: Schema.String }) {
+      readonly outcome = "not_applied" as const
+      override get message(): string {
+        return `escrow denied by ${this.rule}`
+      }
+    }
+    const json = SuiError.toJson(new Denied({ rule: "spend" }))
+    expect(json["message"]).toBe("escrow denied by spend")
+    expect(json["outcome"]).toBe("not_applied")
+  })
+})
+
+/** NB9: what `normalize` actually throws, which the docstring used to get wrong. */
+describe("normalize throws a SchemaError with the issue on it", () => {
+  test("ObjectId.normalize", () => {
+    expect(() => ObjectId.normalize("zz")).toThrow()
+    try {
+      ObjectId.normalize("zz")
+    } catch (error) {
+      expect(Schema.isSchemaError(error)).toBe(true)
+      if (Schema.isSchemaError(error)) {
+        expect(error.issue).toBeDefined()
+        expect(error.message.length).toBeGreaterThan(0)
+      }
+    }
+  })
+
+  test("SuiAddress.normalize", () => {
+    try {
+      SuiAddress.normalize("0xnothex")
+      throw new Error("expected a throw")
+    } catch (error) {
+      expect(Schema.isSchemaError(error)).toBe(true)
+    }
+  })
+
+  test(".make throws a plain Error with the issue in cause, not a SchemaError", () => {
+    try {
+      ObjectId.make("0x6")
+      throw new Error("expected a throw")
+    } catch (error) {
+      expect(Schema.isSchemaError(error)).toBe(false)
+      expect((error as Error).cause).toBeDefined()
+    }
+  })
+})

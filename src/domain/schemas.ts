@@ -61,10 +61,14 @@ const SuiAddressSchema = Schema.String.annotate({
  * document, every CLI flag and every human writes. `normalize` runs the
  * schema's own decode — `normalizeSuiAddress` — and then the check.
  *
- * **It throws** (an `Error` whose cause is the schema issue), like `.make`, so
- * it is for literals and configuration a caller controls. Anything that arrived
- * from outside goes through `Schema.decodeUnknownEffect(SuiAddress)`, which
- * puts the failure in the error channel where a caller can handle it.
+ * **It throws a `SchemaError`** — `Schema.isSchemaError(error)` is the guard —
+ * whose `.issue` is the structured schema issue and whose `.message` is the
+ * formatted line, because it is `Schema.decodeSync`. (`.make`, which validates
+ * without decoding, throws a plain `Error` with the issue in `cause` instead;
+ * the two are not the same shape.) So it is for literals and configuration a
+ * caller controls. Anything that arrived from outside goes through
+ * `Schema.decodeUnknownEffect(SuiAddress)`, which puts the failure in the error
+ * channel where a caller can handle it.
  *
  * @since 0.1.1
  *
@@ -114,9 +118,11 @@ const ObjectIdSchema = Schema.String.annotate({
  * and branding after — the object-id twin of `SuiAddress.normalize`, and the
  * answer to `ObjectId.make("0x6")` throwing.
  *
- * **It throws**, like `.make`, so it is for literals and configuration a caller
- * controls; anything from outside goes through
- * `Schema.decodeUnknownEffect(ObjectId)`.
+ * **It throws a `SchemaError`** (`Schema.isSchemaError`), whose `.issue` is the
+ * schema issue and whose `.message` is the formatted line, because it is
+ * `Schema.decodeSync`; `.make` throws a plain `Error` with the issue in
+ * `cause`. So it is for literals and configuration a caller controls; anything
+ * from outside goes through `Schema.decodeUnknownEffect(ObjectId)`.
  *
  * @since 0.1.1
  *

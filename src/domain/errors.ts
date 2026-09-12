@@ -764,6 +764,25 @@ const withOutcome = (
 }
 
 /**
+ * The human sentence, in the same key for every error.
+ *
+ * Fifteen of the eighteen taxonomy classes carry `message` as an
+ * `override get message()` rather than as a schema field, and a getter stays
+ * out of the encoding — so a JSON log line had a sentence for three tags and
+ * none for the rest, and an operator had to special-case them. This adds it
+ * when the encoding did not produce one. Additive: a decoder ignores the
+ * excess key, so every round trip still holds. Never fails.
+ */
+const withMessage = (
+  json: Record<string, unknown>,
+  sentence: () => string | undefined
+): Record<string, unknown> => {
+  if (typeof json["message"] === "string" && json["message"].length > 0) return json
+  const value = sentence()
+  return value === undefined || value.length === 0 ? json : { ...json, message: value }
+}
+
+/**
  * The JSON an operator or a log line gets for a failure.
  *
  * A tag in the taxonomy encodes through {@link SuiErrorSchema}. **Anything
@@ -778,15 +797,30 @@ const withOutcome = (
  * wrapper script acts on, and losing it in the log while `Script.exitCode` saw
  * it was the one inconsistency in the serialization.
  *
+ * **`message` is always there too**, for the same reason: fifteen of the
+ * eighteen taxonomy classes carry it as a getter, which stays out of the
+ * encoding, so a log line had a sentence for three tags and nothing for the
+ * rest. A taxonomy error gets {@link describe}; an extension error gets its own
+ * `.message` when it is a non-empty string. Added only when the encoding
+ * produced none, and ignored on decode, so nothing round-trips differently.
+ *
  * Never fails.
  */
 const toJson = (error: SuiError | { readonly _tag: string }): Record<string, unknown> => {
   const encoded = encode(error)
   if (Result.isSuccess(encoded)) {
-    return withOutcome(error, encoded.success as Record<string, unknown>)
+    return withMessage(
+      withOutcome(error, encoded.success as Record<string, unknown>),
+      () => describe(error as SuiError)
+    )
   }
   const own = encodeThroughOwnSchema(error)
-  if (own !== undefined) return withOutcome(error, own)
+  if (own !== undefined) {
+    return withMessage(withOutcome(error, own), () => {
+      const value = (error as { readonly message?: unknown }).message
+      return typeof value === "string" && value.length > 0 ? value : undefined
+    })
+  }
   const message = TAXONOMY_TAGS.has(error._tag)
     ? describe(error as SuiError)
     : causeLine(error) ?? error._tag
@@ -811,6 +845,12 @@ const isTaxonomy = (error: unknown): error is SuiError => {
  * The helpers every repo hand-rolls: is this worth retrying, did the
  * transaction land, is it even one of ours, what does an operator need to read,
  * and what goes in a log.
+ *
+ * For *branching* on a failure, the taxonomy is a flat tagged union, so
+ * `Effect.catchTags({ ObjectNotFound: ..., TransportError: ... })` in the error
+ * channel and `Match.tagsExhaustive` over a `SuiError` value both work and are
+ * the two documented consumer idioms; these helpers are for the questions that
+ * are the same whatever the tag is.
  */
 export const SuiError = {
   isRetryable,
