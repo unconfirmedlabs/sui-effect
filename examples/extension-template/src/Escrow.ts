@@ -16,7 +16,7 @@ import {
   Schema,
   Stream
 } from "effect"
-import type { ChangedRef, Recipe, SuiObject, UnexpectedEffects } from "sui-effect"
+import type { ChangedRef, Recipe, SuiObject, UnexpectedEffects } from "@unconfirmed/sui-effect"
 import { normalizeSuiAddress } from "@mysten/sui/utils"
 import {
   DecodeError,
@@ -27,9 +27,9 @@ import {
   SuiAddress,
   SuiSchema,
   TransportError
-} from "sui-effect"
-import type { RunError, Signer } from "sui-effect/tx"
-import { Tx } from "sui-effect/tx"
+} from "@unconfirmed/sui-effect"
+import type { RunError, Signer } from "@unconfirmed/sui-effect/tx"
+import { Tx } from "@unconfirmed/sui-effect/tx"
 import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
 import { escrowType, EscrowContent, ESCROW_PACKAGE, receiptType } from "./schema.ts"
 import type { SettlementApi } from "./upstream.ts"
@@ -433,7 +433,7 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
   /**
    * The test layer: the real service over an in-memory settlement service, so
    * an extension test drives the production code path and never opens a socket.
-   * Compose it with `layerExtensionTest` from `sui-effect/testing`. Never fails.
+   * Compose it with `layerExtensionTest` from `@unconfirmed/sui-effect/testing`. Never fails.
    */
   static readonly layerTest = (
     state: { readonly settled?: boolean } = {}

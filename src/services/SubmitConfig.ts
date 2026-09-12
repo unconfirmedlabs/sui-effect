@@ -183,7 +183,7 @@ export const defaults: SubmitConfigService = {
  * @example
  * ```ts
  * import { Effect } from "effect"
- * import { SubmitConfig } from "sui-effect/tx"
+ * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
  *
  * const strict = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
  *   Effect.provideService(effect, SubmitConfig, {
@@ -193,7 +193,7 @@ export const defaults: SubmitConfigService = {
  * ```
  */
 export const SubmitConfig = Object.assign(
-  Context.Reference<SubmitConfigService>("sui-effect/SubmitConfig", {
+  Context.Reference<SubmitConfigService>("@unconfirmed/sui-effect/SubmitConfig", {
     defaultValue: () => defaults
   }),
   { defaults }

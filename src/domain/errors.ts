@@ -54,7 +54,7 @@ export class TransportError extends Schema.TaggedError<TransportError>()("Transp
    *
    * @example
    * ```ts
-   * import { TransportError } from "sui-effect"
+   * import { TransportError } from "@unconfirmed/sui-effect"
    * import { Effect } from "effect"
    *
    * const status = Effect.tryPromise({

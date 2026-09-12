@@ -12,7 +12,7 @@
  * name two packages could plausibly both want.
  */
 import { Schema } from "effect"
-import { Digest, type Outcome, ObjectId } from "sui-effect"
+import { Digest, type Outcome, ObjectId } from "@unconfirmed/sui-effect"
 
 /**
  * No escrow object with this id, or it is not an escrow at all.

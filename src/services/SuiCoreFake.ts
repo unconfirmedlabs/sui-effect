@@ -536,13 +536,13 @@ const unimplemented = (method: string): never => {
  * @example
  * ```ts
  * import { Effect } from "effect"
- * import { SuiCoreFake } from "sui-effect/testing"
+ * import { SuiCoreFake } from "@unconfirmed/sui-effect/testing"
  *
  * const layer = SuiCoreFake.layer({ chainId: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S" })
  * ```
  */
 export class SuiCoreFake extends Context.Service<SuiCoreFake, SuiCoreFakeState>()(
-  "sui-effect/testing/SuiCoreFake"
+  "@unconfirmed/sui-effect/testing/SuiCoreFake"
 ) {
   /**
    * Provides both `SuiCore` (backed by the fake) and `SuiCoreFake` (the handle a

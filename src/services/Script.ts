@@ -74,7 +74,7 @@ export const readNetwork: Effect.Effect<string, Config.ConfigError> = Effect.gen
 
 /** The read-only script service, which has no `signer` in its type. */
 export class ScriptReadOnly
-  extends Context.Service<ScriptReadOnly, ScriptReadOnlyService>()("sui-effect/ScriptReadOnly")
+  extends Context.Service<ScriptReadOnly, ScriptReadOnlyService>()("@unconfirmed/sui-effect/ScriptReadOnly")
 {}
 
 /**
@@ -83,7 +83,7 @@ export class ScriptReadOnly
  * @example
  * ```ts
  * import { Console, Effect } from "effect"
- * import { Script } from "sui-effect/script"
+ * import { Script } from "@unconfirmed/sui-effect/script"
  *
  * Script.run(Effect.gen(function*() {
  *   const { sui } = yield* Script
@@ -91,7 +91,7 @@ export class ScriptReadOnly
  * }))
  * ```
  */
-export class Script extends Context.Service<Script, ScriptService>()("sui-effect/Script") {
+export class Script extends Context.Service<Script, ScriptService>()("@unconfirmed/sui-effect/Script") {
   /**
    * Everything a script needs, with `Sui` and `SuiCore` merged in so `Tx.*`
    * works inside a script with no further wiring.

@@ -51,7 +51,7 @@ export const layerTest = (
  *
  * @example
  * ```ts
- * import { layerExtensionTest } from "sui-effect/testing"
+ * import { layerExtensionTest } from "@unconfirmed/sui-effect/testing"
  *
  * const layer = layerExtensionTest(Escrow.layerTest(), { objects: [escrow] })
  * ```
@@ -200,7 +200,7 @@ const calls = (
  * @example
  * ```ts
  * import { Effect } from "effect"
- * import { SuiTest } from "sui-effect/testing"
+ * import { SuiTest } from "@unconfirmed/sui-effect/testing"
  *
  * const program = Effect.gen(function*() {
  *   yield* SuiTest.bumpVersion("0x…")

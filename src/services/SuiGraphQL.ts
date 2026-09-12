@@ -42,7 +42,7 @@ const unavailableClient = (reason: string): SuiGraphQLClient =>
  * @example
  * ```ts
  * import { Effect } from "effect"
- * import { SuiGraphQL, TransportError } from "sui-effect"
+ * import { SuiGraphQL, TransportError } from "@unconfirmed/sui-effect"
  *
  * const names = Effect.gen(function*() {
  *   const graphql = yield* SuiGraphQL
@@ -54,7 +54,7 @@ const unavailableClient = (reason: string): SuiGraphQLClient =>
  * ```
  */
 export class SuiGraphQL extends Context.Service<SuiGraphQL, SuiGraphQLClient>()(
-  "sui-effect/SuiGraphQL"
+  "@unconfirmed/sui-effect/SuiGraphQL"
 ) {
   /**
    * The tag over a client the caller built. Never fails.
@@ -119,7 +119,7 @@ export class SuiGraphQL extends Context.Service<SuiGraphQL, SuiGraphQLClient>()(
    *
    * @example
    * ```ts
-   * import { SuiGraphQL } from "sui-effect"
+   * import { SuiGraphQL } from "@unconfirmed/sui-effect"
    *
    * const chain = SuiGraphQL.query(
    *   (client) => client.query({ query: "{ chainIdentifier }" }),

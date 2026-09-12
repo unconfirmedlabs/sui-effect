@@ -9,7 +9,7 @@
  *
  * There is no second implementation to keep in step, which is the whole point.
  */
-import { SuiExtension } from "sui-effect/extension"
+import { SuiExtension } from "@unconfirmed/sui-effect/extension"
 import type { EscrowOptions } from "./Escrow.ts"
 import { Escrow } from "./Escrow.ts"
 

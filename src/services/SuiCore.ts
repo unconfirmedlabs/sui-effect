@@ -434,7 +434,7 @@ export interface SuiCoreService {
  * @example
  * ```ts
  * import { Effect } from "effect"
- * import { SuiCore } from "sui-effect"
+ * import { SuiCore } from "@unconfirmed/sui-effect"
  *
  * const chainId = Effect.gen(function*() {
  *   const core = yield* SuiCore
@@ -443,7 +443,7 @@ export interface SuiCoreService {
  * })
  * ```
  */
-export class SuiCore extends Context.Service<SuiCore, SuiCoreService>()("sui-effect/SuiCore") {
+export class SuiCore extends Context.Service<SuiCore, SuiCoreService>()("@unconfirmed/sui-effect/SuiCore") {
   /** Wraps a client the caller already built and configured. */
   static readonly layerFromClient = (client: ClientWithCoreApi): Layer.Layer<SuiCore> =>
     Layer.succeed(SuiCore, makeFromClient(client))

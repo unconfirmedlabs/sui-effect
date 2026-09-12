@@ -9,9 +9,9 @@
  * Two rules make that work, and both are visible below.
  */
 import { Context, Effect, Layer } from "effect"
-import type { ChangedRef, ObjectId, Sui } from "sui-effect"
-import { SuiExtension } from "sui-effect/extension"
-import type { Signer } from "sui-effect/tx"
+import type { ChangedRef, ObjectId, Sui } from "@unconfirmed/sui-effect"
+import { SuiExtension } from "@unconfirmed/sui-effect/extension"
+import type { Signer } from "@unconfirmed/sui-effect/tx"
 import { Escrow } from "./Escrow.ts"
 import type { ClaimForError, EscrowOptions, EscrowService } from "./Escrow.ts"
 

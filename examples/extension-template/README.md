@@ -16,7 +16,7 @@ every code block in it is copied from this directory.
 | `src/Escrow.ts` | The service: a read, a recipe fragment, a submit-on-behalf operation, a nested namespace, and `layer` / `layerConfig` / `layerTest` |
 | `src/upstream.ts` | A stand-in for a third-party Promise SDK, wrapped in `src/Escrow.ts` with `SuiCore.use` and `Effect.tryPromise` |
 | `src/extension.ts` | `SuiExtension.fromService`: the Promise face, derived, never hand-written |
-| `test/escrow.test.ts` | The whole test suite on `layerExtensionTest` and `SuiTest` from `sui-effect/testing`. No network, no mocks of its own |
+| `test/escrow.test.ts` | The whole test suite on `layerExtensionTest` and `SuiTest` from `@unconfirmed/sui-effect/testing`. No network, no mocks of its own |
 
 ## Running it here
 
@@ -29,7 +29,7 @@ From the repository root, `bun run check:template` does the same thing.
 
 Do **not** run `bun install` in this directory while it lives inside the
 sui-effect repository. It needs no install: `effect` and `@mysten/sui` resolve
-from the repository's own `node_modules`, and `sui-effect` resolves through the
+from the repository's own `node_modules`, and `@unconfirmed/sui-effect` resolves through the
 `paths` block in `tsconfig.json`. Installing here would put a second copy of
 `effect` in scope, and two copies of `effect` in one process means two
 `Context.Service` identities and layers that silently do not match.
@@ -41,8 +41,8 @@ than a published version, use the packed tarball, not `link:` or `bun link`:
 
 ```bash
 cd /path/to/sui-effect && bun run build && npm pack
-mkdir -p vendor && cp /path/to/sui-effect/sui-effect-*.tgz vendor/
-bun add -d ./vendor/sui-effect-0.1.0.tgz
+mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-*.tgz vendor/
+bun add -d ./vendor/unconfirmed-sui-effect-0.1.0.tgz
 ```
 
 `link:` and `bun link` symlink the checkout, and **module resolution follows the
@@ -67,11 +67,11 @@ conversion can be re-run against the same library.
    `tsconfig.build.json`**, and install the dependencies:
 
    ```bash
-   bun add -d sui-effect effect@4.0.0-rc.112 @mysten/sui@2.30.0 @mysten/bcs \
+   bun add -d @unconfirmed/sui-effect effect@4.0.0-rc.112 @mysten/sui@2.30.0 @mysten/bcs \
      @effect/language-service @types/bun typescript
    ```
 
-   Note the `-d`. `sui-effect`, `effect` and `@mysten/sui` belong in
+   Note the `-d`. `@unconfirmed/sui-effect`, `effect` and `@mysten/sui` belong in
    **`peerDependencies` and `devDependencies`**, never in `dependencies` — a
    library that depends on any of them directly puts a second copy in the
    consumer's process, and two copies of `effect` means two `Context.Service`
@@ -82,13 +82,13 @@ conversion can be re-run against the same library.
    `effect` is pinned **exactly** (`4.0.0-rc.112`), not to a range: rc.113
    renamed `Config.nonEmptyString`, `Config.string` and `Config.redacted` to
    `Config.NonEmptyString`, `Config.String` and `Config.Redacted`, so the
-   neighbouring rcs are not interchangeable. Match whatever `sui-effect`'s own
+   neighbouring rcs are not interchangeable. Match whatever `@unconfirmed/sui-effect`'s own
    `peerDependencies` pins.
 
-   **Until `sui-effect` is published**, bun probes the registry for every
+   **Until `@unconfirmed/sui-effect` is published**, bun probes the registry for every
    `peerDependencies` entry — even one a local dependency already satisfies —
    and a 404 fails the install. That is what the
-   `peerDependenciesMeta.sui-effect.optional: true` block in `package.json` is
+   `peerDependenciesMeta["@unconfirmed/sui-effect"].optional: true` block in `package.json` is
    for. Delete that block on the swap to the published package, and make it a
    line on your release checklist: left in, it turns a genuinely missing peer
    into a silent `undefined` at import time.
@@ -124,11 +124,11 @@ whose `dist` is never built and whose `files` list therefore ships nothing —
 which is exactly the state this template was in before. Keep the script.
 
 **It works after you copy the template out.** `check-package.ts` resolves
-`sui-effect`, `effect` and `@mysten/*` from this package's own `node_modules`
+`@unconfirmed/sui-effect`, `effect` and `@mysten/*` from this package's own `node_modules`
 first, which is what a copied-out package has after `bun install`, and only
 falls back to the sui-effect repository two directories up when that repository
 is really there (it checks the `name` in its `package.json`). Whichever copy of
-`sui-effect` it finds has to be **built**, because the consumer imports its
+`@unconfirmed/sui-effect` it finds has to be **built**, because the consumer imports its
 `exports` map; a published tarball always is.
 
 To publish:
@@ -165,6 +165,6 @@ The guide's checklist, in short. Reject an extension that has a `Promise` in an
 interface, calls `executeTransaction` directly, holds a consumer signer in a
 layer, has `unknown` in an error channel, maintains a Promise facade by hand,
 or builds its own client instead of requiring `Sui`. Also reject one that
-declares `sui-effect` in `dependencies`, hand-builds a `TransportError` instead
+declares `@unconfirmed/sui-effect` in `dependencies`, hand-builds a `TransportError` instead
 of `TransportError.fromUnknown`, or registers two extensions on one client with
 different chain ids.
