@@ -3329,7 +3329,7 @@ declare const isUnresolved: (value: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
+        readonly chain?: string;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -3360,7 +3360,7 @@ declare const isUnresolved: (value: {
                 readonly chain: string;
                 readonly nonce: number;
             };
-        } | undefined;
+        };
     };
     readonly lastError: string;
     readonly attempts: number;
@@ -3378,7 +3378,7 @@ declare const isUnresolved: (value: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
+        readonly chain?: string;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -3409,14 +3409,14 @@ declare const isUnresolved: (value: {
                 readonly chain: string;
                 readonly nonce: number;
             };
-        } | undefined;
+        };
     };
     readonly signedAt: import("effect/DateTime").Utc;
 } | {
     readonly at: import("effect/DateTime").Utc;
     readonly digest: Digest;
     readonly _tag: "Executed";
-    readonly checkpoint?: bigint | undefined;
+    readonly checkpoint?: bigint;
 } | {
     readonly _tag: "Failed";
     readonly digest: Digest;
@@ -3502,7 +3502,7 @@ declare const isUnresolved: (value: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
+        readonly chain?: string;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -3533,7 +3533,7 @@ declare const isUnresolved: (value: {
                 readonly chain: string;
                 readonly nonce: number;
             };
-        } | undefined;
+        };
     };
     readonly lastError: string;
     readonly attempts: number;
@@ -3546,7 +3546,7 @@ declare const isUnresolved: (value: {
         readonly sender: SuiAddress;
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
+        readonly chain?: string;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -3577,7 +3577,7 @@ declare const isUnresolved: (value: {
                 readonly chain: string;
                 readonly nonce: number;
             };
-        } | undefined;
+        };
     };
     readonly signedAt: import("effect/DateTime").Utc;
 }
