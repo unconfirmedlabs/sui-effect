@@ -150,9 +150,15 @@ export const Digest = Schema.String.annotate({
     Schema.makeFilter((value: string) =>
       isValidTransactionDigest(value) ? undefined : "Expected a base58 32-byte transaction digest"
     )
-  ),
-  Schema.brand("Digest")
-)
+  )
+  // Again **after** the check, because a check-only brand reports from the
+  // checked node and the annotation on the bare `Schema.String` underneath it
+  // does not reach there. The check's own message still wins for a string of
+  // the wrong shape; this is only what a non-string is compared against.
+).annotate({
+  identifier: "Digest",
+  description: "A base58 32-byte transaction digest"
+}).pipe(Schema.brand("Digest"))
 export type Digest = typeof Digest.Type
 
 /**
@@ -204,21 +210,34 @@ export const ObjectType = Schema.Union([StructTag, Schema.Literal("package")])
 export type ObjectType = typeof ObjectType.Type
 
 /** An amount in MIST. Encoded as the decimal string every SDK response uses. */
-export const Mist = Schema.BigIntFromString.annotate({
+export const Mist = Schema.BigIntFromString.pipe(
+  Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n))
+).annotate({
   identifier: "Mist",
   description: "An amount in MIST, encoded as a decimal string"
 }).pipe(
-  Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n)),
+  // `Schema.annotateEncoded` is what names the **string** side: the wrong-type
+  // failure for a `BigIntFromString` comes from its unannotated string source,
+  // not from the bigint node the plain `annotate` reaches.
+  Schema.annotateEncoded({
+    identifier: "Mist",
+    description: "An amount in MIST, encoded as a decimal string"
+  }),
   Schema.brand("Mist")
 )
 export type Mist = typeof Mist.Type
 
 /** A Move object version. Encoded as the decimal string the SDK returns. */
-export const Version = Schema.BigIntFromString.annotate({
+export const Version = Schema.BigIntFromString.pipe(
+  Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n))
+).annotate({
   identifier: "Version",
   description: "A Move object version, encoded as a decimal string"
 }).pipe(
-  Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n)),
+  Schema.annotateEncoded({
+    identifier: "Version",
+    description: "A Move object version, encoded as a decimal string"
+  }),
   Schema.brand("Version")
 )
 export type Version = typeof Version.Type
@@ -588,10 +607,10 @@ export type TransactionEffects = typeof TransactionEffects.Type
 export const Signature = Schema.String.annotate({
   identifier: "Signature",
   description: "A serialized transaction signature"
-}).pipe(
-  Schema.check(Schema.isNonEmpty()),
-  Schema.brand("Signature")
-)
+}).pipe(Schema.check(Schema.isNonEmpty())).annotate({
+  identifier: "Signature",
+  description: "A serialized transaction signature"
+}).pipe(Schema.brand("Signature"))
 export type Signature = typeof Signature.Type
 
 /** The largest value a Move `u64` can hold. */

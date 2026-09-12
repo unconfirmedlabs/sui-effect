@@ -28,6 +28,7 @@ import {
   Balance,
   CoinType,
   Digest,
+  Network,
   Mist,
   ObjectId,
   ObjectRef,
@@ -508,17 +509,61 @@ describe("TransportError.fromUnknown", () => {
  * instead, which is the trap the docs warn about.
  */
 describe("schema annotations", () => {
-  test("a non-string reports the identifier, not `Expected string`", () => {
-    const result = Schema.decodeUnknownResult(ObjectId)(5)
-    expect(result._tag).toBe("Failure")
-    if (result._tag === "Failure") {
-      expect(String(result.failure)).toContain("Expected ObjectId")
+  /**
+   * Every branded schema, not a sample.
+   *
+   * The annotation has to sit on the node that *reports*, and which node that
+   * is depends on how the brand is built: a brand with a decode transform
+   * reports from the string underneath it, a check-only brand reports from the
+   * checked node, and a `BigIntFromString` brand reports from its **encoded**
+   * string source (`Schema.annotateEncoded`). Getting one of the three wrong
+   * leaves `Expected string`, which is what this table catches.
+   */
+  const brands = [
+    ["SuiAddress", SuiAddress, "0xnothex", "Expected a 32-byte Sui address"],
+    ["ObjectId", ObjectId, "zz", "Expected a 32-byte Sui object id"],
+    ["Digest", Digest, "zz", "Expected a base58 32-byte transaction digest"],
+    ["StructTag", StructTag, "not a tag", "Expected a fully qualified Move struct tag"],
+    ["CoinType", CoinType, "not a tag", "Expected a fully qualified Move coin type"],
+    ["Signature", Signature, "", "Expected a value with a length of at least 1"],
+    ["Mist", Mist, "-1", "Expected a value greater than or equal to 0n"],
+    ["Version", Version, "-1", "Expected a value greater than or equal to 0n"],
+    // `Network` is a brand with no check at all, so it has no check message.
+    ["Network", Network, undefined, undefined]
+  ] as const
+
+  test("a wrong-typed input reports the identifier, not `Expected string`", () => {
+    for (const [name, schema] of brands) {
+      const result = Schema.decodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(5)
+      expect([name, result._tag]).toEqual([name, "Failure"])
+      if (result._tag !== "Failure") continue
+      expect([name, String(result.failure)]).toEqual([
+        name,
+        `SchemaError(Expected ${name})`
+      ])
     }
-    // The filter message still wins for a string of the wrong shape.
-    const badString = Schema.decodeUnknownResult(ObjectId)("zz")
-    expect(badString._tag).toBe("Failure")
-    if (badString._tag === "Failure") {
-      expect(String(badString.failure)).toContain("Expected a 32-byte Sui object id")
+  })
+
+  test("a failed check still reports the check's own message", () => {
+    for (const [name, schema, badValue, message] of brands) {
+      if (badValue === undefined) continue
+      const result = Schema.decodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(badValue)
+      expect([name, result._tag]).toEqual([name, "Failure"])
+      if (result._tag !== "Failure") continue
+      expect([name, String(result.failure)]).toEqual([name, `SchemaError(${message})`])
+    }
+  })
+
+  test("every brand gets a named definition in a JSON Schema document", () => {
+    for (const [name, schema] of brands) {
+      const document = JSON.stringify(
+        Schema.toJsonSchemaDocument(
+          Schema.Struct({ value: schema as Schema.Codec<string, string> }).annotate({
+            identifier: "Holder"
+          })
+        )
+      )
+      expect([name, document.includes(`"${name}":`)]).toEqual([name, true])
     }
   })
 
