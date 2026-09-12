@@ -664,12 +664,16 @@ process verbatim.
 sponsor policy typically allows. Narrow it once, where the runtime is built:
 
 ```ts
-Effect.provideService(program, SubmitConfig, {
-  ...SubmitConfig.defaults,
-  maxGasBudget: 1_000_000_000n, // 1 SUI
-  lockSender: false             // see below
-})
+program.pipe(SubmitConfig.with({
+  maxGasBudget: Mist.make(1_000_000_000n), // 1 SUI
+  lockSender: false                        // see below
+}))
 ```
+
+`SubmitConfig.with(overrides)` spreads `SubmitConfig.defaults` for you and
+provides the whole value, which is what a `Context.Reference` holds;
+`SubmitConfig.layer(overrides)` is the same thing as a `Layer`, for an
+application that sets its policy once where the runtime is built.
 
 `lockSender` is the other one worth a decision. The lock exists because two
 concurrent builds from one address can pick the same gas coin; with

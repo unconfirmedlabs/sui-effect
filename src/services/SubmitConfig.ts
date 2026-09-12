@@ -5,8 +5,7 @@
  *
  * @since 0.1.0
  */
-import { Context, Duration, Random, Schedule } from "effect"
-import type { Effect } from "effect"
+import { Context, Duration, Effect, Layer, Random, Schedule } from "effect"
 import type { PolicyDenied } from "../domain/errors.ts"
 import type { Mist, Simulation } from "../domain/schemas.ts"
 import { U32_MAX } from "../domain/schemas.ts"
@@ -178,23 +177,75 @@ export const defaults: SubmitConfigService = {
  * Because this is a `Context.Reference` and not a service, it never appears in
  * an `R`: a one-shot script gets the defaults with no wiring, and an
  * application overrides what it cares about with
- * `Effect.provideService(effect, SubmitConfig, { ...SubmitConfig.defaults, validFor: "30 seconds" })`.
+ * {@link SubmitConfig.with} (one effect) or {@link SubmitConfig.layer} (a whole
+ * application), both of which spread {@link SubmitConfig.defaults} for you.
  *
  * @example
  * ```ts
  * import { Effect } from "effect"
+ * import { Mist } from "@unconfirmed/sui-effect"
  * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
  *
  * const strict = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
- *   Effect.provideService(effect, SubmitConfig, {
- *     ...SubmitConfig.defaults,
- *     maxGasBudget: 100_000_000n as typeof SubmitConfig.defaults.maxGasBudget
- *   })
+ *   effect.pipe(SubmitConfig.with({ maxGasBudget: Mist.make(100_000_000n) }))
  * ```
  */
-export const SubmitConfig = Object.assign(
-  Context.Reference<SubmitConfigService>("@unconfirmed/sui-effect/SubmitConfig", {
-    defaultValue: () => defaults
-  }),
-  { defaults }
+const SubmitConfigRef = Context.Reference<SubmitConfigService>(
+  "@unconfirmed/sui-effect/SubmitConfig",
+  { defaultValue: () => defaults }
 )
+
+/**
+ * A `Layer` that puts {@link defaults} in force with `overrides` applied, for
+ * an application or a test that sets its lifecycle policy once at the edge.
+ *
+ * The spread is the point: a `Context.Reference` holds one whole value, so
+ * providing it by hand means writing `{ ...SubmitConfig.defaults, ... }` at
+ * every site and casting every branded literal back to its field's type. This
+ * does both. The `Journal.layerMemory` precedent is the same idea.
+ *
+ * Never fails, requires nothing.
+ *
+ * @since 0.1.3
+ *
+ * @example
+ * ```ts
+ * import { Layer } from "effect"
+ * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
+ *
+ * const app = Layer.mergeAll(SubmitConfig.layer({ resubmitAttempts: 1 }))
+ * ```
+ */
+const layer = (overrides: Partial<SubmitConfigService>): Layer.Layer<never> =>
+  Layer.succeed(SubmitConfigRef, { ...defaults, ...overrides })
+
+/**
+ * {@link defaults} with `overrides` applied, provided to one effect — the
+ * `.pipe`-able form of {@link layer}, for overriding the lifecycle for a single
+ * submission rather than for a whole application.
+ *
+ * Never fails, requires nothing.
+ *
+ * @since 0.1.3
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { Mist } from "@unconfirmed/sui-effect"
+ * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const submission: Effect.Effect<void>
+ *
+ * const cheap = submission.pipe(SubmitConfig.with({ maxGasBudget: Mist.make(1_000_000_000n) }))
+ * ```
+ */
+const withOverrides =
+  (overrides: Partial<SubmitConfigService>) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.provideService(effect, SubmitConfigRef, { ...defaults, ...overrides })
+
+export const SubmitConfig = Object.assign(SubmitConfigRef, {
+  defaults,
+  layer,
+  with: withOverrides
+})

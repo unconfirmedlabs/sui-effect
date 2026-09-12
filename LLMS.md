@@ -2927,15 +2927,10 @@ caller's error union does not grow a branch per credential kind.
 ```ts
 declare const SubmitConfig: Context.Reference<SubmitConfigService> & {
     defaults: SubmitConfigService;
+    layer: (overrides: Partial<SubmitConfigService>) => Layer.Layer<never>;
+    with: (overrides: Partial<SubmitConfigService>) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
 }
 ```
-
-The lifecycle settings.
-
-Because this is a `Context.Reference` and not a service, it never appears in
-an `R`: a one-shot script gets the defaults with no wiring, and an
-application overrides what it cares about with
-`Effect.provideService(effect, SubmitConfig, { ...SubmitConfig.defaults, validFor: "30 seconds" })`.
 
 ### `SubmitConfigService` (interface)
 

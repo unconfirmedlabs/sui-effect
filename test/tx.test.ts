@@ -19,7 +19,7 @@ import { TestClock } from "effect/testing"
 import { KeyValueStore } from "effect/unstable/persistence"
 import { JournalError, PolicyDenied } from "../src/domain/errors.ts"
 import { JournalEntry } from "../src/domain/journal-entry.ts"
-import { maxTimestampMsOf, ObjectId, SuiAddress } from "../src/domain/schemas.ts"
+import { maxTimestampMsOf, Mist, ObjectId, SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
 import type { SubmitConfigService } from "../src/services/SubmitConfig.ts"
@@ -139,8 +139,7 @@ const moveAbort: SuiClientTypes.ExecutionError = {
   }
 } as unknown as SuiClientTypes.ExecutionError
 
-const withConfig = (config: Partial<SubmitConfigService>) =>
-  Layer.succeed(SubmitConfig, { ...SubmitConfig.defaults, ...config })
+const withConfig = (config: Partial<SubmitConfigService>) => SubmitConfig.layer(config)
 
 const run = <A, E>(
   effect: Effect.Effect<A, E, Sui | SuiCoreFake | TestClock.TestClock>,
@@ -189,10 +188,9 @@ describe("Tx.build", () => {
 
   test("a wall-clock bound is opt-in through SubmitConfig.validFor", async () => {
     const built = await run(
-      Effect.provideService(Tx.build(claim, { sender: SENDER }), SubmitConfig, {
-        ...SubmitConfig.defaults,
-        validFor: Duration.minutes(2)
-      })
+      Tx.build(claim, { sender: SENDER }).pipe(
+        SubmitConfig.with({ validFor: Duration.minutes(2) })
+      )
     )
     if (built.expiration?.$kind === "ValidDuring") {
       // Measured from the chain's clock, in milliseconds, not the process's.
@@ -222,10 +220,7 @@ describe("Tx.build", () => {
 
   test("expiration epoch reads the system state and sets the Epoch variant", async () => {
     const built = await run(
-      Effect.provideService(Tx.build(claim, { sender: SENDER }), SubmitConfig, {
-        ...SubmitConfig.defaults,
-        expiration: "epoch"
-      }),
+      Tx.build(claim, { sender: SENDER }).pipe(SubmitConfig.with({ expiration: "epoch" })),
       { ...baseScript, epoch: 77n }
     )
     expect(built.expiration?.$kind).toBe("Epoch")
@@ -235,10 +230,9 @@ describe("Tx.build", () => {
   test("expiration none costs no system-state read", async () => {
     const methods = await run(
       Effect.gen(function*() {
-        yield* Effect.provideService(Tx.build(claim, { sender: SENDER }), SubmitConfig, {
-          ...SubmitConfig.defaults,
-          expiration: "none"
-        })
+        yield* Tx.build(claim, { sender: SENDER }).pipe(
+          SubmitConfig.with({ expiration: "none" })
+        )
         return (yield* SuiTest.calls()).map((call) => call.method)
       })
     )
@@ -258,10 +252,7 @@ describe("Tx.build", () => {
 
   test("sets no expiration of its own when the policy says none", async () => {
     const built = await run(
-      Effect.provideService(Tx.build(claim, { sender: SENDER }), SubmitConfig, {
-        ...SubmitConfig.defaults,
-        expiration: "none"
-      })
+      Tx.build(claim, { sender: SENDER }).pipe(SubmitConfig.with({ expiration: "none" }))
     )
     // The SDK's own builder writes the `None` variant, which bounds nothing:
     // there is no `maxTimestamp`, so `Tx.reconcile` can never call it expired.
@@ -280,10 +271,10 @@ describe("Tx.build", () => {
 
   test("refuses a gas budget over the configured maximum", async () => {
     const error = await run(
-      Effect.provideService(Tx.build(claim, { sender: SENDER }).pipe(Effect.flip), SubmitConfig, {
-        ...SubmitConfig.defaults,
-        maxGasBudget: 1n as typeof SubmitConfig.defaults.maxGasBudget
-      })
+      Tx.build(claim, { sender: SENDER }).pipe(
+        Effect.flip,
+        SubmitConfig.with({ maxGasBudget: Mist.make(1n) })
+      )
     )
     expect(error._tag).toBe("BuildError")
   })
@@ -437,10 +428,12 @@ describe("Tx.run", () => {
 
   test("preflight denial stops before anything is signed", async () => {
     const error = await run(
-      Effect.provideService(Tx.run(claim, { signer }).pipe(Effect.flip), SubmitConfig, {
-        ...SubmitConfig.defaults,
-        preflight: () => Effect.fail(new PolicyDenied({ rule: "spend", message: "too much" }))
-      }),
+      Tx.run(claim, { signer }).pipe(
+        Effect.flip,
+        SubmitConfig.with({
+          preflight: () => Effect.fail(new PolicyDenied({ rule: "spend", message: "too much" }))
+        })
+      ),
       { ...baseScript, simulate: [FakeOutcome.succeed()], execute: [executed] }
     )
     expect(error._tag).toBe("PolicyDenied")
@@ -485,6 +478,72 @@ describe("Tx.run", () => {
       { ...baseScript, simulate: [FakeOutcome.succeed()], execute: [executed] }
     )
     expect(order).toEqual(["first", "second"])
+  })
+
+  // NB16: `SubmitConfig.with(overrides)` spreads the defaults, so an override
+  // is one call instead of `Effect.provideService(e, SubmitConfig, { ...defaults, ... })`.
+  test("SubmitConfig.with({ lockSender: false }) stops two runs serializing", async () => {
+    const order = await run(
+      Effect.gen(function*() {
+        const gate = yield* Deferred.make<void>()
+        const inside = yield* Deferred.make<void>()
+        const order: Array<string> = []
+        let held = false
+        const start = (name: string) =>
+          Effect.forkChild(
+            Tx.run(claim, { signer }).pipe(
+              Effect.tap(() => Effect.sync(() => order.push(name))),
+              SubmitConfig.with({
+                lockSender: false,
+                preflight: () =>
+                  Effect.gen(function*() {
+                    if (held) return
+                    held = true
+                    yield* Deferred.succeed(inside, undefined)
+                    yield* Deferred.await(gate)
+                  })
+              })
+            )
+          )
+        const first = yield* start("first")
+        yield* Deferred.await(inside)
+        const second = yield* start("second")
+        yield* TestClock.adjust("1 second")
+        // With the lock held this array is empty; without a lock the second
+        // run walks straight past the one stuck in preflight.
+        expect(order).toEqual(["second"])
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.join(first)
+        yield* Fiber.join(second)
+        return order
+      }),
+      { ...baseScript, simulate: [FakeOutcome.succeed()], execute: [executed] }
+    )
+    expect(order).toEqual(["second", "first"])
+  })
+
+  // NB16: the `Layer` form, composed beside `layerTest` the way an application
+  // composes it beside its own client layer.
+  test("SubmitConfig.layer({ resubmitAttempts: 1 }) sends exactly once", async () => {
+    const calls = await run(
+      Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(Tx.run(claim, { signer }).pipe(Effect.flip))
+        yield* TestClock.adjust("5 minutes")
+        yield* Fiber.join(fiber)
+        return (yield* SuiTest.calls()).map((call) => call.method)
+      }),
+      {
+        ...baseScript,
+        execute: [FakeOutcome.transportError("UNAVAILABLE")],
+        getTransaction: [FakeOutcome.transportError("UNAVAILABLE")]
+      },
+      SubmitConfig.layer({
+        resubmit: Schedule.spaced("1 second"),
+        resubmitAttempts: 1,
+        executeTimeout: Duration.seconds(5)
+      })
+    )
+    expect(calls.filter((method) => method === "executeTransaction")).toHaveLength(1)
   })
 
   test("two sponsored runs with one gas owner serialize, even for different senders", async () => {
@@ -667,13 +726,15 @@ describe("Tx.reconcile", () => {
       Effect.gen(function*() {
         const fake = yield* SuiCoreFake
         const fiber = yield* Effect.forkChild(
-          Effect.provideService(Tx.run(claim, { signer }), SubmitConfig, {
-            ...SubmitConfig.defaults,
-            resubmit: Schedule.spaced("1 second"),
-            resubmitAttempts: 2,
-            executeTimeout: Duration.seconds(5),
-            validFor: Duration.minutes(2)
-          }).pipe(Effect.flip)
+          Tx.run(claim, { signer }).pipe(
+            SubmitConfig.with({
+              resubmit: Schedule.spaced("1 second"),
+              resubmitAttempts: 2,
+              executeTimeout: Duration.seconds(5),
+              validFor: Duration.minutes(2)
+            }),
+            Effect.flip
+          )
         )
         yield* TestClock.adjust("1 second")
         // The chain clock passes the recorded bound plus the margin while the
