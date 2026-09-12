@@ -11,7 +11,7 @@
 import type { BcsType } from "@mysten/bcs"
 import { normalizeStructTag, parseStructTag } from "@mysten/sui/utils"
 import { Effect, Schema, SchemaAST, SchemaIssue, SchemaTransformation } from "effect"
-import { DecodeError, decodeIssues } from "./errors.ts"
+import { DecodeError, decodePayload } from "./errors.ts"
 import type { ObjectId } from "./schemas.ts"
 
 const SUI_TYPE_ANNOTATION = "sui-effect/suiType"
@@ -327,8 +327,7 @@ export const decodeContent = <T>(
           // themselves did not parse: a layout mismatch or a corrupt object,
           // never something to swallow.
           kind: "bytes",
-          issue: error.message,
-          issues: decodeIssues(error)
+          ...decodePayload(error)
         })
     )
   )

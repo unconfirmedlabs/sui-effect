@@ -274,15 +274,42 @@ export class DecodeError extends Schema.TaggedError<DecodeError>()("DecodeError"
 const standardIssues = SchemaIssue.makeFormatterStandardSchemaV1()
 
 /**
- * Every issue of a `SchemaError`, flattened to `{ path, message }` the way
- * {@link DecodeError.issues} carries them.
+ * The **first** issue of a `SchemaError`'s formatted message, which is what
+ * {@link DecodeError}'s `issue` has always carried.
  *
- * `SchemaError.issue` is a tree; this is Effect's own Standard-Schema
- * formatter over it, so the paths are the ones every other tool prints. A
- * decode run with `{ errors: "all" }` reports every field rather than the
- * first. Never fails.
+ * The producers decode with `{ errors: "all" }` so `issues` can carry every
+ * path, and the formatter joins those issues with a newline — which turned
+ * `error.message` into a paragraph. `issue` is one sentence for a human and
+ * its shape is part of what 0.1.2 shipped, so it is cut back to the first
+ * issue's block: the message plus the indented `at [...]` line the formatter
+ * puts under it. A single-issue failure has no second block, so it comes
+ * through byte for byte. Never fails.
  */
-export const decodeIssues = (
+const firstIssue = (message: string): string => {
+  const lines = message.split("\n")
+  // A continuation line of the same issue is indented; the next issue starts
+  // at column zero.
+  const next = lines.findIndex((line, index) => index > 0 && !line.startsWith("  "))
+  return next === -1 ? message : lines.slice(0, next).join("\n")
+}
+
+/**
+ * The `DecodeError` payload a failed decode deserves: the first issue as the
+ * sentence `issue` has always been, and every issue as `{ path, message }`.
+ *
+ * `SchemaError.issue` is a tree; the second half is Effect's own
+ * Standard-Schema formatter over it, so the paths are the ones every other
+ * tool prints. A decode run with `{ errors: "all" }` reports every field
+ * rather than the first. Never fails.
+ */
+export const decodePayload = (error: Schema.SchemaError): {
+  readonly issue: string
+  readonly issues: ReadonlyArray<
+    { readonly path: ReadonlyArray<string | number>; readonly message: string }
+  >
+} => ({ issue: firstIssue(error.message), issues: decodeIssues(error) })
+
+const decodeIssues = (
   error: Schema.SchemaError
 ): ReadonlyArray<{ readonly path: ReadonlyArray<string | number>; readonly message: string }> =>
   standardIssues(error.issue).issues.map((issue) => ({

@@ -14,7 +14,7 @@
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { fromBase64 } from "@mysten/sui/utils"
 import { Effect, Predicate, Schema } from "effect"
-import { DecodeError, decodeIssues, ExecutionFailed, UnexpectedEffects } from "./errors.ts"
+import { DecodeError, decodePayload, ExecutionFailed, UnexpectedEffects } from "./errors.ts"
 import {
   BalanceChange,
   ChangedObject,
@@ -416,9 +416,7 @@ export const fromTransactionResult = Effect.fn("Executed.fromTransactionResult")
       timestampMs: transaction.timestampMs
     }
     const executed = yield* decodeExecuted(encoded).pipe(
-      Effect.mapError((error) =>
-        new DecodeError({ kind: "shape", issue: error.message, issues: decodeIssues(error) })
-      )
+      Effect.mapError((error) => new DecodeError({ kind: "shape", ...decodePayload(error) }))
     )
     if (!transaction.status.success) {
       return yield* new ExecutionFailed({
@@ -560,11 +558,14 @@ const fromPartial = (envelope: unknown): Effect.Effect<Executed, DecodeError> =>
   }
   return decodeExecuted(encoded).pipe(
     Effect.mapError((error) =>
-      new DecodeError({
-        kind: "shape",
-        issue: `this is not an execute envelope Executed can be built from: ${error.message}`,
-        issues: decodeIssues(error)
-      })
+      (() => {
+        const payload = decodePayload(error)
+        return new DecodeError({
+          kind: "shape",
+          ...payload,
+          issue: `this is not an execute envelope Executed can be built from: ${payload.issue}`
+        })
+      })()
     )
   )
 }

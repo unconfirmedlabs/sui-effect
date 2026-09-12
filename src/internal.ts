@@ -10,7 +10,7 @@
  * @since 0.1.0
  */
 export { bcs, decodeContent, expectedTypeOf, typeMatches } from "./domain/bcs.ts"
-export { digestOf, SuiErrorSchema } from "./domain/errors.ts"
+export { decodePayload, digestOf, SuiErrorSchema } from "./domain/errors.ts"
 export { EXECUTE_INCLUDE, fromTransactionResult } from "./domain/executed.ts"
 export { executionReasonOf, makeSuiObject } from "./domain/schemas.ts"
 export { OBJECT_INCLUDE, SIMULATE_INCLUDE } from "./services/Sui.ts"
