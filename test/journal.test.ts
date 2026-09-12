@@ -89,6 +89,39 @@ describe("JournalEntry", () => {
     })
   }
 
+  /**
+   * BR1 (0.2.0): the optional fields on `SignedTransaction` and on the
+   * `Executed` entry became `Schema.optionalKey`. JSON cannot carry an
+   * explicit `undefined`, so a line written by 0.1.x is unaffected — this is
+   * the proof, written out as the bytes a durable journal holds rather than
+   * re-encoded from a fixture.
+   */
+  test("a journal line persisted by 0.1.x still decodes", () => {
+    const persistedSigned = JSON.parse(
+      `{"_tag":"Signed","digest":"${DIGEST}","signed":{"digest":"${DIGEST}",` +
+        `"bytes":"AQID","signatures":["sig"],"sender":"${SENDER}"},` +
+        `"signedAt":1700000000000}`
+    )
+    const decodedSigned = Schema.decodeUnknownSync(JournalEntry)(persistedSigned)
+    if (decodedSigned._tag !== "Signed") throw new Error("expected a Signed entry")
+    expect("expiration" in decodedSigned.signed).toBe(false)
+    expect("chain" in decodedSigned.signed).toBe(false)
+
+    const persistedExecuted = JSON.parse(
+      `{"_tag":"Executed","digest":"${DIGEST}","at":1700000000000}`
+    )
+    const decodedExecuted = Schema.decodeUnknownSync(JournalEntry)(persistedExecuted)
+    expect(decodedExecuted._tag).toBe("Executed")
+    expect("checkpoint" in decodedExecuted).toBe(false)
+
+    // And a line that did carry the optional keys still decodes to them.
+    const withCheckpoint = JSON.parse(
+      `{"_tag":"Executed","digest":"${DIGEST}","checkpoint":"88","at":1700000000000}`
+    )
+    const decodedCheckpoint = Schema.decodeUnknownSync(JournalEntry)(withCheckpoint)
+    expect(decodedCheckpoint._tag === "Executed" && decodedCheckpoint.checkpoint).toBe(88n)
+  })
+
   test("Signed and Unknown are the unresolved tags", () => {
     expect(JournalEntry.isAnyOf(["Signed", "Unknown"])(signedEntry)).toBe(true)
     expect(JournalEntry.isAnyOf(["Signed", "Unknown"])(executedEntry)).toBe(false)
