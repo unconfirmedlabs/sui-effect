@@ -447,7 +447,7 @@ const renderApi = (): string => {
     const moduleDoc = moduleSymbol === undefined ? "" : summaryOf(docOf(moduleSymbol, checker))
     const exports = moduleSymbol === undefined ? [] : checker.getExportsOfModule(moduleSymbol)
     const rendered = [...exports]
-      .sort((left, right) => left.getName().localeCompare(right.getName()))
+      .sort((left, right) => (left.getName() < right.getName() ? -1 : left.getName() > right.getName() ? 1 : 0))
       .map((symbol) => renderSymbol(symbol, checker, 3, printed, subpath.name))
       .filter((section): section is string => section !== undefined)
     sections.push(

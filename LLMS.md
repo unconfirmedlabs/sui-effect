@@ -105,23 +105,6 @@ A transaction built into bytes and ready to sign, with the expiration the
 builder settled on recorded so `Tx.reconcile` can decide, later and without
 the builder, whether the transaction can still land.
 
-### `chainOf` (const)
-
-```ts
-declare const chainOf: (expiration: TransactionExpiration | undefined) => string | undefined
-```
-
-The chain identifier an expiration names, or `undefined` for the variants
-that name none (`None`, `Epoch`).
-
-This is the first half of the chain-identity guard `Tx.reconcile` applies
-before it asks a node anything: bytes built for one chain must not be
-declared expired by another chain's epoch. The second half is
-`SignedTransaction.chain`, which `Tx.build` records for the variants that
-carry no chain of their own.
-
-**Never fails.**
-
 ### `ChangedObject` (const)
 
 ```ts
@@ -253,18 +236,6 @@ export declare class DecodeError extends DecodeError_base {
 ```
 
 BCS content or a schema boundary did not decode.
-
-### `defaultGrpcUrl` (const)
-
-```ts
-declare const defaultGrpcUrl: (network: string) => string | undefined
-```
-
-The gRPC endpoint sui-effect uses when `SUI_RPC_URL` is not set. The SDK
-ships no such table; these are the URLs its own documentation uses.
-Returns `undefined` for any other network.
-
-**Never fails.**
 
 ### `Digest` (const)
 
@@ -842,42 +813,6 @@ declare const KnownNetwork: Schema
 
 The four networks with a built-in default gRPC endpoint.
 
-### `maxEpochOf` (const)
-
-```ts
-declare const maxEpochOf: (expiration: TransactionExpiration | undefined) => bigint | undefined
-```
-
-The last epoch in which a transaction can still be applied, or `undefined`
-when its expiration sets no such bound (`None`, or a `ValidDuring` with no
-`maxEpoch`).
-
-An `Epoch` expiration is that epoch: the SDK's `Epoch` variant means "valid
-until the end of this epoch", so it is its own upper bound.
-
-This is the bound that matters in practice. Epochs are what the default
-expiration carries and what the validator rule is written in, and unlike a
-wall clock an epoch is a consensus fact, so `Tx.reconcile` needs no skew
-margin to reason about it.
-
-**Never fails.**
-
-### `maxTimestampMsOf` (const)
-
-```ts
-declare const maxTimestampMsOf: (expiration: TransactionExpiration | undefined) => bigint | undefined
-```
-
-The wall-clock bound after which a transaction can no longer be applied, in
-milliseconds, or `undefined` when its expiration sets no such bound — which
-is `None`, `Epoch`, and the default `ValidDuring`, whose `maxTimestamp` is
-`null` unless `SubmitConfig.validFor` asks for one.
-
-`Tx.reconcile` compares it against `chainTime` with
-`SubmitConfig.expiryMargin` for skew, which the epoch bound needs none of.
-
-**Never fails.**
-
 ### `Mist` (const)
 
 ```ts
@@ -1078,17 +1013,6 @@ declare const ObjectRef: Schema
 Everything the transaction builder needs to consume an object again, plus the
 type and owner so a caller can tell a shared object from an owned one.
 
-### `objectRefOf` (const)
-
-```ts
-declare const objectRefOf: (ref: ChangedRef) => ObjectRef | undefined
-```
-
-The full builder reference of a changed object, when the effects carried
-every field the builder needs.
-
-**Never fails.**
-
 ### `ObjectType` (const)
 
 ```ts
@@ -1184,34 +1108,6 @@ export interface SdkObjectRef {
 ```
 
 The SDK's own object reference shape, as `Transaction#objectRef` takes it.
-
-### `sdkRefOf` (const)
-
-```ts
-declare const sdkRefOf: (ref: ChangedRef | ObjectRef) => SdkObjectRef | undefined
-```
-
-The shape `Transaction#objectRef` and `Inputs.ObjectRef` want: `objectId`
-rather than `id`, and a decimal **string** version rather than a `bigint`.
-
-sui-effect's own `ObjectRef` carries the branded `id` and a `bigint`
-`version`, because that is what a domain model wants and what a `Version`
-check can be run on; the SDK builder wants neither. This is the one
-conversion, so nobody writes `{ objectId: ref.id, version: String(ref.version) }`
-by hand and gets the field name wrong.
-
-**Only for an address-owned (or immutable) object.** `tx.objectRef` pins a
-version, which is exactly right for an owned input and exactly wrong for a
-**shared** object: a shared object is passed with `tx.sharedObjectRef({
-objectId, initialSharedVersion, mutable })` (the initial shared version lives
-on `ref.owner.Shared.initialSharedVersion`), and a **receiving** object with
-`tx.receivingRef(...)`, which takes the same three fields this returns.
-Passing a shared object by `objectRef` produces bytes a validator rejects.
-
-`undefined` when the effects did not carry a version or a digest — a deleted
-object has no output version, and nothing can be consumed without both.
-
-**Never fails.**
 
 ### `Signature` (const)
 
@@ -2574,202 +2470,118 @@ What a versioned object read found: the object as it was at that exact
 version, with the digest of the transaction that produced it, or nothing at
 all with a reason a log can print.
 
+### `chainOf` (const)
+
+```ts
+declare const chainOf: (expiration: TransactionExpiration | undefined) => string | undefined
+```
+
+The chain identifier an expiration names, or `undefined` for the variants
+that name none (`None`, `Epoch`).
+
+This is the first half of the chain-identity guard `Tx.reconcile` applies
+before it asks a node anything: bytes built for one chain must not be
+declared expired by another chain's epoch. The second half is
+`SignedTransaction.chain`, which `Tx.build` records for the variants that
+carry no chain of their own.
+
+**Never fails.**
+
+### `defaultGrpcUrl` (const)
+
+```ts
+declare const defaultGrpcUrl: (network: string) => string | undefined
+```
+
+The gRPC endpoint sui-effect uses when `SUI_RPC_URL` is not set. The SDK
+ships no such table; these are the URLs its own documentation uses.
+Returns `undefined` for any other network.
+
+**Never fails.**
+
+### `maxEpochOf` (const)
+
+```ts
+declare const maxEpochOf: (expiration: TransactionExpiration | undefined) => bigint | undefined
+```
+
+The last epoch in which a transaction can still be applied, or `undefined`
+when its expiration sets no such bound (`None`, or a `ValidDuring` with no
+`maxEpoch`).
+
+An `Epoch` expiration is that epoch: the SDK's `Epoch` variant means "valid
+until the end of this epoch", so it is its own upper bound.
+
+This is the bound that matters in practice. Epochs are what the default
+expiration carries and what the validator rule is written in, and unlike a
+wall clock an epoch is a consensus fact, so `Tx.reconcile` needs no skew
+margin to reason about it.
+
+**Never fails.**
+
+### `maxTimestampMsOf` (const)
+
+```ts
+declare const maxTimestampMsOf: (expiration: TransactionExpiration | undefined) => bigint | undefined
+```
+
+The wall-clock bound after which a transaction can no longer be applied, in
+milliseconds, or `undefined` when its expiration sets no such bound — which
+is `None`, `Epoch`, and the default `ValidDuring`, whose `maxTimestamp` is
+`null` unless `SubmitConfig.validFor` asks for one.
+
+`Tx.reconcile` compares it against `chainTime` with
+`SubmitConfig.expiryMargin` for skew, which the epoch bound needs none of.
+
+**Never fails.**
+
+### `objectRefOf` (const)
+
+```ts
+declare const objectRefOf: (ref: ChangedRef) => ObjectRef | undefined
+```
+
+The full builder reference of a changed object, when the effects carried
+every field the builder needs.
+
+**Never fails.**
+
+### `sdkRefOf` (const)
+
+```ts
+declare const sdkRefOf: (ref: ChangedRef | ObjectRef) => SdkObjectRef | undefined
+```
+
+The shape `Transaction#objectRef` and `Inputs.ObjectRef` want: `objectId`
+rather than `id`, and a decimal **string** version rather than a `bigint`.
+
+sui-effect's own `ObjectRef` carries the branded `id` and a `bigint`
+`version`, because that is what a domain model wants and what a `Version`
+check can be run on; the SDK builder wants neither. This is the one
+conversion, so nobody writes `{ objectId: ref.id, version: String(ref.version) }`
+by hand and gets the field name wrong.
+
+**Only for an address-owned (or immutable) object.** `tx.objectRef` pins a
+version, which is exactly right for an owned input and exactly wrong for a
+**shared** object: a shared object is passed with `tx.sharedObjectRef({
+objectId, initialSharedVersion, mutable })` (the initial shared version lives
+on `ref.owner.Shared.initialSharedVersion`), and a **receiving** object with
+`tx.receivingRef(...)`, which takes the same three fields this returns.
+Passing a shared object by `objectRef` produces bytes a validator rejects.
+
+`undefined` when the effects did not carry a version or a digest — a deleted
+object has no output version, and nothing can be consumed without both.
+
+**Never fails.**
+
 ## `@unconfirmed/sui-effect/tx`
 
 
 37 exported symbols.
 
-### `build` (const)
-
-```ts
-declare const build: (input: Transaction | Recipe, opts: {
-    readonly sender: SuiAddress;
-    readonly gasOwner?: SuiAddress;
-}) => Effect.Effect<{
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-    readonly gasOwner?: SuiAddress | undefined;
-}, TransportError | SimulationFailed | BuildError, Sui>
-```
-
-Builds a transaction into signable bytes.
-
-**Building always simulates.** On gRPC the SDK's resolve plugin simulates
-with checks enabled to choose the gas budget, and an execution failure there
-arrives as `SimulationFailed`. That costs nothing extra — but the resolver
-returns early for a transaction that was **already fully resolved** (every
-input resolved, gas price, budget and payment set), and then nothing
-simulates at all. `Tx.build` detects that case and runs one explicit
-`simulateTransaction` with checks enabled, so simulate-before-submit holds
-for every transaction: it costs nothing extra when the SDK had to resolve,
-and one call otherwise.
-
-An interrupted build cancels the request it started: the SDK is handed a
-client whose Core calls carry the Effect's `AbortSignal`.
-
-When the recipe set no expiration, `SubmitConfig.expiration` decides one.
-The default, `ValidDuring`, bounds the transaction to the **current epoch and
-the next**, names the chain (bytes signed for testnet cannot land on mainnet)
-and carries a `u32` nonce from `SubmitConfig.nonce`. There is **no
-wall-clock bound** unless `SubmitConfig.validFor` asks for one: no Sui
-network accepts a timestamp expiration yet, and a node refuses any
-transaction carrying one. The expiration that ends up in the bytes is
-recorded on the result, because it is what `Tx.reconcile` needs later to
-prove a transaction can no longer land.
-
-`Tx.build` takes no sender lock; `Tx.run` is what holds one from build
-through submit. Called on its own, two concurrent builds for one address can
-pick the same gas coin.
-
-**Fails with: `BuildError` (the recipe threw, an input could not be resolved, or the budget the node chose is over `SubmitConfig.maxGasBudget`), `SimulationFailed` (the transaction would abort on chain), `TransportError`.**
-
 ### `Built` (const)
 
 Re-exported from `@unconfirmed/sui-effect`.
-
-### `chainOf` (const)
-
-Re-exported from `@unconfirmed/sui-effect`.
-
-### `cosign` (const)
-
-```ts
-declare const cosign: (signed: {
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly signatures: readonly Signature[];
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-}, signer: Signer) => Effect.Effect<{
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly signatures: readonly Signature[];
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-}, SigningError, never>
-```
-
-Adds one more signature to already signed bytes, for a sponsored or
-multi-party transaction. The bytes are untouched, so both parties sign
-exactly the same transaction.
-
-As in `sign`, the co-signer's address must be the sender or the gas
-owner named in the bytes.
-
-**Fails with: `SigningError`.**
-
-### `ephemeral` (const)
-
-```ts
-declare const ephemeral: Effect.Effect<Signer>
-```
-
-A fresh Ed25519 credential that exists only for this process. For tests,
-localnet and throwaway addresses.
-
-This is the one place sui-effect does not take randomness from Effect's
-`Random`: key generation must come from a cryptographically secure source,
-and `Random` is a seeded, test-controllable PRNG whose whole purpose is to be
-reproducible. `new Ed25519Keypair()` uses the SDK's CSPRNG (`@noble/curves`
-over `crypto.getRandomValues`). A `TestClock`-style deterministic key would
-be a security bug, not a convenience.
-
-**Never fails.**
 
 ### `ExpirationPolicy` (type)
 
@@ -2806,326 +2618,6 @@ lags its epoch view can report the new epoch and miss a transaction it has in
 fact executed, twice in a row. The recheck delay makes that unlikely, not
 impossible; a deployment that cannot tolerate it sets `"never"` and settles
 unknown submissions by hand.
-
-### `fromConfig` (const)
-
-```ts
-declare const fromConfig: (name?: string) => Effect.Effect<Signer, Config.ConfigError>
-```
-
-Reads a Bech32 `suiprivkey1…` secret key from configuration and builds the
-signer for whichever of the three schemes its flag names.
-
-The key is read with `Config.redacted`, and the decoded bytes never leave
-this function. Neither does anything derived from them: the failure carries
-one fixed sentence and no `cause`, because the decoder's own message quotes
-the input it rejected.
-
-**Fails with: `ConfigError` when the variable is missing, is not a Bech32 Sui private key, or names a scheme that has no keypair class (`MultiSig`, `ZkLogin`, `Passkey` — use {@link remote} for those).**
-
-### `fromKeypair` (const)
-
-```ts
-declare const fromKeypair: (keypair: Keypair) => Signer
-```
-
-`fromSdkSigner` under the name the spec gave it when a keypair was the
-only thing it took. A `Keypair` **is** an SDK `Signer`, so this is a thin
-alias kept for callers who hold one.
-
-**Never fails.**
-
-### `fromSdkSigner` (const)
-
-```ts
-declare const fromSdkSigner: (keypair: SdkSigner) => Signer
-```
-
-Wraps any `@mysten/sui/cryptography` `Signer`.
-
-The SDK's `Signer` is the base class every credential extends: `Keypair` and
-its three schemes, but also a Ledger signer, a wallet adapter's signer, a KMS
-signer — anything that can `toSuiAddress`, `getKeyScheme`, `signTransaction`
-and `signPersonalMessage`. Nothing here needs the secret, so nothing here
-needs a keypair, and the `Signer` this returns exposes no secret material
-either.
-
-For a credential that is not an SDK `Signer` at all — a remote service, a
-hardware device behind your own protocol — use `remote`, which takes
-Effects and the address to sign as.
-
-Never fails: a bad address or signature surfaces as a `SigningError` from the
-member that produced it, not from construction.
-
-### `isUnresolved` (const)
-
-```ts
-declare const isUnresolved: (value: {
-    readonly _tag: "Unknown";
-    readonly digest: Digest;
-    readonly signed: {
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    };
-    readonly lastError: string;
-    readonly attempts: number;
-    readonly at: import("effect/DateTime").Utc;
-} | {
-    readonly _tag: "NotApplied";
-    readonly digest: Digest;
-    readonly evidence: "expired" | "inputConsumed";
-    readonly at: import("effect/DateTime").Utc;
-} | {
-    readonly _tag: "Signed";
-    readonly digest: Digest;
-    readonly signed: {
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    };
-    readonly signedAt: import("effect/DateTime").Utc;
-} | {
-    readonly at: import("effect/DateTime").Utc;
-    readonly digest: Digest;
-    readonly _tag: "Executed";
-    readonly checkpoint?: bigint | undefined;
-} | {
-    readonly _tag: "Failed";
-    readonly digest: Digest;
-    readonly reason: {
-        readonly $kind: "MoveAbort";
-        readonly MoveAbort: {
-            readonly abortCode: bigint;
-            readonly location?: {
-                readonly function?: number | undefined;
-                readonly package?: string | undefined;
-                readonly module?: string | undefined;
-                readonly functionName?: string | undefined;
-                readonly instruction?: number | undefined;
-            } | undefined;
-            readonly cleverError?: {
-                readonly value?: string | undefined;
-                readonly errorCode?: number | undefined;
-                readonly lineNumber?: number | undefined;
-                readonly constantName?: string | undefined;
-                readonly constantType?: string | undefined;
-            } | undefined;
-        };
-    } | {
-        readonly $kind: "SizeError";
-        readonly SizeError: {
-            readonly name: string;
-            readonly size: number;
-            readonly maxSize: number;
-        };
-    } | {
-        readonly $kind: "CommandArgumentError";
-        readonly CommandArgumentError: {
-            readonly argument: number;
-            readonly name: string;
-        };
-    } | {
-        readonly $kind: "TypeArgumentError";
-        readonly TypeArgumentError: {
-            readonly typeArgument: number;
-            readonly name: string;
-        };
-    } | {
-        readonly $kind: "PackageUpgradeError";
-        readonly PackageUpgradeError: {
-            readonly name: string;
-            readonly digest?: string | undefined;
-            readonly packageId?: string | undefined;
-        };
-    } | {
-        readonly $kind: "IndexError";
-        readonly IndexError: {
-            readonly index?: number | undefined;
-            readonly subresult?: number | undefined;
-        };
-    } | {
-        readonly $kind: "CoinDenyListError";
-        readonly CoinDenyListError: {
-            readonly coinType: string;
-            readonly name: string;
-            readonly address?: string | undefined;
-        };
-    } | {
-        readonly $kind: "CongestedObjects";
-        readonly CongestedObjects: {
-            readonly name: string;
-            readonly objects: readonly string[];
-        };
-    } | {
-        readonly $kind: "ObjectIdError";
-        readonly ObjectIdError: {
-            readonly objectId: string;
-            readonly name?: string | undefined;
-        };
-    } | {
-        readonly $kind: "Unknown";
-    };
-    readonly at: import("effect/DateTime").Utc;
-}) => value is {
-    readonly _tag: "Unknown";
-    readonly digest: Digest;
-    readonly signed: {
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    };
-    readonly lastError: string;
-    readonly attempts: number;
-    readonly at: import("effect/DateTime").Utc;
-} | {
-    readonly _tag: "Signed";
-    readonly digest: Digest;
-    readonly signed: {
-        readonly digest: Digest;
-        readonly sender: SuiAddress;
-        readonly signatures: readonly Signature[];
-        readonly bytes: Uint8Array<ArrayBufferLike>;
-        readonly chain?: string | undefined;
-        readonly expiration?: {
-            readonly $kind: "None";
-            readonly None: true;
-        } | {
-            readonly $kind: "Epoch";
-            readonly Epoch: bigint;
-        } | {
-            readonly $kind: "ValidDuring";
-            readonly ValidDuring: {
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | {
-            readonly $kind: "Validity";
-            readonly Validity: {
-                readonly allowedProposers: {
-                    readonly epoch: bigint;
-                    readonly proposers: readonly number[];
-                } | null;
-                readonly minEpoch: bigint | null;
-                readonly maxEpoch: bigint | null;
-                readonly minTimestamp: bigint | null;
-                readonly maxTimestamp: bigint | null;
-                readonly chain: string;
-                readonly nonce: number;
-            };
-        } | undefined;
-    };
-    readonly signedAt: import("effect/DateTime").Utc;
-}
-```
-
-Whether this entry is still waiting for an answer, and therefore something
-`Tx.reconcileAll` has work to do about.
-
-**Never fails.**
 
 ### `Journal` (const)
 
@@ -3373,104 +2865,6 @@ export interface JournalService {
 
 Reading and writing the submission journal.
 
-### `maxEpochOf` (const)
-
-Re-exported from `@unconfirmed/sui-effect`.
-
-### `maxTimestampMsOf` (const)
-
-Re-exported from `@unconfirmed/sui-effect`.
-
-### `reconcile` (const)
-
-```ts
-declare const reconcile: (input: ReconcileInput) => Effect.Effect<Executed, TransportError | ExecutionFailed | SubmissionUnknown | NotApplied, Sui>
-```
-
-Finds out what happened to a transaction that was sent but never answered
-for.
-
-A transaction the node knows is `Executed`, or `ExecutionFailed` when it
-applied and aborted. A transaction the node does not know is only ever
-`NotApplied` on evidence, and there are exactly two kinds:
-
-- `"expired"`, under an **ordered and repeated** rule, because a closed
-  expiration window proves only that the bytes cannot execute *later*, not
-  that they did not execute *earlier*, and a transaction can execute between
-  a lookup and an expiry check. So: the window must be observed closed, then
-  `getTransaction` must miss, then — after `SubmitConfig.reconcileRecheck`
-  (two seconds by default, through the `Clock`) — both must hold again. Any
-  other order, or a single observation, is `SubmissionUnknown`. Set
-  `SubmitConfig.expiryEvidence: "never"` to disable the rule entirely, which
-  is what a deployment behind a mixed-node load balancer wants. The residual
-  risk is a node whose transaction index lags its epoch view;
-- `"inputConsumed"` when the transaction that last mutated a pinned object is
-  a **different** one **and its own effects report `inputVersion` equal to
-  the version these bytes pinned**, so those exact bytes can never execute
-  again.
-
-An input that merely advanced is not evidence: the transaction being
-reconciled is itself the likeliest thing to have advanced it, and calling
-that `NotApplied` would tell the documented retry idiom to execute the
-caller's intent a second time. When the live object names *our* digest the
-transaction applied and `getTransaction` is asked again; when the consuming
-transaction took a **later** version than ours — which is the common case,
-because Sui stamps every output with the transaction's Lamport version and
-the object "one version on" from ours usually never existed — nothing is
-proven and the answer is `SubmissionUnknown`, which carries the bytes so a
-later process, or a person, can settle it. Every pinned reference is tried
-before that answer is given.
-
-**Chain identity is checked before anything is asked.** Bytes built for one
-chain must never be declared expired by another chain's epoch, which a
-process-wide journal holding two networks' submissions makes easy to do. A
-mismatch is `SubmissionUnknown` naming both chains.
-
-**No `TransportError` escapes.** A recovery read that fails says nothing
-about whether the transaction applied, and `SuiError.outcome` puts
-`TransportError` on `"not_applied"` — which would tell a wrapper to retry a
-submission whose outcome is genuinely unknown. Every read failure here
-becomes `SubmissionUnknown` carrying the digest, the bytes and the cause. The
-tag stays in the signature so the union does not shrink under callers.
-
-Given only a `Digest` there can be no evidence, so an unknown transaction is
-always `SubmissionUnknown`. Pass the `Signed` bytes (or the
-`SubmissionUnknown` that carries them) to get the evidence rules.
-
-**Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `TransportError`.**
-
-### `reconcileAll` (const)
-
-```ts
-declare const reconcileAll: () => Effect.Effect<readonly Reconciled[], TransportError | JournalError, Sui>
-```
-
-Settles every unresolved entry in the journal: the explicit startup call a
-long-lived application makes after building a durable `Journal`.
-
-Nothing here fails per entry: each one settles to an `Executed`, an
-`ExecutionFailed`, a `NotApplied` or a `SubmissionUnknown`, in the order the
-journal listed them, and the journal is updated to match. Every settled entry
-gets the same evidence rules `Tx.reconcile` applies — the ordered, repeated
-expiry rule, the chain-identity guard and the versioned consumer check — so a
-startup never reports a transaction that applied as `NotApplied`, and a
-recovery read that fails becomes that entry's `SubmissionUnknown` rather than
-escaping as a `TransportError` the taxonomy would call "not applied".
-
-The whole call fails only if the journal itself cannot be **read**: a write
-that fails after an entry has been settled is logged and the answer stands,
-the same rule `Tx.submit` follows.
-
-**Fails with: `JournalError`, `TransportError`.**
-
-### `Reconciled` (type)
-
-```ts
-export type Reconciled = Executed | ExecutionFailed | NotApplied | SubmissionUnknown;
-```
-
-What one entry of `Tx.reconcileAll` settled to.
-
 ### `ReconcileInput` (type)
 
 ```ts
@@ -3479,21 +2873,13 @@ export type ReconcileInput = Digest | Signed | SubmissionUnknown;
 
 What `Tx.reconcile` can be asked about.
 
-### `remote` (const)
+### `Reconciled` (type)
 
 ```ts
-declare const remote: (signer: RemoteSigner) => Signer
+export type Reconciled = Executed | ExecutionFailed | NotApplied | SubmissionUnknown;
 ```
 
-Builds a signer around something that signs elsewhere: a KMS, a wallet, a
-hardware device, another process.
-
-The returned signer decodes whatever the remote produced, so a malformed
-signature is a `SigningError` rather than a surprise at execution. When
-`signPersonalMessage` is not given, asking for one fails with `SigningError`
-instead of pretending.
-
-**Never fails.**
+What one entry of `Tx.reconcileAll` settled to.
 
 ### `RemoteSigner` (interface)
 
@@ -3514,51 +2900,6 @@ transaction's sender and gas owner and refuse a mismatch, which is the only
 thing standing between a misconfigured KMS key and an `INVALID_ARGUMENT`
 rejection that `Tx.submit` can only report as `SubmissionUnknown`.
 
-### `run` (const)
-
-```ts
-declare const run: (recipe: Transaction | Recipe, opts: {
-    readonly signer: Signer;
-    readonly gasOwner?: SuiAddress;
-    /**
-     * The gas owner's signer, for a sponsored transaction. Required whenever
-     * the bytes name a gas owner that is not the sender.
-     */
-    readonly sponsor?: Signer;
-}) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>
-```
-
-Build, preflight, sign and submit, with the sender lock held throughout.
-
-Gas coins are chosen during build, so two transactions from one address that
-overlap can pick the same coin and one of them will fail on chain. `Tx.run`
-holds the sender lock from build through submit, which is the whole reason to
-prefer it over calling the steps separately.
-
-The address that matters is the one whose coins are being spent, which is the
-**gas owner** when there is one: two sponsored runs for different senders
-paid by one sponsor are exactly the case that picks the same coin twice. When
-sender and gas owner differ, both locks are held, in ascending address order
-— a fixed order, so two runs that each need the same pair cannot deadlock by
-taking them the other way round.
-
-When `SubmitConfig.preflight` is set it costs one extra simulate, and is
-where spend limits and target policies refuse a transaction before anything
-is signed.
-
-**A sponsored run needs both signatures.** A transaction whose gas owner is
-not its sender is signed by *both* parties; one signature is bytes a
-validator rejects. So when `opts.gasOwner` differs from the signer's address
-— or when the recipe itself set a different gas owner, which `Tx.sponsored`
-does — `opts.sponsor` is required and co-signs the same bytes. Without it
-`Tx.run` fails with `SigningError` naming the address whose signature is
-missing, before anything is built when the gas owner was given as an option
-and immediately after the build when it came out of the recipe. Use the
-explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
-two parties cannot both sign in one process.
-
-**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`).**
-
 ### `RunError` (type)
 
 ```ts
@@ -3567,95 +2908,6 @@ export type RunError = BuildError | SimulationFailed | PolicyDenied | SigningErr
 
 Everything `run` can fail with, as one name: `SubmitError` plus
 what building, preflighting and signing can produce.
-
-### `sign` (const)
-
-```ts
-declare const sign: (built: {
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-    readonly gasOwner?: SuiAddress | undefined;
-}, signer: Signer) => Effect.Effect<{
-    readonly digest: Digest;
-    readonly sender: SuiAddress;
-    readonly signatures: readonly Signature[];
-    readonly bytes: Uint8Array<ArrayBufferLike>;
-    readonly chain?: string | undefined;
-    readonly expiration?: {
-        readonly $kind: "None";
-        readonly None: true;
-    } | {
-        readonly $kind: "Epoch";
-        readonly Epoch: bigint;
-    } | {
-        readonly $kind: "ValidDuring";
-        readonly ValidDuring: {
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | {
-        readonly $kind: "Validity";
-        readonly Validity: {
-            readonly allowedProposers: {
-                readonly epoch: bigint;
-                readonly proposers: readonly number[];
-            } | null;
-            readonly minEpoch: bigint | null;
-            readonly maxEpoch: bigint | null;
-            readonly minTimestamp: bigint | null;
-            readonly maxTimestamp: bigint | null;
-            readonly chain: string;
-            readonly nonce: number;
-        };
-    } | undefined;
-}, SigningError, never>
-```
-
-Signs built bytes.
-
-The signer's address must be the transaction's sender or, for a sponsored
-transaction, its gas owner; anything else is a `SigningError` rather than a
-rejection at execution time. A `Signer.remote` therefore has to report the
-address it signs as truthfully.
-
-**Fails with: `SigningError`.**
 
 ### `Signature` (const)
 
@@ -3705,51 +2957,6 @@ A credential: who it signs as, how, and the two things it can sign.
 Both members fail with `SigningError` and nothing else: a signer that has to
 reach a KMS or a wallet wraps its own transport failure in the `cause`, so a
 caller's error union does not grow a branch per credential kind.
-
-### `sponsored` (const)
-
-```ts
-declare const sponsored: (opts: {
-    readonly sender: SuiAddress;
-    readonly gasOwner: SuiAddress;
-}) => (recipe: Recipe) => Recipe
-```
-
-Turns a recipe into a sponsored one: the sender owns the transaction, the
-gas owner pays, and gas comes from the sponsor's address balance rather than
-from coin objects, so the two parties never have to agree on a gas coin and
-can sign in either order.
-
-Never fails; the recipe it returns throws only if the recipe it wraps does,
-which `Tx.build` reports as `BuildError`.
-
-### `submit` (const)
-
-```ts
-declare const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>
-```
-
-Sends signed bytes, and does not stop caring until it knows what happened.
-
-Before the first `executeTransaction` it writes a `Signed` journal entry, so
-a process that dies mid-flight leaves a record of bytes that may be on the
-wire. A retryable transport failure or a timeout re-sends the identical bytes
-on `SubmitConfig.resubmit`; nothing is ever rebuilt, so a retry can only land
-the transaction that was already signed. When the retries run out it runs
-`Tx.reconcile`, which either finds the transaction, proves it never applied,
-or says it does not know.
-
-`TransportError` never escapes: once bytes may have been sent, "the network
-was unreachable" is not an answer a caller can act on, so it becomes
-`SubmissionUnknown` carrying the signed bytes.
-
-`JournalError` can only come from the `Signed` write, before anything has
-been sent. Once the network has answered, a journal write that fails is
-logged with `Effect.logError` and the answer stands, because "the journal is
-broken" is not a thing a caller can act on and reporting it in place of a
-charged `ExecutionFailed` would invite a second submission.
-
-**Fails with: `ExecutionFailed` (applied on chain and failed; gas was charged), `NotApplied` (provably never applied), `SubmissionUnknown` (the outcome is not known and the bytes are in the error), `JournalError` (only before the first send).**
 
 ### `SubmitConfig` (const)
 
@@ -4125,6 +3332,799 @@ declare const UNRESOLVED_TAGS: readonly ["Signed", "Unknown"]
 
 The tags whose entries still need an answer from the network.
 
+### `build` (const)
+
+```ts
+declare const build: (input: Transaction | Recipe, opts: {
+    readonly sender: SuiAddress;
+    readonly gasOwner?: SuiAddress;
+}) => Effect.Effect<{
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+    readonly gasOwner?: SuiAddress | undefined;
+}, TransportError | SimulationFailed | BuildError, Sui>
+```
+
+Builds a transaction into signable bytes.
+
+**Building always simulates.** On gRPC the SDK's resolve plugin simulates
+with checks enabled to choose the gas budget, and an execution failure there
+arrives as `SimulationFailed`. That costs nothing extra — but the resolver
+returns early for a transaction that was **already fully resolved** (every
+input resolved, gas price, budget and payment set), and then nothing
+simulates at all. `Tx.build` detects that case and runs one explicit
+`simulateTransaction` with checks enabled, so simulate-before-submit holds
+for every transaction: it costs nothing extra when the SDK had to resolve,
+and one call otherwise.
+
+An interrupted build cancels the request it started: the SDK is handed a
+client whose Core calls carry the Effect's `AbortSignal`.
+
+When the recipe set no expiration, `SubmitConfig.expiration` decides one.
+The default, `ValidDuring`, bounds the transaction to the **current epoch and
+the next**, names the chain (bytes signed for testnet cannot land on mainnet)
+and carries a `u32` nonce from `SubmitConfig.nonce`. There is **no
+wall-clock bound** unless `SubmitConfig.validFor` asks for one: no Sui
+network accepts a timestamp expiration yet, and a node refuses any
+transaction carrying one. The expiration that ends up in the bytes is
+recorded on the result, because it is what `Tx.reconcile` needs later to
+prove a transaction can no longer land.
+
+`Tx.build` takes no sender lock; `Tx.run` is what holds one from build
+through submit. Called on its own, two concurrent builds for one address can
+pick the same gas coin.
+
+**Fails with: `BuildError` (the recipe threw, an input could not be resolved, or the budget the node chose is over `SubmitConfig.maxGasBudget`), `SimulationFailed` (the transaction would abort on chain), `TransportError`.**
+
+### `chainOf` (const)
+
+Re-exported from `@unconfirmed/sui-effect`.
+
+### `cosign` (const)
+
+```ts
+declare const cosign: (signed: {
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly signatures: readonly Signature[];
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+}, signer: Signer) => Effect.Effect<{
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly signatures: readonly Signature[];
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+}, SigningError, never>
+```
+
+Adds one more signature to already signed bytes, for a sponsored or
+multi-party transaction. The bytes are untouched, so both parties sign
+exactly the same transaction.
+
+As in `sign`, the co-signer's address must be the sender or the gas
+owner named in the bytes.
+
+**Fails with: `SigningError`.**
+
+### `ephemeral` (const)
+
+```ts
+declare const ephemeral: Effect.Effect<Signer>
+```
+
+A fresh Ed25519 credential that exists only for this process. For tests,
+localnet and throwaway addresses.
+
+This is the one place sui-effect does not take randomness from Effect's
+`Random`: key generation must come from a cryptographically secure source,
+and `Random` is a seeded, test-controllable PRNG whose whole purpose is to be
+reproducible. `new Ed25519Keypair()` uses the SDK's CSPRNG (`@noble/curves`
+over `crypto.getRandomValues`). A `TestClock`-style deterministic key would
+be a security bug, not a convenience.
+
+**Never fails.**
+
+### `fromConfig` (const)
+
+```ts
+declare const fromConfig: (name?: string) => Effect.Effect<Signer, Config.ConfigError>
+```
+
+Reads a Bech32 `suiprivkey1…` secret key from configuration and builds the
+signer for whichever of the three schemes its flag names.
+
+The key is read with `Config.redacted`, and the decoded bytes never leave
+this function. Neither does anything derived from them: the failure carries
+one fixed sentence and no `cause`, because the decoder's own message quotes
+the input it rejected.
+
+**Fails with: `ConfigError` when the variable is missing, is not a Bech32 Sui private key, or names a scheme that has no keypair class (`MultiSig`, `ZkLogin`, `Passkey` — use {@link remote} for those).**
+
+### `fromKeypair` (const)
+
+```ts
+declare const fromKeypair: (keypair: Keypair) => Signer
+```
+
+`fromSdkSigner` under the name the spec gave it when a keypair was the
+only thing it took. A `Keypair` **is** an SDK `Signer`, so this is a thin
+alias kept for callers who hold one.
+
+**Never fails.**
+
+### `fromSdkSigner` (const)
+
+```ts
+declare const fromSdkSigner: (keypair: SdkSigner) => Signer
+```
+
+Wraps any `@mysten/sui/cryptography` `Signer`.
+
+The SDK's `Signer` is the base class every credential extends: `Keypair` and
+its three schemes, but also a Ledger signer, a wallet adapter's signer, a KMS
+signer — anything that can `toSuiAddress`, `getKeyScheme`, `signTransaction`
+and `signPersonalMessage`. Nothing here needs the secret, so nothing here
+needs a keypair, and the `Signer` this returns exposes no secret material
+either.
+
+For a credential that is not an SDK `Signer` at all — a remote service, a
+hardware device behind your own protocol — use `remote`, which takes
+Effects and the address to sign as.
+
+Never fails: a bad address or signature surfaces as a `SigningError` from the
+member that produced it, not from construction.
+
+### `isUnresolved` (const)
+
+```ts
+declare const isUnresolved: (value: {
+    readonly _tag: "Unknown";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly lastError: string;
+    readonly attempts: number;
+    readonly at: import("effect/DateTime").Utc;
+} | {
+    readonly _tag: "NotApplied";
+    readonly digest: Digest;
+    readonly evidence: "expired" | "inputConsumed";
+    readonly at: import("effect/DateTime").Utc;
+} | {
+    readonly _tag: "Signed";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly signedAt: import("effect/DateTime").Utc;
+} | {
+    readonly at: import("effect/DateTime").Utc;
+    readonly digest: Digest;
+    readonly _tag: "Executed";
+    readonly checkpoint?: bigint | undefined;
+} | {
+    readonly _tag: "Failed";
+    readonly digest: Digest;
+    readonly reason: {
+        readonly $kind: "MoveAbort";
+        readonly MoveAbort: {
+            readonly abortCode: bigint;
+            readonly location?: {
+                readonly function?: number | undefined;
+                readonly package?: string | undefined;
+                readonly module?: string | undefined;
+                readonly functionName?: string | undefined;
+                readonly instruction?: number | undefined;
+            } | undefined;
+            readonly cleverError?: {
+                readonly value?: string | undefined;
+                readonly errorCode?: number | undefined;
+                readonly lineNumber?: number | undefined;
+                readonly constantName?: string | undefined;
+                readonly constantType?: string | undefined;
+            } | undefined;
+        };
+    } | {
+        readonly $kind: "SizeError";
+        readonly SizeError: {
+            readonly name: string;
+            readonly size: number;
+            readonly maxSize: number;
+        };
+    } | {
+        readonly $kind: "CommandArgumentError";
+        readonly CommandArgumentError: {
+            readonly argument: number;
+            readonly name: string;
+        };
+    } | {
+        readonly $kind: "TypeArgumentError";
+        readonly TypeArgumentError: {
+            readonly typeArgument: number;
+            readonly name: string;
+        };
+    } | {
+        readonly $kind: "PackageUpgradeError";
+        readonly PackageUpgradeError: {
+            readonly name: string;
+            readonly digest?: string | undefined;
+            readonly packageId?: string | undefined;
+        };
+    } | {
+        readonly $kind: "IndexError";
+        readonly IndexError: {
+            readonly index?: number | undefined;
+            readonly subresult?: number | undefined;
+        };
+    } | {
+        readonly $kind: "CoinDenyListError";
+        readonly CoinDenyListError: {
+            readonly coinType: string;
+            readonly name: string;
+            readonly address?: string | undefined;
+        };
+    } | {
+        readonly $kind: "CongestedObjects";
+        readonly CongestedObjects: {
+            readonly name: string;
+            readonly objects: readonly string[];
+        };
+    } | {
+        readonly $kind: "ObjectIdError";
+        readonly ObjectIdError: {
+            readonly objectId: string;
+            readonly name?: string | undefined;
+        };
+    } | {
+        readonly $kind: "Unknown";
+    };
+    readonly at: import("effect/DateTime").Utc;
+}) => value is {
+    readonly _tag: "Unknown";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly lastError: string;
+    readonly attempts: number;
+    readonly at: import("effect/DateTime").Utc;
+} | {
+    readonly _tag: "Signed";
+    readonly digest: Digest;
+    readonly signed: {
+        readonly digest: Digest;
+        readonly sender: SuiAddress;
+        readonly signatures: readonly Signature[];
+        readonly bytes: Uint8Array<ArrayBufferLike>;
+        readonly chain?: string | undefined;
+        readonly expiration?: {
+            readonly $kind: "None";
+            readonly None: true;
+        } | {
+            readonly $kind: "Epoch";
+            readonly Epoch: bigint;
+        } | {
+            readonly $kind: "ValidDuring";
+            readonly ValidDuring: {
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | {
+            readonly $kind: "Validity";
+            readonly Validity: {
+                readonly allowedProposers: {
+                    readonly epoch: bigint;
+                    readonly proposers: readonly number[];
+                } | null;
+                readonly minEpoch: bigint | null;
+                readonly maxEpoch: bigint | null;
+                readonly minTimestamp: bigint | null;
+                readonly maxTimestamp: bigint | null;
+                readonly chain: string;
+                readonly nonce: number;
+            };
+        } | undefined;
+    };
+    readonly signedAt: import("effect/DateTime").Utc;
+}
+```
+
+Whether this entry is still waiting for an answer, and therefore something
+`Tx.reconcileAll` has work to do about.
+
+**Never fails.**
+
+### `maxEpochOf` (const)
+
+Re-exported from `@unconfirmed/sui-effect`.
+
+### `maxTimestampMsOf` (const)
+
+Re-exported from `@unconfirmed/sui-effect`.
+
+### `reconcile` (const)
+
+```ts
+declare const reconcile: (input: ReconcileInput) => Effect.Effect<Executed, TransportError | ExecutionFailed | SubmissionUnknown | NotApplied, Sui>
+```
+
+Finds out what happened to a transaction that was sent but never answered
+for.
+
+A transaction the node knows is `Executed`, or `ExecutionFailed` when it
+applied and aborted. A transaction the node does not know is only ever
+`NotApplied` on evidence, and there are exactly two kinds:
+
+- `"expired"`, under an **ordered and repeated** rule, because a closed
+  expiration window proves only that the bytes cannot execute *later*, not
+  that they did not execute *earlier*, and a transaction can execute between
+  a lookup and an expiry check. So: the window must be observed closed, then
+  `getTransaction` must miss, then — after `SubmitConfig.reconcileRecheck`
+  (two seconds by default, through the `Clock`) — both must hold again. Any
+  other order, or a single observation, is `SubmissionUnknown`. Set
+  `SubmitConfig.expiryEvidence: "never"` to disable the rule entirely, which
+  is what a deployment behind a mixed-node load balancer wants. The residual
+  risk is a node whose transaction index lags its epoch view;
+- `"inputConsumed"` when the transaction that last mutated a pinned object is
+  a **different** one **and its own effects report `inputVersion` equal to
+  the version these bytes pinned**, so those exact bytes can never execute
+  again.
+
+An input that merely advanced is not evidence: the transaction being
+reconciled is itself the likeliest thing to have advanced it, and calling
+that `NotApplied` would tell the documented retry idiom to execute the
+caller's intent a second time. When the live object names *our* digest the
+transaction applied and `getTransaction` is asked again; when the consuming
+transaction took a **later** version than ours — which is the common case,
+because Sui stamps every output with the transaction's Lamport version and
+the object "one version on" from ours usually never existed — nothing is
+proven and the answer is `SubmissionUnknown`, which carries the bytes so a
+later process, or a person, can settle it. Every pinned reference is tried
+before that answer is given.
+
+**Chain identity is checked before anything is asked.** Bytes built for one
+chain must never be declared expired by another chain's epoch, which a
+process-wide journal holding two networks' submissions makes easy to do. A
+mismatch is `SubmissionUnknown` naming both chains.
+
+**No `TransportError` escapes.** A recovery read that fails says nothing
+about whether the transaction applied, and `SuiError.outcome` puts
+`TransportError` on `"not_applied"` — which would tell a wrapper to retry a
+submission whose outcome is genuinely unknown. Every read failure here
+becomes `SubmissionUnknown` carrying the digest, the bytes and the cause. The
+tag stays in the signature so the union does not shrink under callers.
+
+Given only a `Digest` there can be no evidence, so an unknown transaction is
+always `SubmissionUnknown`. Pass the `Signed` bytes (or the
+`SubmissionUnknown` that carries them) to get the evidence rules.
+
+**Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `TransportError`.**
+
+### `reconcileAll` (const)
+
+```ts
+declare const reconcileAll: () => Effect.Effect<readonly Reconciled[], TransportError | JournalError, Sui>
+```
+
+Settles every unresolved entry in the journal: the explicit startup call a
+long-lived application makes after building a durable `Journal`.
+
+Nothing here fails per entry: each one settles to an `Executed`, an
+`ExecutionFailed`, a `NotApplied` or a `SubmissionUnknown`, in the order the
+journal listed them, and the journal is updated to match. Every settled entry
+gets the same evidence rules `Tx.reconcile` applies — the ordered, repeated
+expiry rule, the chain-identity guard and the versioned consumer check — so a
+startup never reports a transaction that applied as `NotApplied`, and a
+recovery read that fails becomes that entry's `SubmissionUnknown` rather than
+escaping as a `TransportError` the taxonomy would call "not applied".
+
+The whole call fails only if the journal itself cannot be **read**: a write
+that fails after an entry has been settled is logged and the answer stands,
+the same rule `Tx.submit` follows.
+
+**Fails with: `JournalError`, `TransportError`.**
+
+### `remote` (const)
+
+```ts
+declare const remote: (signer: RemoteSigner) => Signer
+```
+
+Builds a signer around something that signs elsewhere: a KMS, a wallet, a
+hardware device, another process.
+
+The returned signer decodes whatever the remote produced, so a malformed
+signature is a `SigningError` rather than a surprise at execution. When
+`signPersonalMessage` is not given, asking for one fails with `SigningError`
+instead of pretending.
+
+**Never fails.**
+
+### `run` (const)
+
+```ts
+declare const run: (recipe: Transaction | Recipe, opts: {
+    readonly signer: Signer;
+    readonly gasOwner?: SuiAddress;
+    /**
+     * The gas owner's signer, for a sponsored transaction. Required whenever
+     * the bytes name a gas owner that is not the sender.
+     */
+    readonly sponsor?: Signer;
+}) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>
+```
+
+Build, preflight, sign and submit, with the sender lock held throughout.
+
+Gas coins are chosen during build, so two transactions from one address that
+overlap can pick the same coin and one of them will fail on chain. `Tx.run`
+holds the sender lock from build through submit, which is the whole reason to
+prefer it over calling the steps separately.
+
+The address that matters is the one whose coins are being spent, which is the
+**gas owner** when there is one: two sponsored runs for different senders
+paid by one sponsor are exactly the case that picks the same coin twice. When
+sender and gas owner differ, both locks are held, in ascending address order
+— a fixed order, so two runs that each need the same pair cannot deadlock by
+taking them the other way round.
+
+When `SubmitConfig.preflight` is set it costs one extra simulate, and is
+where spend limits and target policies refuse a transaction before anything
+is signed.
+
+**A sponsored run needs both signatures.** A transaction whose gas owner is
+not its sender is signed by *both* parties; one signature is bytes a
+validator rejects. So when `opts.gasOwner` differs from the signer's address
+— or when the recipe itself set a different gas owner, which `Tx.sponsored`
+does — `opts.sponsor` is required and co-signs the same bytes. Without it
+`Tx.run` fails with `SigningError` naming the address whose signature is
+missing, before anything is built when the gas owner was given as an option
+and immediately after the build when it came out of the recipe. Use the
+explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
+two parties cannot both sign in one process.
+
+**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`).**
+
+### `sign` (const)
+
+```ts
+declare const sign: (built: {
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+    readonly gasOwner?: SuiAddress | undefined;
+}, signer: Signer) => Effect.Effect<{
+    readonly digest: Digest;
+    readonly sender: SuiAddress;
+    readonly signatures: readonly Signature[];
+    readonly bytes: Uint8Array<ArrayBufferLike>;
+    readonly chain?: string | undefined;
+    readonly expiration?: {
+        readonly $kind: "None";
+        readonly None: true;
+    } | {
+        readonly $kind: "Epoch";
+        readonly Epoch: bigint;
+    } | {
+        readonly $kind: "ValidDuring";
+        readonly ValidDuring: {
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | {
+        readonly $kind: "Validity";
+        readonly Validity: {
+            readonly allowedProposers: {
+                readonly epoch: bigint;
+                readonly proposers: readonly number[];
+            } | null;
+            readonly minEpoch: bigint | null;
+            readonly maxEpoch: bigint | null;
+            readonly minTimestamp: bigint | null;
+            readonly maxTimestamp: bigint | null;
+            readonly chain: string;
+            readonly nonce: number;
+        };
+    } | undefined;
+}, SigningError, never>
+```
+
+Signs built bytes.
+
+The signer's address must be the transaction's sender or, for a sponsored
+transaction, its gas owner; anything else is a `SigningError` rather than a
+rejection at execution time. A `Signer.remote` therefore has to report the
+address it signs as truthfully.
+
+**Fails with: `SigningError`.**
+
+### `sponsored` (const)
+
+```ts
+declare const sponsored: (opts: {
+    readonly sender: SuiAddress;
+    readonly gasOwner: SuiAddress;
+}) => (recipe: Recipe) => Recipe
+```
+
+Turns a recipe into a sponsored one: the sender owns the transaction, the
+gas owner pays, and gas comes from the sponsor's address balance rather than
+from coin objects, so the two parties never have to agree on a gas coin and
+can sign in either order.
+
+Never fails; the recipe it returns throws only if the recipe it wraps does,
+which `Tx.build` reports as `BuildError`.
+
+### `submit` (const)
+
+```ts
+declare const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>
+```
+
+Sends signed bytes, and does not stop caring until it knows what happened.
+
+Before the first `executeTransaction` it writes a `Signed` journal entry, so
+a process that dies mid-flight leaves a record of bytes that may be on the
+wire. A retryable transport failure or a timeout re-sends the identical bytes
+on `SubmitConfig.resubmit`; nothing is ever rebuilt, so a retry can only land
+the transaction that was already signed. When the retries run out it runs
+`Tx.reconcile`, which either finds the transaction, proves it never applied,
+or says it does not know.
+
+`TransportError` never escapes: once bytes may have been sent, "the network
+was unreachable" is not an answer a caller can act on, so it becomes
+`SubmissionUnknown` carrying the signed bytes.
+
+`JournalError` can only come from the `Signed` write, before anything has
+been sent. Once the network has answered, a journal write that fails is
+logged with `Effect.logError` and the answer stands, because "the journal is
+broken" is not a thing a caller can act on and reporting it in place of a
+charged `ExecutionFailed` would invite a second submission.
+
+**Fails with: `ExecutionFailed` (applied on chain and failed; gas was charged), `NotApplied` (provably never applied), `SubmissionUnknown` (the outcome is not known and the bytes are in the error), `JournalError` (only before the first send).**
+
 ## `@unconfirmed/sui-effect/journal`
 
 
@@ -4236,92 +4236,6 @@ export interface ExtensionFace {
 What every registration carries besides the service's own members, under
 `$`-prefixed names so an extension is free to call a member `ready` or
 `dispose` itself.
-
-### `fromService` (const)
-
-```ts
-declare const fromService: <Self, Shape, E, const Name extends string>(service: Context.Key<Self, Shape>, options: SuiExtensionOptions<Self, E, Name>) => SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & ExtensionFace>
-```
-
-Turns an Effect service into a `SuiClientRegistration` a Promise consumer
-passes to `client.$extend(...)`.
-
-`register(client)` does no work by default: the `ManagedRuntime` over
-`SuiCore.layerFromClient(client)`, a `Sui` for the client's effective chain
-id and the extension's own layer is built on the first call and shared by
-every call after it. The `Sui` and `SuiCore` underneath are shared with every
-other registration on that client that names the same chain id — one
-transport, one chain identity and one sender-lock map. A rejection carries
-the original tagged error instance, so a Promise consumer can still switch on
-`_tag`.
-
-`name` is generic in a string literal, so `client.escrow` is a property of
-the extended client's type and not an index lookup: no cast, and no
-`| undefined` under `noUncheckedIndexedAccess`.
-
-**The window before the runtime exists.** Until then nothing knows what a
-member *is*, so a member read off the face is a placeholder. An `Effect` or
-`Stream` member behaves exactly as its type says — the call returns a
-Promise, the iteration works — because that is what the face promises for
-them anyway. A **synchronous** member does not: `PromiseFace` types a recipe
-builder as returning a `Recipe` and a plain value as that value, and a
-placeholder has neither. So a synchronous member used in that window fails
-with `ExtensionNotReady` naming itself, rather than quietly handing back a
-Promise where the type says `Recipe` — which is a bug that only shows up on
-the *second* call, when the member has become real. Two cures:
-
-- `await client.<name>.$ready()` once after `$extend`, which builds the
-  runtime and resolves the service; every member is real from then on;
-- register with `warm`, which does the same synchronously inside `register`,
-  for a layer that needs no network.
-
-Two lifetimes worth knowing:
-
-- **`$dispose()` is not final.** It releases everything the layer acquired
-  and forgets the runtime; the next call builds a fresh one — and a `warm`
-  registration re-runs its **warm** build, with the same options, on the next
-  use, so it does not silently degrade to cold with every synchronous member
-  throwing `ExtensionNotReady`. That is what a
-  long-lived page wants (a disposed extension is usable again after a
-  reconnect) and it does mean a `$dispose()` that races an in-flight call can
-  leave the caller's Promise rejected while a new runtime starts behind it.
-  Dispose when the consumer is done, not between calls. `dispose()` is the
-  same function under the name it had first.
-- **Each `register` is independent.** Registering the same extension on two
-  clients — or twice on one — gives two runtimes, two layer builds and two
-  copies of whatever the layer holds (a cache, a connection). Register once
-  per client and keep the extended client.
-
-**A cold call is a real `Promise`.** The placeholder a member call returns
-before the runtime exists is a `Promise` subclass that also implements
-`Symbol.asyncIterator`, so `instanceof Promise` holds and `bun:test`'s
-`expect(...).rejects` recognises it. Its rejection is **pre-handled** (a
-no-op `catch` is attached at creation), so a cold call nobody awaits —
-`client.ext.doThing()` as a statement — cannot abort the process with an
-unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
-
-Never fails, except a `warm` registration. A warm registration builds the
-**whole layer** synchronously inside `register`, so **any** failure of that
-layer — a missing deployment for the network, a configuration error, a
-`NetworkMismatch`, not only an asynchronous step or an unknown chain
-identifier — is thrown synchronously out of `register`, which means out of
-`client.$extend(...)`. Catch it where you register. A lazy registration has
-nowhere to put such a failure at registration time, so it surfaces as the
-rejection of the first call that needs the layer.
-
-### `leaf` (const)
-
-```ts
-declare const leaf: <T>(value: T) => Leaf<T>
-```
-
-Marks a value as a `Leaf`: the Promise face passes it through untouched
-instead of walking into it.
-
-The registry is a `WeakSet`, so a frozen value can be marked and nothing is
-added to the value itself.
-
-**Never fails.**
 
 ### `Leaf` (type)
 
@@ -4485,90 +4399,96 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
 
 What `fromService` needs to know beyond the service key itself.
 
+### `fromService` (const)
+
+```ts
+declare const fromService: <Self, Shape, E, const Name extends string>(service: Context.Key<Self, Shape>, options: SuiExtensionOptions<Self, E, Name>) => SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & ExtensionFace>
+```
+
+Turns an Effect service into a `SuiClientRegistration` a Promise consumer
+passes to `client.$extend(...)`.
+
+`register(client)` does no work by default: the `ManagedRuntime` over
+`SuiCore.layerFromClient(client)`, a `Sui` for the client's effective chain
+id and the extension's own layer is built on the first call and shared by
+every call after it. The `Sui` and `SuiCore` underneath are shared with every
+other registration on that client that names the same chain id — one
+transport, one chain identity and one sender-lock map. A rejection carries
+the original tagged error instance, so a Promise consumer can still switch on
+`_tag`.
+
+`name` is generic in a string literal, so `client.escrow` is a property of
+the extended client's type and not an index lookup: no cast, and no
+`| undefined` under `noUncheckedIndexedAccess`.
+
+**The window before the runtime exists.** Until then nothing knows what a
+member *is*, so a member read off the face is a placeholder. An `Effect` or
+`Stream` member behaves exactly as its type says — the call returns a
+Promise, the iteration works — because that is what the face promises for
+them anyway. A **synchronous** member does not: `PromiseFace` types a recipe
+builder as returning a `Recipe` and a plain value as that value, and a
+placeholder has neither. So a synchronous member used in that window fails
+with `ExtensionNotReady` naming itself, rather than quietly handing back a
+Promise where the type says `Recipe` — which is a bug that only shows up on
+the *second* call, when the member has become real. Two cures:
+
+- `await client.<name>.$ready()` once after `$extend`, which builds the
+  runtime and resolves the service; every member is real from then on;
+- register with `warm`, which does the same synchronously inside `register`,
+  for a layer that needs no network.
+
+Two lifetimes worth knowing:
+
+- **`$dispose()` is not final.** It releases everything the layer acquired
+  and forgets the runtime; the next call builds a fresh one — and a `warm`
+  registration re-runs its **warm** build, with the same options, on the next
+  use, so it does not silently degrade to cold with every synchronous member
+  throwing `ExtensionNotReady`. That is what a
+  long-lived page wants (a disposed extension is usable again after a
+  reconnect) and it does mean a `$dispose()` that races an in-flight call can
+  leave the caller's Promise rejected while a new runtime starts behind it.
+  Dispose when the consumer is done, not between calls. `dispose()` is the
+  same function under the name it had first.
+- **Each `register` is independent.** Registering the same extension on two
+  clients — or twice on one — gives two runtimes, two layer builds and two
+  copies of whatever the layer holds (a cache, a connection). Register once
+  per client and keep the extended client.
+
+**A cold call is a real `Promise`.** The placeholder a member call returns
+before the runtime exists is a `Promise` subclass that also implements
+`Symbol.asyncIterator`, so `instanceof Promise` holds and `bun:test`'s
+`expect(...).rejects` recognises it. Its rejection is **pre-handled** (a
+no-op `catch` is attached at creation), so a cold call nobody awaits —
+`client.ext.doThing()` as a statement — cannot abort the process with an
+unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
+
+Never fails, except a `warm` registration. A warm registration builds the
+**whole layer** synchronously inside `register`, so **any** failure of that
+layer — a missing deployment for the network, a configuration error, a
+`NetworkMismatch`, not only an asynchronous step or an unknown chain
+identifier — is thrown synchronously out of `register`, which means out of
+`client.$extend(...)`. Catch it where you register. A lazy registration has
+nowhere to put such a failure at registration time, so it surfaces as the
+rejection of the first call that needs the layer.
+
+### `leaf` (const)
+
+```ts
+declare const leaf: <T>(value: T) => Leaf<T>
+```
+
+Marks a value as a `Leaf`: the Promise face passes it through untouched
+instead of walking into it.
+
+The registry is a `WeakSet`, so a frozen value can be marked and nothing is
+added to the value itself.
+
+**Never fails.**
+
 ## `@unconfirmed/sui-effect/script`
 
 
 9 exported symbols.
-
-### `exitCode` (const)
-
-```ts
-declare const exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number
-```
-
-The exit code one failure deserves.
-
-The axis is what a wrapper can act on: did the transaction apply (5, gas was
-charged, do not retry), is the outcome unknown (3, reconcile before doing
-anything else), or did nothing apply (4, safe to retry)? Configuration
-problems are 2 because no amount of retrying fixes them, a defect is 1, and
-an interrupt is 130 the way a shell expects — unless the journal says there
-is a submission outstanding, in which case it is 3, because a wrapper that
-sees 130 has no reason to go looking for one.
-
-An extension error that declares an `outcome` is honoured, so a downstream
-SDK's own failures land on the same axis. `SchemaError` — what Effect's own
-`Config.schema` and `Schema.decodeUnknownEffect` fail with — is exit 2 with
-`ConfigError`, because in a script it can only mean the input a person gave
-did not fit the schema, and no retry fixes that.
-
-An error with a tag this library has never heard of and no `outcome` is
-*unclassified* and exits 1, the code that also means defect. It deliberately
-does not follow `SuiError.outcome`, which answers `"unknown"` for the same
-value: 3 would tell a wrapper there is a transaction to reconcile, and an
-unrecognised error is not evidence that anything was ever sent. Extensions
-are told to declare `outcome` on every error precisely so their failures
-never land here.
-
-**Never fails.**
-
-### `readNetwork` (const)
-
-```ts
-declare const readNetwork: Effect.Effect<string, Config.ConfigError>
-```
-
-`SUI_NETWORK`, with no default and with the mainnet gate.
-
-There is no default network on purpose: a script that runs against whatever
-happened to be configured is how a test transaction reaches mainnet. And a
-script that means mainnet has to say so twice, in `SUI_NETWORK` and in
-`SUI_ALLOW_MAINNET=1`.
-
-**Fails with: `ConfigError`.**
-
-### `run` (const)
-
-```ts
-declare const run: <A, E>(effect: Effect.Effect<A, E, Script | Sui | SuiCore>, options?: ScriptRunOptions) => Promise<number>
-```
-
-Runs a script: builds `Script.layer`, forks the program, interrupts it on
-SIGINT or SIGTERM so finalizers run, writes one diagnostic line per failure
-to stderr, and exits with `exitCode`.
-
-stdout carries only what the script itself printed: the logger is bound to
-stderr for the whole run, so `Effect.log` from the script or from anything it
-calls cannot land in the script's output. A `SubmissionUnknown` additionally
-prints the base64 of the signed bytes and a line saying to reconcile, because
-those bytes are the durable record a script has.
-
-On **every** non-zero exit it also prints whatever the journal the script ran
-with still holds unresolved, which is the only record of bytes that may be on
-the wire when a script is killed — or fails — between signing and the answer.
-That count is also what decides a timeout (3 rather than 4) and an interrupt
-(3 rather than 130): an `Effect.timeout` around a submission interrupts it
-from the outside and never reaches `Tx.submit`'s own mapping.
-
-**A second SIGINT does nothing.** The handler interrupts the root fiber once;
-pressing Ctrl-C again while finalizers run is ignored, because the whole
-point of the first interrupt is to let those finalizers — the journal write
-that records what was sent, above all — complete. A script whose finalizers
-hang has to be killed with SIGKILL, which by construction no process can
-handle.
-
-Returns the exit code as well as passing it to `exit`, so a test can inject
-`exit` and assert on the number without ending the test process.
 
 ### `Script` (class)
 
@@ -4696,6 +4616,86 @@ export interface SignalSource {
 
 The part of `process` `run` uses, so a test can stand in for it.
 
+### `exitCode` (const)
+
+```ts
+declare const exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number
+```
+
+The exit code one failure deserves.
+
+The axis is what a wrapper can act on: did the transaction apply (5, gas was
+charged, do not retry), is the outcome unknown (3, reconcile before doing
+anything else), or did nothing apply (4, safe to retry)? Configuration
+problems are 2 because no amount of retrying fixes them, a defect is 1, and
+an interrupt is 130 the way a shell expects — unless the journal says there
+is a submission outstanding, in which case it is 3, because a wrapper that
+sees 130 has no reason to go looking for one.
+
+An extension error that declares an `outcome` is honoured, so a downstream
+SDK's own failures land on the same axis. `SchemaError` — what Effect's own
+`Config.schema` and `Schema.decodeUnknownEffect` fail with — is exit 2 with
+`ConfigError`, because in a script it can only mean the input a person gave
+did not fit the schema, and no retry fixes that.
+
+An error with a tag this library has never heard of and no `outcome` is
+*unclassified* and exits 1, the code that also means defect. It deliberately
+does not follow `SuiError.outcome`, which answers `"unknown"` for the same
+value: 3 would tell a wrapper there is a transaction to reconcile, and an
+unrecognised error is not evidence that anything was ever sent. Extensions
+are told to declare `outcome` on every error precisely so their failures
+never land here.
+
+**Never fails.**
+
+### `readNetwork` (const)
+
+```ts
+declare const readNetwork: Effect.Effect<string, Config.ConfigError>
+```
+
+`SUI_NETWORK`, with no default and with the mainnet gate.
+
+There is no default network on purpose: a script that runs against whatever
+happened to be configured is how a test transaction reaches mainnet. And a
+script that means mainnet has to say so twice, in `SUI_NETWORK` and in
+`SUI_ALLOW_MAINNET=1`.
+
+**Fails with: `ConfigError`.**
+
+### `run` (const)
+
+```ts
+declare const run: <A, E>(effect: Effect.Effect<A, E, Script | Sui | SuiCore>, options?: ScriptRunOptions) => Promise<number>
+```
+
+Runs a script: builds `Script.layer`, forks the program, interrupts it on
+SIGINT or SIGTERM so finalizers run, writes one diagnostic line per failure
+to stderr, and exits with `exitCode`.
+
+stdout carries only what the script itself printed: the logger is bound to
+stderr for the whole run, so `Effect.log` from the script or from anything it
+calls cannot land in the script's output. A `SubmissionUnknown` additionally
+prints the base64 of the signed bytes and a line saying to reconcile, because
+those bytes are the durable record a script has.
+
+On **every** non-zero exit it also prints whatever the journal the script ran
+with still holds unresolved, which is the only record of bytes that may be on
+the wire when a script is killed — or fails — between signing and the answer.
+That count is also what decides a timeout (3 rather than 4) and an interrupt
+(3 rather than 130): an `Effect.timeout` around a submission interrupts it
+from the outside and never reaches `Tx.submit`'s own mapping.
+
+**A second SIGINT does nothing.** The handler interrupts the root fiber once;
+pressing Ctrl-C again while finalizers run is ignored, because the whole
+point of the first interrupt is to let those finalizers — the journal write
+that records what was sent, above all — complete. A script whose finalizers
+hang has to be killed with SIGKILL, which by construction no process can
+handle.
+
+Returns the exit code as well as passing it to `exit`, so a test can inject
+`exit` and assert on the number without ending the test process.
+
 ## `@unconfirmed/sui-effect/testing`
 
 
@@ -4765,14 +4765,6 @@ export interface FakeChange {
 ```
 
 A created, mutated or deleted object in a scripted execution.
-
-### `fakeDigest` (const)
-
-```ts
-declare const fakeDigest: (seed: number) => string
-```
-
-A deterministic base58 32-byte digest, for fixtures.
 
 ### `FakeExecution` (interface)
 
@@ -4940,53 +4932,6 @@ export declare class FakeUnimplemented extends Error {
 
 Thrown, and re-thrown as a defect, when a test reaches an unscripted method.
 
-### `layerExtensionTest` (const)
-
-```ts
-declare const layerExtensionTest: <Self, E, RExtra = never, EExtra = never>(layer: Layer.Layer<Self, E, Sui | SuiCore | SuiGraphQL | RExtra>, script?: FakeScript, options?: {
-    readonly extra?: Layer.Layer<RExtra, EExtra>;
-}) => Layer.Layer<Self | Sui | SuiCore | SuiCoreFake, E | EExtra | NetworkMismatch | TransportError>
-```
-
-An extension's own layer over `layerTest`, which is the whole wiring an
-extension test needs.
-
-`layerTest` provides `Sui`, `SuiCore` and `SuiCoreFake`, and an extension's
-`layerTest` (or `layer`, for an extension with no fake of its own) may
-require `Sui | SuiCore` and nothing else — the same requirement
-`SuiExtension.fromService` satisfies in production. So composing the two is
-the recipe, and everything the extension's layer provides plus the fake's
-handle comes out the other side.
-
-**`SuiGraphQL` is provided too**, as `SuiGraphQL.layerUnavailable`: an
-extension that reads GraphQL requires the tag, its layer would otherwise not
-build in a test, and "there is no endpoint" is the answer a test wants by
-default — every GraphQL call fails with `GraphQLUnavailable`, which is a
-failure the extension already handles. Pass `extra` to override it with a
-real or scripted client, or to provide anything else the extension's layer
-requires that the client could not have given it (an `HttpClient`, an
-operator service, a sibling extension's test layer).
-
-**Fails with: whatever the extension's layer fails with, whatever `extra` fails with, plus `NetworkMismatch` and `TransportError` when the script asks for them.**
-
-### `layerTest` (const)
-
-```ts
-declare const layerTest: (script?: FakeScript) => Layer.Layer<Sui | SuiCore | SuiCoreFake, NetworkMismatch | TransportError>
-```
-
-The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test
-can script outcomes and inspect what the fake received.
-
-This is `Sui.layerNoDeps`, the production layer, so the chain-id rules are
-the production rules: a script whose `network` is `mainnet` or `testnet` must
-report that network's identifier, and any other network asserts nothing. A
-test that wants the assertion on a custom network builds
-`Sui.layerNoDepsWith({ chainId })` over `SuiCoreFake.layer(script)` itself,
-rather than having the fake compared against its own script.
-
-**Fails with: `NetworkMismatch`, `TransportError` — both only when the script asks for them.**
-
 ### `RecordedCall` (interface)
 
 ```ts
@@ -5107,6 +5052,61 @@ inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
 
 Every member requires `SuiCoreFake`, which `layerTest` and
 `layerExtensionTest` provide.
+
+### `fakeDigest` (const)
+
+```ts
+declare const fakeDigest: (seed: number) => string
+```
+
+A deterministic base58 32-byte digest, for fixtures.
+
+### `layerExtensionTest` (const)
+
+```ts
+declare const layerExtensionTest: <Self, E, RExtra = never, EExtra = never>(layer: Layer.Layer<Self, E, Sui | SuiCore | SuiGraphQL | RExtra>, script?: FakeScript, options?: {
+    readonly extra?: Layer.Layer<RExtra, EExtra>;
+}) => Layer.Layer<Self | Sui | SuiCore | SuiCoreFake, E | EExtra | NetworkMismatch | TransportError>
+```
+
+An extension's own layer over `layerTest`, which is the whole wiring an
+extension test needs.
+
+`layerTest` provides `Sui`, `SuiCore` and `SuiCoreFake`, and an extension's
+`layerTest` (or `layer`, for an extension with no fake of its own) may
+require `Sui | SuiCore` and nothing else — the same requirement
+`SuiExtension.fromService` satisfies in production. So composing the two is
+the recipe, and everything the extension's layer provides plus the fake's
+handle comes out the other side.
+
+**`SuiGraphQL` is provided too**, as `SuiGraphQL.layerUnavailable`: an
+extension that reads GraphQL requires the tag, its layer would otherwise not
+build in a test, and "there is no endpoint" is the answer a test wants by
+default — every GraphQL call fails with `GraphQLUnavailable`, which is a
+failure the extension already handles. Pass `extra` to override it with a
+real or scripted client, or to provide anything else the extension's layer
+requires that the client could not have given it (an `HttpClient`, an
+operator service, a sibling extension's test layer).
+
+**Fails with: whatever the extension's layer fails with, whatever `extra` fails with, plus `NetworkMismatch` and `TransportError` when the script asks for them.**
+
+### `layerTest` (const)
+
+```ts
+declare const layerTest: (script?: FakeScript) => Layer.Layer<Sui | SuiCore | SuiCoreFake, NetworkMismatch | TransportError>
+```
+
+The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test
+can script outcomes and inspect what the fake received.
+
+This is `Sui.layerNoDeps`, the production layer, so the chain-id rules are
+the production rules: a script whose `network` is `mainnet` or `testnet` must
+report that network's identifier, and any other network asserts nothing. A
+test that wants the assertion on a custom network builds
+`Sui.layerNoDepsWith({ chainId })` over `SuiCoreFake.layer(script)` itself,
+rather than having the fake compared against its own script.
+
+**Fails with: `NetworkMismatch`, `TransportError` — both only when the script asks for them.**
 
 # Examples
 
