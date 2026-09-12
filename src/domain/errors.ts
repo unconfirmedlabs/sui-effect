@@ -442,6 +442,15 @@ export const SuiErrorSchema = Schema.Union([
 ])
 
 /**
+ * {@link SuiErrorSchema} as a tagged union, which is what makes the tag list
+ * derivable: `.cases` is keyed by `_tag`, so nothing has to repeat it.
+ *
+ * Not exported — `SuiErrorSchema` is the published shape and this is how the
+ * library reads its own keys.
+ */
+const SuiErrorTagged = SuiErrorSchema.pipe(Schema.toTaggedUnion("_tag"))
+
+/**
  * What a failure says about the transaction it came from, on the axis a caller
  * or a wrapper script acts on.
  */
@@ -484,27 +493,17 @@ const hasOutcome = (error: unknown): error is HasOutcome => isHasOutcome(error)
 const isRetryable = (error: SuiError): boolean =>
   error._tag === "TransportError" ? error.retryable : false
 
-/** Every tag the taxonomy owns, so a foreign tag can be told from one of ours. */
-const TAXONOMY_TAGS: ReadonlySet<string> = new Set([
-  "TransportError",
-  "ObjectNotFound",
-  "ObjectDeleted",
-  "ObjectUnavailable",
-  "TransactionNotFound",
-  "NetworkMismatch",
-  "DecodeError",
-  "SimulationFailed",
-  "ExecutionFailed",
-  "SubmissionUnknown",
-  "NotApplied",
-  "SigningError",
-  "BuildError",
-  "PolicyDenied",
-  "JournalError",
-  "UnexpectedEffects",
-  "GraphQLUnavailable",
-  "ExtensionNotReady"
-])
+/**
+ * Every tag the taxonomy owns, so a foreign tag can be told from one of ours.
+ *
+ * Derived from {@link SuiErrorSchema} rather than written out: a hand-kept copy
+ * of the tag list is one edit that can be forgotten, and forgetting it here
+ * used to mean an error the library defines being classified as somebody
+ * else's. Adding a class to the union adds its tag here.
+ */
+const TAXONOMY_TAGS: ReadonlySet<string> = new Set(
+  Object.keys(SuiErrorTagged.cases)
+)
 
 /**
  * What a failure says about the transaction it came from.

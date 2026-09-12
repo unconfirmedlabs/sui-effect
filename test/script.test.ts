@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Cause, ConfigProvider, Console, DateTime, Effect, Exit, Layer, Schema } from "effect"
+import type { SuiError as SuiErrorType } from "../src/domain/errors.ts"
 import {
   BuildError,
   DecodeError,
   ExecutionFailed,
+  ExtensionNotReady,
+  GraphQLUnavailable,
   JournalError,
   NetworkMismatch,
   NotApplied,
@@ -19,7 +22,7 @@ import {
   TransportError,
   UnexpectedEffects
 } from "../src/domain/errors.ts"
-import { SuiError } from "../src/domain/errors.ts"
+import { SuiError, SuiErrorSchema } from "../src/domain/errors.ts"
 import { JournalEntry } from "../src/domain/journal-entry.ts"
 import { Journal } from "../src/services/Journal.ts"
 import { fakeDigest } from "../src/services/SuiCoreFake.ts"
@@ -183,6 +186,51 @@ describe("Script.exitCode", () => {
     }
     expect(exitCode(fail(new Foreign()))).toBe(1)
     expect(SuiError.outcome(new Foreign() as never)).toBe("unknown")
+  })
+
+  // NB1: `codeOfError` has no per-tag `switch` any more, so the mapping cannot
+  // fall behind the taxonomy. This is the proof, over every tag the schema
+  // declares rather than a list written here — and the `Missing` alias below
+  // stops compiling when a class is added to `SuiErrorSchema` without a
+  // fixture, which is exactly the edit that used to go unnoticed.
+  test("agrees with SuiError.outcome for every tag in the taxonomy", () => {
+    const objectId = SuiAddress.make(ID) as never
+    const fixtures = {
+      TransportError: new TransportError({ method: "getObject", retryable: true, cause: "down" }),
+      ObjectNotFound: new ObjectNotFound({ objectId }),
+      ObjectDeleted: new ObjectDeleted({ objectId }),
+      ObjectUnavailable: new ObjectUnavailable({ objectId }),
+      TransactionNotFound: new TransactionNotFound({ digest: DIGEST }),
+      NetworkMismatch: new NetworkMismatch({ expected: "a", actual: "b" }),
+      DecodeError: new DecodeError({ issue: "bad bytes" }),
+      SimulationFailed: new SimulationFailed({ reason: UNKNOWN_REASON, message: "no" }),
+      ExecutionFailed: new ExecutionFailed({ digest: DIGEST, reason: UNKNOWN_REASON, effects }),
+      SubmissionUnknown: new SubmissionUnknown({ digest: DIGEST, signed, cause: "timeout" }),
+      NotApplied: new NotApplied({ digest: DIGEST, evidence: "expired" }),
+      SigningError: new SigningError({ cause: "no key" }),
+      BuildError: new BuildError({ message: "no gas", cause: "x" }),
+      PolicyDenied: new PolicyDenied({ rule: "spend", message: "too much" }),
+      JournalError: new JournalError({ cause: "disk full" }),
+      UnexpectedEffects: new UnexpectedEffects({ digest: DIGEST, expected: "0x2::a::B", found: [] }),
+      GraphQLUnavailable: new GraphQLUnavailable({ method: "query", reason: "no endpoint" }),
+      ExtensionNotReady: new ExtensionNotReady({ extension: "escrow", member: "status" })
+    } as const
+    // A tag in the taxonomy with no fixture above is a compile error.
+    type Missing = Exclude<SuiErrorType["_tag"], keyof typeof fixtures>
+    const noMissingFixture = <_T extends never>(): true => true
+    expect(noMissingFixture<Missing>()).toBe(true)
+
+    const byOutcome = { applied: 5, unknown: 3, not_applied: 4 } as const
+    const tags = Object.keys(SuiErrorSchema.pipe(Schema.toTaggedUnion("_tag")).cases)
+    expect(tags.sort()).toEqual(Object.keys(fixtures).sort())
+
+    for (const tag of tags) {
+      const error = fixtures[tag as keyof typeof fixtures]
+      // `NetworkMismatch` is the one tag off the applied/not-applied axis: it
+      // is a configuration problem, and no retry fixes it.
+      const expected = tag === "NetworkMismatch" ? 2 : byOutcome[SuiError.outcome(error)]
+      expect([tag, exitCode(fail(error))]).toEqual([tag, expected])
+    }
   })
 
   test("2 for a SchemaError, which is a person's input not fitting a schema", async () => {

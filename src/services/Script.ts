@@ -382,54 +382,42 @@ export const exitCode = <A, E>(
   return failure._tag === "Some" ? codeOfError(failure.value, unresolved) : EXIT.defect
 }
 
-/** The exit code of one error value, the same mapping {@link exitCode} uses. */
+/**
+ * The exit code of one error value, the same mapping {@link exitCode} uses.
+ *
+ * There is no per-tag `switch` here, and that is the point: a `default:` case
+ * over the taxonomy's tags is not a compile error when a tag is added and
+ * forgotten, so a real taxonomy failure used to exit 1 ("defect") instead of
+ * 3, 4 or 5. `SuiError.isTaxonomy` and `SuiError.outcome` are the taxonomy's
+ * own answer to the same question, and they are derived from the schema, so
+ * the mapping cannot fall behind the union. The three tags that are *not* on
+ * the outcome axis at all — a configuration problem is not "did it apply?" —
+ * are named, and everything else the library has never heard of is a defect.
+ */
 const codeOfError = (error: unknown, unresolved: number): number => {
   if (isConfigError(error)) return EXIT.configuration
-  if (hasOutcomeField(error)) return codeOfOutcome((error as unknown as HasOutcomeLike).outcome)
   if (!hasTag(error)) return EXIT.defect
-  switch (error._tag) {
-    case "NetworkMismatch":
-      return EXIT.configuration
-    case "SubmissionUnknown":
-      return EXIT.unknown
-    case "ExecutionFailed":
-    // An `UnexpectedEffects` is built from an `Executed`: the transaction
-    // applied and gas was charged, and only the receipt is missing. Exit 4
-    // would tell a wrapper to run the caller's intent a second time.
-    case "UnexpectedEffects":
-      return EXIT.applied
-    // `Effect.timeout` puts a `TimeoutError` in the error channel that is not
-    // part of the taxonomy. It used to be mapped unconditionally to "not
-    // applied" on the theory that `Tx.submit` turns a timed-out submission into
-    // `SubmissionUnknown` — but an `Effect.timeout` wrapped *around* a
-    // submission interrupts it from the outside and never reaches that mapping,
-    // so the bytes may be on the wire. The journal is what knows.
-    case "TimeoutError":
-      return unresolved > 0 ? EXIT.unknown : EXIT.notApplied
-    case "TransportError":
-    case "ObjectNotFound":
-    case "ObjectDeleted":
-    case "ObjectUnavailable":
-    case "TransactionNotFound":
-    case "DecodeError":
-    case "SimulationFailed":
-    case "NotApplied":
-    case "SigningError":
-    case "BuildError":
-    case "PolicyDenied":
-    case "JournalError":
-    case "GraphQLUnavailable":
-    case "ExtensionNotReady":
-      return EXIT.notApplied
-    case "SchemaError":
-      return EXIT.configuration
-    default:
-      return EXIT.defect
+  // Configuration, not the applied/not-applied axis: no retry fixes any of
+  // these, and `NetworkMismatch` means the layer is pointed at the wrong chain.
+  if (
+    error._tag === "SchemaError" || error._tag === "NetworkMismatch"
+  ) {
+    return EXIT.configuration
   }
-}
-
-interface HasOutcomeLike {
-  readonly outcome: string
+  if (hasOutcomeField(error)) return codeOfOutcome(error.outcome)
+  // `Effect.timeout` puts a `TimeoutError` in the error channel that is not
+  // part of the taxonomy. It used to be mapped unconditionally to "not
+  // applied" on the theory that `Tx.submit` turns a timed-out submission into
+  // `SubmissionUnknown` — but an `Effect.timeout` wrapped *around* a
+  // submission interrupts it from the outside and never reaches that mapping,
+  // so the bytes may be on the wire. The journal is what knows.
+  if (error._tag === "TimeoutError") {
+    return unresolved > 0 ? EXIT.unknown : EXIT.notApplied
+  }
+  if (SuiErrorHelpers.isTaxonomy(error)) {
+    return codeOfOutcome(SuiErrorHelpers.outcome(error))
+  }
+  return EXIT.defect
 }
 
 const codeOfOutcome = (outcome: string): number => {
@@ -473,7 +461,7 @@ export interface SignalSource {
 const describeFailure = (error: unknown): ReadonlyArray<string> => {
   if (!hasTag(error)) return [String(error)]
   const lines: Array<string> = []
-  if (!isSuiError(error)) {
+  if (!SuiErrorHelpers.isTaxonomy(error)) {
     const message = "message" in error && typeof error.message === "string"
       ? ` ${error.message}`
       : ""
@@ -495,30 +483,6 @@ const describeFailure = (error: unknown): ReadonlyArray<string> => {
   }
   return lines
 }
-
-const SUI_ERROR_TAGS = new Set([
-  "TransportError",
-  "ObjectNotFound",
-  "ObjectDeleted",
-  "ObjectUnavailable",
-  "TransactionNotFound",
-  "NetworkMismatch",
-  "DecodeError",
-  "SimulationFailed",
-  "ExecutionFailed",
-  "SubmissionUnknown",
-  "NotApplied",
-  "SigningError",
-  "BuildError",
-  "PolicyDenied",
-  "JournalError",
-  "UnexpectedEffects",
-  "GraphQLUnavailable",
-  "ExtensionNotReady"
-])
-
-const isSuiError = (error: { readonly _tag: string }): error is SuiError =>
-  SUI_ERROR_TAGS.has(error._tag)
 
 const toBase64 = (bytes: Uint8Array): string => {
   let binary = ""
