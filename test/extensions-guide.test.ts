@@ -18,6 +18,9 @@ import { describe, expect, setDefaultTimeout, test } from "bun:test"
 // The generators shell out to the TypeScript checker over dist/; five seconds is tight on a CI runner.
 setDefaultTimeout(120_000)
 import { readFileSync } from "node:fs"
+import { Exit, Schema } from "effect"
+import { SuiError } from "../src/domain/errors.ts"
+import { exitCode } from "../src/services/Script.ts"
 
 const GUIDE = "docs/extensions.md"
 
@@ -107,7 +110,12 @@ describe("docs/extensions.md", () => {
     // template is an extension package and
     // cannot host any of them; the rule they are an exception to is about the
     // extension examples, which are all still quoted from it.
-    expect(inlineBlocks.length).toBeLessThanOrEqual(17)
+    //
+    // 0.1.3 added one: the `Schema.tag("not_applied")` spelling of `outcome`,
+    // shown beside the class-field form the template uses. The template keeps
+    // the class field — three converted packages copy it — so this one has no
+    // home there by construction.
+    expect(inlineBlocks.length).toBeLessThanOrEqual(18)
   })
 
   test("every code block names the template file it came from", () => {
@@ -134,4 +142,35 @@ describe("docs/extensions.md", () => {
       }
     })
   }
+})
+
+/**
+ * NB11: the guide's second spelling of `outcome`. A `Schema.tag` field is a
+ * real schema field, so it encodes without a patch-back, decodes back into an
+ * error, and is visible to `Schema.is` — while the class-field form the
+ * template uses keeps working exactly as before.
+ */
+describe("Schema.tag as the schema-visible outcome", () => {
+  class TaggedOutcome extends Schema.TaggedError<TaggedOutcome>()("escrow/TaggedOutcome", {
+    escrowId: Schema.String,
+    outcome: Schema.tag("not_applied")
+  }) {}
+
+  test("the constructor does not require it, and the instance carries it", () => {
+    const error = new TaggedOutcome({ escrowId: "0x1" })
+    expect(error.outcome).toBe("not_applied")
+    expect(SuiError.outcome(error)).toBe("not_applied")
+  })
+
+  test("toJson encodes it and the class decodes it back", () => {
+    const json = SuiError.toJson(new TaggedOutcome({ escrowId: "0x1" }))
+    expect(json["outcome"]).toBe("not_applied")
+    const decoded = Schema.decodeUnknownSync(TaggedOutcome)(json)
+    expect(decoded.outcome).toBe("not_applied")
+    expect(decoded.escrowId).toBe("0x1")
+  })
+
+  test("Script.exitCode maps it like any other declared outcome", () => {
+    expect(exitCode(Exit.fail(new TaggedOutcome({ escrowId: "0x1" })))).toBe(4)
+  })
 })

@@ -268,6 +268,15 @@ describe("Settlement: a domain class over the BCS bridge", () => {
     claimed_by: bcs.Address
   })
 
+  // The identifier is the class's stable runtime marker and its JSON-Schema
+  // `$ref` key, so it follows the guide's `"<package>/<Name>"` rule: two
+  // extensions with a `Settlement` class must not collide in one document.
+  test("the class identifier is scoped to the package", () => {
+    expect(JSON.stringify(Schema.toJsonSchemaDocument(Settlement))).toContain(
+      "escrow/Settlement"
+    )
+  })
+
   test("snake_case Move fields decode into the camelCase domain class", async () => {
     const bytes = SettlementBcs.serialize({
       escrow_id: ESCROW_ID,

@@ -89,6 +89,31 @@ nothing happened — answering `"not_applied"` would tell the documented retry
 idiom to send again. The `"not_applied"` default is for @unconfirmed/sui-effect's own
 taxonomy, not for yours.
 
+**`outcome` can be a schema field instead of a class field, and there is a
+reason to prefer it.** `readonly outcome: Outcome = "not_applied"` beside the
+schema — what `src/errors.ts` does, and what three converted packages copy — is
+a class field, so it is invisible to the schema: it does not appear in the
+error's JSON Schema, `Schema.decodeUnknownSync(MyError)` on a logged line does
+not get it back, and `SuiError.toJson` has to read it off the instance and patch
+it in. `Schema.tag` makes it a real field with a fixed value:
+
+<!-- inline -->
+
+```ts
+export class EscrowUnsupportedNetwork extends Schema.TaggedError<EscrowUnsupportedNetwork>()(
+  "escrow/EscrowUnsupportedNetwork",
+  { network: Schema.String, outcome: Schema.tag("not_applied") }
+) {}
+```
+
+`new EscrowUnsupportedNetwork({ network: "devnet" })` still takes only
+`network` — a `Schema.tag` field supplies itself — while `outcome` is present on
+the instance, encoded by `SuiError.toJson` with no patch-back, decodable again,
+and visible to `Schema.is`. `SuiError.outcome` and `Script.exitCode` read it
+exactly as they read the class field, so the two forms are interchangeable at
+every call site and **the class-field form keeps working**; use `Schema.tag` for
+errors you are writing now.
+
 **Tag strings are namespaced by whoever defined them, and sui-effect's are
 not.** @unconfirmed/sui-effect's own tags are bare — `TransportError`,
 `ObjectNotFound`, `DecodeError` — while an extension prefixes its own, so a
@@ -187,16 +212,17 @@ encoder: a mapping function has no inverse, so serialize with the layout itself.
 
 The domain class is an ordinary `Schema.Class`:
 
-@@ src/schema.ts :: export class Settlement extends Schema.Class<Settlement>("Settlement")({ :: }) {}
+@@ src/schema.ts :: export class Settlement extends Schema.Class<Settlement>("escrow/Settlement")({ :: }) {}
 
-**The halfway shape must be an explicit interface.** The transformation's source
-type — what `decode` produces and `encode` consumes — is written out as its own
-interface, as `src/schema.ts` does. Reaching for `typeof Settlement.Encoded` or
-`typeof Settlement.Type` instead looks equivalent and is not: those name the
-class's *own* two sides, which inverts the direction the transformation is being
-inferred in, and the result does not compile — with an error about the wrong
-side of the transformation, several frames away from the line that caused it.
-Write the interface.
+**The halfway shape is the target's `Encoded` side.** The transformation's
+source type — what `decode` produces and `encode` consumes — is
+`typeof Settlement.Encoded`, and `src/schema.ts` spells it exactly that way. A
+hand-written interface with the same fields is equivalent and compiles too, but
+it is a second copy of the class's shape that can drift from it, so prefer the
+`Encoded` side. What does **not** fit is `typeof Settlement.Type`: that is the
+*instance* side, which inverts the direction the transformation is being
+inferred in, and the error arrives several frames away from the line that caused
+it.
 
 `decode` produces the target's field shape and the target schema does the rest,
 so the `ObjectId` and `SuiAddress` brands are checked as part of the same
@@ -1197,7 +1223,13 @@ extension exits with the code a wrapper can act on — 5 applied, 4 not applied,
 `SuiError.toJson` serializes your errors too. A tag in @unconfirmed/sui-effect's own taxonomy
 encodes through the taxonomy's schema; **anything else that is a
 `Schema.TaggedError` encodes through its own**, so an extension error arrives as
-`{ _tag, escrowId, outcome }` rather than a bare `{ _tag, message }`.
+`{ _tag, escrowId, outcome, message }` rather than a bare `{ _tag, message }`.
+`outcome` is there whichever form section 2 you chose — a class field is read
+off the instance and added, a `Schema.tag("not_applied")` field is simply
+encoded — but only the `Schema.tag` form survives a
+`Schema.decodeUnknownSync(YourError)` of that line back into an error, because
+only it is part of the schema. `message` is added from the error's own
+`.message` when the encoding produced none.
 
 **`outcome` is in that JSON even though it is a class field.** Declaring it the
 way the template does — `readonly outcome: Outcome = "unknown"` beside the

@@ -5636,21 +5636,11 @@ const SettlementBcs = bcs.struct("Settlement", {
  * needs a real `BcsType` so it can re-serialize what it parsed and reject
  * trailing bytes, and a domain type is not a BCS layout.
  */
-export class Settlement extends Schema.Class<Settlement>("Settlement")({
+export class Settlement extends Schema.Class<Settlement>("escrow/Settlement")({
   escrowId: ObjectId,
   settledAt: Schema.DateTimeUtc,
   claimedBy: SuiAddress
 }) {}
-
-/**
- * The halfway shape the transformation produces: the domain field names, before
- * `Settlement`'s own schema brands the ids.
- */
-interface SettlementParts {
-  readonly escrowId: string
-  readonly settledAt: DateTime.Utc
-  readonly claimedBy: string
-}
 
 /**
  * The composed codec: BCS bytes to `Settlement`, and back.
@@ -5665,10 +5655,11 @@ interface SettlementParts {
  *
  * Two details worth copying:
  *
- * - **`decode` produces the target's field shape, not an instance.** `decodeTo`
- *   sits between the source type and the target schema, which is what lets the
- *   target's own checks — the `ObjectId` and `SuiAddress` brands here — run
- *   afterwards.
+ * - **`decode` produces the target's `Encoded` side, not an instance.**
+ *   `typeof Settlement.Encoded` is exactly that shape, so nothing has to be
+ *   written out by hand and nothing can drift. `decodeTo` sits between the
+ *   source type and the target schema, which is what lets the target's own
+ *   checks — the `ObjectId` and `SuiAddress` brands here — run afterwards.
  * - **`encode` is the inverse mapper and is not optional.** A codec that cannot
  *   encode is one `Schema.encodeUnknownEffect` fails on, and the compiler asks
  *   for it here rather than at the call site.
@@ -5688,7 +5679,7 @@ export const SettlementContent = (typeOrigin: string) =>
   ).pipe(
     Schema.decodeTo(
       Settlement,
-      SchemaTransformation.transformOrFail<SettlementParts, typeof SettlementBcs.$inferType>({
+      SchemaTransformation.transformOrFail<typeof Settlement.Encoded, typeof SettlementBcs.$inferType>({
         decode: (fields, options) =>
           // `transformOrFail`, not `transform`, because one of these mappings can
           // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
@@ -5705,7 +5696,7 @@ export const SettlementContent = (typeOrigin: string) =>
                   options
                 )
             ),
-            (settledAt): SettlementParts => ({
+            (settledAt): typeof Settlement.Encoded => ({
               escrowId: fields.escrow_id,
               settledAt,
               claimedBy: fields.claimed_by
@@ -6648,6 +6639,15 @@ describe("Settlement: a domain class over the BCS bridge", () => {
     escrow_id: bcs.Address,
     settled_at_ms: bcs.u64(),
     claimed_by: bcs.Address
+  })
+
+  // The identifier is the class's stable runtime marker and its JSON-Schema
+  // `$ref` key, so it follows the guide's `"<package>/<Name>"` rule: two
+  // extensions with a `Settlement` class must not collide in one document.
+  test("the class identifier is scoped to the package", () => {
+    expect(JSON.stringify(Schema.toJsonSchemaDocument(Settlement))).toContain(
+      "escrow/Settlement"
+    )
   })
 
   test("snake_case Move fields decode into the camelCase domain class", async () => {
