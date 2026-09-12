@@ -344,13 +344,31 @@ export const BalanceChange = Schema.Struct({
 })
 export type BalanceChange = typeof BalanceChange.Type
 
-/** An emitted Move event. Mirrors `SuiClientTypes.Event`; `json` is dropped on purpose. */
+/**
+ * An emitted Move event. Mirrors `SuiClientTypes.Event` with the branded ids
+ * this package uses.
+ *
+ * The decode a caller wants is `SuiSchema.decode(codec, event.bcs)`, which
+ * gives a typed value; `json` is the node's own rendering and is **not**
+ * something to build on — it is absent on most transports and its shape follows
+ * whatever the node feels like. It is kept only when the source carried it,
+ * which in practice means a relay or sponsor envelope decoded through
+ * `Executed.fromPartial`, where it may be the only form of the event there is.
+ */
 export const Event = Schema.Struct({
   packageId: ObjectId,
   module: Schema.String,
   sender: SuiAddress,
   eventType: Schema.String,
-  bcs: Schema.Uint8Array
+  bcs: Schema.Uint8Array,
+  /**
+   * The node's own JSON rendering of the event, when whatever produced this
+   * carried one. Never populated from a gRPC execute; never to be preferred
+   * over `bcs`.
+   *
+   * @since 0.1.2
+   */
+  json: Schema.optional(Schema.Unknown)
 })
 export type Event = typeof Event.Type
 

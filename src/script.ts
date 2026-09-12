@@ -6,6 +6,8 @@
 export {
   exitCode,
   readNetwork,
+  report,
+  type ReportOptions,
   run,
   Script,
   ScriptReadOnly,

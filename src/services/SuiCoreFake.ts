@@ -15,6 +15,8 @@ import { bcs } from "@mysten/sui/bcs"
 import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
 import { Inputs, TransactionDataBuilder } from "@mysten/sui/transactions"
+import { parseSerializedSignature } from "@mysten/sui/cryptography"
+import { publicKeyFromRawBytes } from "@mysten/sui/verify"
 import type { TransactionPlugin } from "@mysten/sui/transactions"
 import {
   normalizeStructTag,
@@ -23,8 +25,9 @@ import {
   SUI_TYPE_ARG,
   toBase58
 } from "@mysten/sui/utils"
-import { Context, Effect, Layer, Option } from "effect"
+import { Context, Effect, Layer, Option, Result, Schema } from "effect"
 import { typeMatches } from "../domain/bcs.ts"
+import { ExecutionReason } from "../domain/schemas.ts"
 import type { SuiCoreService } from "./SuiCore.ts"
 import { DefectMarker, makeFromClient, SuiCore } from "./SuiCore.ts"
 
@@ -129,15 +132,67 @@ export type FakeOutcome =
   | { readonly _tag: "notFound" }
   | { readonly _tag: "timeoutThen"; readonly found: boolean }
 
+/**
+ * The wire `ExecutionError` a scripted failure needs, from either shape a test
+ * is likely to hold.
+ *
+ * The SDK's own shape — a required top-level `message` and an `abortCode`
+ * **string** — is what the node sends and what the fake must hand back. A test
+ * that has sui-effect's decoded {@link ExecutionReason} instead (`abortCode` a
+ * `bigint`, no `message`) used to be accepted silently, then fail the
+ * `Simulation`/`Executed` decode much later as a `DecodeError` or a
+ * `TransportError`, and — because the outcome cursor had already moved — often
+ * surface as an unrelated `FakeUnimplemented` on some other method. So it is
+ * encoded here, at the point where the fixture is written, and anything that is
+ * neither shape says so immediately.
+ */
+const executionErrorOf = (
+  reason: SuiClientTypes.ExecutionError | ExecutionReason
+): SuiClientTypes.ExecutionError => {
+  const kind = (reason as { readonly $kind?: unknown })?.$kind
+  if (typeof kind !== "string") {
+    throw new Error(
+      "FakeOutcome.failWith: an execution failure is `{ $kind, [$kind]: …, message }` —" +
+        " the SDK's `SuiClientTypes.ExecutionError` — or sui-effect's decoded" +
+        " `ExecutionReason` (`{ $kind, [$kind]: … }`, `abortCode` a bigint)." +
+        ` This value has no $kind: ${String(reason)}`
+    )
+  }
+  if (typeof (reason as { readonly message?: unknown }).message === "string") {
+    return reason as SuiClientTypes.ExecutionError
+  }
+  const encoded = Schema.encodeUnknownResult(ExecutionReason)(reason)
+  if (Result.isFailure(encoded)) {
+    throw new Error(
+      `FakeOutcome.failWith: this ${kind} is neither the SDK's ExecutionError` +
+        " (a top-level `message`, `abortCode` a decimal string) nor a decodable" +
+        ` ExecutionReason: ${encoded.failure.message}`
+    )
+  }
+  return {
+    message: `fake execution failure (${kind})`,
+    ...(encoded.success as object)
+  } as SuiClientTypes.ExecutionError
+}
+
 /** Builders for {@link FakeOutcome}. */
 export const FakeOutcome = {
   /** The call succeeds with these effects. */
   succeed: (value: FakeExecution = {}): FakeOutcome => ({ _tag: "succeed", value }),
-  /** The call resolves with an on-chain failure (`FailedTransaction`). */
+  /**
+   * The call resolves with an on-chain failure (`FailedTransaction`).
+   *
+   * `reason` may be the SDK's `SuiClientTypes.ExecutionError` — the wire shape,
+   * with a top-level `message` and an `abortCode` **string** — or sui-effect's
+   * decoded `ExecutionReason`, whose `abortCode` is a `bigint` and which
+   * carries no `message`. The second is encoded into the first here; a value
+   * that is neither throws immediately, naming the two shapes, rather than
+   * failing a decode several calls later.
+   */
   failWith: (
-    reason: SuiClientTypes.ExecutionError,
+    reason: SuiClientTypes.ExecutionError | ExecutionReason,
     value: FakeExecution = {}
-  ): FakeOutcome => ({ _tag: "failWith", reason, value }),
+  ): FakeOutcome => ({ _tag: "failWith", reason: executionErrorOf(reason), value }),
   /** The call rejects with a gRPC status, as `RpcError` would. */
   transportError: (status: string): FakeOutcome => ({ _tag: "transportError", status }),
   /** The call rejects the way a missing transaction does. */
@@ -148,6 +203,18 @@ export const FakeOutcome = {
    * for the same digest should find the transaction.
    */
   timeoutThen: (found: boolean): FakeOutcome => ({ _tag: "timeoutThen", found })
+}
+
+/**
+ * A balance the fake serves, optionally for one owner.
+ *
+ * `owner` is the address this balance belongs to. Left out, the entry answers
+ * for **any** owner, which is what every script written before 0.1.2 assumed.
+ *
+ * @since 0.1.2
+ */
+export interface FakeBalance extends SuiClientTypes.Balance {
+  readonly owner?: string
 }
 
 /** Everything the fake serves. Every field is optional. */
@@ -166,7 +233,29 @@ export interface FakeScript {
   readonly coins?: ReadonlyArray<SuiClientTypes.Coin>
   /** The gas budget the resolve plugin sets when a transaction has none. */
   readonly gasBudget?: bigint
-  readonly balances?: ReadonlyArray<SuiClientTypes.Balance>
+  /**
+   * The balances `getBalance` and `listBalances` serve.
+   *
+   * Keyed by **owner and coin type**: an entry with an `owner` answers only for
+   * that address, and one without answers for any, which is what a script
+   * written before 0.1.2 meant. A `getBalance` for an owner and coin type no
+   * entry names answers zero, the way a node does for an address that holds
+   * none of that coin.
+   */
+  readonly balances?: ReadonlyArray<FakeBalance>
+  /**
+   * Scripted outcomes for `getObject`, oldest first; the last repeats forever.
+   *
+   * This is transport-error injection on a **read**: `FakeOutcome.transportError`
+   * and `FakeOutcome.timeoutThen` are what it is for, and they are how a test
+   * drives `SuiCore`'s read retry policy or an extension's own fallback.
+   * `FakeOutcome.notFound` answers the way a missing object does
+   * (`ObjectNotFound`). A `succeed` entry — and an empty or exhausted script —
+   * means "serve the object map", which is the normal behaviour.
+   *
+   * @since 0.1.2
+   */
+  readonly getObject?: ReadonlyArray<FakeOutcome>
   /**
    * What `getCoinMetadata` answers, keyed by coin type.
    *
@@ -264,7 +353,7 @@ export interface SuiCoreFakeState {
   readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void>
   /** Replaces the remaining scripted outcomes of a method. */
   readonly setOutcomes: (
-    method: "simulate" | "execute" | "getTransaction" | "buildSimulate",
+    method: "simulate" | "execute" | "getTransaction" | "buildSimulate" | "getObject",
     outcomes: ReadonlyArray<FakeOutcome>
   ) => Effect.Effect<void>
 }
@@ -288,12 +377,19 @@ interface Mutable {
   epoch: bigint
   calls: Array<RecordedCall>
   aborted: number
-  cursors: { simulate: number; execute: number; getTransaction: number; buildSimulate: number }
+  cursors: {
+    simulate: number
+    execute: number
+    getTransaction: number
+    buildSimulate: number
+    getObject: number
+  }
   scripts: {
     simulate: ReadonlyArray<FakeOutcome>
     execute: ReadonlyArray<FakeOutcome>
     getTransaction: ReadonlyArray<FakeOutcome>
     buildSimulate: ReadonlyArray<FakeOutcome>
+    getObject: ReadonlyArray<FakeOutcome>
   }
   pendingDigests: Map<string, boolean>
   knownTransactions: Map<string, SettledTransaction>
@@ -597,12 +693,13 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
       epoch: script.epoch ?? DEFAULT_EPOCH,
       calls: [],
       aborted: 0,
-      cursors: { simulate: 0, execute: 0, getTransaction: 0, buildSimulate: 0 },
+      cursors: { simulate: 0, execute: 0, getTransaction: 0, buildSimulate: 0, getObject: 0 },
       scripts: {
         simulate: script.simulate ?? [],
         execute: script.execute ?? [],
         getTransaction: script.getTransaction ?? [],
-        buildSimulate: script.buildSimulate ?? []
+        buildSimulate: script.buildSimulate ?? [],
+        getObject: script.getObject ?? []
       },
       pendingDigests: new Map(),
       knownTransactions: new Map(),
@@ -713,7 +810,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   }
 
   const next = (
-    key: "simulate" | "execute" | "getTransaction" | "buildSimulate"
+    key: "simulate" | "execute" | "getTransaction" | "buildSimulate" | "getObject"
   ): FakeOutcome | undefined => {
     const outcomes = state.scripts[key]
     if (outcomes.length === 0) return undefined
@@ -889,6 +986,31 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       ? { $kind: "FailedTransaction", FailedTransaction: result.transaction }
       : { $kind: "Transaction", Transaction: result.transaction }
 
+  /** Whether two coin types name the same coin, comparing normalized tags. */
+  const sameCoinType = (left: string, right: string): boolean => {
+    if (left === right) return true
+    try {
+      return normalizeStructTag(left) === normalizeStructTag(right)
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * The balances this owner has, with the owner stripped: an entry that names
+   * no owner answers for everyone, which is what a pre-0.1.2 script meant.
+   */
+  const balancesOf = (owner: string): ReadonlyArray<SuiClientTypes.Balance> => {
+    const address = normalizeSuiAddress(owner)
+    const matching: Array<SuiClientTypes.Balance> = []
+    for (const entry of script.balances ?? []) {
+      if (entry.owner !== undefined && normalizeSuiAddress(entry.owner) !== address) continue
+      const { owner: _owner, ...balance } = entry
+      matching.push(balance)
+    }
+    return matching
+  }
+
   const coinsOf = (
     owner: string,
     coinType?: string
@@ -931,11 +1053,30 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     const core = options.client?.core ?? client.core
     const { referenceGasPrice } = await core.getReferenceGasPrice({})
     // A real transport's resolver simulates to choose the gas budget, which is
-    // why `Tx.build` can fail with `SimulationFailed`. The fake does it only
-    // when a test scripted it.
-    const budgetOutcome = state.scripts.buildSimulate.length === 0
-      ? undefined
-      : next("buildSimulate")
+    // why `Tx.build` can fail with `SimulationFailed` — and why "building
+    // always simulates" has to be observable here. The call is **recorded**
+    // whether or not a script drives it, so `SuiTest.calls("simulateTransaction")`
+    // counts the build's simulate the way it counts every other call; before
+    // 0.1.2 a build on the fake recorded nothing and a conversion moving onto
+    // this build could not see its own simulate at all.
+    //
+    // Which script answers it: `buildSimulate` when there is one — the slot
+    // that exists precisely for the resolver's simulate — and otherwise the
+    // ordered `simulate` script, so `simulate: [FakeOutcome.failWith(...)]`
+    // surfaces through `Tx.build` as the `SimulationFailed` a node would give.
+    // With neither, the resolver sets the budget from `script.gasBudget` and
+    // the recorded call is the only trace.
+    record("simulateTransaction", {
+      transaction: undefined,
+      checks: "enabled",
+      resolver: true,
+      signal: lastSignal
+    })
+    const budgetOutcome = state.scripts.buildSimulate.length > 0
+      ? next("buildSimulate")
+      : state.scripts.simulate.length > 0
+      ? next("simulate")
+      : undefined
     if (budgetOutcome !== undefined) {
       if (budgetOutcome._tag === "timeoutThen") {
         // Never settles until the build is interrupted, which is exactly what a
@@ -1004,15 +1145,60 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   }
 
   /**
-   * Refuses a submission that carries fewer signatures than the bytes name
-   * distinct signing addresses.
+   * Refuses a submission whose signatures do not cover the addresses the bytes
+   * name as signers, the way a validator refuses it.
    *
    * A transaction takes a signature from its sender and, when its gas owner is
    * someone else, from that party too; one signature on sponsored bytes is
-   * something a validator rejects outright. The fake used to accept it, which
-   * is how a whole family of sponsorship and locking tests passed while
-   * describing a transaction that could never land.
+   * something a validator rejects outright. Two checks, in order: the **count**
+   * (fewer signatures than distinct signers), and the **addresses** — every
+   * signature whose public key can be read is turned back into the address it
+   * signs as, and a required address nobody signed for is a refusal. A
+   * signature the SDK cannot parse (a multisig, a zkLogin proof, a fixture that
+   * is not a real signature) makes the address check stand down, so only the
+   * count applies there.
+   *
+   * **It rejects the way a gRPC node does**: an `RpcError` carrying
+   * `INVALID_ARGUMENT`, which `mapSdkError` turns into
+   * `TransportError { retryable: false, status: "INVALID_ARGUMENT" }` and which
+   * `Tx.submit` reports as-is rather than reconciling. A plain `Error` here was
+   * classified as a retryable transport failure, so `Tx.submit` retried it,
+   * reconciled, and a scripted `getTransaction: succeed` reported a **success**
+   * for bytes no validator would have accepted.
+   *
+   * A sponsored submission against the fake therefore needs `Tx.cosign` (or
+   * `Tx.run`'s `sponsor`) first, exactly as it does against a node.
    */
+  const signerAddressesOf = (
+    signatures: ReadonlyArray<string>
+  ): ReadonlyArray<string> | undefined => {
+    const addresses: Array<string> = []
+    for (const signature of signatures) {
+      try {
+        const parsed = parseSerializedSignature(signature)
+        if (parsed.signatureScheme === "MultiSig" || parsed.signatureScheme === "ZkLogin") {
+          return undefined
+        }
+        addresses.push(
+          normalizeSuiAddress(
+            publicKeyFromRawBytes(parsed.signatureScheme, parsed.publicKey).toSuiAddress()
+          )
+        )
+      } catch {
+        // A multisig, a zkLogin signature, or a fixture that is not a real
+        // signature at all: the address check cannot speak about this set.
+        return undefined
+      }
+    }
+    return addresses
+  }
+
+  const refuse = (message: string): never => {
+    const error = new Error(`fake validator: ${message}`)
+    Object.assign(error, { code: "INVALID_ARGUMENT", name: "RpcError" })
+    throw error
+  }
+
   const assertSignatures = (bytes: Uint8Array, signatures: ReadonlyArray<string>): void => {
     let required: ReadonlyArray<string>
     try {
@@ -1026,12 +1212,25 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       return
     }
     if (signatures.length < required.length) {
-      const error = new Error(
-        `fake validator: these bytes name ${required.length} signer(s) (${required.join(", ")})` +
-          ` and carry ${signatures.length} signature(s)`
+      refuse(
+        `these bytes name ${required.length} signer(s) (${required.join(", ")})` +
+          ` and carry ${signatures.length} signature(s).` +
+          (required.length > 1
+            ? " A sponsored transaction is signed by both parties: Tx.cosign the" +
+              " signed bytes with the gas owner's signer, or use Tx.run(recipe," +
+              " { signer, sponsor })."
+            : "")
       )
-      Object.assign(error, { code: "INVALID_ARGUMENT", name: "RpcError" })
-      throw error
+    }
+    const signed = signerAddressesOf(signatures)
+    if (signed === undefined) return
+    const missing = required.filter((address) => !signed.includes(address))
+    if (missing.length > 0) {
+      refuse(
+        `these bytes name ${missing.join(", ")} as (a) signer(s) and carry no signature` +
+          ` from ${missing.length === 1 ? "that address" : "those addresses"}` +
+          ` (the signatures are from ${signed.join(", ")})`
+      )
     }
   }
 
@@ -1044,9 +1243,35 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     }
   }
 
+  /**
+   * The scripted read failure for this `getObject` call, if a script asked for
+   * one. `succeed` (and an exhausted or absent script) means "serve the object
+   * map", which is the normal path.
+   */
+  const readOutcome = async (options: SuiClientTypes.GetObjectOptions): Promise<void> => {
+    if (state.scripts.getObject.length === 0) return
+    const outcome = next("getObject")
+    if (outcome === undefined) return
+    switch (outcome._tag) {
+      case "transportError":
+        throw rpcError(outcome.status)
+      case "notFound":
+        throw new ObjectError("notFound", `object ${options.objectId} does not exist`, {
+          reason: "notFound",
+          objectId: normalizeSuiAddress(options.objectId)
+        })
+      case "timeoutThen":
+        await pending<never>("getObject", options)
+        return
+      default:
+        return
+    }
+  }
+
   const core = {
     getObject: async (options: SuiClientTypes.GetObjectOptions) => {
       record("getObject", options)
+      await readOutcome(options)
       return { object: toSdkObject(lookup(options.objectId), options.include) }
     },
     getObjects: async (options: SuiClientTypes.GetObjectsOptions) => {
@@ -1132,15 +1357,15 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     getBalance: async (options: SuiClientTypes.GetBalanceOptions) => {
       record("getBalance", options)
-      const coinType = options.coinType ?? "0x2::sui::SUI"
-      const balance = (script.balances ?? []).find((item) => item.coinType === coinType)
+      const coinType = options.coinType ?? SUI_TYPE_ARG
+      const balance = balancesOf(options.owner).find((item) => sameCoinType(item.coinType, coinType))
       return {
         balance: balance ?? { coinType, balance: "0", coinBalance: "0", addressBalance: "0" }
       }
     },
     listBalances: async (options: SuiClientTypes.ListBalancesOptions) => {
       record("listBalances", options)
-      const result = page(script.balances ?? [], options.cursor, options.limit)
+      const result = page(balancesOf(options.owner), options.cursor, options.limit)
       return {
         balances: result.items as Array<SuiClientTypes.Balance>,
         hasNextPage: result.hasNextPage,

@@ -301,6 +301,9 @@ export const decodeContent = <T>(
       new DecodeError({
         ...withObject,
         ...withExpected,
+        // The type tag did not match, so not a byte was parsed: this is the
+        // decode failure a caller may answer with "not one of mine".
+        kind: "type",
         issue: `${
           context?.objectId === undefined ? "the bytes have" : `object ${context.objectId} has`
         } type ${actual}`
@@ -313,6 +316,10 @@ export const decodeContent = <T>(
         new DecodeError({
           ...withObject,
           ...withExpected,
+          // The tag matched (or there was none to check) and the bytes
+          // themselves did not parse: a layout mismatch or a corrupt object,
+          // never something to swallow.
+          kind: "bytes",
           issue: error.message
         })
     )

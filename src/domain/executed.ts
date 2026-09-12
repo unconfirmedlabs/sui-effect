@@ -12,6 +12,7 @@
  * @since 0.1.0
  */
 import type { SuiClientTypes } from "@mysten/sui/client"
+import { fromBase64 } from "@mysten/sui/utils"
 import { Effect, Schema } from "effect"
 import { DecodeError, ExecutionFailed, UnexpectedEffects } from "./errors.ts"
 import {
@@ -99,6 +100,16 @@ export interface SdkObjectRef {
 /**
  * A transaction the network executed, built from the fixed execute include set:
  * effects, events, balance changes and object types.
+ *
+ * **`events` is `ReadonlyArray<Event>`, not `SuiClientTypes.Event[]`.** It is
+ * that type minus `json`: `packageId`, `module`, `sender`, `eventType` and
+ * `bcs`, with the branded ids this package uses. The SDK's `json` is dropped on
+ * purpose — it is the node's own rendering, it is absent on most transports,
+ * and the decode a caller wants is `SuiSchema.decode(codec, event.bcs)`, which
+ * gives a typed value rather than a shape that changes with the node. Code
+ * typed against the SDK's `Event[]` therefore does not accept these; take
+ * `ReadonlyArray<Event>` from `@unconfirmed/sui-effect`, or map the fields you
+ * need.
  */
 export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   digest: Digest,
@@ -168,7 +179,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    */
   created(type?: string): ReadonlyArray<ChangedRef> {
     return this.select(
-      (change) => change.idOperation === "Created" && change.outputState === "ObjectWrite",
+      (change) => change.idOperation === "Created" && Executed.wroteAnObject(change),
       "output",
       Executed.byType(type)
     )
@@ -184,7 +195,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    */
   createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef> {
     return this.select(
-      (change) => change.idOperation === "Created" && change.outputState === "ObjectWrite",
+      (change) => change.idOperation === "Created" && Executed.wroteAnObject(change),
       "output",
       predicate
     )
@@ -195,8 +206,8 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
     return this.select(
       (change) =>
         change.idOperation === "None" &&
-        change.outputState === "ObjectWrite" &&
-        change.inputState === "Exists",
+        Executed.wroteAnObject(change) &&
+        (change.inputState === "Exists" || change.inputState === "Unknown"),
       "output",
       Executed.byType(type)
     )
@@ -232,6 +243,20 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    */
   wrapped(): ReadonlyArray<ChangedRef> {
     return this.select(Executed.isWrapped, "input")
+  }
+
+  /**
+   * Whether this change wrote an object, treating `Unknown` as "the envelope
+   * did not say".
+   *
+   * A node always reports the output state; a reduced envelope from a relay or
+   * a sponsor often reports nothing but the id and the id operation, and
+   * {@link Executed.fromPartial} leaves what it was not told as `Unknown`
+   * rather than inventing `ObjectWrite`. Reading `Unknown` as "not an object
+   * write" would make `created()` silently empty for exactly those envelopes.
+   */
+  private static wroteAnObject(change: ChangedObject): boolean {
+    return change.outputState === "ObjectWrite" || change.outputState === "Unknown"
   }
 
   private static isDeleted(change: ChangedObject): boolean {
@@ -279,6 +304,58 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
     const gas = this.effects.gasUsed
     return gas.computationCost + gas.storageCost - gas.storageRebate
   }
+
+  /**
+   * An `Executed` from the SDK's own `TransactionResult`, read with
+   * {@link EXECUTE_INCLUDE}.
+   *
+   * This is what `Tx.submit` uses, exported so a caller holding a result from
+   * somewhere else — `client.core.executeTransaction`, a sponsor's SDK call —
+   * can get the accessors without re-implementing the decode.
+   *
+   * Fails with: `ExecutionFailed` (the transaction applied and failed),
+   * `DecodeError` (the response does not carry the include set).
+   *
+   * @since 0.1.2
+   */
+  static readonly fromTransactionResult = (
+    result: SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
+  ): Effect.Effect<Executed, ExecutionFailed | DecodeError> => fromTransactionResult(result)
+
+  /**
+   * An `Executed` from a **reduced** execute envelope: what a relay, a sponsor
+   * or another service hands back, over JSON, after submitting on your behalf.
+   *
+   * Such an envelope is rarely the SDK's full include set. Everything optional
+   * is filled in with "the node did not say" rather than refused:
+   *
+   * - `changedObjects` entries need only `objectId` and `idOperation`; the
+   *   version, digest and owner on either side default to `null`, and
+   *   `outputState` defaults to `ObjectWrite` (`DoesNotExist` for a
+   *   `Deleted`), so {@link created} and {@link deleted} classify correctly
+   *   from the id operation alone.
+   * - `objectTypes` defaults to `{}`. **The type filters need it**:
+   *   `created(type)`, `mutated(type)` and `expectCreated(type)` can only
+   *   match a change whose type the envelope carried, so without
+   *   `objectTypes` they return nothing. `created()` with no argument, and
+   *   {@link createdWhere}, still list every created id.
+   * - `balanceChanges` and `events` default to `[]`, `checkpoint` and
+   *   `timestampMs` to `null`, `gasUsed` to zeros, and `effects.status` to
+   *   success.
+   * - **JSON spellings are accepted** where the SDK's types are not JSON:
+   *   `bcs` as base64 or as an array of byte values as well as a
+   *   `Uint8Array`, and every `u64` (versions, balances, gas, `checkpoint`)
+   *   as a number or a `bigint` as well as the decimal string the wire uses.
+   *
+   * An envelope with no usable digest, or whose values are the wrong shape
+   * rather than merely absent, fails: absence is filled in, nonsense is not.
+   *
+   * Fails with: `DecodeError`.
+   *
+   * @since 0.1.2
+   */
+  static readonly fromPartial = (envelope: unknown): Effect.Effect<Executed, DecodeError> =>
+    fromPartial(envelope)
 
   /**
    * The single object of this type the transaction created.
@@ -333,7 +410,7 @@ export const fromTransactionResult = Effect.fn("Executed.fromTransactionResult")
       timestampMs: transaction.timestampMs
     }
     const executed = yield* decodeExecuted(encoded).pipe(
-      Effect.mapError((error) => new DecodeError({ issue: error.message }))
+      Effect.mapError((error) => new DecodeError({ kind: "shape", issue: error.message }))
     )
     if (!transaction.status.success) {
       return yield* new ExecutionFailed({
@@ -348,3 +425,137 @@ export const fromTransactionResult = Effect.fn("Executed.fromTransactionResult")
     return executed
   }
 )
+
+/** The zero gas summary a reduced envelope gets when it reports no gas at all. */
+const NO_GAS = {
+  computationCost: "0",
+  storageCost: "0",
+  storageRebate: "0",
+  nonRefundableStorageFee: "0"
+} as const
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+
+const field = (value: unknown, key: string): unknown => (isRecord(value) ? value[key] : undefined)
+
+/** A `u64` in whatever spelling JSON left it in, as the decimal string the schemas take. */
+const u64String = (value: unknown, fallback?: string): string | undefined => {
+  if (typeof value === "string") return value
+  if (typeof value === "bigint") return value.toString()
+  if (typeof value === "number" && Number.isFinite(value)) return BigInt(Math.trunc(value)).toString()
+  return fallback
+}
+
+/** The same, for a field the schema allows to be `null`. */
+const u64OrNull = (value: unknown): string | null =>
+  value === undefined || value === null ? null : u64String(value) ?? null
+
+/**
+ * Event bytes in whatever spelling survived JSON: the bytes themselves, base64,
+ * or an array of byte values. An absent one is empty rather than a failure — a
+ * relay that reports events as JSON carries no BCS to give.
+ */
+const bytesOf = (value: unknown): Uint8Array => {
+  if (value instanceof Uint8Array) return value
+  if (typeof value === "string") {
+    try {
+      return fromBase64(value)
+    } catch {
+      return new Uint8Array()
+    }
+  }
+  if (Array.isArray(value) && value.every((byte) => typeof byte === "number")) {
+    return Uint8Array.from(value as ReadonlyArray<number>)
+  }
+  return new Uint8Array()
+}
+
+/** One changed object, with every field the envelope left out filled in as "not said". */
+const partialChange = (value: unknown): Record<string, unknown> => ({
+  objectId: field(value, "objectId"),
+  inputState: field(value, "inputState") ?? "Unknown",
+  inputVersion: u64OrNull(field(value, "inputVersion")),
+  inputDigest: field(value, "inputDigest") ?? null,
+  inputOwner: field(value, "inputOwner") ?? null,
+  outputState: field(value, "outputState") ?? "Unknown",
+  outputVersion: u64OrNull(field(value, "outputVersion")),
+  outputDigest: field(value, "outputDigest") ?? null,
+  outputOwner: field(value, "outputOwner") ?? null,
+  idOperation: field(value, "idOperation") ?? "Unknown"
+})
+
+const partialEvent = (value: unknown): Record<string, unknown> => {
+  const json = field(value, "json")
+  return {
+    packageId: field(value, "packageId"),
+    module: field(value, "module"),
+    sender: field(value, "sender"),
+    eventType: field(value, "eventType") ?? field(value, "type"),
+    // A relay that renders events as JSON carries no BCS; the bytes are empty
+    // and `json` is the whole of the event.
+    bcs: bytesOf(field(value, "bcs")),
+    ...(json === undefined ? {} : { json })
+  }
+}
+
+const partialBalanceChange = (value: unknown): Record<string, unknown> => ({
+  coinType: field(value, "coinType"),
+  address: field(value, "address") ?? field(value, "owner"),
+  amount: u64String(field(value, "amount"), "0")
+})
+
+const asArray = (value: unknown): ReadonlyArray<unknown> => (Array.isArray(value) ? value : [])
+
+/**
+ * The body of {@link Executed.fromPartial}: normalize what a reduced envelope
+ * carries into the encoded shape `Executed` decodes, then decode it.
+ */
+const fromPartial = (envelope: unknown): Effect.Effect<Executed, DecodeError> => {
+  const effects = field(envelope, "effects")
+  const digest = field(envelope, "digest") ?? field(effects, "transactionDigest")
+  const status = field(effects, "status") ?? field(envelope, "status")
+  const encoded = {
+    digest,
+    effects: {
+      version: field(effects, "version") ?? 2,
+      status: { success: field(status, "success") ?? true },
+      gasUsed: {
+        computationCost: u64String(field(field(effects, "gasUsed"), "computationCost"), NO_GAS.computationCost),
+        storageCost: u64String(field(field(effects, "gasUsed"), "storageCost"), NO_GAS.storageCost),
+        storageRebate: u64String(field(field(effects, "gasUsed"), "storageRebate"), NO_GAS.storageRebate),
+        nonRefundableStorageFee: u64String(
+          field(field(effects, "gasUsed"), "nonRefundableStorageFee"),
+          NO_GAS.nonRefundableStorageFee
+        )
+      },
+      transactionDigest: field(effects, "transactionDigest") ?? digest,
+      gasObject: field(effects, "gasObject") ?? null,
+      eventsDigest: field(effects, "eventsDigest") ?? null,
+      dependencies: asArray(field(effects, "dependencies")),
+      lamportVersion: u64OrNull(field(effects, "lamportVersion")),
+      changedObjects: asArray(field(effects, "changedObjects") ?? field(envelope, "changedObjects"))
+        .map(partialChange),
+      unchangedConsensusObjects: asArray(field(effects, "unchangedConsensusObjects")),
+      auxiliaryDataDigest: field(effects, "auxiliaryDataDigest") ?? null
+    },
+    events: asArray(field(envelope, "events")).map(partialEvent),
+    balanceChanges: asArray(field(envelope, "balanceChanges")).map(partialBalanceChange),
+    objectTypes: field(envelope, "objectTypes") ?? {},
+    checkpoint: u64OrNull(field(envelope, "checkpoint")),
+    timestampMs: (() => {
+      const value = field(envelope, "timestampMs")
+      if (value === undefined || value === null) return null
+      const asNumber = typeof value === "string" ? Number(value) : value
+      return typeof asNumber === "number" && Number.isFinite(asNumber) ? asNumber : null
+    })()
+  }
+  return decodeExecuted(encoded).pipe(
+    Effect.mapError((error) =>
+      new DecodeError({
+        kind: "shape",
+        issue: `this is not an execute envelope Executed can be built from: ${error.message}`
+      })
+    )
+  )
+}

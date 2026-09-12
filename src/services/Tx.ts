@@ -27,6 +27,7 @@ import {
   DateTime,
   Duration,
   Effect,
+  type Option,
   Schema
 } from "effect"
 import {
@@ -86,6 +87,7 @@ export type SubmitError =
   | NotApplied
   | SubmissionUnknown
   | JournalError
+  | TransportError
 
 /**
  * Everything {@link run} can fail with, as one name: {@link SubmitError} plus
@@ -99,8 +101,61 @@ export type RunError =
   | SubmitError
   | TransportError
 
-/** What one entry of `Tx.reconcileAll` settled to. */
-export type Reconciled = Executed | ExecutionFailed | NotApplied | SubmissionUnknown
+/**
+ * What one entry of `Tx.reconcileAll` settled to, as a tagged union.
+ *
+ * Every case carries **one** discriminator in the same place: `_tag` is
+ * `"Executed"`, `"ExecutionFailed"`, `"NotApplied"` or `"SubmissionUnknown"`,
+ * and the payload is `executed` for the first and `error` for the other three.
+ * Before 0.1.2 this was a bare union of an `Executed` (which has no `_tag`) and
+ * three errors (which do), so the only way to tell a success from a failure was
+ * `"_tag" in entry` — a shape nothing could `Schema.match` or serialize.
+ *
+ * @since 0.1.2
+ */
+export const Reconciled = Schema.TaggedUnion({
+  /** The transaction is on chain and succeeded. */
+  Executed: { executed: Executed },
+  /** The transaction is on chain and failed. Gas was charged. */
+  ExecutionFailed: { error: ExecutionFailed },
+  /** The transaction provably never applied and never will. */
+  NotApplied: { error: NotApplied },
+  /** The outcome is still not known; the bytes are in the error. */
+  SubmissionUnknown: { error: SubmissionUnknown }
+})
+/** One settled entry of `Tx.reconcileAll`. @since 0.1.2 */
+export type Reconciled = typeof Reconciled.Type
+
+/**
+ * The shape `Tx.reconcileAll` returned in 0.1.0 and 0.1.1: the four outcomes as
+ * a bare union, with the successful one carrying no discriminator at all.
+ *
+ * @deprecated Use {@link Reconciled}, whose cases all carry `_tag`. This name
+ * exists so a 0.1.1 consumer that spelled the old union in its own types still
+ * compiles.
+ */
+export type ReconciledOutcome = Executed | ExecutionFailed | NotApplied | SubmissionUnknown
+
+/**
+ * The transport statuses that mean **the node refused the request outright**,
+ * so the bytes were never executed and never will be by this send.
+ *
+ * gRPC `INVALID_ARGUMENT` (numerically `3`) is what a node answers when the
+ * submission itself is malformed: bytes that do not parse, or — the case this
+ * exists for — a sponsored transaction carrying only the sender's signature.
+ * That is not "the network was unreachable": the answer came *from* the node
+ * and it is final. Reconciling it would ask a second question whose answer is
+ * about some other transaction ("is this digest on chain?"), and against a
+ * scripted or lagging node that question can come back yes.
+ *
+ * Everything else that is not retryable is still `SubmissionUnknown`: an
+ * unrecognised status says nothing about whether the bytes reached a validator.
+ */
+const REFUSED_OUTRIGHT: ReadonlySet<string> = new Set(["INVALID_ARGUMENT", "3"])
+
+/** Whether a transport failure is the node refusing the submission outright. */
+const refusedOutright = (error: TransportError): boolean =>
+  !error.retryable && error.status !== undefined && REFUSED_OUTRIGHT.has(error.status)
 
 const decodeExpiration = Schema.decodeUnknownOption(TransactionExpiration)
 const decodeDigest = Schema.decodeUnknownEffect(Digest)
@@ -845,9 +900,16 @@ const awaitVisible = (
  * `Tx.reconcile`, which either finds the transaction, proves it never applied,
  * or says it does not know.
  *
- * `TransportError` never escapes: once bytes may have been sent, "the network
- * was unreachable" is not an answer a caller can act on, so it becomes
- * `SubmissionUnknown` carrying the signed bytes.
+ * `TransportError` almost never escapes: once bytes may have been sent, "the
+ * network was unreachable" is not an answer a caller can act on, so it becomes
+ * `SubmissionUnknown` carrying the signed bytes. **The one exception is a node
+ * that refused the request outright** — gRPC `INVALID_ARGUMENT`, which is what
+ * a validator answers for malformed bytes or for a sponsored transaction
+ * carrying one signature. That answer came from the node, it is final, and
+ * nothing was executed, so it is reported as the `TransportError` it is rather
+ * than reconciled: a reconcile would go on to ask "is this digest on chain?",
+ * a question about a transaction that was never sent, and a lagging or scripted
+ * node can answer it yes.
  *
  * `JournalError` can only come from the `Signed` write, before anything has
  * been sent. Once the network has answered, a journal write that fails is
@@ -858,7 +920,8 @@ const awaitVisible = (
  * Fails with: `ExecutionFailed` (applied on chain and failed; gas was charged),
  * `NotApplied` (provably never applied), `SubmissionUnknown` (the outcome is
  * not known and the bytes are in the error), `JournalError` (only before the
- * first send).
+ * first send), `TransportError` (only `INVALID_ARGUMENT`: the node refused the
+ * submission and nothing was executed).
  */
 export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui> = Effect.fn(
   "Tx.submit"
@@ -866,7 +929,7 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
   signed: Signed
 ): Effect.fn.Return<
   Executed,
-  ExecutionFailed | NotApplied | SubmissionUnknown | JournalError,
+  ExecutionFailed | NotApplied | SubmissionUnknown | JournalError | TransportError,
   Sui
 > {
   const sui = yield* Sui
@@ -910,8 +973,139 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
     yield* journalSettled(yield* failedEntry(failure))
     return yield* failure
   }
+  // The node refused the request outright — malformed bytes, a missing
+  // signature — so nothing was executed and asking again would only find out
+  // about some other transaction with that digest. Fail with what the node
+  // said.
+  if (refusedOutright(failure)) return yield* failure
   // Bytes may have reached the network: the only honest next step is to ask.
   return yield* reconcileSigned(signed, failure, attempts)
+})
+
+/**
+ * What a third party answers when it has submitted your bytes.
+ *
+ * Three shapes are understood, in this order: an SDK `TransactionResult` (the
+ * service ran `executeTransaction` and passed the whole thing on), a reduced
+ * execute envelope (anything with a `digest` or an `effects`, decoded through
+ * {@link Executed.fromPartial}), and a bare digest string. Anything else — a
+ * `void`, an acknowledgement with no digest — means "ask the chain", and
+ * `submitVia` reconciles by the digest it already has, which is the digest of
+ * the bytes it handed over.
+ *
+ * @since 0.1.2
+ */
+export type SubmitViaReply = unknown
+
+/** Everything {@link submitVia} can fail with, before the sender's own errors. */
+export type SubmitViaError =
+  | ExecutionFailed
+  | NotApplied
+  | SubmissionUnknown
+  | JournalError
+
+const executedOfReply = (
+  signed: Signed,
+  reply: SubmitViaReply
+): Effect.Effect<Executed | undefined, ExecutionFailed> => {
+  const none = Effect.sync(() => undefined)
+  if (reply === undefined || reply === null || typeof reply === "string") return none
+  const kind = (reply as { readonly $kind?: unknown }).$kind
+  if (kind === "Transaction" || kind === "FailedTransaction") {
+    return fromTransactionResult(reply as Parameters<typeof fromTransactionResult>[0]).pipe(
+      Effect.catchTag("DecodeError", () => none)
+    )
+  }
+  const record = reply as { readonly digest?: unknown; readonly effects?: unknown }
+  if (record.digest === undefined && record.effects === undefined) return none
+  return Executed.fromPartial(reply).pipe(
+    // A reply this cannot read is not a failure: the digest is known and the
+    // chain is the authority. Fall through to the reconcile.
+    Effect.catchTag("DecodeError", () => none),
+    Effect.map((executed) =>
+      executed !== undefined && executed.digest === signed.digest ? executed : undefined
+    )
+  )
+}
+
+/**
+ * Submits through **someone else** — a relay, a sponsorship service, a backend
+ * that holds the only key allowed to talk to the node — and keeps the journal
+ * and the evidence rules that `Tx.submit` would have kept.
+ *
+ * The bytes never reach `executeTransaction` here; `send` does whatever the
+ * service needs (an HTTP POST, a queue, another process) and answers with
+ * whatever the service returns. What this owns is everything around it:
+ *
+ * - a `Signed` journal entry is written **before** `send` is called, so a crash
+ *   between here and the service leaves the same record a direct submit leaves;
+ * - `send` is called **once**. A third party's submit is not known to be
+ *   idempotent and re-sending is not this function's decision;
+ * - the reply is turned into an `Executed` when it carries one (see
+ *   {@link SubmitViaReply}), and otherwise the chain is asked — by the digest
+ *   of the bytes that were handed over, which a co-signature does not change;
+ * - a failure from `send` is **ambiguous** unless it says otherwise, so it ends
+ *   in `Tx.reconcile` with the full evidence rules: the ordered expiry check,
+ *   the chain-identity guard, the versioned consumer check. A sender error that
+ *   **declares** `outcome: "not_applied"` on the instance — a 400 from the
+ *   service, a refusal before anything went out — is taken at its word and
+ *   fails straight through without spending a reconcile. A `TransportError` is
+ *   not that: the taxonomy calls it `not_applied`, but a transport failure
+ *   *talking to the relay* is exactly the ambiguous case, so it reconciles;
+ * - every terminal answer is journalled, exactly as `Tx.submit` journals it.
+ *
+ * Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown` (carrying
+ * the signed bytes, with the sender's failure as its `cause`), `JournalError`
+ * (only from the write before `send`), and `E` — whatever `send` fails with —
+ * when that error declares `outcome: "not_applied"`.
+ *
+ * @since 0.1.2
+ */
+export const submitVia = Effect.fn("Tx.submitVia")(function*<E, R>(
+  signed: Signed,
+  send: (
+    bytes: Uint8Array,
+    signatures: ReadonlyArray<Signature>
+  ) => Effect.Effect<SubmitViaReply, E, R>
+): Effect.fn.Return<Executed, SubmitViaError | E, Sui | R> {
+  yield* journalSigned(signed)
+  const sent = yield* Effect.result(send(signed.bytes, signed.signatures))
+  if (sent._tag === "Success") {
+    const decoded = yield* Effect.result(executedOfReply(signed, sent.success))
+    if (decoded._tag === "Failure") {
+      // The service passed on a transaction that applied and failed. Gas was
+      // charged; that is terminal and it goes in the journal as such.
+      yield* journalSettled(yield* failedEntry(decoded.failure))
+      return yield* decoded.failure
+    }
+    if (decoded.success !== undefined) {
+      yield* journalSettled(yield* executedEntry(decoded.success))
+      return decoded.success
+    }
+    return yield* reconcileSigned(
+      signed,
+      new TransportError({
+        method: "submitVia",
+        retryable: false,
+        cause: "the service answered without an execute envelope; asking the chain"
+      }),
+      1
+    )
+  }
+  const failure = sent.failure
+  // A **declared** `outcome` field, not `SuiError.outcome`'s answer: the
+  // taxonomy calls a `TransportError` `not_applied`, and a transport failure
+  // talking to the relay is the ambiguous case this exists for. Only an error
+  // whose own instance says `outcome: "not_applied"` — the refusal a service
+  // returns before it sends anything — skips the reconcile.
+  if ((failure as { readonly outcome?: unknown })?.outcome === "not_applied") {
+    return yield* Effect.fail(failure)
+  }
+  return yield* reconcileSigned(
+    signed,
+    new TransportError({ method: "submitVia", retryable: false, cause: failure }),
+    1
+  )
 })
 
 /** `reconcile` plus the journal bookkeeping `submit` owes after it. */
@@ -1413,6 +1607,14 @@ const assertSponsor = (
  * explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
  * two parties cannot both sign in one process.
  *
+ * **`onSigned` is the hook between signing and sending.** A program with its
+ * own record to keep — a batch row, an outbox, an idempotency key — has to
+ * write the digest before the first send, and that used to mean giving up
+ * `Tx.run` and reassembling `withSenderLock(build → sign → record → submit)` by
+ * hand. Pass `onSigned` instead: it runs inside the sender lock, after the last
+ * signature and before `Tx.submit`'s first `executeTransaction`, and failing it
+ * fails the run with nothing sent.
+ *
  * Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`,
  * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`,
  * `TransportError` (from the build reads; once bytes are sent, transport
@@ -1428,6 +1630,28 @@ export const run = Effect.fn("Tx.run")(function*(
      * the bytes name a gas owner that is not the sender.
      */
     readonly sponsor?: Signer
+    /**
+     * Called with the signed bytes **after every signature is on them and
+     * before the first `executeTransaction`**, which is the one moment a
+     * consumer's own record has to be written: the digest is final from here
+     * on, and anything that happens next may have reached the network.
+     *
+     * `Tx.submit` already writes its `Signed` journal entry at this point; this
+     * is for the record the journal does not hold — a domain row joining the
+     * digest to a batch, an outbox, a log line an operator greps. It runs
+     * inside the sender lock, so it is ordered with the submission it belongs
+     * to.
+     *
+     * Failing it fails the run **before anything is sent**, which is why its
+     * error is a `JournalError`: that is the taxonomy's "the record could not
+     * be written and nothing has gone out yet", it is already in `Tx.run`'s
+     * union, and it is `not_applied`, so the documented retry idiom is correct.
+     * Map your own persistence failure into it
+     * (`Effect.mapError((cause) => new JournalError({ cause }))`).
+     *
+     * @since 0.1.2
+     */
+    readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>
   }
 ): Effect.fn.Return<
   Executed,
@@ -1477,6 +1701,8 @@ export const run = Effect.fn("Tx.run")(function*(
       const sponsor = yield* assertSponsor(required, opts.sponsor)
       signed = yield* cosign(signed, sponsor)
     }
+    // Every signature is on: the digest is final and nothing has been sent.
+    if (opts.onSigned !== undefined) yield* opts.onSigned(signed)
     return yield* submit(signed)
   })
 
@@ -1489,8 +1715,39 @@ export const run = Effect.fn("Tx.run")(function*(
 })
 
 /**
+ * What the journal recorded for one digest, if anything.
+ *
+ * `Tx.reconcileAll` returns **only the entries that were still unresolved**,
+ * because those are the ones it had work to do about; a transaction that had
+ * already settled — executed, failed, or proven never applied — is not in its
+ * answer and never will be. This is how to ask about one of those: the entry is
+ * `Executed`, `Failed` or `NotApplied` for a settled digest, `Signed` or
+ * `Unknown` for one still in flight, and `None` for a digest this journal has
+ * never seen (including every digest at all, when the journal is the in-memory
+ * default and the process restarted).
+ *
+ * It is exactly `(yield* Journal).get(digest)`, named so that the recovery path
+ * does not have to reach for the reference.
+ *
+ * Fails with: `JournalError`.
+ *
+ * @since 0.1.2
+ */
+export const recorded = Effect.fn("Tx.recorded")(function*(
+  digest: Digest
+): Effect.fn.Return<Option.Option<JournalEntry>, JournalError> {
+  const journal = yield* Journal
+  return yield* journal.get(digest)
+})
+
+/**
  * Settles every unresolved entry in the journal: the explicit startup call a
  * long-lived application makes after building a durable `Journal`.
+ *
+ * **Only unresolved entries come back.** `Signed` and `Unknown` are the tags
+ * that still need an answer; a digest that already settled is not in the
+ * journal's unresolved index and is not in this array. Ask about one of those
+ * with {@link recorded}.
  *
  * Nothing here fails per entry: each one settles to an `Executed`, an
  * `ExecutionFailed`, a `NotApplied` or a `SubmissionUnknown`, in the order the
@@ -1521,21 +1778,25 @@ export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(): Effect.fn.
     const result = yield* Effect.result(reconcile(entry.signed))
     if (result._tag === "Success") {
       yield* journalSettled(yield* executedEntry(result.success))
-      settled.push(result.success)
+      settled.push(
+        Reconciled.cases.Executed.make({ _tag: "Executed", executed: result.success })
+      )
       continue
     }
     const failure = result.failure
     switch (failure._tag) {
       case "ExecutionFailed":
         yield* journalSettled(yield* failedEntry(failure))
-        settled.push(failure)
+        settled.push(
+          Reconciled.cases.ExecutionFailed.make({ _tag: "ExecutionFailed", error: failure })
+        )
         break
       case "NotApplied":
         // Terminal, so the entry leaves the unresolved index: without this a
         // durable journal would hold a proven-dead submission forever and
         // `onUnresolved: "fail"` would refuse to build for the life of it.
         yield* journalSettled(yield* notAppliedEntry(failure))
-        settled.push(failure)
+        settled.push(Reconciled.cases.NotApplied.make({ _tag: "NotApplied", error: failure }))
         break
       default: {
         // `Tx.reconcile` converts every recovery read failure into
@@ -1554,7 +1815,12 @@ export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(): Effect.fn.
         yield* journalSettled(
           yield* unknownEntry(entry.signed, SuiError.describe(failure), attempts)
         )
-        settled.push(unresolvedOutcome)
+        settled.push(
+          Reconciled.cases.SubmissionUnknown.make({
+            _tag: "SubmissionUnknown",
+            error: unresolvedOutcome
+          })
+        )
         break
       }
     }
@@ -1573,7 +1839,9 @@ export const Tx = {
   cosign,
   sponsored,
   submit,
+  submitVia,
   reconcile,
+  recorded,
   run,
   reconcileAll
 } as const

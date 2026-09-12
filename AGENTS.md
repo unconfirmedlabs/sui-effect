@@ -28,7 +28,9 @@ the work plan. Where this file and the spec disagree, fix this file.
   await its `Exit` and exit.
 - No `any`. No `unknown` in an error channel. No `console.log` in `src/`. The
   one `console.warn` is `SuiCore.mapSdkError`'s duplicate-SDK warning, which
-  fires at most once per process and is documented where it lives.
+  fires at most once per process and is documented where it lives. **Nothing in
+  `src/` writes to stderr otherwise** — `test/release-0-1-2.test.ts` captures it
+  around a full `Tx.run` on the fake and asserts it is empty.
 - **A branded id from a shorthand spelling** comes from `SuiAddress.normalize`
   / `ObjectId.normalize` (decode, then brand); `.make` validates without
   decoding and is for the padded form only. Neither is for a value that came
@@ -73,7 +75,7 @@ the work plan. Where this file and the spec disagree, fix this file.
 | Tier | What it is | When to use it |
 |---|---|---|
 | `SuiCore` | A 1:1 Effect wrap of `ClientWithCoreApi`. One member per `SuiClientTypes.TransportMethods` key plus `getObject`, `getDynamicObjectField`, `waitForTransaction`, `signAndExecuteTransaction` and `use`. `Include` generics preserved. | Reaching a field or method `Sui` does not expose, and inside extension implementations. |
-| `Sui` | The opinionated tier over `SuiCore`: fixed include sets, decoded BCS content, `Option` where absence is normal, chunked and integrity-checked batch reads (`getObjects` per-item `Result`, `getObjectsOrFail` first-error-wins), `Stream` pagination, one sender lock. | Almost all application and extension code. |
+| `Sui` | The opinionated tier over `SuiCore`: fixed include sets, decoded BCS content, `Option` where absence is normal, chunked and integrity-checked batch reads (`getObjects` per-item `Result`, `getObjectsStrict` first-error-wins — `getObjectsOrFail` is the deprecated alias), `Stream` pagination, one sender lock. | Almost all application and extension code. |
 
 Reads go through `Sui`; writes go through `Tx`. An extension never calls
 `SuiCore.executeTransaction` directly. `Sui` exposes the `SuiCore` it was built
@@ -85,7 +87,7 @@ and nothing else.
 | Name | What it is |
 |---|---|
 | `Signer` | A credential as a **value**, never a service: `{ address, scheme, signTransaction, signPersonalMessage }`. One process may hold two. Secret material never reaches the value. |
-| `Tx.build/sign/cosign/sponsored/submit/reconcile/run/reconcileAll` | The lifecycle as functions, each with a closed error union, all `R = Sui`. |
+| `Tx.build/sign/cosign/sponsored/submit/submitVia/reconcile/recorded/run/reconcileAll` | The lifecycle as functions, each with a closed error union, all `R = Sui`. `submitVia` is `submit` for a submission somebody else makes; `recorded(digest)` reads one journal entry, which is what `reconcileAll` — unresolved entries only — cannot answer. `Tx.run` takes `onSigned`, the hook between the last signature and the first send. |
 | `SubmitConfig` | A `Context.Reference` holding expiration policy, the optional `validFor` wall-clock bound, the gas-budget ceiling, `preflight`, the sender lock, the resubmit schedule, attempts, timeout and expiry margin, plus `expiryEvidence`, `reconcileRecheck`, `awaitVisibility`, `visibilityTimeout` and `nonce`. |
 | `Journal` | A `Context.Reference` with an in-memory default. `@unconfirmed/sui-effect/journal` swaps in a durable one over `KeyValueStore`; `Tx.reconcileAll()` is the explicit startup call. |
 | `Script` | `{ sui, core, signer, network }` plus `Script.run` and `Script.exitCode`. `ScriptReadOnly` is the signer-less variant, a separate key on purpose. |
@@ -105,7 +107,12 @@ copyable package every block of that guide is quoted from, and
 `Tx.submit` journals `Signed` before the first execute, re-sends the identical
 bytes (never a rebuild) on a retryable `TransportError` or a timeout, and
 reconciles when the retries run out. A `TransportError` never escapes once bytes
-may have been sent: it becomes `SubmissionUnknown`, which carries them.
+may have been sent: it becomes `SubmissionUnknown`, which carries them. **The
+one exception is a gRPC `INVALID_ARGUMENT`** (`REFUSED_OUTRIGHT` in `Tx.ts`):
+the node refused the request, nothing executed, and reconciling would ask
+whether a never-sent transaction is on chain — a question a lagging or scripted
+node can answer yes. That error escapes as itself, which is why `SubmitError`
+includes `TransportError`.
 `JournalError` escapes only from the `Signed` write, before anything is sent;
 after the network has answered, a failed journal write is logged and the answer
 stands.
@@ -157,7 +164,7 @@ Every failure is one flat tag; there is no error inheritance.
 | `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | The three `ObjectError.reason` values. |
 | `TransactionNotFound` | No transaction with that digest is known. |
 | `NetworkMismatch` | The node is on another chain than the layer was built for. |
-| `DecodeError` | BCS content or a schema boundary did not decode. |
+| `DecodeError` | BCS content or a schema boundary did not decode. `kind` is `"type"` (tag mismatch, nothing parsed), `"bytes"` (BCS parse or trailing bytes) or `"shape"` (a domain schema). Every producer sets it; consumers branch on it, never on `issue`. |
 | `SimulationFailed` | Simulation reported an execution failure. No gas charged. |
 | `ExecutionFailed` | Applied on chain and failed. Gas charged. |
 | `SubmissionUnknown` | Bytes may have been sent; the outcome is unknown. Carries the signed bytes, unless it came from reconciling a bare digest. |
@@ -170,8 +177,13 @@ Every failure is one flat tag; there is no error inheritance.
 `"not_applied"` for every other tag in the taxonomy, and `"unknown"` for
 anything that is neither one of those tags nor declares an `outcome`.
 `Script.exitCode` exits 1 for that last case rather than 3. An extension error
-may declare its own `outcome`, and should. `SuiError.isRetryable`, `SuiError.describe` (one actionable line) and
-`SuiError.toJson` round it out — and `toJson` adds `outcome` from the instance
+may declare its own `outcome`, and should. `SuiError.outcome` also takes `{ phase: "pre-submit" }`, which changes only the
+unclassified answer (`"not_applied"` instead of `"unknown"`, true by
+construction before a send). `SuiError.isRetryable`, `SuiError.isTaxonomy`,
+`SuiError.describe` (one actionable line, and total over foreign errors) and
+`SuiError.toJson` round it out. **Every error class without a `message` schema
+field carries `override get message()` returning `describe(this)`**, so
+`.message` is never empty; it is a getter, so it stays out of the encoding — and `toJson` adds `outcome` from the instance
 when the error declares one, which is almost always a class field rather than a
 schema field.
 
@@ -186,8 +198,11 @@ by default and `extra` for any other dependency the layer requires) and `SuiTest
 an extension's tests need. Call recording is reached through `SuiTest.calls`,
 not off the fake handle. The fake serves in-memory objects with
 BCS content, the Clock object `0x6`, and scripted outcomes
-(`FakeOutcome.succeed`, `failWith`, `transportError`, `notFound`, `timeoutThen`)
-for simulate, execute, `getTransaction` — which is also what drives every
+(`FakeOutcome.succeed`, `failWith` — which takes the SDK's wire `ExecutionError`
+**or** sui-effect's decoded `ExecutionReason`, encoding the second and throwing
+on anything else — `transportError`, `notFound`, `timeoutThen`)
+for simulate, execute, `getObject` (read-failure injection), `getTransaction` —
+which is also what drives every
 `waitForTransaction` outcome — `coinMetadata`, and the resolver's budget simulation
 (`buildSimulate`, which is how a test makes `Tx.build` fail with
 `SimulationFailed`). It records every call so a test can
@@ -214,6 +229,14 @@ rather than failing a `Simulation` decode.
 The fake enforces the invariants the lifecycle depends on: a known digest
 executes idempotently, gas selection excludes object inputs, the coin set
 evolves (deleted, mutated with `FakeChange.balance`, gas-bumped, created), a
-submission with fewer signatures than the bytes name signers is refused, and a
+submission whose signatures do not cover the addresses the bytes name — by count
+**and** by the addresses recovered from the signatures — is refused the way a
+validator refuses it (an `RpcError` carrying `INVALID_ARGUMENT`, so `Tx.submit`
+fails fast instead of reconciling into a scripted success), and a
 version history is served through `tryGetPastObject`, which is what
-`SuiCore.getObjectAtVersion` reads.
+`SuiCore.getObjectAtVersion` reads. The resolver's budget simulate is recorded
+as a `simulateTransaction` call (`resolver: true`) and answered by
+`FakeScript.buildSimulate` when there is one and by the ordered `simulate`
+script otherwise, so "building always simulates" is observable on the harness.
+`getBalance` and `listBalances` are keyed by owner and coin type; a `FakeBalance`
+with no `owner` answers for everyone.

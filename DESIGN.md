@@ -76,7 +76,7 @@ getObjectOption<S>(id, opts?):                                        // not fou
   Effect<Option<SuiObject<S>>, ObjectUnavailable | DecodeError | TransportError>
 getObjects<S>(ids, opts?):                                            // ids normalized and deduped, chunked by 50, response integrity checked
   Effect<ReadonlyArray<Result<SuiObject<S>, ObjectNotFound | ObjectDeleted | ObjectUnavailable | DecodeError>>, TransportError>
-getObjectsOrFail<S>(ids, opts?):                                      // the fail-first variant: the first item error is the failure
+getObjectsStrict<S>(ids, opts?):                                      // the fail-first variant: the first item error is the failure (0.1.0-0.1.1: getObjectsOrFail, kept as a deprecated alias)
   Effect<ReadonlyArray<SuiObject<S>>, ObjectNotFound | ObjectDeleted | ObjectUnavailable | DecodeError | TransportError>
 getBalance(owner: SuiAddress, coinType?: CoinType): Effect<Balance, TransportError>
 getDynamicFieldOption(parent: ObjectId, name: DynamicFieldName): Effect<Option<DynamicField>, TransportError>
@@ -136,13 +136,22 @@ Tx.build(input: Recipe | Transaction, opts: { sender: SuiAddress; gasOwner?: Sui
 Tx.sign(built: Built, signer: Signer):     Effect<Signed, SigningError>
 Tx.cosign(signed: Signed, signer: Signer): Effect<Signed, SigningError>
 Tx.sponsored(opts: { sender; gasOwner }): (recipe: Recipe) => Recipe      // setSender, setGasOwner, setGasPayment([])
-Tx.submit(signed: Signed):                 Effect<Executed, ExecutionFailed | NotApplied | SubmissionUnknown | JournalError>
+Tx.submit(signed: Signed):                 Effect<Executed, ExecutionFailed | NotApplied | SubmissionUnknown | JournalError | TransportError>
+Tx.submitVia<E, R>(signed: Signed, send: (bytes, signatures) => Effect<unknown, E, R>):   // 0.1.2
+  Effect<Executed, ExecutionFailed | NotApplied | SubmissionUnknown | JournalError | E, Sui | R>
 Tx.reconcile(input: Digest | Signed | SubmissionUnknown):
   Effect<Executed, ExecutionFailed | NotApplied | SubmissionUnknown | TransportError>
-Tx.run(recipe: Recipe | Transaction, opts: { signer: Signer; gasOwner?: SuiAddress; sponsor?: Signer }):
+Tx.recorded(digest: Digest): Effect<Option<JournalEntry>, JournalError>                  // 0.1.2
+Tx.run(recipe: Recipe | Transaction, opts: { signer: Signer; gasOwner?: SuiAddress; sponsor?: Signer; onSigned?: (signed: Signed) => Effect<void, JournalError> }):
   Effect<Executed, BuildError | SimulationFailed | PolicyDenied | SigningError | ExecutionFailed | NotApplied | SubmissionUnknown | JournalError | TransportError>
-Tx.reconcileAll(): Effect<ReadonlyArray<Executed | ExecutionFailed | NotApplied | SubmissionUnknown>, JournalError | TransportError>
+Tx.reconcileAll(): Effect<ReadonlyArray<Reconciled>, JournalError | TransportError>       // Reconciled is a Schema.TaggedUnion since 0.1.2
 ```
+
+`Reconciled` is `{ _tag: "Executed", executed } | { _tag: "ExecutionFailed" | "NotApplied" | "SubmissionUnknown", error }`: one discriminator in one place, which the 0.1.0 shape (a bare `Executed` beside three tagged errors) did not have. `reconcileAll` answers only for entries that were unresolved; `Tx.recorded` is how a caller asks about one that already settled.
+
+`submit` carries `TransportError` for exactly one status: gRPC `INVALID_ARGUMENT`, the node refusing the request outright, where nothing was executed and reconciling would ask whether a never-sent transaction is on chain. Every other transport failure after the bytes may have gone out is still `SubmissionUnknown`.
+
+`submitVia` is `submit` for a submission a third party makes: the `Signed` journal entry before the call, one call, the reply decoded into an `Executed` when it carries one, and `reconcile`'s evidence rules on an ambiguous failure. A `send` error whose instance declares `outcome: "not_applied"` fails through without a reconcile.
 
 `submit` and `run` carry `NotApplied` because `submit` runs `reconcile` when its retries are exhausted, and proving that a transaction never applied is one of the three answers `reconcile` can give. `run` carries `TransportError` because `build` does: reads before the bytes exist can fail the ordinary way. Once bytes may have been sent, no `TransportError` escapes.
 
@@ -194,7 +203,7 @@ Interface: `put(entry)`, `get(digest)`, `listUnresolved`. The memory default kee
 
 **Single writer per store prefix, and it is a limitation, not a guarantee.** The `put` semaphore is module-level, keyed by the store prefix, so two journal instances built in one process share it. Two *processes* over one store still race: `KeyValueStore` has no compare-and-set, so there is nothing to build a cross-process lock on. Run one writer per prefix; a storage-level lock is deferred (§15).
 
-`@unconfirmed/sui-effect/journal` provides `layerKeyValueStore({ onUnresolved: "fail" | "ignore" }): Layer<never, JournalError, KeyValueStore>` and `makeKeyValueStore(store)` as module-level functions, and re-exports the unchanged `Journal` reference. They are not statics on `Journal`: attaching them would mean mutating the one shared reference object at import time, which a package marked `sideEffects: false` is entitled to have dropped. `KeyValueStore` has no key enumeration, so the journal keeps its own index under one key: the digests that are still unresolved, rewritten whenever an entry is put. Layer build does no network work beyond listing entries; an application that wants to reconcile at startup calls `Tx.reconcileAll: Effect<ReadonlyArray<Executed | NotApplied | SubmissionUnknown>, JournalError | TransportError, Sui | Journal>` explicitly. This keeps the layer dependency direction simple and keeps network calls out of layer construction.
+`@unconfirmed/sui-effect/journal` provides `layerKeyValueStore({ onUnresolved: "fail" | "ignore" }): Layer<never, JournalError, KeyValueStore>` and `makeKeyValueStore(store)` as module-level functions, and re-exports the unchanged `Journal` reference. They are not statics on `Journal`: attaching them would mean mutating the one shared reference object at import time, which a package marked `sideEffects: false` is entitled to have dropped. `KeyValueStore` has no key enumeration, so the journal keeps its own index under one key: the digests that are still unresolved, rewritten whenever an entry is put. Layer build does no network work beyond listing entries; an application that wants to reconcile at startup calls `Tx.reconcileAll: Effect<ReadonlyArray<Reconciled>, JournalError | TransportError, Sui | Journal>` explicitly. This keeps the layer dependency direction simple and keeps network calls out of layer construction.
 
 ## 9. `JournalEntry` (`Schema.TaggedUnion`)
 
@@ -210,7 +219,7 @@ All `Schema.TaggedError` so they serialize. Flat tags, no inheritance.
 | `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | `objectId`, `version?` (the three `ObjectError.reason` values) |
 | `TransactionNotFound` | `digest` |
 | `NetworkMismatch` | `expected`, `actual` |
-| `DecodeError` | `objectId?`, `expectedType?`, `issue` |
+| `DecodeError` | `objectId?`, `expectedType?`, `kind: "type" \| "bytes" \| "shape"`, `issue` |
 | `SimulationFailed` | `reason: ExecutionReason`, `message` |
 | `ExecutionFailed` | `digest`, `reason: ExecutionReason`, `command?`, `effects` |
 | `SubmissionUnknown` | `digest`, `signed?`, `cause` (absent only when `Tx.reconcile` was given a bare digest, so there are no bytes to carry) |

@@ -199,6 +199,18 @@ const scriptSimulate = (
 ): Effect.Effect<void, never, SuiCoreFake> =>
   withFake((fake) => fake.setOutcomes("simulate", outcomes))
 
+/**
+ * The same for `getObject`, which is how a test injects a transport failure or
+ * a missing object into a **read**. An empty script (the default) means every
+ * read is served from the object map. Never fails.
+ *
+ * @since 0.1.2
+ */
+const scriptGetObject = (
+  outcomes: ReadonlyArray<FakeOutcome>
+): Effect.Effect<void, never, SuiCoreFake> =>
+  withFake((fake) => fake.setOutcomes("getObject", outcomes))
+
 /** The same for `getTransaction`, which is what `Tx.reconcile` asks. Never fails. */
 const scriptGetTransaction = (
   outcomes: ReadonlyArray<FakeOutcome>
@@ -253,5 +265,6 @@ export const SuiTest = {
   scriptExecute,
   scriptSimulate,
   scriptGetTransaction,
+  scriptGetObject,
   calls
 } as const

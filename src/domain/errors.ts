@@ -5,7 +5,7 @@
  *
  * @since 0.1.0
  */
-import { Result, Schema } from "effect"
+import { Effect, Result, Schema } from "effect"
 import {
   Digest,
   ExecutionReason,
@@ -76,6 +76,11 @@ export class TransportError extends Schema.TaggedError<TransportError>()("Transp
       cause
     })
   }
+
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
 }
 
 /**
@@ -129,38 +134,118 @@ export const classifyTransportCause = (
 export class ObjectNotFound extends Schema.TaggedError<ObjectNotFound>()("ObjectNotFound", {
   objectId: ObjectId,
   version: Schema.optional(Version)
-}) {}
+}) {
+  /**
+   * The one actionable line `SuiError.describe` produces for this error.
+   *
+   * `Schema.TaggedError` gives every class the `Error` constructor and no
+   * message of its own, so `error.message` was the empty string — and a
+   * consumer that surfaces `.message` (a log line, a UI, another library's
+   * error formatter) showed nothing at all. A getter rather than a schema
+   * field, so it is always in step with `describe`, costs nothing to
+   * construct, and stays out of `SuiError.toJson`'s encoding.
+   */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /** The object existed and has been deleted or wrapped. */
 export class ObjectDeleted extends Schema.TaggedError<ObjectDeleted>()("ObjectDeleted", {
   objectId: ObjectId,
   version: Schema.optional(Version)
-}) {}
+}) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /** The node could not say what happened to the object (`ObjectError.reason: "unknown"`). */
 export class ObjectUnavailable extends Schema.TaggedError<ObjectUnavailable>()(
   "ObjectUnavailable",
   { objectId: ObjectId, version: Schema.optional(Version) }
-) {}
+) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /** No transaction with this digest is known to the node. */
 export class TransactionNotFound extends Schema.TaggedError<TransactionNotFound>()(
   "TransactionNotFound",
   { digest: Digest }
-) {}
+) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /** The chain identifier the node reported is not the one the layer was built for. */
 export class NetworkMismatch extends Schema.TaggedError<NetworkMismatch>()("NetworkMismatch", {
   expected: Schema.String,
   actual: Schema.String
-}) {}
+}) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
-/** BCS content or a schema boundary did not decode. */
+/**
+ * Which of the three things that can go wrong at a decode boundary went wrong.
+ *
+ * - `"type"`: the object, the field or the event **is not of the expected Move
+ *   type**. The bytes were never parsed. This is the one a caller answers with
+ *   "that is not one of mine" — a 404 for a foreign object, a `filter` over a
+ *   heterogeneous list — and the one it is safe to swallow.
+ * - `"bytes"`: the type matched and the **BCS parse failed**, or left trailing
+ *   bytes. Either the layout this package was built with is not the layout the
+ *   package on chain writes, or the object is corrupt. Never safe to swallow.
+ * - `"shape"`: a **domain schema** refused a value that was already parsed or
+ *   that came from the node as JSON — a missing field in a node response, a
+ *   number that is not a timestamp, a simulation with no such command. A bug
+ *   here is in this library, the node, or the caller's expectations.
+ *
+ * Branch on this, never on {@link DecodeError}'s `issue`: `issue` is a human
+ * sentence and its wording changes between releases.
+ *
+ * @since 0.1.2
+ */
+export const DecodeKind = Schema.Literals(["type", "bytes", "shape"])
+/** The three decode failures {@link DecodeKind} names. */
+export type DecodeKind = typeof DecodeKind.Type
+
+/**
+ * BCS content or a schema boundary did not decode.
+ *
+ * `kind` says which of the three (`"type"`, `"bytes"`, `"shape"`) and is what a
+ * consumer branches on; `issue` is the sentence for a human and is not stable.
+ * It defaults to `"shape"` when neither a constructor nor an encoded value
+ * carries one, so an extension that builds a `DecodeError` with no `kind` still
+ * compiles and still answers the question conservatively.
+ */
 export class DecodeError extends Schema.TaggedError<DecodeError>()("DecodeError", {
   objectId: Schema.optional(ObjectId),
   expectedType: Schema.optional(Schema.String),
+  /**
+   * Which boundary failed. See {@link DecodeKind}.
+   *
+   * @since 0.1.2
+   */
+  kind: DecodeKind.pipe(
+    Schema.withDecodingDefaultKey(Effect.succeed("shape" as const)),
+    Schema.withConstructorDefault(Effect.succeed("shape" as const))
+  ),
   issue: Schema.String
-}) {}
+}) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /** Simulation reported an execution failure. No gas was charged. */
 export class SimulationFailed extends Schema.TaggedError<SimulationFailed>()("SimulationFailed", {
@@ -174,7 +259,12 @@ export class ExecutionFailed extends Schema.TaggedError<ExecutionFailed>()("Exec
   reason: ExecutionReason,
   command: Schema.optional(Schema.Number),
   effects: TransactionEffects
-}) {}
+}) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /**
  * Bytes may have reached the network and the outcome is unknown. Carries the
@@ -183,7 +273,12 @@ export class ExecutionFailed extends Schema.TaggedError<ExecutionFailed>()("Exec
 export class SubmissionUnknown extends Schema.TaggedError<SubmissionUnknown>()(
   "SubmissionUnknown",
   { digest: Digest, signed: Schema.optional(SignedTransaction), cause: Schema.Defect() }
-) {}
+) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /**
  * The transaction provably cannot have been applied, and never will be.
@@ -197,12 +292,22 @@ export class SubmissionUnknown extends Schema.TaggedError<SubmissionUnknown>()(
 export class NotApplied extends Schema.TaggedError<NotApplied>()("NotApplied", {
   digest: Digest,
   evidence: NotAppliedEvidence
-}) {}
+}) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /** A signer refused or failed to produce a signature. */
 export class SigningError extends Schema.TaggedError<SigningError>()("SigningError", {
   cause: Schema.Defect()
-}) {}
+}) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /** The transaction could not be built into bytes. */
 export class BuildError extends Schema.TaggedError<BuildError>()("BuildError", {
@@ -219,7 +324,12 @@ export class PolicyDenied extends Schema.TaggedError<PolicyDenied>()("PolicyDeni
 /** The submission journal could not be read or written. */
 export class JournalError extends Schema.TaggedError<JournalError>()("JournalError", {
   cause: Schema.Defect()
-}) {}
+}) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /**
  * The effects of an applied transaction did not contain what the caller
@@ -234,7 +344,12 @@ export class JournalError extends Schema.TaggedError<JournalError>()("JournalErr
 export class UnexpectedEffects extends Schema.TaggedError<UnexpectedEffects>()(
   "UnexpectedEffects",
   { digest: Digest, expected: Schema.String, found: Schema.Array(ObjectId) }
-) {}
+) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /**
  * The GraphQL endpoint an extension needs is not usable: none was configured,
@@ -252,7 +367,12 @@ export class UnexpectedEffects extends Schema.TaggedError<UnexpectedEffects>()(
 export class GraphQLUnavailable extends Schema.TaggedError<GraphQLUnavailable>()(
   "GraphQLUnavailable",
   { method: Schema.String, reason: Schema.String }
-) {}
+) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /**
  * A synchronous member of a Promise-faced extension was called before its
@@ -271,7 +391,12 @@ export class GraphQLUnavailable extends Schema.TaggedError<GraphQLUnavailable>()
 export class ExtensionNotReady extends Schema.TaggedError<ExtensionNotReady>()(
   "ExtensionNotReady",
   { extension: Schema.String, member: Schema.String }
-) {}
+) {
+  /** The one actionable line `SuiError.describe` produces for this error. */
+  override get message(): string {
+    return describe(this)
+  }
+}
 
 /** Every failure sui-effect can produce. */
 export type SuiError =
@@ -321,6 +446,21 @@ export const SuiErrorSchema = Schema.Union([
  * or a wrapper script acts on.
  */
 export type Outcome = "applied" | "not_applied" | "unknown"
+
+/**
+ * Where in the lifecycle a failure was caught, which is the only thing that
+ * can classify an error the taxonomy does not own.
+ *
+ * `"post-submit"` (the default, and the 0.1.1 behaviour) is "bytes may have
+ * gone out": a tag nobody here recognises proves nothing, so the answer is
+ * `"unknown"`. `"pre-submit"` is a failure caught while **building, simulating
+ * or signing** — an extension's own `PriceTooLow`, a validation error from the
+ * caller's code — where nothing has been sent by construction and the honest
+ * answer is `"not_applied"`.
+ *
+ * @since 0.1.2
+ */
+export type OutcomePhase = "pre-submit" | "post-submit"
 
 /**
  * An extension error may declare its own `outcome`, and `SuiError.outcome` and
@@ -376,11 +516,27 @@ const TAXONOMY_TAGS: ReadonlySet<string> = new Set([
  * applied, and answering `"not_applied"` for it would tell a retry idiom to
  * send again on no evidence at all. `Script.exitCode` agrees by exiting 1 for
  * an unclassified error rather than 3.
+ *
+ * **`{ phase: "pre-submit" }` changes that last answer, and only that one.**
+ * A failure caught while building, simulating or signing cannot have applied,
+ * whoever's error it is, so an unrecognised tag there is `"not_applied"`
+ * rather than `"unknown"`. Use it where the code knows nothing has been sent —
+ * a `catchAll` around `Tx.build`/`Tx.sign`, an extension's validation — and
+ * leave the default everywhere a submission may already be on the wire.
+ * {@link isTaxonomy} answers the same question a level lower: is this even one
+ * of ours?
  */
-const outcome = (error: SuiError | HasOutcome): Outcome => {
+const outcome = (
+  error: SuiError | HasOutcome,
+  options?: { readonly phase?: OutcomePhase }
+): Outcome => {
   if (hasOutcome(error)) return error.outcome
   const tag = (error as { readonly _tag?: unknown })._tag
-  if (typeof tag !== "string" || !TAXONOMY_TAGS.has(tag)) return "unknown"
+  if (typeof tag !== "string" || !TAXONOMY_TAGS.has(tag)) {
+    // Before anything was sent, an unclassifiable failure still means nothing
+    // reached the chain; after, it means exactly nothing.
+    return options?.phase === "pre-submit" ? "not_applied" : "unknown"
+  }
   switch (tag) {
     case "ExecutionFailed":
     // An `UnexpectedEffects` is built from an `Executed`: the transaction
@@ -446,7 +602,27 @@ const causeLine = (cause: unknown): string | undefined => {
   return undefined
 }
 
-const describe = (error: SuiError): string => {
+/**
+ * One actionable line for a failure.
+ *
+ * **It accepts a foreign error too**, the way {@link outcome} and {@link toJson}
+ * do: an extension's own `Schema.TaggedError`, or any object carrying a `_tag`.
+ * A tag the taxonomy owns gets the taxonomy's wording; anything else gets its
+ * own `message` after the tag, or the bare tag when there is nothing readable —
+ * never `undefined`, which is what a `switch` with no default used to return
+ * for a foreign tag while the signature promised a `string`. A wrapper script
+ * that prints one line per failure should not have to know whose error it is
+ * holding.
+ */
+const describe = (error: SuiError | { readonly _tag: string }): string => {
+  if (!TAXONOMY_TAGS.has(error._tag)) {
+    const line = causeLine(error)
+    return line === undefined || line === error._tag ? error._tag : `${error._tag}: ${line}`
+  }
+  return describeTaxonomy(error as SuiError)
+}
+
+const describeTaxonomy = (error: SuiError): string => {
   switch (error._tag) {
     case "TransportError": {
       const cause = causeLine(error.cause)
@@ -463,7 +639,7 @@ const describe = (error: SuiError): string => {
     case "NetworkMismatch":
       return `NetworkMismatch expected ${error.expected} but the node reported ${error.actual}`
     case "DecodeError":
-      return `DecodeError ${error.expectedType ?? ""} ${error.objectId ?? ""} ${error.issue}`
+      return `DecodeError ${error.kind} ${error.expectedType ?? ""} ${error.objectId ?? ""} ${error.issue}`
         .replace(/\s+/g, " ")
         .trim()
     case "SimulationFailed":
@@ -573,11 +749,27 @@ const toJson = (error: SuiError | { readonly _tag: string }): Record<string, unk
 }
 
 /**
- * The four helpers every repo hand-rolls: is this worth retrying, did the
- * transaction land, what does an operator need to read, and what goes in a log.
+ * Whether this error is one of the tags the closed taxonomy owns.
+ *
+ * The question a wrapper asks before trusting {@link outcome}'s default answer,
+ * and the one a consumer asks before narrowing to `SuiError`. An extension's
+ * own error, a `ConfigError`, a `TypeError` — all `false`. Never fails.
+ *
+ * @since 0.1.2
+ */
+const isTaxonomy = (error: unknown): error is SuiError => {
+  const tag = (error as { readonly _tag?: unknown })?._tag
+  return typeof tag === "string" && TAXONOMY_TAGS.has(tag)
+}
+
+/**
+ * The helpers every repo hand-rolls: is this worth retrying, did the
+ * transaction land, is it even one of ours, what does an operator need to read,
+ * and what goes in a log.
  */
 export const SuiError = {
   isRetryable,
+  isTaxonomy,
   outcome,
   describe,
   toJson
