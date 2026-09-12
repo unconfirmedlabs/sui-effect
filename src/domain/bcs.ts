@@ -11,7 +11,7 @@
 import type { BcsType } from "@mysten/bcs"
 import { normalizeStructTag, parseStructTag } from "@mysten/sui/utils"
 import { Effect, Schema, SchemaAST, SchemaIssue, SchemaTransformation } from "effect"
-import { DecodeError } from "./errors.ts"
+import { DecodeError, decodeIssues } from "./errors.ts"
 import type { ObjectId } from "./schemas.ts"
 
 const SUI_TYPE_ANNOTATION = "sui-effect/suiType"
@@ -314,7 +314,9 @@ export const decodeContent = <T>(
       })
     )
   }
-  return Schema.decodeUnknownEffect(schema)(content).pipe(
+  // `{ errors: "all" }` so a value that is wrong in three places reports three
+  // paths on `DecodeError.issues`, not just the first sentence.
+  return Schema.decodeUnknownEffect(schema)(content, { errors: "all" }).pipe(
     Effect.mapError(
       (error) =>
         new DecodeError({
@@ -324,7 +326,8 @@ export const decodeContent = <T>(
           // themselves did not parse: a layout mismatch or a corrupt object,
           // never something to swallow.
           kind: "bytes",
-          issue: error.message
+          issue: error.message,
+          issues: decodeIssues(error)
         })
     )
   )

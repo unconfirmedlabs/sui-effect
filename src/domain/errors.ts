@@ -5,7 +5,7 @@
  *
  * @since 0.1.0
  */
-import { Effect, Result, Schema } from "effect"
+import { Effect, Result, Schema, SchemaIssue } from "effect"
 import {
   Digest,
   ExecutionReason,
@@ -239,13 +239,59 @@ export class DecodeError extends Schema.TaggedError<DecodeError>()("DecodeError"
     Schema.withDecodingDefaultKey(Effect.succeed("shape" as const)),
     Schema.withConstructorDefault(Effect.succeed("shape" as const))
   ),
-  issue: Schema.String
+  issue: Schema.String,
+  /**
+   * Every issue the schema reported, with its path — the structured form of
+   * {@link DecodeError.issue}, which is only the first issue's sentence.
+   *
+   * An operator debugging a relay envelope with three bad fields sees three
+   * paths rather than one line, and a UI can render a message per field. The
+   * key is absent when the producer had no structured issue to carry (a Move
+   * type mismatch, a hand-built `DecodeError`), so `SuiError.toJson` still
+   * round-trips for every error that was built without one.
+   *
+   * `kind` is still the field to branch on; this is for reading.
+   *
+   * @since 0.1.3
+   */
+  issues: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        /** The path into the decoded value, as the schema walked it. */
+        path: Schema.Array(Schema.Union([Schema.String, Schema.Number])),
+        /** What the schema said about that path. */
+        message: Schema.String
+      })
+    )
+  )
 }) {
   /** The one actionable line `SuiError.describe` produces for this error. */
   override get message(): string {
     return describe(this)
   }
 }
+
+const standardIssues = SchemaIssue.makeFormatterStandardSchemaV1()
+
+/**
+ * Every issue of a `SchemaError`, flattened to `{ path, message }` the way
+ * {@link DecodeError.issues} carries them.
+ *
+ * `SchemaError.issue` is a tree; this is Effect's own Standard-Schema
+ * formatter over it, so the paths are the ones every other tool prints. A
+ * decode run with `{ errors: "all" }` reports every field rather than the
+ * first. Never fails.
+ */
+export const decodeIssues = (
+  error: Schema.SchemaError
+): ReadonlyArray<{ readonly path: ReadonlyArray<string | number>; readonly message: string }> =>
+  standardIssues(error.issue).issues.map((issue) => ({
+    path: (issue.path ?? []).map((segment) => {
+      const key = typeof segment === "object" && segment !== null ? segment.key : segment
+      return typeof key === "number" ? key : String(key)
+    }),
+    message: issue.message
+  }))
 
 /** Simulation reported an execution failure. No gas was charged. */
 export class SimulationFailed extends Schema.TaggedError<SimulationFailed>()("SimulationFailed", {

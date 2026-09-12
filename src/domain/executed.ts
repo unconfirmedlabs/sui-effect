@@ -14,7 +14,7 @@
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { fromBase64 } from "@mysten/sui/utils"
 import { Effect, Schema } from "effect"
-import { DecodeError, ExecutionFailed, UnexpectedEffects } from "./errors.ts"
+import { DecodeError, decodeIssues, ExecutionFailed, UnexpectedEffects } from "./errors.ts"
 import {
   BalanceChange,
   ChangedObject,
@@ -385,7 +385,13 @@ export const EXECUTE_INCLUDE = {
   objectTypes: true
 } as const
 
-const decodeExecuted = Schema.decodeUnknownEffect(Executed)
+const decodeExecutedAst = Schema.decodeUnknownEffect(Executed)
+
+/**
+ * Decodes an `Executed`, reporting **every** issue rather than the first, so
+ * the `DecodeError` an envelope produces can carry one entry per bad field.
+ */
+const decodeExecuted = (input: unknown) => decodeExecutedAst(input, { errors: "all" })
 
 /**
  * Turns an SDK `TransactionResult` read with {@link EXECUTE_INCLUDE} into an
@@ -410,7 +416,9 @@ export const fromTransactionResult = Effect.fn("Executed.fromTransactionResult")
       timestampMs: transaction.timestampMs
     }
     const executed = yield* decodeExecuted(encoded).pipe(
-      Effect.mapError((error) => new DecodeError({ kind: "shape", issue: error.message }))
+      Effect.mapError((error) =>
+        new DecodeError({ kind: "shape", issue: error.message, issues: decodeIssues(error) })
+      )
     )
     if (!transaction.status.success) {
       return yield* new ExecutionFailed({
@@ -554,7 +562,8 @@ const fromPartial = (envelope: unknown): Effect.Effect<Executed, DecodeError> =>
     Effect.mapError((error) =>
       new DecodeError({
         kind: "shape",
-        issue: `this is not an execute envelope Executed can be built from: ${error.message}`
+        issue: `this is not an execute envelope Executed can be built from: ${error.message}`,
+        issues: decodeIssues(error)
       })
     )
   )

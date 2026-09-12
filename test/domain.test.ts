@@ -21,6 +21,7 @@ import {
   SuiError,
   TransactionNotFound,
   TransportError,
+  SuiErrorSchema,
   UnexpectedEffects
 } from "../src/domain/errors.ts"
 import {
@@ -539,5 +540,29 @@ describe("schema annotations", () => {
     expect(document).toContain("\"ObjectRef\"")
     expect(document).toContain("\"ObjectId\"")
     expect(document).toContain("\"StructTag\"")
+  })
+})
+
+describe("DecodeError.issues round-trips (NB4)", () => {
+  test("toJson carries the structured issues and SuiErrorSchema decodes them back", () => {
+    const error = new DecodeError({
+      kind: "shape",
+      issue: "two fields",
+      issues: [
+        { path: ["effects", "gasUsed"], message: "Expected string" },
+        { path: ["events", 0, "eventType"], message: "Expected StructTag" }
+      ]
+    })
+    const json = SuiError.toJson(error)
+    const decoded = Schema.decodeUnknownSync(SuiErrorSchema)(json)
+    expect(decoded._tag).toBe("DecodeError")
+    if (decoded._tag !== "DecodeError") return
+    expect(decoded.issues).toEqual(error.issues)
+  })
+
+  test("the key is absent when nothing structured was carried", () => {
+    const json = SuiError.toJson(new DecodeError({ issue: "no tree here" }))
+    expect("issues" in json).toBe(false)
+    expect(Schema.decodeUnknownSync(SuiErrorSchema)(json)._tag).toBe("DecodeError")
   })
 })

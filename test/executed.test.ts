@@ -248,3 +248,31 @@ describe("Executed", () => {
     }
   })
 })
+
+/**
+ * NB4: `DecodeError.issue` is one sentence; `issues` is the structured tree,
+ * with every issue reported rather than only the first.
+ */
+describe("DecodeError.issues", () => {
+  test("Executed.fromPartial reports one entry per bad field, with its path", async () => {
+    const result = await Effect.runPromise(
+      Effect.result(
+        Executed.fromPartial({
+          digest: DIGEST,
+          objectTypes: { [RECEIPT]: 5, [ESCROW]: 7 },
+          effects: {}
+        })
+      )
+    )
+    expect(result._tag).toBe("Failure")
+    if (result._tag !== "Failure") return
+    expect(result.failure.kind).toBe("shape")
+    expect(result.failure.issues).toHaveLength(2)
+    expect(result.failure.issues?.map((issue) => issue.path)).toEqual([
+      ["objectTypes", RECEIPT],
+      ["objectTypes", ESCROW]
+    ])
+    // The sentence is unchanged: consumers reading `issue` are unaffected.
+    expect(result.failure.issue).toContain("this is not an execute envelope")
+  })
+})
