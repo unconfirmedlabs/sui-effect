@@ -5,7 +5,7 @@
  *
  * @since 0.1.0
  */
-import { Effect, Result, Schema, SchemaIssue } from "effect"
+import { Effect, Predicate, Result, Schema, SchemaIssue } from "effect"
 import {
   Digest,
   ExecutionReason,
@@ -287,7 +287,7 @@ export const decodeIssues = (
 ): ReadonlyArray<{ readonly path: ReadonlyArray<string | number>; readonly message: string }> =>
   standardIssues(error.issue).issues.map((issue) => ({
     path: (issue.path ?? []).map((segment) => {
-      const key = typeof segment === "object" && segment !== null ? segment.key : segment
+      const key = Predicate.isObject(segment) ? segment["key"] : segment
       return typeof key === "number" ? key : String(key)
     }),
     message: issue.message
@@ -303,7 +303,7 @@ export class SimulationFailed extends Schema.TaggedError<SimulationFailed>()("Si
 export class ExecutionFailed extends Schema.TaggedError<ExecutionFailed>()("ExecutionFailed", {
   digest: Digest,
   reason: ExecutionReason,
-  command: Schema.optional(Schema.Number),
+  command: Schema.optional(Schema.Finite),
   effects: TransactionEffects
 }) {
   /** The one actionable line `SuiError.describe` produces for this error. */
@@ -734,9 +734,7 @@ const encodeThroughOwnSchema = (error: unknown): Record<string, unknown> | undef
   const encoded = Schema.encodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(error)
   if (!Result.isSuccess(encoded)) return undefined
   const value: unknown = encoded.success
-  return typeof value === "object" && value !== null
-    ? (value as Record<string, unknown>)
-    : undefined
+  return Predicate.isObject(value) ? value : undefined
 }
 
 /**

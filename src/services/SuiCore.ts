@@ -14,7 +14,7 @@ import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
 import { isSuiGrpcClient, SuiGrpcClient } from "@mysten/sui/grpc"
 import type { TransactionPlugin } from "@mysten/sui/transactions"
-import { Config, ConfigProvider, Context, Effect, Layer, Schedule, Schema } from "effect"
+import { Config, ConfigProvider, Context, Effect, Layer, Predicate, Schedule, Schema } from "effect"
 import {
   ObjectDeleted,
   ObjectNotFound,
@@ -72,7 +72,7 @@ const asDigest = (value: string): Digest => {
 export const DefectMarker: unique symbol = Symbol.for("sui-effect/DefectMarker")
 
 const rethrowDefects = (cause: unknown): void => {
-  if (typeof cause === "object" && cause !== null && DefectMarker in cause) throw cause
+  if (Predicate.hasProperty(cause, DefectMarker)) throw cause
 }
 
 const transportError = (method: string, cause: unknown): TransportError => {

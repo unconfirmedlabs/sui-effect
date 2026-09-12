@@ -415,7 +415,10 @@ describe("Script.run", () => {
       Effect.fail(new SubmissionUnknown({ digest: DIGEST, signed, cause: "timeout" }))
     )
     expect(result.code).toBe(3)
-    expect(result.lines.some((line) => line.startsWith("bytes: "))).toBe(true)
+    // NB7: `Encoding.encodeBase64`, not a hand-rolled `btoa` loop.
+    expect(result.lines).toContain(
+      `bytes: ${Buffer.from(signed.bytes).toString("base64")}`
+    )
     expect(result.lines.some((line) => line.includes("reconcile"))).toBe(true)
   })
 

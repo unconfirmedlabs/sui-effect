@@ -13,7 +13,7 @@
  */
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { fromBase64 } from "@mysten/sui/utils"
-import { Effect, Schema } from "effect"
+import { Effect, Predicate, Schema } from "effect"
 import { DecodeError, decodeIssues, ExecutionFailed, UnexpectedEffects } from "./errors.ts"
 import {
   BalanceChange,
@@ -118,7 +118,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   balanceChanges: Schema.Array(BalanceChange),
   objectTypes: Schema.Record(Schema.String, Schema.String),
   checkpoint: Schema.NullOr(Schema.BigIntFromString),
-  timestampMs: Schema.NullOr(Schema.Number)
+  timestampMs: Schema.NullOr(Schema.Finite)
 }) {
   /**
    * The type of a changed object, from the `objectTypes` join. A published
@@ -442,10 +442,10 @@ const NO_GAS = {
   nonRefundableStorageFee: "0"
 } as const
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
-
-const field = (value: unknown, key: string): unknown => (isRecord(value) ? value[key] : undefined)
+// `Predicate.isObject` is the non-null, non-array guard; Effect's own agent
+// guide is explicit that a hand-written `isRecord` is never the right answer.
+const field = (value: unknown, key: string): unknown =>
+  Predicate.isObject(value) ? value[key] : undefined
 
 /** A `u64` in whatever spelling JSON left it in, as the decimal string the schemas take. */
 const u64String = (value: unknown, fallback?: string): string | undefined => {

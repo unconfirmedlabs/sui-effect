@@ -19,10 +19,12 @@ import {
   ConfigProvider,
   Context,
   Effect,
+  Encoding,
   Exit,
   Fiber,
   Layer,
   Logger,
+  Predicate,
   Result,
   Schema
 } from "effect"
@@ -312,17 +314,15 @@ const EXIT = {
   interrupted: 130
 } as const
 
-const isConfigError = (error: unknown): boolean =>
-  typeof error === "object" && error !== null &&
-  (error as { readonly _tag?: unknown })._tag === "ConfigError"
+// Effect's own agent guide is explicit that these are `Predicate`'s job, never
+// a hand-written helper: an agent copying this file copies the right idiom.
+const isConfigError = Predicate.isTagged("ConfigError")
 
 const hasTag = (error: unknown): error is { readonly _tag: string } =>
-  typeof error === "object" && error !== null &&
-  typeof (error as { readonly _tag?: unknown })._tag === "string"
+  Predicate.hasProperty(error, "_tag") && typeof error._tag === "string"
 
 const hasOutcomeField = (error: unknown): error is { readonly outcome: string } =>
-  typeof error === "object" && error !== null &&
-  typeof (error as { readonly outcome?: unknown }).outcome === "string"
+  Predicate.hasProperty(error, "outcome") && typeof error.outcome === "string"
 
 /** What {@link exitCode} needs to know beyond the `Exit` itself. */
 export interface ExitCodeOptions {
@@ -474,7 +474,7 @@ const describeFailure = (error: unknown): ReadonlyArray<string> => {
     if (digest !== undefined) lines.push(`digest: ${digest}`)
     if (tagged._tag === "SubmissionUnknown") {
       if (tagged.signed !== undefined) {
-        lines.push(`bytes: ${toBase64(tagged.signed.bytes)}`)
+        lines.push(`bytes: ${Encoding.encodeBase64(tagged.signed.bytes)}`)
       }
       lines.push(
         "the outcome is unknown: reconcile this digest before sending anything else from this sender"
@@ -482,12 +482,6 @@ const describeFailure = (error: unknown): ReadonlyArray<string> => {
     }
   }
   return lines
-}
-
-const toBase64 = (bytes: Uint8Array): string => {
-  let binary = ""
-  for (const byte of bytes) binary += String.fromCharCode(byte)
-  return btoa(binary)
 }
 
 /**
@@ -527,7 +521,7 @@ const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<st
   for (const entry of entries) {
     lines.push(`unresolved ${entry.digest} (${entry._tag})`)
     if (entry._tag === "Signed" || entry._tag === "Unknown") {
-      lines.push(`bytes: ${toBase64(entry.signed.bytes)}`)
+      lines.push(`bytes: ${Encoding.encodeBase64(entry.signed.bytes)}`)
     }
     const encoded = encodeJournalEntry(entry)
     if (Result.isSuccess(encoded)) lines.push(`entry: ${JSON.stringify(encoded.success)}`)

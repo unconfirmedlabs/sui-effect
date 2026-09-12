@@ -244,3 +244,33 @@ describe("SuiSchema.bcs without an expected type", () => {
     expect(Result.isFailure(run(decodeContent(codec, bytes)))).toBe(true)
   })
 })
+
+/**
+ * NB12: the bridge's public type is `Schema.revealCodec`'s answer, not an
+ * `as unknown as` assertion, so the compiler checks it. These assignments are
+ * the test: they compile only because the declared type really is
+ * `Schema.Codec<T, Uint8Array>`, with no cast at the call site.
+ */
+describe("the bridge's codec type is checked, not asserted", () => {
+  const Layout = suiBcs.struct("Escrow", { id: suiBcs.Address, amount: suiBcs.U64 })
+
+  test("SuiSchema.bcs is a Schema.Codec<T, Uint8Array> without a cast", () => {
+    const codec: Schema.Codec<typeof Layout.$inferType, Uint8Array> = SuiSchema.bcs(
+      Layout,
+      "0x2::escrow::Escrow"
+    )
+    expect(expectedTypeOf(codec)).toBe(normalizeStructTag("0x2::escrow::Escrow"))
+  })
+
+  test("SuiSchema.decodeWith is one too", () => {
+    const codec: Schema.Codec<bigint, Uint8Array> = SuiSchema.decodeWith(
+      Layout,
+      "0x2::escrow::Escrow",
+      (raw) => BigInt(raw.amount)
+    )
+    const bytes = Layout.serialize({ id: OBJECT_ID, amount: "7" }).toBytes()
+    const decoded = run(decodeContent(codec, bytes))
+    expect(Result.isSuccess(decoded)).toBe(true)
+    if (Result.isSuccess(decoded)) expect(decoded.success).toBe(7n)
+  })
+})

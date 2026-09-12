@@ -665,3 +665,30 @@ describe("normalize throws a SchemaError with the issue on it", () => {
     }
   })
 })
+
+/**
+ * NB14: a JSON number that reached a schema as `NaN` used to be a value.
+ * `Schema.Finite` makes it a `DecodeError`; the decoded `Type` is still
+ * `number`, so nothing downstream changes.
+ */
+describe("Schema.Finite where a JSON number is meant", () => {
+  test("a NaN version fails TransactionEffects", () => {
+    const good = decode(TransactionEffects, effects(true))
+    expect(Result.isSuccess(good)).toBe(true)
+    const bad = decode(TransactionEffects, { ...effects(true), version: Number.NaN })
+    expect(Result.isFailure(bad)).toBe(true)
+  })
+
+  test("an Infinity command fails ExecutionFailed's schema", () => {
+    const encoded = {
+      _tag: "ExecutionFailed",
+      digest: DIGEST,
+      reason: { $kind: "Unknown" },
+      command: Number.POSITIVE_INFINITY,
+      effects: effects(false)
+    }
+    expect(Result.isFailure(decode(SuiErrorSchema, encoded))).toBe(true)
+    const { command: _command, ...withoutCommand } = encoded
+    expect(Result.isSuccess(decode(SuiErrorSchema, withoutCommand))).toBe(true)
+  })
+})

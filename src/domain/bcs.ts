@@ -96,7 +96,7 @@ export const bcs = <T extends Input, Input>(
     )
   ).annotate(
     normalized === undefined ? {} : { [SUI_TYPE_ANNOTATION]: normalized }
-  ) as unknown as Schema.Codec<T, Uint8Array>
+  ).pipe(Schema.revealCodec)
 }
 
 /**
@@ -180,8 +180,9 @@ export const decodeWith = <T extends Input, Input, A>(
             )
           )
       })
-    )
-  ) as unknown as Schema.Codec<A, Uint8Array>
+    ),
+    Schema.revealCodec
+  )
 }
 
 const MAX_ENCODING_DEPTH = 32

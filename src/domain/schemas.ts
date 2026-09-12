@@ -466,16 +466,16 @@ export type Event = typeof Event.Type
 export const MoveLocation = Schema.Struct({
   package: Schema.optional(Schema.String),
   module: Schema.optional(Schema.String),
-  function: Schema.optional(Schema.Number),
+  function: Schema.optional(Schema.Finite),
   functionName: Schema.optional(Schema.String),
-  instruction: Schema.optional(Schema.Number)
+  instruction: Schema.optional(Schema.Finite)
 })
 export type MoveLocation = typeof MoveLocation.Type
 
 /** A decoded `#[error]` constant. Mirrors `SuiClientTypes.CleverError`. */
 export const CleverError = Schema.Struct({
-  errorCode: Schema.optional(Schema.Number),
-  lineNumber: Schema.optional(Schema.Number),
+  errorCode: Schema.optional(Schema.Finite),
+  lineNumber: Schema.optional(Schema.Finite),
   constantName: Schema.optional(Schema.String),
   constantType: Schema.optional(Schema.String),
   value: Schema.optional(Schema.String)
@@ -502,17 +502,17 @@ export const ExecutionReason = Schema.Union([
     $kind: Schema.Literal("SizeError"),
     SizeError: Schema.Struct({
       name: Schema.String,
-      size: Schema.Number,
-      maxSize: Schema.Number
+      size: Schema.Finite,
+      maxSize: Schema.Finite
     })
   }),
   Schema.Struct({
     $kind: Schema.Literal("CommandArgumentError"),
-    CommandArgumentError: Schema.Struct({ argument: Schema.Number, name: Schema.String })
+    CommandArgumentError: Schema.Struct({ argument: Schema.Finite, name: Schema.String })
   }),
   Schema.Struct({
     $kind: Schema.Literal("TypeArgumentError"),
-    TypeArgumentError: Schema.Struct({ typeArgument: Schema.Number, name: Schema.String })
+    TypeArgumentError: Schema.Struct({ typeArgument: Schema.Finite, name: Schema.String })
   }),
   Schema.Struct({
     $kind: Schema.Literal("PackageUpgradeError"),
@@ -525,8 +525,8 @@ export const ExecutionReason = Schema.Union([
   Schema.Struct({
     $kind: Schema.Literal("IndexError"),
     IndexError: Schema.Struct({
-      index: Schema.optional(Schema.Number),
-      subresult: Schema.optional(Schema.Number)
+      index: Schema.optional(Schema.Finite),
+      subresult: Schema.optional(Schema.Finite)
     })
   }),
   Schema.Struct({
@@ -566,7 +566,7 @@ export type ExecutionStatus = typeof ExecutionStatus.Type
 
 /** Transaction effects. Mirrors `SuiClientTypes.TransactionEffects`. */
 export const TransactionEffects = Schema.Struct({
-  version: Schema.Number,
+  version: Schema.Finite,
   status: ExecutionStatus,
   gasUsed: GasCostSummary,
   transactionDigest: Digest,
@@ -628,7 +628,7 @@ const u64Of = (value: string | number): bigint | undefined => {
  * fail in. A value that is not a non-negative integer below `2^64` is a schema
  * issue like any other.
  */
-const U64 = Schema.Union([Schema.String, Schema.Number]).pipe(
+const U64 = Schema.Union([Schema.String, Schema.Finite]).pipe(
   Schema.decodeTo(
     Schema.BigInt,
     SchemaTransformation.transformOrFail<bigint, string | number>({
@@ -665,7 +665,7 @@ const NullableU64 = Schema.NullOr(U64)
  * is a `u32` on the wire, so anything outside `[0, 2^32)` is a schema issue
  * rather than bytes the validator will reject later.
  */
-const Nonce = Schema.Number.pipe(
+const Nonce = Schema.Finite.pipe(
   Schema.check(Schema.isInt(), Schema.isBetween({ minimum: 0, maximum: U32_MAX }))
 )
 
@@ -697,7 +697,7 @@ export const TransactionExpiration = Schema.Union([
     $kind: Schema.Literal("Validity"),
     Validity: Schema.Struct({
       allowedProposers: Schema.NullOr(
-        Schema.Struct({ epoch: U64, proposers: Schema.Array(Schema.Number) })
+        Schema.Struct({ epoch: U64, proposers: Schema.Array(Schema.Finite) })
       ),
       minEpoch: NullableU64,
       maxEpoch: NullableU64,

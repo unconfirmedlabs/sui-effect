@@ -45,7 +45,7 @@ export const JournalEntry = Schema.TaggedUnion({
     digest: Digest,
     signed: SignedTransaction,
     lastError: Schema.String,
-    attempts: Schema.Number,
+    attempts: Schema.Finite,
     at: Schema.DateTimeUtcFromMillis
   },
   NotApplied: {
