@@ -3,6 +3,33 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
+## 0.2.1
+
+### Added
+
+- **`Tx.gaslessStablecoinTransfer({ coinType, amount, recipient })`.** The
+  recipe uses the Sui SDK's canonical `tx.balance()` →
+  `0x2::balance::send_funds<T>` flow. It does not involve a sponsor and does
+  not force gas fields: gRPC and GraphQL resolution simulate the transaction,
+  consult protocol configuration and set zero gas when the resolved PTB is
+  eligible. The helper is also a named export from
+  `@unconfirmed/sui-effect/tx`.
+- The gasless helper deliberately does not embed today's stablecoin allowlist
+  or 0.01 minimum. Both live in protocol configuration, whose per-token
+  minimum is in base units; the helper has no trustworthy decimals from which
+  to reproduce it. `Tx.build` simulation rejects ineligible types and amounts
+  before signing, while applications with verified metadata can validate
+  display amounts earlier.
+
+### Fixed
+
+- **Successful simulation decoding now accepts the Mainnet gRPC envelope.** A
+  node may omit `Transaction.digest` while returning the digest in
+  `Transaction.effects.transactionDigest`. `Sui.simulate` now uses the effects
+  digest as a fallback. If both locations are present they must agree; a
+  disagreement is a non-retryable `TransportError` rather than effects being
+  attributed to the wrong transaction.
+
 ## 0.2.0
 
 One breaking change, from the same audit of this package against Effect v4

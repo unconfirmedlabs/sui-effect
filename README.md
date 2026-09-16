@@ -428,8 +428,8 @@ was built over as `sui.core`, which is why every `Tx.*` function needs only
 ## The transaction lifecycle
 
 `Tx` is the lifecycle as functions — `build`, `sign`, `cosign`, `sponsored`,
-`submit`, `submitVia`, `reconcile`, `recorded`, `run`, `reconcileAll` — each
-with a closed error union
+`gaslessStablecoinTransfer`, `submit`, `submitVia`, `reconcile`, `recorded`,
+`run`, `reconcileAll` — each with a closed error union
 and `R = Sui`. `Tx.run` holds the sender lock from build through submit, builds
 (which always simulates before anything is signed — the SDK's resolver does it
 when there is anything to resolve, and `Tx.build` runs one explicitly when
@@ -450,6 +450,28 @@ value, not a service, so one process can hold two credentials; `SubmitConfig`
 and `Journal` are `Context.Reference`s with working defaults, so none of this
 needs wiring, and `@unconfirmed/sui-effect/journal` swaps the memory journal for a durable
 one over `KeyValueStore`.
+
+**`Tx.gaslessStablecoinTransfer` builds Sui's canonical free stablecoin
+transfer**, as a `Transaction#balance` intent consumed by
+`0x2::balance::send_funds`. It neither talks to a sponsor nor forces zero gas:
+the gRPC or GraphQL SDK resolver simulates the PTB, checks the network's current
+protocol configuration and sets zero gas only when it qualifies.
+
+```ts
+const recipe = Tx.gaslessStablecoinTransfer({
+  coinType,
+  amount: 1_000_000n,
+  recipient
+})
+const executed = yield* Tx.run(recipe, { signer })
+```
+
+The helper does not hardcode today's allowlist or 0.01 minimum. Both are
+protocol policy, and the minimum is stored per token in base units; this API
+cannot infer trustworthy decimals from a type string. `Tx.build`'s mandatory
+simulation rejects an ineligible type or too-small amount before signing. An
+application that already has verified coin metadata should validate its display
+amount earlier for a better error message.
 
 **`NotApplied` is hard to earn, on purpose.** Saying a transaction never applied
 tells the documented retry idiom to send the caller's intent again, so there are

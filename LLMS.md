@@ -2506,7 +2506,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-42 exported symbols.
+43 exported symbols.
 
 ### `Built` (const)
 
@@ -3103,6 +3103,11 @@ declare const Tx: {
         readonly sender: SuiAddress;
         readonly gasOwner: SuiAddress;
     }) => (recipe: Recipe) => Recipe;
+    readonly gaslessStablecoinTransfer: (opts: {
+        readonly coinType: CoinType;
+        readonly amount: bigint;
+        readonly recipient: SuiAddress;
+    }) => Recipe;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
     readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, TransportError | ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
@@ -3155,8 +3160,8 @@ declare const Tx: {
 ```
 
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
-`Tx.cosign`, `Tx.sponsored`, `Tx.submit`, `Tx.reconcile`, `Tx.run`,
-`Tx.reconcileAll`.
+`Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`,
+`Tx.reconcile`, `Tx.run`, `Tx.reconcileAll`.
 
 ### `UNRESOLVED_TAGS` (const)
 
@@ -3317,6 +3322,37 @@ an SDK signer — that is a wiring mistake in the caller, not a runtime
 failure a program recovers from. Otherwise never fails: a bad address or
 signature surfaces as a `SigningError` from the member that produced it, not
 from construction.
+
+### `gaslessStablecoinTransfer` (const)
+
+```ts
+declare const gaslessStablecoinTransfer: (opts: {
+    readonly coinType: CoinType;
+    readonly amount: bigint;
+    readonly recipient: SuiAddress;
+}) => Recipe
+```
+
+Builds the canonical transfer shape that an eligible stablecoin can execute
+without SUI gas: a `Balance<T>` from the SDK's `Transaction#balance` intent,
+consumed by `0x2::balance::send_funds<T>`.
+
+The recipe deliberately does **not** set gas price, budget or payment. The
+gRPC and GraphQL SDK resolvers simulate the transaction, check the network's
+current protocol configuration and set zero gas only when the coin type,
+amount and resolved PTB qualify. It also does not hardcode an allowlist or
+the current 0.01 minimum: protocol configuration stores both eligibility and
+each token's minimum in base units, while this API has no trustworthy token
+decimals. `Tx.build`'s mandatory simulation therefore remains the authority;
+a UI that already has verified coin metadata may reject a too-small display
+amount earlier.
+
+This sends to the recipient's address balance. The SDK may source the amount
+from the sender's address balance, coin objects, or both, and resolves the
+required eligible helper calls itself.
+
+Never fails; the recipe it returns can throw only if the SDK rejects an
+input, which `Tx.build` reports as `BuildError` before anything is signed.
 
 ### `isUnresolved` (const)
 

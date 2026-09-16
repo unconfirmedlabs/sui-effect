@@ -103,6 +103,70 @@ const boundaryError = (method: string) => (issue: { readonly message: string }):
     cause: `the node returned a response this version cannot read: ${issue.message}`
   })
 
+/**
+ * Decodes the SDK's simulation envelope into sui-effect's stable shape.
+ *
+ * Mainnet gRPC can omit `Transaction.digest` from a successful simulation
+ * while still returning the same digest in `Transaction.effects
+ * .transactionDigest`. The effects digest is authoritative enough for this
+ * read-only result and is the fallback the SDK envelope itself provides. When
+ * both locations are present they must agree: accepting two different digests
+ * would attach effects to the wrong transaction identity.
+ *
+ * This is internal rather than public API; it is exported through
+ * `src/internal.ts` so the two live wire shapes and the disagreement case can
+ * be tested directly.
+ */
+export const fromSimulationResult = Effect.fn("Sui.fromSimulationResult")(function*(
+  result: SuiClientTypes.SimulateTransactionResult<typeof SIMULATE_INCLUDE>
+): Effect.fn.Return<Simulation, SimulationFailed | TransportError> {
+  if (result.$kind === "FailedTransaction") {
+    const status = result.FailedTransaction.status
+    if (status.success) {
+      return yield* TransportError.fromUnknown(
+        "simulateTransaction",
+        "the node reported a failed transaction whose status says it succeeded",
+        false
+      )
+    }
+    return yield* new SimulationFailed({
+      reason: executionReasonOf(status.error),
+      message: status.error.message
+    })
+  }
+
+  const transaction = result.Transaction
+  // The SDK type says the top-level digest is always present, but Mainnet's
+  // gRPC response currently disproves that. Keep the looseness confined to
+  // this transport boundary and let the Digest schema validate the selected
+  // value below.
+  const topLevelDigest = (transaction as { readonly digest?: unknown }).digest
+  const effectsDigest = (transaction.effects as {
+    readonly transactionDigest?: unknown
+  } | null | undefined)?.transactionDigest
+
+  if (
+    typeof topLevelDigest === "string" &&
+    typeof effectsDigest === "string" &&
+    topLevelDigest !== effectsDigest
+  ) {
+    return yield* TransportError.fromUnknown(
+      "simulateTransaction",
+      `the node returned two different transaction digests: ${topLevelDigest} and ${effectsDigest}`,
+      false
+    )
+  }
+
+  return yield* decodeSimulation({
+    digest: topLevelDigest ?? effectsDigest,
+    effects: transaction.effects,
+    events: transaction.events,
+    balanceChanges: transaction.balanceChanges,
+    objectTypes: transaction.objectTypes,
+    commandResults: result.commandResults
+  }).pipe(Effect.mapError(boundaryError("simulateTransaction")))
+})
+
 /** The opinionated tier over `SuiCore`. */
 export interface SuiService {
   /** The network the underlying client was built for. */
@@ -645,39 +709,11 @@ const makeSui = (
     })
   })
 
-  const toSimulation = Effect.fn("Sui.toSimulation")(function*(
-    result: SuiClientTypes.SimulateTransactionResult<typeof SIMULATE_INCLUDE>
-  ): Effect.fn.Return<Simulation, SimulationFailed | TransportError> {
-    if (result.$kind === "FailedTransaction") {
-      const status = result.FailedTransaction.status
-      if (status.success) {
-        return yield* new TransportError({
-          method: "simulateTransaction",
-          retryable: false,
-          cause: "the node reported a failed transaction whose status says it succeeded"
-        })
-      }
-      return yield* new SimulationFailed({
-        reason: executionReasonOf(status.error),
-        message: status.error.message
-      })
-    }
-    const transaction = result.Transaction
-    return yield* decodeSimulation({
-      digest: transaction.digest,
-      effects: transaction.effects,
-      events: transaction.events,
-      balanceChanges: transaction.balanceChanges,
-      objectTypes: transaction.objectTypes,
-      commandResults: result.commandResults
-    }).pipe(Effect.mapError(boundaryError("simulateTransaction")))
-  })
-
   const simulate = Effect.fn("Sui.simulate")(function*(
     input: Recipe | Transaction | Uint8Array,
     opts?: { readonly sender?: SuiAddress }
   ): Effect.fn.Return<Simulation, SimulationFailed | BuildError | TransportError> {
-    return yield* toSimulation(yield* simulateRaw(input, true, opts?.sender))
+    return yield* fromSimulationResult(yield* simulateRaw(input, true, opts?.sender))
   })
 
   const view = Effect.fn("Sui.view")(function*<S, I>(
@@ -696,7 +732,7 @@ const makeSui = (
     const codec = isBcsType(schema)
       ? bcsCodec(schema as unknown as BcsType<S, S>)
       : schema
-    const simulation = yield* toSimulation(yield* simulateRaw(recipe, false, opts?.sender))
+    const simulation = yield* fromSimulationResult(yield* simulateRaw(recipe, false, opts?.sender))
     const index = opts?.command ?? simulation.commandResults.length - 1
     const command = simulation.commandResults[index]
     if (command === undefined) {

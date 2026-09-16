@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { bcs as suiBcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
+import { Transaction } from "@mysten/sui/transactions"
 import { normalizeStructTag, SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
 import {
   DateTime,
@@ -28,6 +29,7 @@ import {
 import { Sui } from "../src/services/Sui.ts"
 import { SuiCore } from "../src/services/SuiCore.ts"
 import { FakeOutcome, fakeDigest, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
+import { fromSimulationResult, SIMULATE_INCLUDE } from "../src/internal.ts"
 import { layerTest } from "../src/testing.ts"
 
 const PADDED = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
@@ -68,7 +70,7 @@ const mockCore = (getObjects: () => Effect.Effect<{ objects: ReadonlyArray<unkno
   })
 
 const run = <A, E>(
-  effect: Effect.Effect<A, E, Sui | SuiCoreFake>,
+  effect: Effect.Effect<A, E, Sui | SuiCore | SuiCoreFake>,
   layer = layerTest(baseScript)
 ) => Effect.runPromise(Effect.provide(effect, layer, { local: true }))
 
@@ -697,6 +699,61 @@ describe("simulate and view", () => {
       },
       checksEnabled: true
     })
+  })
+
+  test("simulation falls back to effects.transactionDigest when the top-level digest is absent", async () => {
+    const expected = fakeDigest(52)
+    const simulation = await run(
+      Effect.gen(function*() {
+        const core = yield* SuiCore
+        const raw = yield* core.simulateTransaction({
+          transaction: new Transaction(),
+          include: SIMULATE_INCLUDE
+        })
+        if (raw.$kind !== "Transaction") return yield* Effect.die("expected a successful simulation")
+        const transaction = { ...raw.Transaction } as { digest?: string }
+        delete transaction.digest
+        return yield* fromSimulationResult({
+          ...raw,
+          Transaction: transaction
+        } as typeof raw)
+      }),
+      layerTest({
+        ...baseScript,
+        simulate: [FakeOutcome.succeed({ digest: expected })]
+      })
+    )
+    expect(simulation.digest).toBe(expected as never)
+  })
+
+  test("simulation refuses different top-level and effects digests", async () => {
+    const topLevel = fakeDigest(53)
+    const effects = fakeDigest(54)
+    const error = await run(
+      Effect.gen(function*() {
+        const core = yield* SuiCore
+        const raw = yield* core.simulateTransaction({
+          transaction: new Transaction(),
+          include: SIMULATE_INCLUDE
+        })
+        if (raw.$kind !== "Transaction") return yield* Effect.die("expected a successful simulation")
+        return yield* fromSimulationResult({
+          ...raw,
+          Transaction: {
+            ...raw.Transaction,
+            digest: topLevel,
+            effects: { ...raw.Transaction.effects, transactionDigest: effects }
+          }
+        }).pipe(Effect.flip)
+      }),
+      layerTest({
+        ...baseScript,
+        simulate: [FakeOutcome.succeed({ digest: topLevel })]
+      })
+    )
+    expect(error._tag).toBe("TransportError")
+    expect(String(error.cause)).toContain(topLevel)
+    expect(String(error.cause)).toContain(effects)
   })
 
   test("simulate decodes a publish, whose object type is the literal `package`", async () => {

@@ -19,7 +19,7 @@ import { TestClock } from "effect/testing"
 import { KeyValueStore } from "effect/unstable/persistence"
 import { JournalError, PolicyDenied } from "../src/domain/errors.ts"
 import { JournalEntry } from "../src/domain/journal-entry.ts"
-import { maxTimestampMsOf, Mist, ObjectId, SuiAddress } from "../src/domain/schemas.ts"
+import { CoinType, maxTimestampMsOf, Mist, ObjectId, SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
 import type { SubmitConfigService } from "../src/services/SubmitConfig.ts"
@@ -37,6 +37,10 @@ const RECEIPT_ID = PADDED("7ece1")
 const ESCROW_TYPE = `${PADDED("2")}::escrow::Escrow`
 const RECEIPT_TYPE = `${PADDED("2")}::escrow::Receipt`
 const CLOCK_MS = 1_700_000_000_000n
+const MAINNET_USDC = CoinType.make(
+  "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC"
+)
+const RECIPIENT = SuiAddress.make(PADDED("a11ce2"))
 
 const keypair = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(7))
 const signer = fromKeypair(keypair)
@@ -365,6 +369,53 @@ describe("Tx.sponsored", () => {
     expect(data.sender).toBe(SENDER)
     expect(data.gasData.owner).toBe(PADDED("5b0"))
     expect(data.gasData.payment).toEqual([])
+  })
+})
+
+describe("Tx.gaslessStablecoinTransfer", () => {
+  test("builds the SDK's canonical balance intent followed by balance::send_funds", () => {
+    const transaction = new Transaction()
+    Tx.gaslessStablecoinTransfer({
+      coinType: MAINNET_USDC,
+      amount: 10_000n,
+      recipient: RECIPIENT
+    })(transaction)
+
+    const data = transaction.getData()
+    expect(data.gasData).toEqual({ budget: null, price: null, owner: null, payment: null })
+    expect(data.commands).toHaveLength(2)
+    expect(data.commands[0]).toMatchObject({
+      $kind: "$Intent",
+      $Intent: {
+        name: "CoinWithBalance",
+        data: { type: MAINNET_USDC, balance: 10_000n, outputKind: "balance" }
+      }
+    })
+    expect(data.commands[1]).toMatchObject({
+      $kind: "MoveCall",
+      MoveCall: {
+        package: PADDED("2"),
+        module: "balance",
+        function: "send_funds",
+        typeArguments: [MAINNET_USDC],
+        arguments: [{ $kind: "Result", Result: 0 }, { $kind: "Input", Input: 0, type: "pure" }]
+      }
+    })
+  })
+
+  test("leaves eligibility, the protocol minimum and zero-gas selection to SDK simulation", () => {
+    const transaction = new Transaction()
+    Tx.gaslessStablecoinTransfer({
+      coinType: MAINNET_USDC,
+      amount: 1n,
+      recipient: RECIPIENT
+    })(transaction)
+
+    const data = transaction.getData()
+    expect(data.gasData.price).toBeNull()
+    expect(data.gasData.budget).toBeNull()
+    expect(data.gasData.payment).toBeNull()
+    expect(data.commands[0]?.$Intent?.data).toMatchObject({ balance: 1n })
   })
 })
 
