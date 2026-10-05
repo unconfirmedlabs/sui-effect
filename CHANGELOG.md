@@ -3,6 +3,17 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
+## 0.2.2
+
+### Fixed
+
+- **`Sui.getDynamicFieldOption` decodes real node responses again.**
+  `SuiClientTypes.DynamicField` declares a top-level `valueType`, but the SDK's
+  `getDynamicField` only returns the type under `value.type` (through at least
+  `@mysten/sui` 2.34), so every read failed with "Missing key at valueType".
+  The decoder now fills `valueType` from `value.type`, and `SuiCoreFake`
+  returns the SDK's runtime shape so tests exercise the same path.
+
 ## 0.2.1
 
 ### Added

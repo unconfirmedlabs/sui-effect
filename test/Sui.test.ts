@@ -571,6 +571,34 @@ describe("reads", () => {
     expect(rejected._tag).toBe("DecodeError")
   })
 
+  test("getDynamicFieldOption decodes the SDK's runtime shape (value.type, no valueType)", async () => {
+    const parent = PADDED("e1")
+    const layer = layerTest({
+      ...baseScript,
+      dynamicFields: {
+        [parent]: [{
+          fieldId: PADDED("f1"),
+          type: "0x2::dynamic_field::Field<u64, u64>",
+          name: { type: "u64", bcs: new Uint8Array([7]) },
+          valueType: "u64",
+          $kind: "DynamicField"
+        }]
+      }
+    })
+    const result = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.getDynamicFieldOption(ObjectId.make(parent), {
+          type: "u64",
+          bcs: new Uint8Array([7])
+        })
+      }),
+      layer
+    )
+    expect(Option.isSome(result)).toBe(true)
+    if (Option.isSome(result)) expect(result.value.valueType).toBe("u64")
+  })
+
   test("getDynamicFieldOption is None when the field is missing", async () => {
     const result = await run(
       Effect.gen(function*() {

@@ -1341,9 +1341,11 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         type: entry.valueType,
         bcs: new Uint8Array()
       }
+      // Like the real SDK, return the value type only under `value.type`.
+      const { valueType: _valueType, ...withoutValueType } = entry
       return {
         dynamicField: {
-          ...entry,
+          ...(withoutValueType as typeof entry),
           value,
           version: "1",
           digest: fakeDigest(21),
