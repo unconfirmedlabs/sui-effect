@@ -649,7 +649,12 @@ const makeSui = (
   ): Effect.fn.Return<Option.Option<DynamicField>, TransportError> {
     return yield* core.getDynamicField({ parentId: parent, name }).pipe(
       Effect.flatMap(({ dynamicField }) =>
-        decodeDynamicField(dynamicField).pipe(
+        // `SuiClientTypes.DynamicField` declares `valueType`, but the SDK's
+        // `getDynamicField` (through at least 2.34) only sets `value.type`.
+        decodeDynamicField({
+          ...dynamicField,
+          valueType: dynamicField.valueType ?? dynamicField.value?.type
+        }).pipe(
           Effect.mapError(boundaryError("getDynamicField")),
           Effect.map(Option.some)
         )
