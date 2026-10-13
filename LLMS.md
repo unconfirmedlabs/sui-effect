@@ -1823,7 +1823,7 @@ differently: parse the bytes with a layout, then hand the raw struct to a
 constructor or a mapping function that may throw (an id that has to be
 branded, a `bigint` that has to be range-checked, a discriminant that has to
 become a union). Written out it is `SuiSchema.bcs(...)` piped into a
-`Schema.decodeTo` with a `transformOrFail` and an `Effect.try`, and the part
+`Schema.decodeTo` with a `transformEffect` and an `Effect.try`, and the part
 that gets forgotten is turning the thrown value into a schema issue, so the
 failure arrives as a defect instead of a `DecodeError`.
 
@@ -3265,7 +3265,7 @@ Two spellings, told apart by the text itself:
   over, and reading it here is what keeps `fromHex` and the decoded bytes out
   of application code.
 
-The key is read with `Config.redacted`, and the decoded bytes never leave
+The key is read with `Config.Redacted`, and the decoded bytes never leave
 this function. Neither does anything derived from them: the failure carries
 one fixed sentence and no `cause`, because the decoder's own message quotes
 the input it rejected.
@@ -4340,7 +4340,7 @@ export declare class Script extends Script_base {
      *
      * Reads `SUI_NETWORK` (required, no default; `mainnet` refused unless
      * `SUI_ALLOW_MAINNET=1`), `SUI_RPC_URL` (optional, defaulted per network) and
-     * `SUI_PRIVATE_KEY` (Bech32, through `Config.redacted`).
+     * `SUI_PRIVATE_KEY` (Bech32, through `Config.Redacted`).
      *
      * Fails with: `ConfigError`, `NetworkMismatch`, `TransportError`.
      */
@@ -5699,7 +5699,7 @@ export class Settlement extends Schema.Class<Settlement>("escrow/Settlement")({
  * - **`encode` is the inverse mapper and is not optional.** A codec that cannot
  *   encode is one `Schema.encodeUnknownEffect` fails on, and the compiler asks
  *   for it here rather than at the call site.
- * - **A mapping that can fail uses `transformOrFail`.** `transform` is for total
+ * - **A mapping that can fail uses `transformEffect`.** `transform` is for total
  *   mappings; a body that throws produces a defect, and a byte that was wrong on
  *   the wire deserves a failure.
  *
@@ -5715,9 +5715,9 @@ export const SettlementContent = (typeOrigin: string) =>
   ).pipe(
     Schema.decodeTo(
       Settlement,
-      SchemaTransformation.transformOrFail<typeof Settlement.Encoded, typeof SettlementBcs.$inferType>({
+      SchemaTransformation.transformEffect<typeof Settlement.Encoded, typeof SettlementBcs.$inferType>({
         decode: (fields, options) =>
-          // `transformOrFail`, not `transform`, because one of these mappings can
+          // `transformEffect`, not `transform`, because one of these mappings can
           // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
           // whose body throws is a **defect**, which is not what a bad byte on the
           // wire should be; failing with a `SchemaIssue` here is what makes it a
@@ -6217,7 +6217,7 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
 
   /**
    * The same layer from the environment: `ESCROW_PACKAGE_ID`, `ESCROW_URL` and
-   * `ESCROW_API_KEY`, which is `Config.redacted` because it is a secret.
+   * `ESCROW_API_KEY`, which is `Config.Redacted` because it is a secret.
    *
    * **The package id is read through its schema, not as a string.**
    * `Config.schema(ObjectId, ...)` is the typed deployment path: an override
@@ -6239,8 +6239,8 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
         packageId: Config.schema(ObjectId, "PACKAGE_ID").pipe(
           Config.withDefault(ObjectId.make(ESCROW_PACKAGE))
         ),
-        url: Config.nonEmptyString("URL"),
-        apiKey: Config.redacted("API_KEY")
+        url: Config.NonEmptyString("URL"),
+        apiKey: Config.Redacted("API_KEY")
       }).pipe(Config.nested("ESCROW"))
       return Escrow.layer(options)
     })
@@ -6967,7 +6967,7 @@ describe("the Promise face: registering on a client", () => {
 
 describe("layerConfig validates through the typed deployment path", () => {
   /**
-   * `Effect.withConfigProvider` does not exist in Effect v4 rc.112. A test
+   * `Effect.withConfigProvider` does not exist in Effect v4 (4.0.3). A test
    * provides the `ConfigProvider` the way it provides anything else — here with
    * `ConfigProvider.layer`, which is `Effect.provideService(…,
    * ConfigProvider.ConfigProvider, …)` as a layer.
@@ -7160,8 +7160,8 @@ describe("the errors", () => {
   "peerDependencies": {
     "@mysten/bcs": "^2.1.1",
     "@mysten/sui": "^2.28",
-    "effect": "4.0.0-rc.112",
-    "@unconfirmed/sui-effect": ">=0.1.0 <0.3.0"
+    "effect": ">=4.0.3 <4.1",
+    "@unconfirmed/sui-effect": ">=0.3.0 <0.4.0"
   },
   "peerDependenciesMeta": {
     "@unconfirmed/sui-effect": {
@@ -7173,7 +7173,7 @@ describe("the errors", () => {
     "@mysten/bcs": "2.1.1",
     "@mysten/sui": "2.30.0",
     "@types/bun": "1.4.2",
-    "effect": "4.0.0-rc.112",
+    "effect": "4.0.3",
     "typescript": "5.9.3"
   }
 }

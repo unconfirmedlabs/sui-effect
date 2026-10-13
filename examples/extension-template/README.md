@@ -67,7 +67,7 @@ conversion can be re-run against the same library.
    `tsconfig.build.json`**, and install the dependencies:
 
    ```bash
-   bun add -d @unconfirmed/sui-effect effect@4.0.0-rc.112 @mysten/sui@2.30.0 @mysten/bcs \
+   bun add -d @unconfirmed/sui-effect effect@4.0.3 @mysten/sui@2.30.0 @mysten/bcs \
      @effect/language-service @types/bun typescript
    ```
 
@@ -79,11 +79,12 @@ conversion can be re-run against the same library.
    block this template ships already says so; `devDependencies` is what pins
    the exact versions you build and test against.
 
-   `effect` is pinned **exactly** (`4.0.0-rc.112`), not to a range: rc.113
-   renamed `Config.nonEmptyString`, `Config.string` and `Config.redacted` to
-   `Config.NonEmptyString`, `Config.String` and `Config.Redacted`, so the
-   neighbouring rcs are not interchangeable. Match whatever `@unconfirmed/sui-effect`'s own
-   `peerDependencies` pins.
+   `effect`'s peer range is `>=4.0.3 <4.1` (stable 4.0.x) and its dev
+   dependency is pinned exactly (`4.0.3`). Release candidates are not
+   supported: rc.113 renamed `Config.nonEmptyString`, `Config.string` and
+   `Config.redacted` to `Config.NonEmptyString`, `Config.String` and
+   `Config.Redacted`. Match whatever `@unconfirmed/sui-effect`'s own
+   `peerDependencies` says.
 
    **Until `@unconfirmed/sui-effect` is published**, bun probes the registry for every
    `peerDependencies` entry — even one a local dependency already satisfies —

@@ -3,6 +3,78 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
+## 0.3.0
+
+### Changed (breaking)
+
+- **The `effect` peer dependency is now `>=4.0.3 <4.1`, the stable 4.0.x line.**
+  Release candidates are no longer supported (0.2.x remains the line for
+  `effect@4.0.0-rc.112`). `@effect/platform-bun` (a devDependency, used by tests
+  and examples only) moves to `4.0.3` with it. `@mysten/sui` and `@mysten/bcs`
+  are unchanged. The public API of this package is unchanged: no export was
+  added, removed or re-typed. The port is otherwise mechanical, but effect 4.0.x
+  itself changes a few observable things, listed under "Observable changes"
+  below.
+- Internally the port is: `effect/unstable/persistence` to `effect/persistence`
+  (the journal's `KeyValueStore`), `SchemaTransformation.transformOrFail` to
+  `transformEffect`, `Config.nonEmptyString` / `string` / `redacted` to
+  `Config.NonEmptyString` / `String` / `Redacted`, and
+  `Encoding.encodeBase64` to `Base64.encode` from `effect/encoding/Base64`.
+  The extension template's `peerDependencies` follow (`effect >=4.0.3 <4.1`,
+  `@unconfirmed/sui-effect >=0.3.0 <0.4.0`), and CI's `effect-rc-matrix` job is
+  now `effect-matrix`, proving `4.0.3`.
+
+### Migrating from 0.2.x
+
+1. Move the whole Effect release train to stable together: `effect@4.0.3` and
+   every `@effect/*` package you use at `4.0.3`. A mixed rc and stable install
+   fails to resolve `effect/*` module paths. Pin `4.0.x` explicitly; the `rc`
+   dist-tag still points at a release candidate.
+2. Update your own rc imports and names (the rc.113 renames and the rc.118
+   removal of `effect/unstable/*`; see Effect's `MIGRATION.md`). Everything you
+   import from `@unconfirmed/sui-effect` keeps its name and signature.
+   Extensions that import `KeyValueStore` use `effect/persistence`.
+3. Review `partition`/`separate` destructuring in your own code: Effect 4.0.x
+   returns `[successes, failures]` (rc: `[failures, successes]`), which does not
+   fail to compile when both sides have the same type. sui-effect itself does
+   not call them.
+4. **Durable journals need no migration.** The journal stores JSON produced by
+   `Schema.fromJsonString(JournalEntry)` plus a JSON index, nothing keyed by
+   Schema check IDs, hashes or `Hash` values. A store written by 0.2.x on rc.112
+   was read and rewritten byte for byte by 0.3.0 on 4.0.3, and the reverse
+   (`test/journal-compat.test.ts` pins the rc.112 bytes). Rolling back to 0.2.x
+   over a store 0.3.0 wrote works too.
+5. Since Effect 4.0.2, `Effect.retry` does not retry a typed failure that is
+   accompanied by a defect or an interruption in the same `Cause`; pure defects
+   never were retried. (rc.112 retried a `fail` plus a dying finalizer four
+   times; 4.0.3 runs it once.) `SubmitConfig`'s `resubmit` schedule, `Sui.layer`'s
+   `retry` and the read policy retry only the typed `TransportError`
+   (`retryable`), so ordinary use is unaffected; a schedule you pass that relied
+   on retrying such a mixed cause now stops at the first attempt.
+
+### Observable changes forced by effect 4.0.x
+
+None of these changes a type or a stored byte; they change text and edge cases.
+
+- **`TimeoutError` has a message.** rc.112's was empty; 4.0.3's is
+  `Operation timed out after '<duration>'`. So `SuiError.describe`, the
+  `lastError` a journal records for a timed-out submission (`Tx.ts`) and
+  `Script`'s printed output change from `...(retryable): TimeoutError` to
+  `...(retryable): Operation timed out after '10ms'`. `lastError` is free text,
+  so stores written by 0.2.x stay readable and the reverse also holds.
+- **`SuiError.outcome` honours an inherited `outcome` property.** Effect 4.0.x
+  (effect #8131) makes `Schema.Struct` checks use `key in input`,
+  so an error whose class (not just its instance) defines `outcome` is now
+  recognised by `SuiError.outcome` (`errors.ts`). That aligns it with
+  `Script.exitCode` and the own-property `outcome` check in `Tx.submit`.
+- **`ManagedRuntime.dispose` interrupts in-flight calls.** `dispose()` on a
+  `SuiExtension` Promise face's runtime now interrupts calls still running
+  rather than letting them finish; await your calls before disposing.
+- **Output of effect itself improved**, and shows through this package:
+  `Cause.pretty` includes stack frames, `SchemaError` renders as JSON,
+  tagged unions expose `.tag`, and `toJsonSchemaDocument` emits
+  `additionalProperties: true` where it previously omitted it.
+
 ## 0.2.2
 
 ### Fixed

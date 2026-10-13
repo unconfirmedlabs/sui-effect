@@ -5,11 +5,11 @@ the work plan. Where this file and the spec disagree, fix this file.
 
 ## Ground rules
 
-- **Effect v4, pinned to exactly `4.0.0-rc.112`.** The peer range is the exact
-  version, not a range: rc.113 renamed `Config.nonEmptyString`, `Config.string`
-  and `Config.redacted` to `Config.NonEmptyString`, `Config.String` and
-  `Config.Redacted`, which this package calls at four sites (`Script.ts:64,66`,
-  `Signer.ts:150,154`, `SuiCore.ts:458-462`, `SuiGraphQL.ts:73-77`). v3 names
+- **Effect v4, stable `4.0.x` (peer `>=4.0.3 <4.1`, developed against `4.0.3`).**
+  No release candidate is supported: rc.113 renamed `Config.nonEmptyString`,
+  `Config.string` and `Config.redacted` to `Config.NonEmptyString`,
+  `Config.String` and `Config.Redacted`, and rc.118 moved `effect/unstable/*` to
+  `effect/*`. v3 names
   are compile errors. Never
   write an Effect name from memory: verify it in `node_modules/effect/dist/*.d.ts`.
   The house skill `effect-ts` and its review checklist are binding.

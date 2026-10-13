@@ -2,8 +2,9 @@
  * `sui-effect/journal`: the durable submission journal.
  *
  * Separate from `sui-effect/tx` because it is the only part of the package
- * that imports `effect/unstable/*` (`KeyValueStore`), and an application that
- * does not need durability should not take that dependency.
+ * that imports `effect/persistence` (`KeyValueStore`, still unstable
+ * upstream), and an application that does not need durability should not take
+ * that dependency.
  *
  * Building the layer does no network work. Settling what a previous run left
  * behind is `Tx.reconcileAll`, which the application calls when it is ready.
@@ -19,7 +20,7 @@
  * @example
  * ```ts
  * import { Layer } from "effect"
- * import { KeyValueStore } from "effect/unstable/persistence"
+ * import { KeyValueStore } from "effect/persistence"
  * import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
  *
  * const layer = layerKeyValueStore({ onUnresolved: "ignore" }).pipe(

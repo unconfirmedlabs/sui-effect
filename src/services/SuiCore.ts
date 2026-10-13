@@ -592,8 +592,8 @@ export class SuiCore extends Context.Service<SuiCore, SuiCoreService>()("@unconf
   static readonly layerConfig: Layer.Layer<SuiCore, Config.ConfigError> = Layer.effect(
     SuiCore,
     Effect.gen(function*() {
-      const network = yield* Config.nonEmptyString("SUI_NETWORK")
-      const baseUrl = yield* Config.nonEmptyString("SUI_RPC_URL").pipe(
+      const network = yield* Config.NonEmptyString("SUI_NETWORK")
+      const baseUrl = yield* Config.NonEmptyString("SUI_RPC_URL").pipe(
         Config.orElse(() => {
           const fallback = defaultGrpcUrl(network)
           return fallback === undefined

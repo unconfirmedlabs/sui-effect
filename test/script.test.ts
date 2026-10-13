@@ -498,7 +498,7 @@ describe("Script.run", () => {
       Effect.fail(new SubmissionUnknown({ digest: DIGEST, signed, cause: "timeout" }))
     )
     expect(result.code).toBe(3)
-    // NB7: `Encoding.encodeBase64`, not a hand-rolled `btoa` loop.
+    // NB7: `Base64.encode` (`effect/encoding/Base64`), not a hand-rolled `btoa` loop.
     expect(result.lines).toContain(
       `bytes: ${Buffer.from(signed.bytes).toString("base64")}`
     )

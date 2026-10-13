@@ -23,7 +23,7 @@ import {
   Stream
 } from "effect"
 import { TestClock } from "effect/testing"
-import { KeyValueStore } from "effect/unstable/persistence"
+import { KeyValueStore } from "effect/persistence"
 import { SuiError, UnexpectedEffects } from "../src/domain/errors.ts"
 import { Executed, sdkRefOf } from "../src/domain/executed.ts"
 import { JournalEntry } from "../src/domain/journal-entry.ts"

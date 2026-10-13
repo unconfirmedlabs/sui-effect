@@ -61,7 +61,7 @@ export const bcs = <T extends Input, Input>(
   return Schema.Uint8Array.pipe(
     Schema.decodeTo(
       target,
-      SchemaTransformation.transformOrFail<T, Uint8Array>({
+      SchemaTransformation.transformEffect<T, Uint8Array>({
         decode: (bytes, options) =>
           Effect.try({
             try: () => {
@@ -107,7 +107,7 @@ export const bcs = <T extends Input, Input>(
  * constructor or a mapping function that may throw (an id that has to be
  * branded, a `bigint` that has to be range-checked, a discriminant that has to
  * become a union). Written out it is `SuiSchema.bcs(...)` piped into a
- * `Schema.decodeTo` with a `transformOrFail` and an `Effect.try`, and the part
+ * `Schema.decodeTo` with a `transformEffect` and an `Effect.try`, and the part
  * that gets forgotten is turning the thrown value into a schema issue, so the
  * failure arrives as a defect instead of a `DecodeError`.
  *
@@ -155,7 +155,7 @@ export const decodeWith = <T extends Input, Input, A>(
   return bcs(bcsType, expectedType).pipe(
     Schema.decodeTo(
       target,
-      SchemaTransformation.transformOrFail<A, T>({
+      SchemaTransformation.transformEffect<A, T>({
         decode: (parsed, options) =>
           Effect.try({
             try: () => map(parsed),

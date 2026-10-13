@@ -86,8 +86,8 @@ export class SuiGraphQL extends Context.Service<SuiGraphQL, SuiGraphQLClient>()(
   static readonly layerConfig: Layer.Layer<SuiGraphQL, Config.ConfigError> = Layer.effect(
     SuiGraphQL,
     Effect.gen(function*() {
-      const url = yield* Config.nonEmptyString("SUI_GRAPHQL_URL")
-      const network = yield* Config.nonEmptyString("SUI_NETWORK")
+      const url = yield* Config.NonEmptyString("SUI_GRAPHQL_URL")
+      const network = yield* Config.NonEmptyString("SUI_NETWORK")
       return new SuiGraphQLClient({ url, network })
     })
   )

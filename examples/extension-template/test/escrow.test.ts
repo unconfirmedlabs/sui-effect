@@ -529,7 +529,7 @@ describe("the Promise face: registering on a client", () => {
 
 describe("layerConfig validates through the typed deployment path", () => {
   /**
-   * `Effect.withConfigProvider` does not exist in Effect v4 rc.112. A test
+   * `Effect.withConfigProvider` does not exist in Effect v4 (4.0.3). A test
    * provides the `ConfigProvider` the way it provides anything else — here with
    * `ConfigProvider.layer`, which is `Effect.provideService(…,
    * ConfigProvider.ConfigProvider, …)` as a layer.
