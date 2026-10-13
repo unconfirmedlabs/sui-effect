@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Option } from "effect"
+import { DateTime, Effect, Option } from "effect"
 import { KeyValueStore } from "effect/persistence"
-import { Digest } from "../src/domain/schemas.ts"
+import { ExecutionReason } from "../src/domain/errors.ts"
+import { JournalEntry } from "../src/domain/journal-entry.ts"
+import { Digest, Signature, SuiAddress } from "../src/domain/schemas.ts"
+import { fakeDigest } from "../src/services/SuiCoreFake.ts"
 import { make } from "../src/services/JournalKeyValueStore.ts"
 
 /**
@@ -60,5 +63,59 @@ describe("a journal written on effect rc.112", () => {
       })
     )
     expect(rewritten).toEqual(STORE_FROM_RC112)
+  })
+})
+
+describe("a journal written by this version", () => {
+  test("encodes the five typed entries to the rc.112 bytes", async () => {
+    const at = DateTime.makeUnsafe(1_700_000_000_000)
+    const d = (n: number) => Digest.make(fakeDigest(n))
+    const signed = (n: number) => ({
+      digest: d(n),
+      bytes: new Uint8Array([1, 2, 3, n]),
+      signatures: [Signature.make("sig")],
+      sender: SuiAddress.make(`0x${"ab".repeat(32)}`),
+      expiration: {
+        $kind: "ValidDuring" as const,
+        ValidDuring: {
+          minEpoch: null,
+          maxEpoch: null,
+          minTimestamp: null,
+          maxTimestamp: 1_700_000_120_000n,
+          chain: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
+          nonce: 7
+        }
+      }
+    })
+    const entries: ReadonlyArray<JournalEntry> = [
+      JournalEntry.cases.Signed.make({ _tag: "Signed", digest: d(1), signed: signed(1), signedAt: at }),
+      JournalEntry.cases.Executed.make({ _tag: "Executed", digest: d(2), checkpoint: 88n, at }),
+      JournalEntry.cases.Failed.make({
+        _tag: "Failed",
+        digest: d(3),
+        reason: ExecutionReason.cases.Unknown.make({ $kind: "Unknown" }),
+        at
+      }),
+      JournalEntry.cases.Unknown.make({
+        _tag: "Unknown",
+        digest: d(4),
+        signed: signed(4),
+        lastError: "TransportError DEADLINE_EXCEEDED",
+        attempts: 5,
+        at
+      }),
+      JournalEntry.cases.NotApplied.make({ _tag: "NotApplied", digest: d(5), evidence: "inputConsumed", at })
+    ]
+    const written = await run(
+      Effect.gen(function*() {
+        const store = yield* KeyValueStore.KeyValueStore
+        const journal = make(store)
+        for (const entry of entries) yield* journal.put(entry)
+        const out: Record<string, string | undefined> = {}
+        for (const key of Object.keys(STORE_FROM_RC112)) out[key] = yield* store.get(key)
+        return out
+      })
+    )
+    expect(written).toEqual(STORE_FROM_RC112)
   })
 })

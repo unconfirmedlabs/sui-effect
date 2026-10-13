@@ -424,7 +424,7 @@ it.
 `decode` produces the target's field shape and the target schema does the rest,
 so the `ObjectId` and `SuiAddress` brands are checked as part of the same
 decode. Use `SchemaTransformation.transform` for a total mapping and
-`transformOrFail` for one that can fail; a `transform` whose body *throws* is a
+`transformEffect` for one that can fail; a `transform` whose body *throws* is a
 defect, and bad bytes deserve a failure. Either way a failure inside the domain
 transform is still a **`DecodeError`** from `SuiSchema.decode` and from
 `sui.getObject`, carrying the same `objectId` and `expectedType` — the domain

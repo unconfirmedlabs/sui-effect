@@ -642,7 +642,7 @@ the wrapper retries a transaction that already ran.
 | `SUI_NETWORK` | yes, no default | `mainnet`, `testnet`, `devnet`, `localnet` or your own |
 | `SUI_ALLOW_MAINNET` | only for mainnet | `1` or `true`; a script that means mainnet has to say so twice |
 | `SUI_RPC_URL` | no | The gRPC endpoint; defaulted per known network |
-| `SUI_PRIVATE_KEY` | `Script` only | A Bech32 `suiprivkey1…` key **or a 32-byte hex seed** (64 hex characters, `0x` optional, read as Ed25519), through `Config.redacted`. A key that does not decode fails with one fixed sentence and no cause: the Bech32 decoder quotes the whole input it rejected, so nothing derived from it is ever printed |
+| `SUI_PRIVATE_KEY` | `Script` only | A Bech32 `suiprivkey1…` key **or a 32-byte hex seed** (64 hex characters, `0x` optional, read as Ed25519), through `Config.Redacted`. A key that does not decode fails with one fixed sentence and no cause: the Bech32 decoder quotes the whole input it rejected, so nothing derived from it is ever printed |
 
 `Script.layerReadOnly` provides `ScriptReadOnly`, which has no signer at all —
 a separate service key, so a script written to sign cannot silently build over a
