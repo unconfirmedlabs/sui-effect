@@ -653,7 +653,7 @@ const u64Of = (value: string | number): bigint | undefined => {
 const U64 = Schema.Union([Schema.String, Schema.Finite]).pipe(
   Schema.decodeTo(
     Schema.BigInt,
-    SchemaTransformation.transformOrFail<bigint, string | number>({
+    SchemaTransformation.transformEffect<bigint, string | number>({
       decode: (value, options) => {
         const parsed = u64Of(value)
         return parsed === undefined

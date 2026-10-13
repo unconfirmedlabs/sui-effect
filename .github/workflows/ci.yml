@@ -21,13 +21,14 @@ jobs:
           bun run docs:extensions
           git diff --exit-code -- LLMS.md docs/extensions.md
 
-  # The peer range in package.json is exactly the set of rcs this job proves.
-  effect-rc-matrix:
+  # The peer range in package.json is the 4.0.x line; this job proves each stable
+  # release in it that exists. Add a version here when a new 4.0.x ships.
+  effect-matrix:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        effect: ["4.0.0-rc.112"]
+        effect: ["4.0.3"]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -70,7 +71,7 @@ jobs:
           TARBALL="$(ls "$GITHUB_WORKSPACE"/unconfirmed-sui-effect-*.tgz | head -n 1)"
           mkdir -p /tmp/consumer && cd /tmp/consumer
           bun init -y >/dev/null
-          bun add "$TARBALL" effect@4.0.0-rc.112 @mysten/sui@2.30.0 @mysten/bcs
+          bun add "$TARBALL" effect@4.0.3 @mysten/sui@2.30.0 @mysten/bcs
           cat > check.ts <<'TS'
           import "@unconfirmed/sui-effect"; import "@unconfirmed/sui-effect/tx"; import "@unconfirmed/sui-effect/journal"
           import "@unconfirmed/sui-effect/extension"; import "@unconfirmed/sui-effect/script"; import "@unconfirmed/sui-effect/testing"

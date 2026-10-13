@@ -19,7 +19,6 @@ import {
   ConfigProvider,
   Context,
   Effect,
-  Encoding,
   Exit,
   Fiber,
   Layer,
@@ -28,6 +27,7 @@ import {
   Result,
   Schema
 } from "effect"
+import * as Base64 from "effect/encoding/Base64"
 import type { NetworkMismatch, SuiError, TransportError } from "../domain/errors.ts"
 import { digestOf, SuiError as SuiErrorHelpers } from "../domain/errors.ts"
 import { JournalEntry } from "../domain/journal-entry.ts"
@@ -75,9 +75,9 @@ const configError = (message: string): Config.ConfigError =>
  * Fails with: `ConfigError`.
  */
 export const readNetwork: Effect.Effect<string, Config.ConfigError> = Effect.gen(function*() {
-  const network = yield* Config.nonEmptyString("SUI_NETWORK")
+  const network = yield* Config.NonEmptyString("SUI_NETWORK")
   if (network !== "mainnet") return network
-  const gate = yield* Config.string(MAINNET_GATE).pipe(Config.withDefault(""))
+  const gate = yield* Config.String(MAINNET_GATE).pipe(Config.withDefault(""))
   if (gate === "1" || gate === "true") return network
   return yield* Effect.fail(
     configError(
@@ -112,7 +112,7 @@ export class Script extends Context.Service<Script, ScriptService>()("@unconfirm
    *
    * Reads `SUI_NETWORK` (required, no default; `mainnet` refused unless
    * `SUI_ALLOW_MAINNET=1`), `SUI_RPC_URL` (optional, defaulted per network) and
-   * `SUI_PRIVATE_KEY` (Bech32, through `Config.redacted`).
+   * `SUI_PRIVATE_KEY` (Bech32, through `Config.Redacted`).
    *
    * Fails with: `ConfigError`, `NetworkMismatch`, `TransportError`.
    */
@@ -478,7 +478,7 @@ const describeFailure = (error: unknown): ReadonlyArray<string> => {
     if (digest !== undefined) lines.push(`digest: ${digest}`)
     if (tagged._tag === "SubmissionUnknown") {
       if (tagged.signed !== undefined) {
-        lines.push(`bytes: ${Encoding.encodeBase64(tagged.signed.bytes)}`)
+        lines.push(`bytes: ${Base64.encode(tagged.signed.bytes)}`)
       }
       lines.push(
         "the outcome is unknown: reconcile this digest before sending anything else from this sender"
@@ -525,7 +525,7 @@ const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<st
   for (const entry of entries) {
     lines.push(`unresolved ${entry.digest} (${entry._tag})`)
     if (entry._tag === "Signed" || entry._tag === "Unknown") {
-      lines.push(`bytes: ${Encoding.encodeBase64(entry.signed.bytes)}`)
+      lines.push(`bytes: ${Base64.encode(entry.signed.bytes)}`)
     }
     const encoded = encodeJournalEntry(entry)
     if (Result.isSuccess(encoded)) lines.push(`entry: ${JSON.stringify(encoded.success)}`)

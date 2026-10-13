@@ -3,6 +3,50 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
+## 0.3.0
+
+### Changed (breaking)
+
+- **The `effect` peer dependency is now `>=4.0.3 <4.1`, the stable 4.0.x line.**
+  Release candidates are no longer supported (0.2.x remains the line for
+  `effect@4.0.0-rc.112`). `@effect/platform-bun` (a devDependency, used by tests
+  and examples only) moves to `4.0.3` with it. `@mysten/sui` and `@mysten/bcs`
+  are unchanged. The public API of this package is unchanged: this release is a
+  port, with no behavior change.
+- Internally the port is: `effect/unstable/persistence` to `effect/persistence`
+  (the journal's `KeyValueStore`), `SchemaTransformation.transformOrFail` to
+  `transformEffect`, `Config.nonEmptyString` / `string` / `redacted` to
+  `Config.NonEmptyString` / `String` / `Redacted`, and
+  `Encoding.encodeBase64` to `Base64.encode` from `effect/encoding/Base64`.
+  The extension template's `peerDependencies` follow (`effect >=4.0.3 <4.1`,
+  `@unconfirmed/sui-effect >=0.3.0 <0.4.0`), and CI's `effect-rc-matrix` job is
+  now `effect-matrix`, proving `4.0.3`.
+
+### Migrating from 0.2.x
+
+1. Move the whole Effect release train to stable together: `effect@4.0.3` and
+   every `@effect/*` package you use at `4.0.3`. A mixed rc and stable install
+   fails to resolve `effect/*` module paths. Pin `4.0.x` explicitly; the `rc`
+   dist-tag still points at a release candidate.
+2. Update your own rc imports and names (the rc.113 renames and the rc.118
+   removal of `effect/unstable/*`; see Effect's `MIGRATION.md`). Everything you
+   import from `@unconfirmed/sui-effect` keeps its name and signature.
+   Extensions that import `KeyValueStore` use `effect/persistence`.
+3. Review `partition`/`separate` destructuring in your own code: Effect 4.0.x
+   returns `[successes, failures]` (rc: `[failures, successes]`), which does not
+   fail to compile when both sides have the same type. sui-effect itself does
+   not call them.
+4. **Durable journals need no migration.** The journal stores JSON produced by
+   `Schema.fromJsonString(JournalEntry)` plus a JSON index, nothing keyed by
+   Schema check IDs, hashes or `Hash` values. A store written by 0.2.x on rc.112
+   was read and rewritten byte for byte by 0.3.0 on 4.0.3, and the reverse
+   (`test/journal-compat.test.ts` pins the rc.112 bytes). Rolling back to 0.2.x
+   over a store 0.3.0 wrote works too.
+5. `Effect.retry` no longer retries defects since Effect 4.0.2. `SubmitConfig`'s
+   `resubmit` schedule, `Sui.layer`'s `retry` and the read policy retry only the
+   typed `TransportError` (`retryable`), so none of them depended on retrying a
+   defect; a schedule you pass that expected a defect to be retried now stops.
+
 ## 0.2.2
 
 ### Fixed

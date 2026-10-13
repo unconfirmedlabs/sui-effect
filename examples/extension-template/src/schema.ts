@@ -99,7 +99,7 @@ export class Settlement extends Schema.Class<Settlement>("escrow/Settlement")({
  * - **`encode` is the inverse mapper and is not optional.** A codec that cannot
  *   encode is one `Schema.encodeUnknownEffect` fails on, and the compiler asks
  *   for it here rather than at the call site.
- * - **A mapping that can fail uses `transformOrFail`.** `transform` is for total
+ * - **A mapping that can fail uses `transformEffect`.** `transform` is for total
  *   mappings; a body that throws produces a defect, and a byte that was wrong on
  *   the wire deserves a failure.
  *
@@ -115,9 +115,9 @@ export const SettlementContent = (typeOrigin: string) =>
   ).pipe(
     Schema.decodeTo(
       Settlement,
-      SchemaTransformation.transformOrFail<typeof Settlement.Encoded, typeof SettlementBcs.$inferType>({
+      SchemaTransformation.transformEffect<typeof Settlement.Encoded, typeof SettlementBcs.$inferType>({
         decode: (fields, options) =>
-          // `transformOrFail`, not `transform`, because one of these mappings can
+          // `transformEffect`, not `transform`, because one of these mappings can
           // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
           // whose body throws is a **defect**, which is not what a bad byte on the
           // wire should be; failing with a `SchemaIssue` here is what makes it a

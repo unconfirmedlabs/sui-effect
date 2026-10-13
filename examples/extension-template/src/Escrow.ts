@@ -368,7 +368,7 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
 
   /**
    * The same layer from the environment: `ESCROW_PACKAGE_ID`, `ESCROW_URL` and
-   * `ESCROW_API_KEY`, which is `Config.redacted` because it is a secret.
+   * `ESCROW_API_KEY`, which is `Config.Redacted` because it is a secret.
    *
    * **The package id is read through its schema, not as a string.**
    * `Config.schema(ObjectId, ...)` is the typed deployment path: an override
@@ -390,8 +390,8 @@ export class Escrow extends Context.Service<Escrow, EscrowService>()(
         packageId: Config.schema(ObjectId, "PACKAGE_ID").pipe(
           Config.withDefault(ObjectId.make(ESCROW_PACKAGE))
         ),
-        url: Config.nonEmptyString("URL"),
-        apiKey: Config.redacted("API_KEY")
+        url: Config.NonEmptyString("URL"),
+        apiKey: Config.Redacted("API_KEY")
       }).pipe(Config.nested("ESCROW"))
       return Escrow.layer(options)
     })

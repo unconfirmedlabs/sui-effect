@@ -202,7 +202,7 @@ const keypairFromSecret = (value: string): Keypair | undefined => {
  *   over, and reading it here is what keeps `fromHex` and the decoded bytes out
  *   of application code.
  *
- * The key is read with `Config.redacted`, and the decoded bytes never leave
+ * The key is read with `Config.Redacted`, and the decoded bytes never leave
  * this function. Neither does anything derived from them: the failure carries
  * one fixed sentence and no `cause`, because the decoder's own message quotes
  * the input it rejected.
@@ -214,7 +214,7 @@ const keypairFromSecret = (value: string): Keypair | undefined => {
 export const fromConfig = (
   name = "SUI_PRIVATE_KEY"
 ): Effect.Effect<Signer, Config.ConfigError> =>
-  Config.redacted(name).pipe(
+  Config.Redacted(name).pipe(
     Effect.flatMap((redacted) =>
       Effect.try({
         try: () => {

@@ -14,15 +14,14 @@ Effect so tests can drive them.
 
 ```bash
 bun add @unconfirmed/sui-effect
-bun add -d effect@4.0.0-rc.112 @mysten/sui@2.30.0
+bun add -d effect@4.0.3 @mysten/sui@2.30.0
 ```
 
 `effect` and `@mysten/sui` are peer dependencies: one copy of each per process,
 or `Context.Service` identities and `instanceof` checks stop matching. The
-`effect` peer is pinned **exactly** to `4.0.0-rc.112`, because rc.113 renamed
-`Config.nonEmptyString`, `Config.string` and `Config.redacted` to
-`Config.NonEmptyString`, `Config.String` and `Config.Redacted`, and neighbouring
-release candidates are not interchangeable.
+`effect` peer is `>=4.0.3 <4.1`: the stable 4.0.x line, which is the long-term
+support line. Release candidates are not supported; 0.2.x of this package is the
+line for `4.0.0-rc.112`.
 
 A **library** built on sui-effect puts all three in its own
 `peerDependencies` **and** `devDependencies`, never in `dependencies`; see
@@ -797,7 +796,7 @@ ordered `simulate` script otherwise.
 
 | Package | Range | Tested against |
 |---|---|---|
-| `effect` | `4.0.0-rc.112` (exact) | `4.0.0-rc.112`, in CI |
+| `effect` | `>=4.0.3 <4.1` | `4.0.3`, in CI; `4.0.3` is the pinned devDependency |
 | `@mysten/sui` | `^2.28` (the first version whose BCS and gRPC round-trip `ValidDuring` and `Validity` expirations) | `2.29.0` and `2.30.0`, both in CI; `2.30.0` is the pinned devDependency |
 | `@mysten/bcs` | `^2.1.1` | `2.1.1` |
 | TypeScript | `5.9.x` to build | `5.9.3` |
@@ -805,10 +804,11 @@ ordered `simulate` script otherwise.
 
 The SDK row is a matrix, not a hope: CI builds, typechecks and runs the suite
 against `@mysten/sui` 2.29.0 and 2.30.0, which are the versions consumers pin
-today. The `effect` row is a matrix of one, and it is exact on purpose: rc.113
-renamed three `Config` constructors this package calls at four sites
-(`Script.ts`, `Signer.ts`, `SuiCore.ts`, `SuiGraphQL.ts`), so widening the range
-means supporting both spellings and proving the wider one in CI.
+today. The `effect` row is a matrix of one today (`4.0.3`): the range admits the 4.0.x
+patch releases, and a release is added to the CI matrix once it exists and the
+suite has run against it. Release candidates are out of range on purpose: the
+module paths (`effect/unstable/*` became `effect/*` in rc.118) and the `Config`
+and `Schema` constructors this package calls differ between rc.112 and 4.0.x.
 
 **Consumers on TypeScript 7 (`tsgo`) are supported.** The shipped `.d.ts` needs
 nothing from the old compiler. The `prepare` script here

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { DateTime, Effect, Layer, Option, Schema } from "effect"
 import { TestSchema } from "effect/testing"
-import { KeyValueStore } from "effect/unstable/persistence"
+import { KeyValueStore } from "effect/persistence"
 import { ExecutionReason } from "../src/domain/errors.ts"
 import { isUnresolved, JournalEntry } from "../src/domain/journal-entry.ts"
 import { Digest, Signature, SuiAddress } from "../src/domain/schemas.ts"

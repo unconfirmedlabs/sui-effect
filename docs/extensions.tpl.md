@@ -603,9 +603,9 @@ service; the shape is `Layer.effect(Self, make).pipe(Layer.provide(Dependency.la
 @@ src/Escrow.ts :: static readonly layer = (options: EscrowOptions): Layer.Layer<Escrow, never, Sui> => ::     )
 
 `layerConfig` reads a prefixed namespace through `Config.nested`, and every
-secret is `Config.redacted`, so it cannot reach a log line. **Every value that
+secret is `Config.Redacted`, so it cannot reach a log line. **Every value that
 has a schema is read through it**, with `Config.schema(ObjectId, "PACKAGE_ID")`
-rather than `Config.nonEmptyString`: an override that is not an object id then
+rather than `Config.NonEmptyString`: an override that is not an object id then
 fails where it was set, naming the variable, instead of being carried into every
 `moveCall` target and every codec and surfacing three calls later as a Move
 abort nobody can trace back to an environment variable. The template has a test
@@ -615,7 +615,7 @@ Two things not to promise in the docs you write around it. `Config.option` turns
 an **empty** variable into "unset", so `FOO=""` takes the default rather than
 failing — do not write "an empty value is a `ConfigError`" above a
 `Config.option`. And `Effect.withConfigProvider` does not exist in Effect v4
-rc.112: a test provides the provider like anything else, with
+(4.0.3): a test provides the provider like anything else, with
 `ConfigProvider.layer(ConfigProvider.fromEnvRecord({ … }))` or
 `Effect.provideService(effect, ConfigProvider.ConfigProvider, provider)`.
 
@@ -1758,7 +1758,7 @@ entries are JSON and its unresolved index is one more key).
 <!-- inline -->
 
 ```ts
-import { KeyValueStore } from "effect/unstable/persistence"
+import { KeyValueStore } from "effect/persistence"
 import { Effect, Layer } from "effect"
 import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
 
@@ -1867,9 +1867,10 @@ the page to read before the conversion rather than after it.
   resolve a just-created object for a while **even after `waitForTransaction`
   returned**: visibility of a transaction is not visibility of its objects in
   the resolver path. Retry the build, do not re-read and despair.
-- **Pin `effect@4.0.0-rc.112` exactly.** rc.113 renamed `Config.nonEmptyString`,
-  `Config.string` and `Config.redacted`, so neighbouring release candidates are
-  not interchangeable — and two copies of `effect` in one process is a different
+- **Use stable `effect@4.0.3` or a later 4.0.x.** Release candidates are not
+  supported: rc.113 renamed `Config.nonEmptyString`, `Config.string` and
+  `Config.redacted`, and rc.118 moved `effect/unstable/*` to `effect/*` — and
+  two copies of `effect` in one process is a different
   and worse problem (section 16).
 - **Copy `scripts/check-package.ts`.** It resolves `@unconfirmed/sui-effect`, `effect` and
   `@mysten/*` from your own `node_modules` first, so it works outside this
@@ -1891,7 +1892,7 @@ the page to read before the conversion rather than after it.
   `SuiSchema.matchesType`; `normalizeStructTag` throws on `u64`, `bool`,
   `address` and `vector<u8>`.
 - **`Stream.runCollect` returns a plain `Array`** in Effect v4, not a `Chunk`.
-- **`Effect.withConfigProvider` does not exist** in rc.112: provide the
+- **`Effect.withConfigProvider` does not exist** in 4.0.3: provide the
   `ConfigProvider` service.
 - **`SuiError.describe` covers `GraphQLUnavailable` and `ExtensionNotReady`**,
   and `Script.run` prints them like any other tag.

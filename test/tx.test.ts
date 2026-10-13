@@ -16,7 +16,7 @@ import {
   Schedule
 } from "effect"
 import { TestClock } from "effect/testing"
-import { KeyValueStore } from "effect/unstable/persistence"
+import { KeyValueStore } from "effect/persistence"
 import { JournalError, PolicyDenied } from "../src/domain/errors.ts"
 import { JournalEntry } from "../src/domain/journal-entry.ts"
 import { CoinType, maxTimestampMsOf, Mist, ObjectId, SuiAddress } from "../src/domain/schemas.ts"

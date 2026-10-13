@@ -67,32 +67,36 @@ const claim = (tx: Transaction) => {
 
 // ---------------------------------------------------------------------------
 
-describe("A1. the effect peer is exactly rc.112, and everything says so", () => {
+describe("A1. the effect peer is the stable 4.0.x line, and everything says so", () => {
   const manifest = JSON.parse(readFileSync("package.json", "utf8"))
   const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
   const readme = readFileSync("README.md", "utf8")
 
-  test("the peer dependency is the exact version, not a range", () => {
+  test("the peer dependency admits stable 4.0.x and no release candidate", () => {
     // rc.113 renamed `Config.nonEmptyString`/`string`/`redacted`, which this
-    // package calls at four sites, so a range that admitted rc.113 admitted a
-    // version where `Script.layer`, `layerConfig` and `Signer.fromConfig` throw.
-    expect(manifest.peerDependencies.effect).toBe("4.0.0-rc.112")
+    // package calls at four sites, and rc.118 moved `effect/unstable/*`, so a
+    // range that admitted a release candidate admitted a version where the
+    // package neither typechecks nor loads.
+    expect(manifest.peerDependencies.effect).toBe(">=4.0.3 <4.1")
+    expect(manifest.devDependencies.effect).toBe("4.0.3")
+    expect(manifest.devDependencies["@effect/platform-bun"]).toBe("4.0.3")
   })
 
-  test("the CI matrix is exactly the set the peer admits", () => {
+  test("the CI matrix proves the version the peer range is developed against", () => {
     const matrix = /effect: \[([^\]]*)\]/.exec(workflow)?.[1] ?? ""
-    expect(matrix).toContain("4.0.0-rc.112")
-    expect(matrix).not.toContain("rc.113")
+    expect(matrix).toContain("4.0.3")
+    expect(matrix).not.toContain("rc.")
   })
 
   test("the README version table agrees", () => {
-    expect(readme).toContain("| `effect` | `4.0.0-rc.112` (exact) |")
-    expect(readme).not.toContain("`4.0.0-rc.113`")
+    expect(readme).toContain("| `effect` | `>=4.0.3 <4.1` |")
+    expect(readme).not.toContain("4.0.0-rc.112`, in CI")
   })
 
-  test("the template pins the same exact version", () => {
+  test("the template admits the same range", () => {
     const template = JSON.parse(readFileSync("examples/extension-template/package.json", "utf8"))
-    expect(template.peerDependencies.effect).toBe("4.0.0-rc.112")
+    expect(template.peerDependencies.effect).toBe(">=4.0.3 <4.1")
+    expect(template.devDependencies.effect).toBe("4.0.3")
   })
 })
 
@@ -107,7 +111,7 @@ describe("A2. every CI job can pass as written", () => {
   }
 
   test("both matrix jobs build before they test", () => {
-    for (const name of ["effect-rc-matrix", "sui-sdk-matrix"]) {
+    for (const name of ["effect-matrix", "sui-sdk-matrix"]) {
       const job = jobNamed(name)
       const run = /bun run typecheck[^\n]*/.exec(job)?.[0] ?? ""
       expect(run).toContain("bun run build")

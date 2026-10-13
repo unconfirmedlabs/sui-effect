@@ -1,9 +1,9 @@
 /**
- * The durable `Journal`, over `KeyValueStore` from `effect/unstable/persistence`.
+ * The durable `Journal`, over `KeyValueStore` from `effect/persistence`.
  *
- * This is the only file in the package that imports `effect/unstable/*`, and it
- * is reachable only through the `sui-effect/journal` subpath, so the core
- * modules stay on stable Effect.
+ * This is the only file in the package that imports `effect/persistence`
+ * (`@stability unstable` upstream), and it is reachable only through the
+ * `sui-effect/journal` subpath, so the core modules stay on stable Effect.
  *
  * Building the layer does no network work: it reads the index of unresolved
  * entries and, when asked to, refuses to start while any are outstanding. What
@@ -12,7 +12,7 @@
  * @since 0.1.0
  */
 import { Effect, Layer, Option, Schema, Semaphore } from "effect"
-import { KeyValueStore } from "effect/unstable/persistence"
+import { KeyValueStore } from "effect/persistence"
 import { JournalError } from "../domain/errors.ts"
 import { isUnresolved, JournalEntry } from "../domain/journal-entry.ts"
 import type { Digest } from "../domain/schemas.ts"
