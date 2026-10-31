@@ -1,7 +1,8 @@
 /**
- * Generates `LLMS.md`: the whole public surface of sui-effect, with every
- * exported symbol's signature and the error union its JSDoc states, followed by
- * every example in the repository verbatim.
+ * Generates `LLMS.md`: a hand-written "start here" head (`docs/llms-head.md`,
+ * with its recipes and its index filled in), then the whole public surface of
+ * sui-effect, with every exported symbol's signature and the error union its
+ * JSDoc states, followed by every example in the repository verbatim.
  *
  * It is mechanical on purpose. Signatures come from the emitted `.d.ts` in
  * `dist/` through the TypeScript compiler API, and prose comes from the JSDoc
@@ -34,10 +35,53 @@ const WORKED_EXAMPLE_FILES = [
   "src/errors.ts",
   "src/Escrow.ts",
   "src/upstream.ts",
-  "src/extension.ts",
-  "test/escrow.test.ts",
-  "package.json"
+  "src/extension.ts"
 ]
+
+/**
+ * Template files named by path rather than printed: the test suite alone is a
+ * sixth of this document, and the template ships inside the package, so an
+ * agent can open them from `node_modules` without a checkout.
+ */
+const WORKED_EXAMPLE_REFERENCED = [
+  "test/escrow.test.ts",
+  "test/durable-object.test.ts",
+  "recipes/durable-object.ts",
+  "package.json",
+  "scripts/check-package.ts"
+]
+
+/** The hand-written head, with `<!-- recipe: path -->` and `<!-- index -->` filled in. */
+const HEAD = "docs/llms-head.md"
+
+/**
+ * The relative `src/` imports a recipe file uses, spelled as the package
+ * subpaths a consumer writes. A recipe is a file in this repository so that it
+ * is typechecked and tested; this is the only change made to it on the way
+ * into `LLMS.md`.
+ */
+const SUBPATH_OF_SOURCE: ReadonlyArray<readonly [string, string]> = [
+  ["src/index.ts", "@unconfirmed/sui-effect"],
+  ["src/tx.ts", "@unconfirmed/sui-effect/tx"],
+  ["src/journal.ts", "@unconfirmed/sui-effect/journal"],
+  ["src/extension.ts", "@unconfirmed/sui-effect/extension"],
+  ["src/script.ts", "@unconfirmed/sui-effect/script"],
+  ["src/testing.ts", "@unconfirmed/sui-effect/testing"]
+]
+
+/**
+ * One recipe file with its imports rewritten. Throws when a relative import is
+ * left over, which would be a recipe no consumer can paste.
+ */
+export const recipeOf = (path: string, source: string): string => {
+  let text = source
+  for (const [file, subpath] of SUBPATH_OF_SOURCE) {
+    text = text.replace(new RegExp(`"(?:\\.\\./)+${file.replace(".", "\\.")}"`, "g"), `"${subpath}"`)
+  }
+  const relative = /from "\.{1,2}\/[^"]*"/.exec(text)
+  if (relative !== null) throw new Error(`${path}: ${relative[0]} has no package subpath`)
+  return text.trimEnd()
+}
 
 /**
  * How every type in this file is rendered.
@@ -445,7 +489,20 @@ export const missingDeclaration = (): string | undefined => {
   return undefined
 }
 
-const renderApi = (): string => {
+/** One line per exported name: the subpath index in the head. */
+type IndexLine = { readonly name: string; readonly summary: string }
+
+/**
+ * The first sentence of a summary, on one line. A period inside a dotted name
+ * (`Tx.run`) does not end it; a period followed by whitespace does.
+ */
+const firstSentence = (summary: string): string => {
+  const flat = summary.replace(/\s+/g, " ").trim()
+  const end = /\.(?=\s|$)/.exec(flat)
+  return end === null ? flat : flat.slice(0, end.index + 1)
+}
+
+const renderApi = (): { readonly api: string; readonly index: string } => {
   const files = SUBPATHS.map((subpath) => subpath.file)
   const missing = missingDeclaration()
   if (missing !== undefined) {
@@ -464,6 +521,7 @@ const renderApi = (): string => {
   })
   const checker = program.getTypeChecker()
   const sections: Array<string> = []
+  const indexSections: Array<string> = []
   const printed: Rendered = new Map()
   for (const subpath of SUBPATHS) {
     const source = program.getSourceFile(subpath.file)
@@ -471,10 +529,24 @@ const renderApi = (): string => {
     const moduleSymbol = checker.getSymbolAtLocation(source)
     const moduleDoc = moduleSymbol === undefined ? "" : summaryOf(docOf(moduleSymbol, checker))
     const exports = moduleSymbol === undefined ? [] : checker.getExportsOfModule(moduleSymbol)
-    const rendered = [...exports]
+    const sorted = [...exports]
       .sort((left, right) => (left.getName() < right.getName() ? -1 : left.getName() > right.getName() ? 1 : 0))
+    // Read before rendering: `renderSymbol` records where each declaration was
+    // first printed, and the index has to know that from the state before.
+    const lines = sorted.map((symbol) => indexLineOf(symbol, checker, printed, subpath.name))
+    const rendered = sorted
       .map((symbol) => renderSymbol(symbol, checker, 3, printed, subpath.name))
       .filter((section): section is string => section !== undefined)
+    indexSections.push(
+      [
+        `### \`${subpath.name}\``,
+        "",
+        ...lines
+          .filter((line): line is IndexLine => line !== undefined)
+          .map(({ name, summary }) => `- \`${name}\`${summary === "" ? "" : ` — ${summary}`}`),
+        ""
+      ].join("\n")
+    )
     sections.push(
       [
         `## \`${subpath.name}\``,
@@ -486,7 +558,37 @@ const renderApi = (): string => {
       ].join("\n")
     )
   }
-  return sections.join("\n")
+  return { api: sections.join("\n"), index: indexSections.join("\n") }
+}
+
+/** The index line of one exported name, read off the same declaration `renderSymbol` prints. */
+const indexLineOf = (
+  symbol: ts.Symbol,
+  checker: ts.TypeChecker,
+  printed: Rendered,
+  subpath: string
+): IndexLine | undefined => {
+  const target = (symbol.flags & ts.SymbolFlags.Alias) !== 0
+    ? checker.getAliasedSymbol(symbol)
+    : symbol
+  const declaration = target.declarations?.[0]
+  if (declaration === undefined) return undefined
+  const name = symbol.getName()
+  if (ts.isSourceFile(declaration)) return { name, summary: "a namespace; its members are listed under it below." }
+  const first = printed.get(declaration)
+  if (first !== undefined && first !== subpath) return { name, summary: `re-exported from \`${first}\`.` }
+  return { name, summary: withoutLinks(firstSentence(summaryOf(docOfDeclaration(declaration)))) }
+}
+
+/** `docs/llms-head.md` with its recipes quoted and its index filled in. */
+const renderHead = (index: string): string => {
+  const head = readFileSync(HEAD, "utf8")
+  if (!head.includes("<!-- index -->")) throw new Error(`${HEAD} has no <!-- index --> marker`)
+  return head
+    .replace(/<!-- recipe: ([^ ]+) -->/g, (_, path: string) =>
+      ["```ts", recipeOf(path, readFileSync(path, "utf8")), "```"].join("\n"))
+    .replace("<!-- index -->", index.trimEnd())
+    .trimEnd()
 }
 
 const listFiles = (dir: string): ReadonlyArray<string> =>
@@ -507,29 +609,15 @@ const renderFiles = (paths: ReadonlyArray<string>): string =>
 
 /** The whole file, as a string, so a test can compare it with what is committed. */
 export const render = (): string => {
-  const head = [
-    "# @unconfirmed/sui-effect for agents",
-    "",
-    "This file is generated by `bun scripts/llms.ts` from the emitted type",
-    "declarations and the JSDoc in `src/`, plus every example in the repository.",
-    "Do not edit it by hand; a test fails when it is stale.",
-    "",
-    "@unconfirmed/sui-effect is an opinionated Effect v4 layer over `@mysten/sui`. Two client",
-    "tiers (`SuiCore` mirrors the SDK, `Sui` makes the decisions), a closed error",
-    "union on every function, the transaction lifecycle as functions with typed",
-    "outcomes, and an in-memory fake so every test runs with no network.",
-    "",
-    "`AGENTS.md` has the invariants, `README.md` the tour, `docs/extensions.md` the",
-    "contract for building an extension package on top of it.",
-    "",
-    "# API",
-    ""
-  ].join("\n")
+  const { api, index } = renderApi()
   const examples = EXAMPLE_DIRS.flatMap(listFiles)
   const worked = WORKED_EXAMPLE_FILES.map((file) => `${WORKED_EXAMPLE}/${file}`)
   return [
-    head,
-    renderApi(),
+    renderHead(index),
+    "",
+    "# API",
+    "",
+    api,
     "# Examples",
     "",
     "Every file below is typechecked, and each one is exercised by a test against",
@@ -539,7 +627,10 @@ export const render = (): string => {
     "# The extension worked example",
     "",
     "`examples/extension-template/` is a complete, copyable extension package, and",
-    "the source of every code block in `docs/extensions.md`.",
+    "the source of every code block in `docs/extensions.md`. It ships inside this",
+    "package (`node_modules/@unconfirmed/sui-effect/examples/extension-template/`).",
+    "Its source files are below; these are in the template too and are not",
+    `reprinted here: ${WORKED_EXAMPLE_REFERENCED.map((file) => `\`${file}\``).join(", ")}.`,
     "",
     renderFiles(worked)
   ].join("\n")

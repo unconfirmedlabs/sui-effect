@@ -12,8 +12,8 @@ import { describe, expect, setDefaultTimeout, test } from "bun:test"
 
 // The generators shell out to the TypeScript checker over dist/; five seconds is tight on a CI runner.
 setDefaultTimeout(120_000)
-import { existsSync, readFileSync } from "node:fs"
-import { errorsOf, missingDeclaration, render, summaryOf } from "../scripts/llms.ts"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { errorsOf, missingDeclaration, recipeOf, render, summaryOf } from "../scripts/llms.ts"
 
 const missing = missingDeclaration()
 
@@ -39,6 +39,38 @@ describe("the error sentence", () => {
       "The durable journal lives in\n@unconfirmed/sui-effect/journal."
     )
     expect(summaryOf("Prose.\n@example\n```ts\nx\n```")).toBe("Prose.")
+  })
+})
+
+describe("the start-here head", () => {
+  test("a recipe's relative src imports become the package subpaths", () => {
+    const source = [
+      `import { Sui } from "../../src/index.ts"`,
+      `import { Tx } from "../../src/tx.ts"`,
+      `import { layerTest } from "../src/testing.ts"`,
+      ""
+    ].join("\n")
+    expect(recipeOf("x.ts", source)).toBe([
+      `import { Sui } from "@unconfirmed/sui-effect"`,
+      `import { Tx } from "@unconfirmed/sui-effect/tx"`,
+      `import { layerTest } from "@unconfirmed/sui-effect/testing"`
+    ].join("\n"))
+  })
+
+  test("a relative import with no subpath is refused, not printed", () => {
+    expect(() => recipeOf("x.ts", `import { x } from "../src/services/Tx.ts"`)).toThrow("no package subpath")
+  })
+
+  test("every recipe the head names is a file, and every recipe file is named", () => {
+    const head = readFileSync("docs/llms-head.md", "utf8")
+    const named = [...head.matchAll(/<!-- recipe: ([^ ]+) -->/g)].map((match) => match[1]!)
+    expect(named).toHaveLength(5)
+    for (const path of named) expect(existsSync(path)).toBe(true)
+    const files = [
+      ...readdirSync("examples/recipes").map((file) => `examples/recipes/${file}`),
+      ...readdirSync("test/recipes").map((file) => `test/recipes/${file}`)
+    ]
+    expect([...files].sort()).toEqual([...named].sort())
   })
 })
 

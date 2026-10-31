@@ -113,7 +113,10 @@ const normalizeSuiAddressValue: (input: string) => typeof SuiAddressSchema.Type 
   SuiAddressSchema
 )
 
-/** The schema, plus {@link normalizeSuiAddressValue} as `SuiAddress.normalize`. */
+/**
+ * A 32-byte Sui account address in the padded lowercase `0x` form: the schema,
+ * plus `SuiAddress.normalize` for a shorthand spelling such as `"0x2"`.
+ */
 export const SuiAddress = Object.assign(SuiAddressSchema, {
   normalize: normalizeSuiAddressValue
 })
@@ -156,7 +159,10 @@ const normalizeObjectIdValue: (input: string) => typeof ObjectIdSchema.Type = Sc
   ObjectIdSchema
 )
 
-/** The schema, plus {@link normalizeObjectIdValue} as `ObjectId.normalize`. */
+/**
+ * A 32-byte Sui object id in the padded lowercase `0x` form: the schema, plus
+ * `ObjectId.normalize` for a shorthand spelling such as `"0x6"`.
+ */
 export const ObjectId = Object.assign(ObjectIdSchema, { normalize: normalizeObjectIdValue })
 export type ObjectId = typeof ObjectIdSchema.Type
 
