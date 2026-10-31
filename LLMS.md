@@ -354,7 +354,7 @@ export declare class Executed extends Executed_base {
     /**
      * The type of a changed object, from the `objectTypes` join. A published
      * package reports the literal `package` rather than a struct tag, so the
-     * decode goes through {@link ObjectType}.
+     * decode goes through `ObjectType`.
      */
     /**
      * Everything the effects actually say about one changed object. Nothing is
@@ -363,8 +363,9 @@ export declare class Executed extends Executed_base {
      * "version 0" and "the node did not say".
      */
     /**
-     * Objects this transaction created, optionally filtered by Move type
-     * (compared with `normalizeStructTag`). Never fails.
+     * Objects this transaction created, optionally filtered by Move type through
+     * `typeMatches`: a bare tag matches every instantiation of the generic, a
+     * parameterized one is compared in full after normalization. Never fails.
      */
     created(type?: string): ReadonlyArray<ChangedRef>;
     /**
@@ -372,7 +373,7 @@ export declare class Executed extends Executed_base {
      *
      * The direct replacement for the substring matching every repo hand-rolls
      * (`createdByType("::Receipt")`), without making substring matching the
-     * default: `created(type)` still compares normalized struct tags.
+     * default: `created(type)` still compares through `typeMatches`.
      * Never fails.
      */
     createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef>;
@@ -387,7 +388,7 @@ export declare class Executed extends Executed_base {
      *
      * - a **delete**, which the node reports as `idOperation: "Deleted"`;
      * - a **wrap**, which has no id operation at all (`"None"`) and shows up only
-     *   as an input that existed and an output that does not. {@link wrapped}
+     *   as an input that existed and an output that does not. `wrapped`
      *   returns just those, for a caller that has to tell the two apart — a
      *   wrapped object still exists inside its wrapper and can come back.
      *
@@ -397,7 +398,7 @@ export declare class Executed extends Executed_base {
     /**
      * Objects this transaction wrapped: they went in existing and came out
      * nonexistent without their id being deleted, which is how the SDK's effects
-     * converter represents wrapping. They are a subset of {@link deleted}.
+     * converter represents wrapping. They are a subset of `deleted`.
      * Never fails.
      */
     wrapped(): ReadonlyArray<ChangedRef>;
@@ -407,7 +408,7 @@ export declare class Executed extends Executed_base {
      *
      * A node always reports the output state; a reduced envelope from a relay or
      * a sponsor often reports nothing but the id and the id operation, and
-     * {@link Executed.fromPartial} leaves what it was not told as `Unknown`
+     * `Executed.fromPartial` leaves what it was not told as `Unknown`
      * rather than inventing `ObjectWrite`. Reading `Unknown` as "not an object
      * write" would make `created()` silently empty for exactly those envelopes.
      */
@@ -425,7 +426,7 @@ export declare class Executed extends Executed_base {
     get gasUsedTotal(): bigint;
     /**
      * An `Executed` from the SDK's own `TransactionResult`, read with
-     * {@link EXECUTE_INCLUDE}.
+     * `EXECUTE_INCLUDE`.
      *
      * This is what `Tx.submit` uses, exported so a caller holding a result from
      * somewhere else — `client.core.executeTransaction`, a sponsor's SDK call —
@@ -447,13 +448,13 @@ export declare class Executed extends Executed_base {
      * - `changedObjects` entries need only `objectId` and `idOperation`; the
      *   version, digest and owner on either side default to `null`, and
      *   `outputState` defaults to `ObjectWrite` (`DoesNotExist` for a
-     *   `Deleted`), so {@link created} and {@link deleted} classify correctly
+     *   `Deleted`), so `created` and `deleted` classify correctly
      *   from the id operation alone.
      * - `objectTypes` defaults to `{}`. **The type filters need it**:
      *   `created(type)`, `mutated(type)` and `expectCreated(type)` can only
      *   match a change whose type the envelope carried, so without
      *   `objectTypes` they return nothing. `created()` with no argument, and
-     *   {@link createdWhere}, still list every created id.
+     *   `createdWhere`, still list every created id.
      * - `balanceChanges` and `events` default to `[]`, `checkpoint` and
      *   `timestampMs` to `null`, `gasUsed` to zeros, and `effects.status` to
      *   success.
@@ -1404,7 +1405,7 @@ signed transaction so an operator or a later process can reconcile it.
 ```ts
 export declare class Sui extends Sui_base {
     /**
-     * Like {@link layerNoDeps}, but refuses to build when the node reports a
+     * Like `layerNoDeps`, but refuses to build when the node reports a
      * different chain identifier than `options.chainId`, whatever the network.
      *
      * Fails with: `NetworkMismatch`, `TransportError`.
@@ -1422,19 +1423,19 @@ export declare class Sui extends Sui_base {
      * on the transaction's `ValidDuring` expiration, and a validator refuses
      * bytes signed for another chain.
      *
-     * Prefer {@link layerNoDeps}, which asks. Never fails.
+     * Prefer `layerNoDeps`, which asks. Never fails.
      */
     static readonly layerNoDepsPinned: (chainId: string) => Layer.Layer<Sui, never, SuiCore>;
     /**
      * Builds `Sui` over whatever `SuiCore` is provided, reading the chain
      * identifier once.
      *
-     * When the client's network is one of the entries in {@link KNOWN_CHAIN_IDS}
+     * When the client's network is one of the entries in `KNOWN_CHAIN_IDS`
      * (`mainnet`, `testnet`) the identifier the node reports must match it, so a
      * program pointed at the wrong node fails at layer build rather than reading
      * the wrong chain. `devnet`, `localnet` and custom networks have no fixed
      * identifier: the observed one is recorded on `Sui.chainId` and nothing is
-     * asserted unless {@link layerNoDepsWith} is given a `chainId`.
+     * asserted unless `layerNoDepsWith` is given a `chainId`.
      *
      * Fails with: `NetworkMismatch`, `TransportError`.
      */
@@ -1469,16 +1470,16 @@ The schema, plus `normalizeSuiAddressValue` as `SuiAddress.normalize`.
 
 ```ts
 export declare class SuiCore extends SuiCore_base {
-    /** Wraps a client the caller already built and configured. */
+    /** Wraps a client the caller already built and configured. Never fails. */
     static readonly layerFromClient: (client: ClientWithCoreApi) => Layer.Layer<SuiCore>;
-    /** Builds a `SuiGrpcClient` and wraps it. */
+    /** Builds a `SuiGrpcClient` and wraps it. Never fails. */
     static readonly layerGrpc: (options: SuiGrpcLayerOptions) => Layer.Layer<SuiCore>;
     /**
      * Reads `SUI_NETWORK` (required, no default) and `SUI_RPC_URL` (optional,
-     * defaulted from {@link defaultGrpcUrl} for the four known networks).
+     * defaulted from `defaultGrpcUrl` for the four known networks).
      *
-     * The layer fails with `ConfigError` when `SUI_NETWORK` is missing, or when
-     * it names a network with no built-in URL and `SUI_RPC_URL` is not set.
+     * Fails with: `ConfigError` (the layer) when `SUI_NETWORK` is missing, or
+     * when it names a network with no built-in URL and `SUI_RPC_URL` is not set.
      */
     static readonly layerConfig: Layer.Layer<SuiCore, Config.ConfigError>;
 }
@@ -1657,7 +1658,9 @@ export declare class SuiGraphQL extends SuiGraphQL_base {
      * endpoint was missing. This is those three lines, once.
      *
      * `method` is what a `TransportError` is labelled with; give the query's own
-     * name so a log says which read failed.
+     * name so a log says which read failed. `run` receives the Effect's
+     * `AbortSignal` as its second argument: pass it on as the query's `signal`,
+     * so `Effect.timeout` and interruption cancel the request.
      *
      * Fails with: `GraphQLUnavailable` (there is no usable endpoint),
      * `TransportError` (the call reached one and failed).
@@ -1667,12 +1670,12 @@ export declare class SuiGraphQL extends SuiGraphQL_base {
      * import { SuiGraphQL } from "@unconfirmed/sui-effect"
      *
      * const chain = SuiGraphQL.query(
-     *   (client) => client.query({ query: "{ chainIdentifier }" }),
+     *   (client, signal) => client.query({ query: "{ chainIdentifier }", signal }),
      *   "chainIdentifier"
      * )
      * ```
      */
-    static readonly query: <A>(run: (client: SuiGraphQLClient) => Promise<A>, method?: string) => Effect.Effect<A, GraphQLUnavailable | TransportError, SuiGraphQL>;
+    static readonly query: <A>(run: (client: SuiGraphQLClient, signal: AbortSignal) => Promise<A>, method?: string) => Effect.Effect<A, GraphQLUnavailable | TransportError, SuiGraphQL>;
 }
 ```
 
@@ -1712,7 +1715,7 @@ export interface SuiLayerOptions {
     /**
      * The chain identifier this program expects, as `getChainIdentifier` returns
      * it. When set, a layer over a node on another chain fails to build, and it
-     * overrides the {@link KNOWN_CHAIN_IDS} entry for the client's network.
+     * overrides the `KNOWN_CHAIN_IDS` entry for the client's network.
      *
      * Leave it unset for `mainnet` and `testnet`: their chain identifiers are in
      * the table and are asserted by default. `devnet`, `localnet` and any custom
@@ -1990,7 +1993,7 @@ export interface SuiService {
         }): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>;
     };
     /**
-     * {@link getObjectsStrict} under its 0.1.0 name.
+     * `getObjectsStrict` under its 0.1.0 name.
      *
      * `getObjectsOrFail` reads, out of context, as though failing were the point
      * — `getObjects(ids).orFail()` — rather than as the strictness of the read.
@@ -2559,9 +2562,9 @@ unknown submissions by hand.
 
 ```ts
 declare const Journal: Context.Reference<JournalService> & {
-    /** A fresh in-memory journal, for a test or a process that wants its own. */
+    /** A fresh in-memory journal, for a test or a process that wants its own. Never fails. */
     layerMemory: Layer.Layer<never, never, never>;
-    /** The in-memory implementation, for building one directly. */
+    /** The in-memory implementation, for building one directly. Never fails. */
     makeMemoryUnsafe: () => JournalService;
 }
 ```
@@ -2933,11 +2936,29 @@ caller's error union does not grow a branch per credential kind.
 
 ```ts
 declare const SubmitConfig: Context.Reference<SubmitConfigService> & {
+    /** The settings in force when nothing overrides them. */
     defaults: SubmitConfigService;
+    /**
+     * A `Layer` that puts `defaults` in force with `overrides` applied, for an
+     * application or a test that sets its lifecycle policy once at the edge.
+     * Never fails, requires nothing.
+     */
     layer: (overrides: Partial<SubmitConfigService>) => Layer.Layer<never>;
+    /**
+     * `defaults` with `overrides` applied, provided to one effect: the
+     * `.pipe`-able form of `layer`. Never fails, requires nothing.
+     */
     with: (overrides: Partial<SubmitConfigService>) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
 }
 ```
+
+The lifecycle settings.
+
+Because this is a `Context.Reference` and not a service, it never appears in
+an `R`: a one-shot script gets the defaults with no wiring, and an
+application overrides what it cares about with
+`SubmitConfig.with` (one effect) or `SubmitConfig.layer` (a whole
+application), both of which spread `SubmitConfig.defaults` for you.
 
 ### `SubmitConfigService` (interface)
 
@@ -3009,7 +3030,7 @@ export interface SubmitConfigService {
     readonly expiryMargin: Duration.Duration;
     /**
      * Whether a closed expiration window may be evidence at all, and under which
-     * rule. See {@link ExpiryEvidencePolicy}. Defaults to `"epochThenMiss"`.
+     * rule. See `ExpiryEvidencePolicy`. Defaults to `"epochThenMiss"`.
      */
     readonly expiryEvidence: ExpiryEvidencePolicy;
     /**
@@ -3281,7 +3302,7 @@ this function. Neither does anything derived from them: the failure carries
 one fixed sentence and no `cause`, because the decoder's own message quotes
 the input it rejected.
 
-**Fails with: `ConfigError` when the variable is missing, is neither spelling, or names a scheme that has no keypair class (`MultiSig`, `ZkLogin`, `Passkey` — use {@link remote} for those).**
+**Fails with: `ConfigError` when the variable is missing, is neither spelling, or names a scheme that has no keypair class (`MultiSig`, `ZkLogin`, `Passkey` — use `remote` for those).**
 
 ### `fromKeypair` (const)
 
@@ -3330,9 +3351,9 @@ Effects and the address to sign as.
 
 **Throws** a `TypeError` naming the missing member when the argument is not
 an SDK signer — that is a wiring mistake in the caller, not a runtime
-failure a program recovers from. Otherwise never fails: a bad address or
-signature surfaces as a `SigningError` from the member that produced it, not
-from construction.
+failure a program recovers from.
+
+**Otherwise never fails: a bad address or signature surfaces as a `SigningError` from the member that produced it, not from construction.**
 
 ### `gaslessStablecoinTransfer` (const)
 
@@ -3362,8 +3383,7 @@ This sends to the recipient's address balance. The SDK may source the amount
 from the sender's address balance, coin objects, or both, and resolves the
 required eligible helper calls itself.
 
-Never fails; the recipe it returns can throw only if the SDK rejects an
-input, which `Tx.build` reports as `BuildError` before anything is signed.
+**Never fails; the recipe it returns can throw only if the SDK rejects an input, which `Tx.build` reports as `BuildError` before anything is signed.**
 
 ### `isUnresolved` (const)
 
@@ -3884,8 +3904,7 @@ gas owner pays, and gas comes from the sponsor's address balance rather than
 from coin objects, so the two parties never have to agree on a gas coin and
 can sign in either order.
 
-Never fails; the recipe it returns throws only if the recipe it wraps does,
-which `Tx.build` reports as `BuildError`.
+**Never fails; the recipe it returns throws only if the recipe it wraps does, which `Tx.build` reports as `BuildError`.**
 
 ### `submit` (const)
 
@@ -4081,8 +4100,6 @@ export interface ExtensionFace {
      * the next call builds a fresh one.
      */
     readonly $dispose: () => Promise<void>;
-    /** The name `$dispose` had first. The same function. */
-    readonly dispose: () => Promise<void>;
 }
 ```
 
@@ -4300,8 +4317,7 @@ Two lifetimes worth knowing:
   long-lived page wants (a disposed extension is usable again after a
   reconnect) and it does mean a `$dispose()` that races an in-flight call can
   leave the caller's Promise rejected while a new runtime starts behind it.
-  Dispose when the consumer is done, not between calls. `dispose()` is the
-  same function under the name it had first.
+  Dispose when the consumer is done, not between calls.
 - **Each `register` is independent.** Registering the same extension on two
   clients — or twice on one — gives two runtimes, two layer builds and two
   copies of whatever the layer holds (a cache, a connection). Register once
@@ -4315,7 +4331,7 @@ no-op `catch` is attached at creation), so a cold call nobody awaits —
 `client.ext.doThing()` as a statement — cannot abort the process with an
 unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
 
-Never fails, except a `warm` registration. A warm registration builds the
+A warm registration builds the
 **whole layer** synchronously inside `register`, so **any** failure of that
 layer — a missing deployment for the network, a configuration error, a
 `NetworkMismatch`, not only an asynchronous step or an unknown chain
@@ -4323,6 +4339,8 @@ identifier — is thrown synchronously out of `register`, which means out of
 `client.$extend(...)`. Catch it where you register. A lazy registration has
 nowhere to put such a failure at registration time, so it surfaces as the
 rejection of the first call that needs the layer.
+
+**Never fails, except that a `warm` registration throws any failure of its layer synchronously out of `register`.**
 
 ### `leaf` (const)
 
@@ -4380,7 +4398,7 @@ export declare class Script extends Script_base {
      */
     static readonly layer: Layer.Layer<Script | Sui | SuiCore, Config.ConfigError | NetworkMismatch | TransportError>;
     /**
-     * Like {@link layer}, but over a `Sui` and `SuiCore` the caller already has,
+     * Like `layer`, but over a `Sui` and `SuiCore` the caller already has,
      * which is how a test runs a script against the fake.
      *
      * Fails with: `ConfigError`.
@@ -4401,17 +4419,17 @@ export declare class Script extends Script_base {
      */
     static readonly layerReadOnly: Layer.Layer<ScriptReadOnly | Sui | SuiCore, Config.ConfigError | NetworkMismatch | TransportError>;
     /**
-     * {@link layerReadOnly} over a `Sui` and `SuiCore` the caller already has,
+     * `layerReadOnly` over a `Sui` and `SuiCore` the caller already has,
      * which is how a test exercises the read-only preset against the fake.
      *
      * Fails with: `ConfigError`.
      */
     static readonly layerReadOnlyNoDeps: Layer.Layer<ScriptReadOnly, Config.ConfigError, Sui | SuiCore>;
-    /** See {@link exitCode}. */
+    /** See `exitCode`. */
     static readonly exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number;
-    /** See {@link run}. */
+    /** See `run`. */
     static readonly run: <A, E>(effect: Effect.Effect<A, E, Script | Sui | SuiCore>, options?: ScriptRunOptions) => Promise<number>;
-    /** See {@link report}. */
+    /** See `report`. */
     static readonly report: <A, E>(exit: Exit.Exit<A, E>, options?: ReportOptions) => Promise<number>;
 }
 ```
@@ -4446,7 +4464,7 @@ What a read-only script gets: everything except a way to sign.
 ```ts
 export interface ScriptRunOptions {
     /**
-     * The layer to run the script over. Defaults to {@link Script.layer}, which
+     * The layer to run the script over. Defaults to `Script.layer`, which
      * reads the environment; a test passes `Script.layerNoDeps` over
      * `layerTest(script)` and never touches the network.
      */
@@ -4591,6 +4609,8 @@ handle.
 
 Returns the exit code as well as passing it to `exit`, so a test can inject
 `exit` and assert on the number without ending the test process.
+
+**Never fails: every failure of the program becomes an exit code, and a `stderr` writer that throws loses its line, not the exit.**
 
 ## `@unconfirmed/sui-effect/testing`
 
@@ -4810,7 +4830,7 @@ export interface FakeScript {
     readonly pageSize?: number;
     /**
      * The epoch `getCurrentSystemState` reports. Defaults to
-     * {@link DEFAULT_EPOCH}.
+     * `DEFAULT_EPOCH`.
      *
      * This one is defaulted rather than left to die unscripted, because it is an
      * ambient fact about the chain the way `chainId` and the reference gas price
@@ -5480,7 +5500,7 @@ export const readWithPromises = async (
     const found = await api.get(ObjectId.make(id))
     return BigInt(found.content.amount)
   } finally {
-    await api.dispose()
+    await api.$dispose()
   }
 }
 
@@ -6443,7 +6463,7 @@ export interface EscrowRegistrationOptions extends EscrowOptions {
  * const client = new SuiGrpcClient({ network: "testnet", baseUrl }).$extend(escrow(options))
  * const info = await client.escrow.get(id)
  * for await (const item of client.escrow.owned.stream(owner)) console.log(item.id)
- * await client.escrow.dispose()
+ * await client.escrow.$dispose()
  * ```
  *
  * It is registered `warm`, like `platform` in `Platform.ts`: the service has

@@ -282,9 +282,7 @@ export const report = async <A, E>(
   exit: Exit.Exit<A, E>,
   options?: ReportOptions
 ): Promise<number> => {
-  const write = options?.stderr ?? ((line: string) => {
-    process.stderr.write(`${line}\n`)
-  })
+  const write = safeWriter(options?.stderr)
   if (Exit.isSuccess(exit)) return exitCode(exit)
   if (Cause.hasDies(exit.cause)) {
     write(Cause.pretty(exit.cause))
@@ -298,9 +296,31 @@ export const report = async <A, E>(
       write(Cause.pretty(exit.cause))
     }
   }
+  // On **every** non-zero exit, not only a defect or an interrupt: a typed
+  // failure escaping after a submission — an outer timeout, a preflight that
+  // ran too late, an extension error raised past `Tx.submit` — leaves the
+  // same record on the wire, and the operator needs the same bytes.
   const unresolved = await readUnresolved(options?.journal)
   for (const line of unresolvedLines(unresolved)) write(line)
   return exitCode(exit, { unresolved: unresolved.length })
+}
+
+/**
+ * The diagnostic writer, made total: a caller's `stderr` that throws (a closed
+ * pipe, a test double) must not reject `report` — or `run` before it reaches
+ * `exit` — so a failed write drops that line and nothing else.
+ */
+const safeWriter = (stderr: ((line: string) => void) | undefined) => {
+  const raw = stderr ?? ((line: string) => {
+    process.stderr.write(`${line}\n`)
+  })
+  return (line: string): void => {
+    try {
+      raw(line)
+    } catch {
+      // The line is lost; the exit code is not.
+    }
+  }
 }
 
 /** Exit codes, on the axis a wrapper script acts on. */
@@ -547,6 +567,10 @@ const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<st
  * which is exactly the script with something to lose — would otherwise have its
  * unresolved entries looked for in the process-wide in-memory default, find
  * none, and print nothing.
+ *
+ * This is the one `Effect.runPromise` outside `run` and the extension facade:
+ * `report` is `run`'s own tail, exported for a program that owns its process,
+ * so it sits at the same process edge.
  */
 const readUnresolved = async (
   journal: JournalService | undefined
@@ -586,14 +610,15 @@ const readUnresolved = async (
  *
  * Returns the exit code as well as passing it to `exit`, so a test can inject
  * `exit` and assert on the number without ending the test process.
+ *
+ * Never fails: every failure of the program becomes an exit code, and a
+ * `stderr` writer that throws loses its line, not the exit.
  */
 export const run = async <A, E>(
   effect: Effect.Effect<A, E, Script | Sui | SuiCore>,
   options?: ScriptRunOptions
 ): Promise<number> => {
-  const write = options?.stderr ?? ((line: string) => {
-    process.stderr.write(`${line}\n`)
-  })
+  const write = safeWriter(options?.stderr)
   const stop = options?.exit ?? ((code: number) => {
     process.exit(code)
   })
@@ -625,28 +650,7 @@ export const run = async <A, E>(
   const exit = await Effect.runPromise(Fiber.await(fiber))
   for (const [name, handler] of handlers) signals.off?.(name, handler)
 
-  let unresolved: ReadonlyArray<JournalEntry> = []
-  if (Exit.isFailure(exit)) {
-    if (Cause.hasDies(exit.cause)) {
-      write(Cause.pretty(exit.cause))
-    } else {
-      const failure = Cause.findErrorOption(exit.cause)
-      if (failure._tag === "Some") {
-        for (const line of describeFailure(failure.value)) write(line)
-      } else if (Cause.hasInterrupts(exit.cause)) {
-        write("interrupted")
-      } else {
-        write(Cause.pretty(exit.cause))
-      }
-    }
-    // On **every** non-zero exit, not only a defect or an interrupt: a typed
-    // failure escaping after a submission — an outer timeout, a preflight that
-    // ran too late, an extension error raised past `Tx.submit` — leaves the
-    // same record on the wire, and the operator needs the same bytes.
-    unresolved = await readUnresolved(journal)
-    for (const line of unresolvedLines(unresolved)) write(line)
-  }
-  const code = exitCode(exit, { unresolved: unresolved.length })
+  const code = await report(exit, journal === undefined ? { stderr: write } : { stderr: write, journal })
   stop(code)
   return code
 }

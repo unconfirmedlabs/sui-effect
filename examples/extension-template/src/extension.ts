@@ -39,7 +39,7 @@ export interface EscrowRegistrationOptions extends EscrowOptions {
  * const client = new SuiGrpcClient({ network: "testnet", baseUrl }).$extend(escrow(options))
  * const info = await client.escrow.get(id)
  * for await (const item of client.escrow.owned.stream(owner)) console.log(item.id)
- * await client.escrow.dispose()
+ * await client.escrow.$dispose()
  * ```
  *
  * It is registered `warm`, like `platform` in `Platform.ts`: the service has

@@ -56,6 +56,29 @@ describe("SuiGraphQL", () => {
     expect(error.method).toBe("execute")
   })
 
+  test("query hands run the Effect's AbortSignal, so a timeout cancels the request", async () => {
+    const client = new SuiGraphQLClient({
+      url: "https://sui-testnet.mystenlabs.com/graphql",
+      network: "testnet"
+    })
+    let seen: AbortSignal | undefined
+    const exit = await run(
+      Effect.exit(
+        SuiGraphQL.query(
+          (_client, signal) => {
+            seen = signal
+            return new Promise<never>(() => {})
+          },
+          "hang"
+        ).pipe(Effect.timeout("10 millis"))
+      ),
+      SuiGraphQL.layer(client)
+    )
+    expect(exit._tag).toBe("Failure")
+    expect(seen).toBeInstanceOf(AbortSignal)
+    expect(seen?.aborted).toBe(true)
+  })
+
   test("layerConfig reads SUI_GRAPHQL_URL and SUI_NETWORK", async () => {
     const env = ConfigProvider.layer(
       ConfigProvider.fromEnvRecord({

@@ -32,6 +32,8 @@ import {
 } from "./schemas.ts"
 import { typeMatches } from "./bcs.ts"
 
+const decodeObjectType = Schema.decodeUnknownOption(ObjectType)
+
 const isAccumulatorWrite = (change: ChangedObject): boolean =>
   change.outputState === "AccumulatorWriteV1"
 
@@ -128,7 +130,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   private typeOf(objectId: ObjectId): ObjectType | undefined {
     const type = this.objectTypes[objectId]
     if (type === undefined) return undefined
-    const decoded = Schema.decodeUnknownOption(ObjectType)(type)
+    const decoded = decodeObjectType(type)
     return decoded._tag === "Some" ? decoded.value : undefined
   }
 
@@ -174,15 +176,12 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   }
 
   /**
-   * Objects this transaction created, optionally filtered by Move type
-   * (compared with `normalizeStructTag`). Never fails.
+   * Objects this transaction created, optionally filtered by Move type through
+   * `typeMatches`: a bare tag matches every instantiation of the generic, a
+   * parameterized one is compared in full after normalization. Never fails.
    */
   created(type?: string): ReadonlyArray<ChangedRef> {
-    return this.select(
-      (change) => change.idOperation === "Created" && Executed.wroteAnObject(change),
-      "output",
-      Executed.byType(type)
-    )
+    return this.createdWhere(Executed.byType(type) ?? (() => true))
   }
 
   /**
@@ -190,7 +189,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    *
    * The direct replacement for the substring matching every repo hand-rolls
    * (`createdByType("::Receipt")`), without making substring matching the
-   * default: `created(type)` still compares normalized struct tags.
+   * default: `created(type)` still compares through `typeMatches`.
    * Never fails.
    */
   createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef> {
