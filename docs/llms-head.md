@@ -133,8 +133,9 @@ a defect exits 1, an interrupt with nothing outstanding 130. An error that
 declares an integer `exitCode` from 1 to 255 — the plain field, or Effect's
 `[Runtime.errorExitCode]` marker — exits with it. **Once a
 transaction of this run applied**, a failure that would exit 2, 4 or 130 exits
-5 instead, because a retry would send a second transaction; an unresolved entry
-still exits 3.
+5 instead, because a retry would send a second transaction; **while an entry of
+this run is unresolved**, the same failure exits 3 instead, applied or not,
+because an outstanding submission means "reconcile before anything else".
 
 Three rules:
 

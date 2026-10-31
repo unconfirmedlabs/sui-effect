@@ -267,7 +267,12 @@ package did not. Several signatures and one stored shape change; read
 - `Script.run` finds the journal wherever the program provided it and reports
   only this run's entries. A failure after this run's transaction applied exits
   5, never 2, 4 or 130 (`ExitCodeOptions.applied`), and prints "N submission(s)
-  of this run applied on chain: … do not send them again". Diagnostics are one
+  of this run applied on chain: … do not send them again". A failure while
+  this run left a submission unresolved exits 3, never 2, 4 or 130, applied
+  transactions or not (`ExitCodeOptions.unresolved`): before, an applied run
+  with an unresolved entry that then failed with a not-applied error such as
+  `ObjectNotFound` exited 4, and a wrapper's retry re-sent the applied intent.
+  Diagnostics are one
   line per failure through `SuiError.describe` (a `ConfigError` names the
   variable), with the bytes printed once. `Script.layerNoDeps`,
   `layerWithSigner` and `layerReadOnlyNoDeps` read the network from `SuiCore`,

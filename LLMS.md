@@ -439,8 +439,9 @@ a defect exits 1, an interrupt with nothing outstanding 130. An error that
 declares an integer `exitCode` from 1 to 255 — the plain field, or Effect's
 `[Runtime.errorExitCode]` marker — exits with it. **Once a
 transaction of this run applied**, a failure that would exit 2, 4 or 130 exits
-5 instead, because a retry would send a second transaction; an unresolved entry
-still exits 3.
+5 instead, because a retry would send a second transaction; **while an entry of
+this run is unresolved**, the same failure exits 3 instead, applied or not,
+because an outstanding submission means "reconcile before anything else".
 
 Three rules:
 
@@ -6373,9 +6374,12 @@ on the same axis. `SchemaError` — what Effect's own `Config.schema` and
 because in a script it can only mean the input a person gave did not fit the
 schema, and no retry fixes that.
 
-**Once this run applied a transaction** (`ExitCodeOptions.applied`),
+**While a submission is outstanding** (`ExitCodeOptions.unresolved`),
 any failure that would exit 2, 4 or 130 — a declared `exitCode` included —
-exits 5: none of those may be read as "nothing happened" any more.
+exits 3, applied transactions or not: reconcile before anything else.
+**Once this run applied a transaction** (`ExitCodeOptions.applied`)
+and nothing is outstanding, the same failures exit 5: none of them may be
+read as "nothing happened" any more. 1, 3 and 5 are never rewritten.
 
 An error with a tag this library has never heard of and no `outcome` is
 *unclassified* and exits 1, the code that also means defect. It deliberately
@@ -6448,10 +6452,11 @@ inside the program with `Effect.provide(journalLayer)` — and entries other
 processes wrote to a shared durable journal are not this run's business.
 On **every** non-zero exit the run prints the submissions *it* left
 unresolved, which is the only record of bytes that may be on the wire when a
-script is killed — or fails — between signing and the answer. Those entries
-decide a timeout (3 rather than 4) and an interrupt (3 rather than 130), and
-a submission of this run that the network answered as applied turns a
-would-be 2, 4 or 130 into 5 (see `ExitCodeOptions.applied`).
+script is killed — or fails — between signing and the answer. Any of those
+entries turns a would-be 2, 4 or 130 — a timeout, an interrupt, a
+not-applied error — into 3 (see `ExitCodeOptions.unresolved`); with
+none, a submission of this run that the network answered as applied turns
+the same codes into 5 (see `ExitCodeOptions.applied`).
 
 **A second SIGINT does nothing.** The handler interrupts the root fiber once;
 pressing Ctrl-C again while finalizers run is ignored, because the whole

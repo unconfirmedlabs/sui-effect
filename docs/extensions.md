@@ -2056,10 +2056,11 @@ tag.
 **An error may declare its own exit code.** An integer `exitCode` (1–255) on an
 error — a plain field, or Effect's `[Runtime.errorExitCode]` marker when there
 is no such field — is honoured by `Script.exitCode`, after `ConfigError` and before
-`outcome` — which is how a user-input error exits 2 instead of 4. One rule
-overrides it: once this run applied a transaction, a failure that would exit 2,
-4 or 130 exits 5, and `Script.run` prints the applied digests with "do not send
-them again".
+`outcome` — which is how a user-input error exits 2 instead of 4. Two rules
+override it: while this run left a submission unresolved, a failure that would
+exit 2, 4 or 130 exits 3, applied or not — reconcile before anything else; and
+otherwise, once this run applied a transaction, the same failure exits 5, and
+`Script.run` prints the applied digests with "do not send them again".
 
 **A CLI with its own argv parser does not need `Script.run`.** `Script.run` is a
 whole entrypoint — it builds the layer, forks the root fiber, installs signal
@@ -2082,7 +2083,8 @@ receipt is missing; treating it as "safe to retry" would run the caller's intent
 twice. And a `Cause.TimeoutError` from an `Effect.timeout` wrapped *around* a
 submission exits 3, not 4, when the journal still holds an unresolved entry: the
 outer timeout interrupts the submission from outside and the bytes may be on the
-wire. `Script.run` prints those unresolved entries, with their base64 bytes, on
+wire. So does any other failure that would exit 2 or 4 while an entry is
+unresolved. `Script.run` prints those unresolved entries, with their base64 bytes, on
 every non-zero exit.
 
 ## 12. Converting an existing facade

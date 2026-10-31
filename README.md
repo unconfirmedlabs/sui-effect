@@ -557,10 +557,13 @@ Two rules sit on top of the table. **An error may declare its own exit code**:
 an integer `exitCode` (1–255) — a plain field, or Effect's own
 `[Runtime.errorExitCode]` marker when there is no such field — is honoured
 after `ConfigError` and before `outcome`, which is how a bad-input error of your own exits 2 instead of 4.
-And **once this run applied a transaction, nothing exits 2, 4 or 130**: the exit
-is 5, and the applied digests are printed with "do not send them again" — a
-timeout or a Ctrl-C after the execute answered must not read as "safe to
-retry". `Script.run` finds the journal wherever the program provided it, so
+And **while this run left a submission unresolved, nothing exits 2, 4 or 130**:
+the exit is 3, whether or not another transaction applied, because an
+outstanding submission means "reconcile before anything else". With nothing
+unresolved, **once this run applied a transaction** the exit is 5 instead, and
+the applied digests are printed with "do not send them again" — a timeout or a
+Ctrl-C after the execute answered must not read as "safe to retry". 1, 3 and 5
+are never rewritten. `Script.run` finds the journal wherever the program provided it, so
 this holds for a durable journal provided inside the program too.
 
 **`Script.report(exit, { stderr?, journal? })`** is those last two steps on

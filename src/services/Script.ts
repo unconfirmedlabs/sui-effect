@@ -440,12 +440,17 @@ export interface ExitCodeOptions {
   /**
    * How many submissions the script's journal still holds unresolved.
    *
-   * It is what decides a timeout or an interrupt. `Effect.timeout` around a
-   * whole submission interrupts it and produces an outer `Cause.TimeoutError`
-   * that never went through `Tx.submit`'s own mapping, so the bytes may well be
-   * on the wire; the journal is the only thing that knows. With an unresolved
-   * entry the exit is 3, "reconcile before doing anything else"; with none it
-   * is the ordinary 4 for a timeout and 130 for an interrupt.
+   * When this is above zero, **any** failure that would exit 2, 4 or 130 — a
+   * timeout, an interrupt, a typed not-applied error, a declared `exitCode`
+   * among those — exits **3**, "reconcile before doing anything else", whether
+   * or not another transaction of the run applied: while a submission is
+   * outstanding, no failure may read as "safe to retry" or "fix the input and
+   * run again", because the rerun would send it a second time. A timeout is the
+   * case that makes it necessary: `Effect.timeout` around a whole submission
+   * interrupts it and produces an outer `Cause.TimeoutError` that never went
+   * through `Tx.submit`'s own mapping, so the bytes may well be on the wire,
+   * and the journal is the only thing that knows. 1 (a defect or an
+   * unclassified failure), 3 and 5 are never rewritten.
    *
    * `Script.run` fills it in from the entries the script itself wrote. Left
    * out, it is zero, and a timeout is 4 as before.
@@ -458,8 +463,9 @@ export interface ExitCodeOptions {
    * A failure *after* a transaction applied — a timeout around the visibility
    * wait, a read that failed afterwards, an interrupt — must not tell a
    * wrapper "nothing happened, safe to retry", because the retry sends a
-   * second transaction. So when this is above zero, a failure that would exit
-   * 2, 4 or 130 exits **5** instead. An unresolved entry still wins (3).
+   * second transaction. So when this is above zero and nothing is
+   * {@link ExitCodeOptions.unresolved}, a failure that would exit 2, 4 or 130
+   * exits **5** instead. An unresolved entry wins: the same failure exits 3.
    *
    * `Script.run` fills it in. Left out, it is zero.
    *
@@ -490,9 +496,12 @@ export interface ExitCodeOptions {
  * because in a script it can only mean the input a person gave did not fit the
  * schema, and no retry fixes that.
  *
- * **Once this run applied a transaction** ({@link ExitCodeOptions.applied}),
+ * **While a submission is outstanding** ({@link ExitCodeOptions.unresolved}),
  * any failure that would exit 2, 4 or 130 — a declared `exitCode` included —
- * exits 5: none of those may be read as "nothing happened" any more.
+ * exits 3, applied transactions or not: reconcile before anything else.
+ * **Once this run applied a transaction** ({@link ExitCodeOptions.applied})
+ * and nothing is outstanding, the same failures exit 5: none of them may be
+ * read as "nothing happened" any more. 1, 3 and 5 are never rewritten.
  *
  * An error with a tag this library has never heard of and no `outcome` is
  * *unclassified* and exits 1, the code that also means defect. It deliberately
@@ -510,10 +519,12 @@ export const exitCode = <A, E>(
   const unresolved = options?.unresolved ?? 0
   const applied = options?.applied ?? 0
   const code = rawExitCode(exit.cause, unresolved)
-  if (unresolved > 0 || applied === 0) return code
-  return code === EXIT.configuration || code === EXIT.notApplied || code === EXIT.interrupted
-    ? EXIT.applied
-    : code
+  // 1 (defect or unclassified), 3 and 5 already say something a wrapper must
+  // act on; only "fix the input", "safe to retry" and "interrupted" can lie.
+  const mayLie = code === EXIT.configuration || code === EXIT.notApplied || code === EXIT.interrupted
+  if (!mayLie) return code
+  if (unresolved > 0) return EXIT.unknown
+  return applied > 0 ? EXIT.applied : code
 }
 
 const rawExitCode = <E>(cause: Cause.Cause<E>, unresolved: number): number => {
@@ -733,10 +744,11 @@ const readUnresolved = async (
  * processes wrote to a shared durable journal are not this run's business.
  * On **every** non-zero exit the run prints the submissions *it* left
  * unresolved, which is the only record of bytes that may be on the wire when a
- * script is killed — or fails — between signing and the answer. Those entries
- * decide a timeout (3 rather than 4) and an interrupt (3 rather than 130), and
- * a submission of this run that the network answered as applied turns a
- * would-be 2, 4 or 130 into 5 (see {@link ExitCodeOptions.applied}).
+ * script is killed — or fails — between signing and the answer. Any of those
+ * entries turns a would-be 2, 4 or 130 — a timeout, an interrupt, a
+ * not-applied error — into 3 (see {@link ExitCodeOptions.unresolved}); with
+ * none, a submission of this run that the network answered as applied turns
+ * the same codes into 5 (see {@link ExitCodeOptions.applied}).
  *
  * **A second SIGINT does nothing.** The handler interrupts the root fiber once;
  * pressing Ctrl-C again while finalizers run is ignored, because the whole
