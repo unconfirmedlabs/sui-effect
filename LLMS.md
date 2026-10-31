@@ -17,7 +17,7 @@ contract for building an extension package on top of it.
 ## `@unconfirmed/sui-effect`
 
 
-84 exported symbols.
+85 exported symbols.
 
 ### `Balance` (const)
 
@@ -759,6 +759,17 @@ export declare class NetworkMismatch extends NetworkMismatch_base {
 
 The chain identifier the node reported is not the one the layer was built for.
 
+### `Nonce` (const)
+
+```ts
+declare const Nonce: Schema
+// decodes to: number
+```
+
+The replay-guard nonce a `ValidDuring` or `Validity` expiration carries. It
+is a `u32` on the wire, so anything outside `[0, 2^32)` is a schema issue
+rather than bytes the validator will reject later.
+
 ### `NotApplied` (class)
 
 ```ts
@@ -780,7 +791,7 @@ node will not name are all `SubmissionUnknown`, not this.
 
 ```ts
 declare const NotAppliedEvidence: Schema
-// decodes to: "expired" | "inputConsumed"
+// decodes to: "expired" | "inputConsumed" | "refused"
 ```
 
 Why a transaction provably never applied, and never will.
@@ -790,6 +801,7 @@ past the recorded `maxEpoch`, or `chainTime` past a recorded `maxTimestamp`
 by more than `SubmitConfig.expiryMargin` — around a `getTransaction` miss,
 twice. `"inputConsumed"`: a **different** transaction's own effects report
 that it took an object these bytes pinned at exactly the version they pinned.
+`"refused"`: the node refused the first send outright (gRPC `INVALID_ARGUMENT`).
 
 Shared by `NotApplied` and by the journal entry that records it, so the two
 cannot drift.
@@ -2516,7 +2528,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-45 exported symbols.
+44 exported symbols.
 
 ### `Built` (const)
 
@@ -2634,7 +2646,7 @@ declare const JournalEntry: Schema
 // } | {
 //     readonly _tag: "NotApplied";
 //     readonly digest: Digest;
-//     readonly evidence: "expired" | "inputConsumed";
+//     readonly evidence: "expired" | "inputConsumed" | "refused";
 //     readonly at: Utc;
 // } | {
 //     readonly _tag: "Signed";
@@ -2840,15 +2852,6 @@ and the payload is `executed` for the first and `error` for the other three.
 Before 0.1.2 this was a bare union of an `Executed` (which has no `_tag`) and
 three errors (which do), so the only way to tell a success from a failure was
 `"_tag" in entry` — a shape nothing could `Schema.match` or serialize.
-
-### `ReconciledOutcome` (type)
-
-```ts
-export type ReconciledOutcome = Executed | ExecutionFailed | NotApplied | SubmissionUnknown;
-```
-
-The shape `Tx.reconcileAll` returned in 0.1.0 and 0.1.1: the four outcomes as
-a bare union, with the successful one carrying no discriminator at all.
 
 ### `RemoteSigner` (interface)
 
@@ -3136,7 +3139,7 @@ declare const Tx: {
     }) => Recipe;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
-    readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, TransportError | ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
+    readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
     readonly recorded: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never>;
     readonly run: (recipe: Transaction | Recipe, opts: {
         readonly signer: Signer;
@@ -3181,13 +3184,13 @@ declare const Tx: {
     } | {
         readonly _tag: "Executed";
         readonly executed: Executed;
-    })[], TransportError | JournalError, Sui>;
+    })[], JournalError, Sui>;
 }
 ```
 
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
 `Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`,
-`Tx.reconcile`, `Tx.run`, `Tx.reconcileAll`.
+`Tx.submitVia`, `Tx.reconcile`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 
 ### `UNRESOLVED_TAGS` (const)
 
@@ -3253,6 +3256,12 @@ rather than `ExecutionFailed` after a send.
 
 An interrupted build cancels the request it started: the SDK is handed a
 client whose Core calls carry the Effect's `AbortSignal`.
+
+The resolver's own reads go straight to the SDK rather than through
+`SuiCore`'s read retries, so `Tx.build` retries the whole resolve on a
+retryable `TransportError` with the same policy (five attempts, jittered
+exponential backoff capped at ten seconds). Nothing has been signed, so a
+retry cannot send anything twice.
 
 When the recipe set no expiration, `SubmitConfig.expiration` decides one.
 The default, `ValidDuring`, bounds the transaction to the **current epoch and
@@ -3462,7 +3471,7 @@ declare const isUnresolved: (value: {
 } | {
     readonly _tag: "NotApplied";
     readonly digest: Digest;
-    readonly evidence: "expired" | "inputConsumed";
+    readonly evidence: "expired" | "inputConsumed" | "refused";
     readonly at: import("effect/DateTime").Utc;
 } | {
     readonly _tag: "Signed";
@@ -3693,7 +3702,7 @@ Re-exported from `@unconfirmed/sui-effect`.
 ### `reconcile` (const)
 
 ```ts
-declare const reconcile: (input: ReconcileInput) => Effect.Effect<Executed, TransportError | ExecutionFailed | SubmissionUnknown | NotApplied, Sui>
+declare const reconcile: (input: ReconcileInput) => Effect.Effect<Executed, ExecutionFailed | SubmissionUnknown | NotApplied, Sui>
 ```
 
 Finds out what happened to a transaction that was sent but never answered
@@ -3739,14 +3748,13 @@ mismatch is `SubmissionUnknown` naming both chains.
 about whether the transaction applied, and `SuiError.outcome` puts
 `TransportError` on `"not_applied"` — which would tell a wrapper to retry a
 submission whose outcome is genuinely unknown. Every read failure here
-becomes `SubmissionUnknown` carrying the digest, the bytes and the cause. The
-tag stays in the signature so the union does not shrink under callers.
+becomes `SubmissionUnknown` carrying the digest, the bytes and the cause.
 
 Given only a `Digest` there can be no evidence, so an unknown transaction is
 always `SubmissionUnknown`. Pass the `Signed` bytes (or the
 `SubmissionUnknown` that carries them) to get the evidence rules.
 
-**Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `TransportError`.**
+**Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`.**
 
 ### `reconcileAll` (const)
 
@@ -3763,7 +3771,7 @@ declare const reconcileAll: () => Effect.Effect<readonly ({
 } | {
     readonly _tag: "Executed";
     readonly executed: Executed;
-})[], TransportError | JournalError, Sui>
+})[], JournalError, Sui>
 ```
 
 Settles every unresolved entry in the journal: the explicit startup call a
@@ -3787,7 +3795,7 @@ The whole call fails only if the journal itself cannot be **read**: a write
 that fails after an entry has been settled is logged and the answer stands,
 the same rule `Tx.submit` follows.
 
-**Fails with: `JournalError`, `TransportError`.**
+**Fails with: `JournalError`.**
 
 ### `recorded` (const)
 
@@ -3892,6 +3900,14 @@ and immediately after the build when it came out of the recipe. Use the
 explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
 two parties cannot both sign in one process.
 
+**The gas owner's lock comes from `opts.gasOwner` only.** The locks are taken
+before anything is built, so a gas owner the recipe sets itself is not known
+when they are chosen, and a recipe that does so without
+`tx.setGasPayment([])` has the gas owner's coins selected under the sender's
+lock alone. Pass the same address as `opts.gasOwner` whenever the recipe sets
+one (`Tx.sponsored` pays from an address balance and selects no coins, but
+passing it costs nothing).
+
 **`onSigned` is the hook between signing and sending.** A program with its
 own record to keep — a batch row, an outbox, an idempotency key — has to
 write the digest before the first send, and that used to mean giving up
@@ -3958,7 +3974,11 @@ carrying one signature. That answer came from the node, it is final, and
 nothing was executed, so it is reported as the `TransportError` it is rather
 than reconciled: a reconcile would go on to ask "is this digest on chain?",
 a question about a transaction that was never sent, and a lagging or scripted
-node can answer it yes.
+node can answer it yes. The journal entry is settled as `NotApplied
+{ evidence: "refused" }`, so `Tx.reconcileAll` has nothing left to do for it.
+That holds for the **first** send only: a refusal after a timeout or a
+retryable failure says nothing about the earlier send, which may have
+landed, so it reconciles like any other ambiguous failure.
 
 `JournalError` can only come from the `Signed` write, before anything has
 been sent. Once the network has answered, a journal write that fails is
@@ -3966,7 +3986,7 @@ logged with `Effect.logError` and the answer stands, because "the journal is
 broken" is not a thing a caller can act on and reporting it in place of a
 charged `ExecutionFailed` would invite a second submission.
 
-**Fails with: `ExecutionFailed` (applied on chain and failed; gas was charged), `NotApplied` (provably never applied), `SubmissionUnknown` (the outcome is not known and the bytes are in the error), `JournalError` (only before the first send), `TransportError` (only `INVALID_ARGUMENT`: the node refused the submission and nothing was executed).**
+**Fails with: `ExecutionFailed` (applied on chain and failed; gas was charged), `NotApplied` (provably never applied), `SubmissionUnknown` (the outcome is not known and the bytes are in the error), `JournalError` (only before the first send), `TransportError` (only `INVALID_ARGUMENT` on the first send: the node refused the submission and nothing was executed).**
 
 ### `submitVia` (const)
 
@@ -3994,7 +4014,8 @@ whatever the service returns. What this owns is everything around it:
   the chain-identity guard, the versioned consumer check. A sender error that
   **declares** `outcome: "not_applied"` on the instance — a 400 from the
   service, a refusal before anything went out — is taken at its word and
-  fails straight through without spending a reconcile. A `TransportError` is
+  fails straight through without spending a reconcile, and the journal entry
+  is settled as `NotApplied { evidence: "refused" }`. A `TransportError` is
   not that: the taxonomy calls it `not_applied`, but a transport failure
   *talking to the relay* is exactly the ambiguous case, so it reconciles;
 - every terminal answer is journalled, exactly as `Tx.submit` journals it.

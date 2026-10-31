@@ -18,18 +18,11 @@ import type { SuiGrpcClient } from "@mysten/sui/grpc"
 import { GrpcCoreClient, isSuiGrpcClient } from "@mysten/sui/grpc"
 import type { TransactionPlugin } from "@mysten/sui/transactions"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
-import { normalizeSuiAddress } from "@mysten/sui/utils"
+import { fromBase58, normalizeSuiAddress } from "@mysten/sui/utils"
 
 /** The shape `Transaction#setExpiration` accepts, which the SDK does not export. */
 type SdkExpiration = NonNullable<Parameters<Transaction["setExpiration"]>[0]>
-import {
-  Cause,
-  DateTime,
-  Duration,
-  Effect,
-  type Option,
-  Schema
-} from "effect"
+import { DateTime, Duration, Effect, Option, Schema } from "effect"
 import {
   BuildError,
   ExecutionFailed,
@@ -51,6 +44,7 @@ import {
   Digest,
   maxEpochOf,
   maxTimestampMsOf,
+  Nonce,
   ObjectId,
   type Signature,
   SignedTransaction,
@@ -59,6 +53,7 @@ import {
   U32_MAX,
   Version
 } from "../domain/schemas.ts"
+import { readSchedule } from "./SuiCore.ts"
 import { Journal } from "./Journal.ts"
 import type { Signer } from "./Signer.ts"
 import type { SubmitConfigService } from "./SubmitConfig.ts"
@@ -134,16 +129,6 @@ export const Reconciled = Schema.TaggedUnion({
 export type Reconciled = typeof Reconciled.Type
 
 /**
- * The shape `Tx.reconcileAll` returned in 0.1.0 and 0.1.1: the four outcomes as
- * a bare union, with the successful one carrying no discriminator at all.
- *
- * @deprecated Use {@link Reconciled}, whose cases all carry `_tag`. This name
- * exists so a 0.1.1 consumer that spelled the old union in its own types still
- * compiles.
- */
-export type ReconciledOutcome = Executed | ExecutionFailed | NotApplied | SubmissionUnknown
-
-/**
  * The transport statuses that mean **the node refused the request outright**,
  * so the bytes were never executed and never will be by this send.
  *
@@ -169,12 +154,16 @@ const decodeDigest = Schema.decodeUnknownEffect(Digest)
 const decodeDigestOption = Schema.decodeUnknownOption(Digest)
 const decodeVersion = Schema.decodeUnknownOption(Version)
 const decodeObjectId = Schema.decodeUnknownOption(ObjectId)
+const decodeNonce = Schema.decodeUnknownEffect(Nonce)
+
+/**
+ * How many times `Tx.build` runs the SDK's resolver before a retryable
+ * `TransportError` stands: the same five attempts `SuiCore` gives a read.
+ */
+const BUILD_ATTEMPTS = 5
 
 const buildError = (message: string) => (cause: unknown): BuildError =>
   new BuildError({ message, cause })
-
-/** The `u32` nonce a `ValidDuring` expiration carries as its replay guard. */
-const MAX_NONCE = U32_MAX
 
 /**
  * The gRPC resolve plugin, re-created over a client whose
@@ -385,40 +374,72 @@ const unresolvedObjectIdsOf = (tx: Transaction): ReadonlyArray<string> => {
 }
 
 /**
+ * The bytes as the SDK reads them, or `None` for bytes this version cannot
+ * parse. Every reader below is pure over the parsed data, so a caller that
+ * needs two facts out of one set of bytes parses them once.
+ */
+const dataOfBytes: (bytes: Uint8Array) => Option.Option<TransactionDataBuilder> = Option
+  .liftThrowable((bytes: Uint8Array) => TransactionDataBuilder.fromBytes(bytes))
+
+/** A pinned object reference: an id and the version the bytes named. */
+type PinnedRef = { readonly objectId: string; readonly version: Version }
+
+/**
  * The expiration a transaction was built with, read back out of the bytes so
  * that what is recorded is what was signed rather than what was intended.
  */
-const expirationOfBytes = (bytes: Uint8Array): TransactionExpiration | undefined => {
-  try {
-    const data = TransactionDataBuilder.fromBytes(bytes)
-    if (data.expiration === null) return undefined
-    const decoded = decodeExpiration(data.expiration)
-    return decoded._tag === "Some" ? decoded.value : undefined
-  } catch {
-    return undefined
-  }
-}
+const expirationOf = (data: TransactionDataBuilder): TransactionExpiration | undefined =>
+  data.expiration === null || data.expiration === undefined
+    ? undefined
+    : Option.getOrUndefined(decodeExpiration(data.expiration))
 
 /** The owned object inputs a transaction referenced, with the versions it pinned. */
-const ownedInputsOfBytes = (
-  bytes: Uint8Array
-): ReadonlyArray<{ readonly objectId: string; readonly version: Version }> => {
-  try {
-    const data = TransactionDataBuilder.fromBytes(bytes)
-    const inputs: Array<{ objectId: string; version: Version }> = []
-    for (const input of data.inputs) {
-      const object = input.Object
-      if (object === undefined) continue
-      const owned = object.ImmOrOwnedObject ?? object.Receiving
-      if (owned === undefined) continue
-      const version = decodeVersion(String(owned.version))
-      if (version._tag === "Some") {
-        inputs.push({ objectId: owned.objectId, version: version.value })
-      }
+const ownedInputsOf = (data: TransactionDataBuilder): ReadonlyArray<PinnedRef> => {
+  const inputs: Array<PinnedRef> = []
+  for (const input of data.inputs) {
+    const object = input.Object
+    if (object === undefined) continue
+    const owned = object.ImmOrOwnedObject ?? object.Receiving
+    if (owned === undefined) continue
+    const version = decodeVersion(String(owned.version))
+    if (version._tag === "Some") {
+      inputs.push({ objectId: owned.objectId, version: version.value })
     }
-    return inputs
+  }
+  return inputs
+}
+
+/**
+ * The 20 bytes that mark a **coin reservation** ref, at offset 12 of its
+ * 32-byte digest.
+ *
+ * Mirrors `COIN_RESERVATION_MAGIC` and `isCoinReservationDigest` in the SDK's
+ * `dist/utils/coin-reservation.mjs`, which the typed `@mysten/sui/utils` index
+ * does not export (and which 2.30 does not ship at all).
+ */
+const COIN_RESERVATION_MAGIC = 0xac
+const COIN_RESERVATION_MAGIC_OFFSET = 12
+const DIGEST_LENGTH = 32
+
+/**
+ * Whether a gas payment ref is a synthetic coin reservation rather than an
+ * object.
+ *
+ * The core resolver's `setGasPayment` and node-side gRPC gas selection may put
+ * one first in `gasData.payment` to draw gas from the address balance: version
+ * `0`, a digest carrying the magic, and an object id that is the accumulator
+ * field id XOR the chain id. There is no such object, so reading it proves
+ * nothing and only costs a read — and used to name a nonsense id as the reason
+ * of every `SubmissionUnknown` for such a transaction. Never fails.
+ */
+const isCoinReservationRef = (ref: { readonly version: string | number; readonly digest: string }): boolean => {
+  if (String(ref.version) !== "0") return false
+  try {
+    const bytes = fromBase58(ref.digest)
+    return bytes.length === DIGEST_LENGTH &&
+      bytes.slice(COIN_RESERVATION_MAGIC_OFFSET).every((byte) => byte === COIN_RESERVATION_MAGIC)
   } catch {
-    return []
+    return false
   }
 }
 
@@ -426,63 +447,40 @@ const ownedInputsOfBytes = (
  * The gas coins a transaction pinned, which are owned inputs too: a sponsored
  * transaction pays from an address balance and has none, but an ordinary one
  * names its coins in `gasData.payment` rather than in `inputs`, and a coin that
- * has moved on is exactly as good evidence as any other consumed input.
+ * has moved on is exactly as good evidence as any other consumed input. A coin
+ * reservation ref is not a coin and is left out.
  */
-const gasPaymentOfBytes = (
-  bytes: Uint8Array
-): ReadonlyArray<{ readonly objectId: string; readonly version: Version }> => {
-  try {
-    const payment = TransactionDataBuilder.fromBytes(bytes).gasData.payment ?? []
-    const refs: Array<{ objectId: string; version: Version }> = []
-    for (const ref of payment) {
-      const version = decodeVersion(String(ref.version))
-      if (version._tag === "Some") refs.push({ objectId: ref.objectId, version: version.value })
-    }
-    return refs
-  } catch {
-    return []
+const gasPaymentOf = (data: TransactionDataBuilder): ReadonlyArray<PinnedRef> => {
+  const refs: Array<PinnedRef> = []
+  for (const ref of data.gasData.payment ?? []) {
+    if (isCoinReservationRef(ref)) continue
+    const version = decodeVersion(String(ref.version))
+    if (version._tag === "Some") refs.push({ objectId: ref.objectId, version: version.value })
   }
+  return refs
 }
 
 /** Every object reference whose version these bytes pinned, inputs and gas alike. */
-const pinnedRefsOfBytes = (
-  bytes: Uint8Array
-): ReadonlyArray<{ readonly objectId: string; readonly version: Version }> => [
-  ...ownedInputsOfBytes(bytes),
-  ...gasPaymentOfBytes(bytes)
-]
+const pinnedRefsOfBytes = (bytes: Uint8Array): ReadonlyArray<PinnedRef> =>
+  Option.match(dataOfBytes(bytes), {
+    onNone: () => [],
+    onSome: (data) => [...ownedInputsOf(data), ...gasPaymentOf(data)]
+  })
 
 /** The addresses a transaction's bytes will accept a signature from. */
-const signersOfBytes = (bytes: Uint8Array): ReadonlyArray<string> => {
-  try {
-    const data = TransactionDataBuilder.fromBytes(bytes)
-    return [data.sender, data.gasData.owner]
-      .filter((address): address is string => typeof address === "string" && address.length > 0)
-      .map((address) => normalizeSuiAddress(address))
-  } catch {
-    return []
-  }
-}
+const signersOfBytes = (bytes: Uint8Array): ReadonlyArray<string> =>
+  Option.match(dataOfBytes(bytes), {
+    onNone: () => [],
+    onSome: (data) =>
+      [data.sender, data.gasData.owner]
+        .filter((address): address is string => typeof address === "string" && address.length > 0)
+        .map((address) => normalizeSuiAddress(address))
+  })
 
-const gasBudgetOfBytes = (bytes: Uint8Array): bigint | undefined => {
-  try {
-    const budget = TransactionDataBuilder.fromBytes(bytes).gasData.budget
-    return budget === null || budget === undefined ? undefined : BigInt(budget)
-  } catch {
-    return undefined
-  }
+const gasBudgetOf = (data: TransactionDataBuilder): bigint | undefined => {
+  const budget = data.gasData.budget
+  return budget === null || budget === undefined ? undefined : BigInt(budget)
 }
-
-/** A timeout on an execute is a transport failure that may already have landed. */
-const timeoutAsTransport = (method: string) => (error: TransportError | Cause.TimeoutError): TransportError =>
-  error._tag === "TimeoutError"
-    ? new TransportError({
-      method,
-      retryable: true,
-      status: "DEADLINE_EXCEEDED",
-      cause: error
-    })
-    : error
 
 const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, BuildError> =>
   typeof input === "function"
@@ -515,6 +513,12 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  *
  * An interrupted build cancels the request it started: the SDK is handed a
  * client whose Core calls carry the Effect's `AbortSignal`.
+ *
+ * The resolver's own reads go straight to the SDK rather than through
+ * `SuiCore`'s read retries, so `Tx.build` retries the whole resolve on a
+ * retryable `TransportError` with the same policy (five attempts, jittered
+ * exponential backoff capped at ten seconds). Nothing has been signed, so a
+ * retry cannot send anything twice.
  *
  * When the recipe set no expiration, `SubmitConfig.expiration` decides one.
  * The default, `ValidDuring`, bounds the transaction to the **current epoch and
@@ -574,6 +578,16 @@ export const build = Effect.fn("Tx.build")(function*(
       return { bytes, simulated }
     })
     .pipe(
+      // The resolver's own reads (system state, coins, the budget simulate) go
+      // straight to the SDK, under none of `SuiCore`'s read retries. Nothing
+      // has been signed, so a transient failure is retried on the read policy.
+      // `simulated` is asked afresh each attempt: an attempt that set the
+      // budget before failing leaves one the next attempt must simulate itself.
+      Effect.retry({
+        schedule: readSchedule,
+        times: BUILD_ATTEMPTS - 1,
+        while: (error) => error._tag === "TransportError" && error.retryable
+      }),
       Effect.catchTag(
         ["ObjectNotFound", "ObjectDeleted", "ObjectUnavailable", "TransactionNotFound"],
         (error) =>
@@ -606,7 +620,8 @@ export const build = Effect.fn("Tx.build")(function*(
     yield* sui.simulate(bytes)
   }
 
-  const budget = gasBudgetOfBytes(bytes)
+  const data = dataOfBytes(bytes)
+  const budget = Option.getOrUndefined(Option.map(data, gasBudgetOf))
   if (budget !== undefined && budget > config.maxGasBudget) {
     return yield* new BuildError({
       message: `the gas budget ${budget} is over the configured maximum ${config.maxGasBudget}`,
@@ -619,7 +634,7 @@ export const build = Effect.fn("Tx.build")(function*(
       new BuildError({ message: `the built bytes have no readable digest: ${issue.message}`, cause: issue })
     )
   )
-  const expiration = expirationOfBytes(bytes)
+  const expiration = Option.getOrUndefined(Option.map(data, expirationOf))
   return {
     digest,
     bytes,
@@ -655,21 +670,20 @@ const epochOf = (epoch: string): Effect.Effect<bigint, TransportError> =>
  */
 const nonceOf = (config: SubmitConfigService): Effect.Effect<number, BuildError> =>
   Effect.flatMap(config.nonce, (nonce) =>
-    Number.isInteger(nonce) && nonce >= 0 && nonce <= MAX_NONCE
-      ? Effect.succeed(nonce)
-      : Effect.fail(
-        // A `BuildError`, not a `TransportError`: nothing was sent, no node was
-        // asked, and the build is what failed. `SubmitConfig.ts` and DESIGN
-        // section 6 both say so.
+    decodeNonce(nonce).pipe(
+      // A `BuildError`, not a `TransportError`: nothing was sent, no node was
+      // asked, and the build is what failed. `SubmitConfig.ts` and DESIGN
+      // section 6 both say so.
+      Effect.mapError((issue) =>
         new BuildError({
-          message:
-            `SubmitConfig.nonce produced ${nonce}, which is not a u32 (0 to ${MAX_NONCE})`,
-          cause: nonce
+          message: `SubmitConfig.nonce produced ${nonce}, which is not a u32 (0 to ${U32_MAX})`,
+          cause: issue
         })
-      ))
+      )
+    ))
 
 /** The expiration `Tx.build` sets when the recipe set none. */
-const defaultExpiration = Effect.fn("Tx.defaultExpiration")(function*(
+const defaultExpiration = Effect.fnUntraced(function*(
   sui: Sui["Service"],
   config: SubmitConfigService
 ): Effect.fn.Return<SdkExpiration | undefined, BuildError | TransportError> {
@@ -855,7 +869,7 @@ export const gaslessStablecoinTransfer = (opts: {
   })
 }
 
-const journalSigned = Effect.fn("Tx.journalSigned")(function*(signed: Signed) {
+const journalSigned = Effect.fnUntraced(function*(signed: Signed) {
   const journal = yield* Journal
   const now = yield* DateTime.now
   yield* journal.put(
@@ -863,7 +877,7 @@ const journalSigned = Effect.fn("Tx.journalSigned")(function*(signed: Signed) {
   )
 })
 
-const journalOutcome = Effect.fn("Tx.journalOutcome")(function*(
+const journalOutcome = Effect.fnUntraced(function*(
   entry: JournalEntry
 ): Effect.fn.Return<void, JournalError> {
   const journal = yield* Journal
@@ -892,7 +906,7 @@ const journalSettled = (entry: JournalEntry): Effect.Effect<void> =>
     Effect.annotateLogs({ digest: entry.digest, entry: entry._tag })
   )
 
-const executedEntry = Effect.fn("Tx.executedEntry")(function*(executed: Executed) {
+const executedEntry = Effect.fnUntraced(function*(executed: Executed) {
   const now = yield* DateTime.now
   return JournalEntry.cases.Executed.make({
     _tag: "Executed",
@@ -902,7 +916,7 @@ const executedEntry = Effect.fn("Tx.executedEntry")(function*(executed: Executed
   })
 })
 
-const failedEntry = Effect.fn("Tx.failedEntry")(function*(error: ExecutionFailed) {
+const failedEntry = Effect.fnUntraced(function*(error: ExecutionFailed) {
   const now = yield* DateTime.now
   return JournalEntry.cases.Failed.make({
     _tag: "Failed",
@@ -912,7 +926,7 @@ const failedEntry = Effect.fn("Tx.failedEntry")(function*(error: ExecutionFailed
   })
 })
 
-const notAppliedEntry = Effect.fn("Tx.notAppliedEntry")(function*(error: NotApplied) {
+const notAppliedEntry = Effect.fnUntraced(function*(error: NotApplied) {
   const now = yield* DateTime.now
   return JournalEntry.cases.NotApplied.make({
     _tag: "NotApplied",
@@ -922,7 +936,18 @@ const notAppliedEntry = Effect.fn("Tx.notAppliedEntry")(function*(error: NotAppl
   })
 })
 
-const unknownEntry = Effect.fn("Tx.unknownEntry")(function*(
+/**
+ * Settles the `Signed` entry of a submission the node (or the service) refused
+ * before anything executed, as `NotApplied { evidence: "refused" }`. Never
+ * fails: like every write after the network answered, a failure is logged.
+ */
+const journalRefused = (signed: Signed): Effect.Effect<void> =>
+  Effect.flatMap(
+    notAppliedEntry(new NotApplied({ digest: signed.digest, evidence: "refused" })),
+    journalSettled
+  )
+
+const unknownEntry = Effect.fnUntraced(function*(
   signed: Signed,
   lastError: string,
   attempts: number
@@ -965,17 +990,15 @@ const awaitVisible = (
     .waitForTransaction({ digest })
     .pipe(
       Effect.timeout(config.visibilityTimeout),
-      Effect.asVoid,
-      // `Effect.catch`, not `Effect.catchCause`: a timeout, a `TransportError`
-      // and a `TransactionNotFound` are the failures this is allowed to swallow
-      // — a **defect** is a bug, and turning one into a warning line hid it
-      // behind an outcome that was going to stand anyway.
-      Effect.catch(() =>
-        Effect.logWarning(
-          "the transaction executed but did not become visible to reads within" +
-            " SubmitConfig.visibilityTimeout; the outcome stands"
-        )
-      ),
+      // `Effect.ignore`, not `Effect.ignoreCause`: a timeout, a
+      // `TransportError` and a `TransactionNotFound` are the failures this is
+      // allowed to swallow — a **defect** is a bug, and turning one into a
+      // warning line hid it behind an outcome that was going to stand anyway.
+      Effect.ignore({
+        log: "Warn",
+        message: "the transaction executed but did not become visible to reads within" +
+          " SubmitConfig.visibilityTimeout; the outcome stands"
+      }),
       Effect.annotateLogs({ digest }),
       Effect.withSpan("Tx.awaitVisible")
     )
@@ -1000,7 +1023,11 @@ const awaitVisible = (
  * nothing was executed, so it is reported as the `TransportError` it is rather
  * than reconciled: a reconcile would go on to ask "is this digest on chain?",
  * a question about a transaction that was never sent, and a lagging or scripted
- * node can answer it yes.
+ * node can answer it yes. The journal entry is settled as `NotApplied
+ * { evidence: "refused" }`, so `Tx.reconcileAll` has nothing left to do for it.
+ * That holds for the **first** send only: a refusal after a timeout or a
+ * retryable failure says nothing about the earlier send, which may have
+ * landed, so it reconciles like any other ambiguous failure.
  *
  * `JournalError` can only come from the `Signed` write, before anything has
  * been sent. Once the network has answered, a journal write that fails is
@@ -1011,8 +1038,8 @@ const awaitVisible = (
  * Fails with: `ExecutionFailed` (applied on chain and failed; gas was charged),
  * `NotApplied` (provably never applied), `SubmissionUnknown` (the outcome is
  * not known and the bytes are in the error), `JournalError` (only before the
- * first send), `TransportError` (only `INVALID_ARGUMENT`: the node refused the
- * submission and nothing was executed).
+ * first send), `TransportError` (only `INVALID_ARGUMENT` on the first send:
+ * the node refused the submission and nothing was executed).
  */
 export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui> = Effect.fn(
   "Tx.submit"
@@ -1040,8 +1067,20 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
         signatures: [...signed.signatures],
         include: EXECUTE_INCLUDE
       })),
-      Effect.timeout(config.executeTimeout),
-      Effect.mapError(timeoutAsTransport("executeTransaction"))
+      // A timeout on an execute is a transport failure that may already have
+      // landed: retryable, and re-sent as the identical bytes.
+      Effect.timeoutOrElse({
+        duration: config.executeTimeout,
+        orElse: () =>
+          Effect.fail(
+            new TransportError({
+              method: "executeTransaction",
+              retryable: true,
+              status: "DEADLINE_EXCEEDED",
+              cause: `no answer within SubmitConfig.executeTimeout (${Duration.format(config.executeTimeout)})`
+            })
+          )
+      })
     )
   })
 
@@ -1072,8 +1111,16 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
   // The node refused the request outright — malformed bytes, a missing
   // signature — so nothing was executed and asking again would only find out
   // about some other transaction with that digest. Fail with what the node
-  // said.
-  if (refusedOutright(failure)) return yield* failure
+  // said, and settle the journal entry so no startup reconciles it again.
+  //
+  // Only on the **first** send. After a timeout or a retryable failure the
+  // earlier bytes may already be on chain, and a later refusal (a proxy, a
+  // node answering an already-finalized submission differently) says nothing
+  // about them: that is the ambiguous case, and it reconciles.
+  if (attempts === 1 && refusedOutright(failure)) {
+    yield* journalRefused(signed)
+    return yield* failure
+  }
   // Bytes may have reached the network: the only honest next step is to ask.
   return yield* reconcileSigned(signed, failure, attempts)
 })
@@ -1104,7 +1151,7 @@ const executedOfReply = (
   signed: Signed,
   reply: SubmitViaReply
 ): Effect.Effect<Executed | undefined, ExecutionFailed> => {
-  const none = Effect.sync(() => undefined)
+  const none = Effect.undefined
   if (reply === undefined || reply === null || typeof reply === "string") return none
   const kind = (reply as { readonly $kind?: unknown }).$kind
   if (kind === "Transaction" || kind === "FailedTransaction") {
@@ -1145,7 +1192,8 @@ const executedOfReply = (
  *   the chain-identity guard, the versioned consumer check. A sender error that
  *   **declares** `outcome: "not_applied"` on the instance — a 400 from the
  *   service, a refusal before anything went out — is taken at its word and
- *   fails straight through without spending a reconcile. A `TransportError` is
+ *   fails straight through without spending a reconcile, and the journal entry
+ *   is settled as `NotApplied { evidence: "refused" }`. A `TransportError` is
  *   not that: the taxonomy calls it `not_applied`, but a transport failure
  *   *talking to the relay* is exactly the ambiguous case, so it reconciles;
  * - every terminal answer is journalled, exactly as `Tx.submit` journals it.
@@ -1195,6 +1243,9 @@ export const submitVia = Effect.fn("Tx.submitVia")(function*<E, R>(
   // whose own instance says `outcome: "not_applied"` — the refusal a service
   // returns before it sends anything — skips the reconcile.
   if ((failure as { readonly outcome?: unknown })?.outcome === "not_applied") {
+    // Terminal on the service's word, so the `Signed` entry written above does
+    // not stay unresolved until its expiration window closes.
+    yield* journalRefused(signed)
     return yield* Effect.fail(failure)
   }
   return yield* reconcileSigned(
@@ -1204,42 +1255,53 @@ export const submitVia = Effect.fn("Tx.submitVia")(function*<E, R>(
   )
 })
 
+/**
+ * Reconciles signed bytes and records what that settled to: the one
+ * settle-and-journal step `Tx.submit`, `Tx.submitVia` and `Tx.reconcileAll`
+ * share.
+ *
+ * `Executed`, `Failed` and `NotApplied` are terminal entries; anything still
+ * unknown is rewritten as `Unknown`, carrying the bytes, `lastError` (the
+ * reconcile's own answer when there is none) and `attempts`. A journal write
+ * that fails is logged and the answer stands. Never fails.
+ */
+const settle = Effect.fnUntraced(function*(
+  signed: Signed,
+  attempts: number,
+  lastError: string | undefined
+): Effect.fn.Return<Reconciled, never, Sui> {
+  const result = yield* Effect.result(reconcile(signed))
+  if (result._tag === "Success") {
+    yield* journalSettled(yield* executedEntry(result.success))
+    return Reconciled.cases.Executed.make({ _tag: "Executed", executed: result.success })
+  }
+  const failure = result.failure
+  switch (failure._tag) {
+    case "ExecutionFailed":
+      yield* journalSettled(yield* failedEntry(failure))
+      return Reconciled.cases.ExecutionFailed.make({ _tag: "ExecutionFailed", error: failure })
+    case "NotApplied":
+      // Terminal, so the entry leaves the unresolved index: without this a
+      // durable journal would hold a proven-dead submission forever and
+      // `onUnresolved: "fail"` would refuse to build for the life of it.
+      yield* journalSettled(yield* notAppliedEntry(failure))
+      return Reconciled.cases.NotApplied.make({ _tag: "NotApplied", error: failure })
+    case "SubmissionUnknown":
+      yield* journalSettled(
+        yield* unknownEntry(signed, lastError ?? SuiError.describe(failure), attempts)
+      )
+      return Reconciled.cases.SubmissionUnknown.make({ _tag: "SubmissionUnknown", error: failure })
+  }
+})
+
 /** `reconcile` plus the journal bookkeeping `submit` owes after it. */
 const reconcileSigned = Effect.fn("Tx.reconcileSigned")(function*(
   signed: Signed,
   lastError: TransportError,
   attempts: number
-): Effect.fn.Return<
-  Executed,
-  ExecutionFailed | NotApplied | SubmissionUnknown | JournalError,
-  Sui
-> {
-  const settled = yield* Effect.result(reconcile(signed))
-  if (settled._tag === "Success") {
-    yield* journalSettled(yield* executedEntry(settled.success))
-    return settled.success
-  }
-  const failure = settled.failure
-  switch (failure._tag) {
-    case "ExecutionFailed":
-      yield* journalSettled(yield* failedEntry(failure))
-      return yield* failure
-    case "NotApplied":
-      // Terminal: the transaction was proven never to have applied, so the
-      // journal records that rather than leaving an `Unknown` nothing will
-      // ever settle.
-      yield* journalSettled(yield* notAppliedEntry(failure))
-      return yield* failure
-    default: {
-      const unknown = failure._tag === "SubmissionUnknown"
-        ? failure
-        : new SubmissionUnknown({ digest: signed.digest, signed, cause: failure })
-      yield* journalSettled(
-        yield* unknownEntry(signed, SuiError.describe(lastError), attempts)
-      )
-      return yield* unknown
-    }
-  }
+): Effect.fn.Return<Executed, ExecutionFailed | NotApplied | SubmissionUnknown, Sui> {
+  const settled = yield* settle(signed, attempts, SuiError.describe(lastError))
+  return settled._tag === "Executed" ? settled.executed : yield* settled.error
 })
 
 const inputOf = (input: ReconcileInput): { digest: Digest; signed?: Signed } => {
@@ -1523,23 +1585,17 @@ const chainOfSigned = (signed: Signed): string | undefined =>
  * about whether the transaction applied, and `SuiError.outcome` puts
  * `TransportError` on `"not_applied"` — which would tell a wrapper to retry a
  * submission whose outcome is genuinely unknown. Every read failure here
- * becomes `SubmissionUnknown` carrying the digest, the bytes and the cause. The
- * tag stays in the signature so the union does not shrink under callers.
+ * becomes `SubmissionUnknown` carrying the digest, the bytes and the cause.
  *
  * Given only a `Digest` there can be no evidence, so an unknown transaction is
  * always `SubmissionUnknown`. Pass the `Signed` bytes (or the
  * `SubmissionUnknown` that carries them) to get the evidence rules.
  *
- * Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`,
- * `TransportError`.
+ * Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`.
  */
 export const reconcile = Effect.fn("Tx.reconcile")(function*(
   input: ReconcileInput
-): Effect.fn.Return<
-  Executed,
-  ExecutionFailed | NotApplied | SubmissionUnknown | TransportError,
-  Sui
-> {
+): Effect.fn.Return<Executed, ExecutionFailed | NotApplied | SubmissionUnknown, Sui> {
   const sui = yield* Sui
   const config = yield* SubmitConfig
   const { digest, signed } = inputOf(input)
@@ -1591,7 +1647,7 @@ const recover = Effect.fn("Tx.recover")(function*(
   }
 
   /** One `getTransaction`, with "the node does not know it" as a value. */
-  const lookup = Effect.fn("Tx.recover.lookup")(function*(): Effect.fn.Return<
+  const lookup = Effect.fnUntraced(function*(): Effect.fn.Return<
     Executed | undefined,
     ExecutionFailed | TransportError
   > {
@@ -1708,6 +1764,14 @@ const assertSponsor = (
  * and immediately after the build when it came out of the recipe. Use the
  * explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
  * two parties cannot both sign in one process.
+ *
+ * **The gas owner's lock comes from `opts.gasOwner` only.** The locks are taken
+ * before anything is built, so a gas owner the recipe sets itself is not known
+ * when they are chosen, and a recipe that does so without
+ * `tx.setGasPayment([])` has the gas owner's coins selected under the sender's
+ * lock alone. Pass the same address as `opts.gasOwner` whenever the recipe sets
+ * one (`Tx.sponsored` pays from an address balance and selects no coins, but
+ * passing it costs nothing).
  *
  * **`onSigned` is the hook between signing and sending.** A program with its
  * own record to keep — a batch row, an outbox, an idempotency key — has to
@@ -1868,76 +1932,25 @@ export const recorded: (
  * that fails after an entry has been settled is logged and the answer stands,
  * the same rule `Tx.submit` follows.
  *
- * Fails with: `JournalError`, `TransportError`.
+ * Fails with: `JournalError`.
  */
 export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(): Effect.fn.Return<
   ReadonlyArray<Reconciled>,
-  JournalError | TransportError,
+  JournalError,
   Sui
 > {
   const journal = yield* Journal
   const entries = yield* journal.listUnresolved
-  const settled: Array<Reconciled> = []
-  for (const entry of entries) {
-    if (!isUnresolved(entry)) continue
-    const attempts = entry._tag === "Unknown" ? entry.attempts : 1
-    const result = yield* Effect.result(reconcile(entry.signed))
-    if (result._tag === "Success") {
-      yield* journalSettled(yield* executedEntry(result.success))
-      settled.push(
-        Reconciled.cases.Executed.make({ _tag: "Executed", executed: result.success })
-      )
-      continue
-    }
-    const failure = result.failure
-    switch (failure._tag) {
-      case "ExecutionFailed":
-        yield* journalSettled(yield* failedEntry(failure))
-        settled.push(
-          Reconciled.cases.ExecutionFailed.make({ _tag: "ExecutionFailed", error: failure })
-        )
-        break
-      case "NotApplied":
-        // Terminal, so the entry leaves the unresolved index: without this a
-        // durable journal would hold a proven-dead submission forever and
-        // `onUnresolved: "fail"` would refuse to build for the life of it.
-        yield* journalSettled(yield* notAppliedEntry(failure))
-        settled.push(Reconciled.cases.NotApplied.make({ _tag: "NotApplied", error: failure }))
-        break
-      default: {
-        // `Tx.reconcile` converts every recovery read failure into
-        // `SubmissionUnknown`, so `TransportError` is in its signature and
-        // never in its values; it is mapped here anyway rather than given a
-        // case of its own that nothing could reach. Either way the failure
-        // settles **this** entry and the loop goes on, instead of aborting a
-        // whole startup on one unreachable read.
-        const unresolvedOutcome = failure._tag === "SubmissionUnknown"
-          ? failure
-          : new SubmissionUnknown({
-            digest: entry.digest,
-            signed: entry.signed,
-            cause: failure
-          })
-        yield* journalSettled(
-          yield* unknownEntry(entry.signed, SuiError.describe(failure), attempts)
-        )
-        settled.push(
-          Reconciled.cases.SubmissionUnknown.make({
-            _tag: "SubmissionUnknown",
-            error: unresolvedOutcome
-          })
-        )
-        break
-      }
-    }
-  }
-  return settled
+  return yield* Effect.forEach(
+    entries.filter(isUnresolved),
+    (entry) => settle(entry.signed, entry._tag === "Unknown" ? entry.attempts : 1, undefined)
+  )
 })
 
 /**
  * The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
  * `Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`,
- * `Tx.reconcile`, `Tx.run`, `Tx.reconcileAll`.
+ * `Tx.submitVia`, `Tx.reconcile`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
  */
 export const Tx = {
   build,

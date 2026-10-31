@@ -64,6 +64,7 @@ export {
   maxTimestampMsOf,
   MoveLocation,
   Network,
+  Nonce,
   NotAppliedEvidence,
   ObjectEnvelope,
   ObjectId,
