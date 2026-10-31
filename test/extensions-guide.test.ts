@@ -115,7 +115,12 @@ describe("docs/extensions.md", () => {
     // shown beside the class-field form the template uses. The template keeps
     // the class field — three converted packages copy it — so this one has no
     // home there by construction.
-    expect(inlineBlocks.length).toBeLessThanOrEqual(18)
+    //
+    // 0.4.0 added two, both consumer code: decoding a typed value through
+    // `SuiAddress.Strict`, and calling a Promise face from plain TypeScript
+    // with a `Signer` and a branded id. The template is the extension, not its
+    // consumer, so neither has a home there.
+    expect(inlineBlocks.length).toBeLessThanOrEqual(20)
   })
 
   test("every code block names the template file it came from", () => {
