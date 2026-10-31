@@ -781,11 +781,7 @@ const withOutcome = (
   json: Record<string, unknown>
 ): Record<string, unknown> => {
   if ("outcome" in json) return json
-  const value = (error as { readonly outcome?: unknown })?.outcome
-  return typeof value === "string" && (value === "applied" || value === "not_applied" ||
-      value === "unknown")
-    ? { ...json, outcome: value }
-    : json
+  return hasOutcome(error) ? { ...json, outcome: error.outcome } : json
 }
 
 /**
