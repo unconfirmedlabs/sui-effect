@@ -240,7 +240,10 @@ export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
       reason: simulation.executionError === undefined
         ? UNKNOWN_REASON
         : executionReasonOf(simulation.executionError),
-      message: simulation.message
+      message: simulation.message,
+      ...(simulation.executionError?.command === undefined
+        ? {}
+        : { command: simulation.executionError.command })
     })
   }
   return transportError(method, cause)

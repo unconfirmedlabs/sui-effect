@@ -596,6 +596,10 @@ export type CleverError = typeof CleverError.Type
  * discriminant, with two differences: `abortCode` is decoded to `bigint`, and
  * the shared `message` and `command` fields live on the error class that
  * carries the reason rather than being repeated in every variant.
+ *
+ * The one exception is `Unknown`, which keeps `message` and `command`: it has
+ * no payload of its own, and the node's sentence is the only place the real
+ * kind (`InsufficientCoinBalance`, `FunctionNotFound`, ...) is written down.
  */
 export const ExecutionReason = Schema.Union([
   Schema.Struct({
@@ -659,7 +663,26 @@ export const ExecutionReason = Schema.Union([
       objectId: Schema.String
     })
   }),
-  Schema.Struct({ $kind: Schema.Literal("Unknown") })
+  Schema.Struct({
+    $kind: Schema.Literal("Unknown"),
+    /**
+     * The node's own sentence, which is the only detail an `Unknown` has: the
+     * SDK reports every kind it has no structured variant for —
+     * `InsufficientCoinBalance`, `InsufficientGas`, `FunctionNotFound`,
+     * `ArityMismatch`, a verifier error — as `Unknown` with the kind and the
+     * command in `message` (`"InsufficientCoinBalance in command 0"`). Absent
+     * when the source carried none.
+     *
+     * @since 0.4.0
+     */
+    message: Schema.optionalKey(Schema.String),
+    /**
+     * The index of the command that failed, when the node named one.
+     *
+     * @since 0.4.0
+     */
+    command: Schema.optionalKey(Schema.Finite)
+  })
 ]).pipe(Schema.toTaggedUnion("$kind"))
 export type ExecutionReason = typeof ExecutionReason.Type
 
@@ -1074,14 +1097,23 @@ type SimulationType = typeof Simulation.Type
  */
 export interface Simulation extends SimulationType {}
 
-const UNKNOWN_REASON = ExecutionReason.cases.Unknown.make({ $kind: "Unknown" })
-
 /**
  * Decodes the SDK's `ExecutionError` into an {@link ExecutionReason}, falling
  * back to `Unknown` when the node reports a variant this version does not
- * model. Never fails.
+ * model. Either way an `Unknown` keeps the node's `message` and `command`,
+ * which are all it has. Never fails.
  */
 export const executionReasonOf = (error: SuiClientTypes.ExecutionError): ExecutionReason => {
   const decoded = Schema.decodeUnknownOption(ExecutionReason)(error)
-  return decoded._tag === "Some" ? decoded.value : UNKNOWN_REASON
+  if (decoded._tag === "Some") return decoded.value
+  const record = error as { readonly message?: unknown; readonly command?: unknown }
+  return ExecutionReason.cases.Unknown.make({
+    $kind: "Unknown",
+    ...(typeof record.message === "string" && record.message.length > 0
+      ? { message: record.message }
+      : {}),
+    ...(typeof record.command === "number" && Number.isFinite(record.command)
+      ? { command: record.command }
+      : {})
+  })
 }

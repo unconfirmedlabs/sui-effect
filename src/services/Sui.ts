@@ -194,7 +194,8 @@ export const fromSimulationResult = Effect.fn("Sui.fromSimulationResult")(functi
     }
     return yield* new SimulationFailed({
       reason: executionReasonOf(status.error),
-      message: status.error.message
+      message: status.error.message,
+      ...(status.error.command === undefined ? {} : { command: status.error.command })
     })
   }
 
@@ -696,6 +697,7 @@ const makeSui = (
           objectId: envelope.objectId,
           expectedType: expected,
           kind: "type",
+          actualType: envelope.type,
           issue: `object ${envelope.objectId} has type ${envelope.type}`
         })
       }
