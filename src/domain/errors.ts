@@ -577,15 +577,37 @@ const OutcomeSchema = Schema.Literals(["applied", "not_applied", "unknown"])
 
 const isHasOutcome = Schema.is(Schema.Struct({ outcome: OutcomeSchema }))
 
-const hasOutcome = (error: unknown): error is HasOutcome => isHasOutcome(error)
-
-const tagOf = (error: unknown): string | undefined => {
-  const tag = Predicate.isObject(error) ? error["_tag"] : undefined
-  return typeof tag === "string" ? tag : undefined
+/**
+ * `run()`, or `fallback` when it throws.
+ *
+ * Every helper on {@link SuiError} is documented "Never fails" and takes
+ * `unknown`, and a value from outside can throw from anywhere: a getter, a
+ * Proxy trap (a revoked Proxy throws from `Array.isArray`), a `toString`, a
+ * taxonomy tag on an object without the tag's fields. The helpers read such a
+ * value through this, so the worst they answer is a tag-shaped line, `false`,
+ * `none` or `"unknown"`, never an exception.
+ */
+const totally = <A>(run: () => A, fallback: () => A): A => {
+  try {
+    return run()
+  } catch {
+    return fallback()
+  }
 }
 
+const hasOutcome = (error: unknown): error is HasOutcome => totally(() => isHasOutcome(error), () => false)
+
+const tagOf = (error: unknown): string | undefined =>
+  totally(() => {
+    const tag = Predicate.isObject(error) ? error["_tag"] : undefined
+    return typeof tag === "string" ? tag : undefined
+  }, () => undefined)
+
 const isRetryable = (error: unknown): boolean =>
-  tagOf(error) === "TransportError" && (error as TransportError).retryable === true
+  totally(
+    () => tagOf(error) === "TransportError" && (error as TransportError).retryable === true,
+    () => false
+  )
 
 /**
  * Every tag the taxonomy owns, so a foreign tag can be told from one of ours.
@@ -629,7 +651,10 @@ const outcome = (
   error: unknown,
   options?: { readonly phase?: OutcomePhase }
 ): Outcome => {
-  if (hasOutcome(error)) return error.outcome
+  if (hasOutcome(error)) {
+    const declared = totally((): Outcome | undefined => error.outcome, () => undefined)
+    if (declared !== undefined) return declared
+  }
   const tag = tagOf(error)
   if (tag === undefined || !TAXONOMY_TAGS.has(tag)) {
     // Before anything was sent, an unclassifiable failure still means nothing
@@ -782,12 +807,36 @@ const causeLine = (cause: unknown): string | undefined => {
   return flat.length === 0 ? undefined : clip(flat)
 }
 
+/**
+ * The objects whose line is being read right now.
+ *
+ * Reading a foreign error's line reads its `.message`, and an extension error
+ * that does what the house classes do — `override get message() { return
+ * SuiError.describe(this) }` — calls straight back in; so does a cyclic
+ * `cause` chain. A value met again while its own line is being read answers
+ * its tag, which is what turns that recursion into a one-line answer instead
+ * of a stack overflow.
+ */
+const READING = new WeakSet<object>()
+
 const rawCauseLine = (cause: unknown): string | undefined => {
   if (cause === undefined || cause === null) return undefined
   if (typeof cause === "string") return cause.length === 0 ? undefined : cause
   if (typeof cause !== "object") return undefined
+  if (READING.has(cause)) return tagOf(cause)
+  READING.add(cause)
+  try {
+    return readCauseLine(cause)
+  } catch {
+    return tagOf(cause)
+  } finally {
+    READING.delete(cause)
+  }
+}
+
+const readCauseLine = (cause: object): string | undefined => {
   const tag = tagOf(cause)
-  if (tag !== undefined && TAXONOMY_TAGS.has(tag)) return describeTaxonomy(cause as SuiError)
+  if (tag !== undefined && TAXONOMY_TAGS.has(tag)) return describeTaxonomySafely(cause as SuiError)
   if (tag === "ConfigError") return describeConfigError(cause)
   const message = (cause as { readonly message?: unknown }).message
   if (typeof message === "string" && message.length > 0) {
@@ -907,7 +956,7 @@ export interface DescribeOptions {
  */
 const describe = (error: unknown, options?: DescribeOptions): string => {
   const tag = tagOf(error)
-  const line = describeAny(error, tag)
+  const line = totally(() => describeAny(error, tag), () => tag ?? stringOf(error))
   if (options?.tag !== false || tag === undefined) return line
   if (line === tag) return line
   for (const separator of [": ", " "]) {
@@ -916,14 +965,35 @@ const describe = (error: unknown, options?: DescribeOptions): string => {
   return line
 }
 
+/**
+ * `String(value)`, for a value whose `toString` may throw or not exist (a
+ * null-prototype object): then `Object.prototype.toString`, then
+ * `"UnknownError"`.
+ */
+const stringOf = (value: unknown): string =>
+  totally(
+    () => oneLine(String(value)),
+    () => totally(() => Object.prototype.toString.call(value), () => "UnknownError")
+  )
+
 const describeAny = (error: unknown, tag: string | undefined): string => {
-  if (tag !== undefined && TAXONOMY_TAGS.has(tag)) return describeTaxonomy(error as SuiError)
-  if (tag === "ConfigError") return `ConfigError ${oneLine(describeConfigError(error as object))}`
+  if (tag !== undefined && TAXONOMY_TAGS.has(tag)) return describeTaxonomySafely(error as SuiError)
+  if (tag === "ConfigError") {
+    if (Predicate.isObject(error) && READING.has(error)) return tag
+    READING.add(error as object)
+    try {
+      return `ConfigError ${oneLine(describeConfigError(error as object))}`
+    } finally {
+      READING.delete(error as object)
+    }
+  }
   if (tag !== undefined) {
     const line = causeLine(error)
     return line === undefined || line === tag ? tag : `${tag}: ${line}`
   }
-  return causeLine(error) ?? (error instanceof Error ? error.name : oneLine(String(error)))
+  return causeLine(error) ?? (totally(() => error instanceof Error, () => false)
+    ? (error as Error).name
+    : stringOf(error))
 }
 
 /** ` (cause)`-style tail: `: <line>` when there is a line worth printing. */
@@ -933,16 +1003,11 @@ const withCause = (head: string, cause: unknown): string => {
 }
 
 /**
- * A `SubmissionUnknown`'s tail: its cause, and — when the error carries a
- * `lastError` (the last execute failure, which is what an operator needs to
- * read) that the cause does not already say — that too.
+ * A `SubmissionUnknown`'s line: its digest and its cause, which is where
+ * `Tx.submit` folds the last execute failure.
  */
-const describeSubmissionUnknown = (error: SubmissionUnknown): string => {
-  const head = withCause(`SubmissionUnknown ${error.digest}`, error.cause)
-  const last = causeLine((error as { readonly lastError?: unknown }).lastError)
-  if (last === undefined || head.includes(last)) return head
-  return `${head}; last error: ${last}`
-}
+const describeSubmissionUnknown = (error: SubmissionUnknown): string =>
+  withCause(`SubmissionUnknown ${error.digest}`, error.cause)
 
 const describeDecodeError = (error: DecodeError): string => {
   if (error.kind === "type" && error.actualType !== undefined) {
@@ -952,6 +1017,13 @@ const describeDecodeError = (error: DecodeError): string => {
   }
   return oneLine(`DecodeError ${error.kind} ${error.expectedType ?? ""} ${error.objectId ?? ""} ${error.issue}`)
 }
+
+/**
+ * {@link describeTaxonomy}, or the bare tag when the value carries a taxonomy
+ * tag without the fields the tag promises (`{ _tag: "ExecutionFailed" }`).
+ */
+const describeTaxonomySafely = (error: SuiError): string =>
+  totally(() => describeTaxonomy(error), () => tagOf(error) ?? "UnknownError")
 
 const describeTaxonomy = (error: SuiError): string => {
   switch (error._tag) {
@@ -1085,6 +1157,26 @@ const withMessage = (
  */
 const toJson = (error: unknown): Record<string, unknown> => {
   const tag = tagOf(error)
+  const fallback = (): Record<string, unknown> => ({
+    _tag: tag ?? "UnknownError",
+    message: tag === undefined ? describe(error) : describe(error, { tag: false })
+  })
+  if (!totally(() => Predicate.isObject(error), () => true)) return totally(() => toJsonOf(error, tag), fallback)
+  const object = error as object
+  // A `message` getter that calls `toJson(this)` comes straight back here.
+  if (SERIALIZING.has(object)) return { _tag: tag ?? "UnknownError", message: tag ?? "UnknownError" }
+  SERIALIZING.add(object)
+  try {
+    return totally(() => toJsonOf(error, tag), fallback)
+  } finally {
+    SERIALIZING.delete(object)
+  }
+}
+
+/** The objects {@link toJson} is serializing right now; see {@link READING}. */
+const SERIALIZING = new WeakSet<object>()
+
+const toJsonOf = (error: unknown, tag: string | undefined): Record<string, unknown> => {
   if (tag !== undefined && TAXONOMY_TAGS.has(tag)) {
     const encoded = encode(error)
     if (Result.isSuccess(encoded)) {
@@ -1144,7 +1236,7 @@ export const digestOf = (error: unknown): Digest | undefined => {
     case "SubmissionUnknown":
     case "NotApplied":
     case "UnexpectedEffects":
-      return error.digest
+      return totally((): Digest | undefined => error.digest, () => undefined)
     default:
       return undefined
   }
@@ -1200,7 +1292,10 @@ export interface MoveAbortInfo {
  *
  * @since 0.4.0
  */
-const moveAbort = (error: unknown): Option.Option<MoveAbortInfo> => {
+const moveAbort = (error: unknown): Option.Option<MoveAbortInfo> =>
+  totally(() => readMoveAbort(error), () => Option.none())
+
+const readMoveAbort = (error: unknown): Option.Option<MoveAbortInfo> => {
   const tag = tagOf(error)
   if (tag !== "SimulationFailed" && tag !== "ExecutionFailed") return Option.none()
   const failure = error as SimulationFailed | ExecutionFailed
@@ -1269,6 +1364,10 @@ const isMoveAbort = (
   if (Option.isNone(found)) return false
   const abort = found.value
   if (match === undefined) return true
+  return totally(() => matchesAbort(abort, match), () => false)
+}
+
+const matchesAbort = (abort: MoveAbortInfo, match: MoveAbortMatch): boolean => {
   if (
     match.package !== undefined &&
     (abort.package === undefined || normalizeHex(abort.package) !== normalizeHex(match.package))
@@ -1276,7 +1375,12 @@ const isMoveAbort = (
   if (match.module !== undefined && abort.module !== match.module) return false
   if (match.function !== undefined && abort.function !== match.function) return false
   if (match.constant !== undefined && abort.constant !== match.constant) return false
-  if (match.code !== undefined && abort.code !== BigInt(match.code)) return false
+  if (match.code !== undefined) {
+    // `BigInt(1.5)` throws a RangeError: a code that is not an integer matches
+    // no abort.
+    if (typeof match.code === "number" && !Number.isInteger(match.code)) return false
+    if (abort.code !== BigInt(match.code)) return false
+  }
   return true
 }
 

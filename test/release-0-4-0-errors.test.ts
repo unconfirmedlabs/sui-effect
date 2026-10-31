@@ -366,19 +366,20 @@ describe("SubmissionUnknown stays one readable line (wallet#5, wallet#11)", () =
     expect(line.length).toBeLessThan(400)
   })
 
-  test("a lastError the cause does not already say is appended", () => {
-    const lastError = new TransportError({
-      method: "executeTransaction",
-      retryable: true,
-      status: "UNAVAILABLE",
-      cause: "connection reset"
-    })
+  test("the last send's failure is read from the cause, where Tx.submit folds it", () => {
+    // `SubmissionUnknown` has no `lastError` field: `Tx.reconcileSigned` puts
+    // the last send's line into `cause`, so that is the only place describe
+    // reads. A stray `lastError` property is not part of the error.
     const error = Object.assign(
-      new SubmissionUnknown({ digest: DIGEST as never, cause: "the node does not know this digest" }),
-      { lastError }
+      new SubmissionUnknown({
+        digest: DIGEST as never,
+        cause:
+          "the node does not know this digest; the last send failed with TransportError executeTransaction UNAVAILABLE (retryable): connection reset"
+      }),
+      { lastError: "ignored" }
     )
     expect(SuiError.describe(error)).toBe(
-      `SubmissionUnknown ${DIGEST}: the node does not know this digest; last error: TransportError executeTransaction UNAVAILABLE (retryable): connection reset`
+      `SubmissionUnknown ${DIGEST}: the node does not know this digest; the last send failed with TransportError executeTransaction UNAVAILABLE (retryable): connection reset`
     )
   })
 })
