@@ -3958,7 +3958,7 @@ whatever the service returns. What this owns is everything around it:
 ## `@unconfirmed/sui-effect/journal`
 
 
-5 exported symbols.
+6 exported symbols.
 
 ### `Journal` (const)
 
@@ -4007,33 +4007,56 @@ declare const make: (store: KeyValueStore.KeyValueStore, options?: {
 
 A journal backed by a `KeyValueStore`.
 
-The store has no key enumeration, so the journal keeps its own index: one
-key holding the digests of the entries that are still unresolved, rewritten
-whenever an entry is put. A terminal entry (`Executed`, `Failed`,
-`NotApplied`) drops its digest from the index and keeps the entry itself, so
-a later `get` still finds the answer.
+Each entry is one key, `entry:<digest>`, holding the entry as JSON, and a
+`put` is one `set` of that key. A terminal entry (`Executed`, `Failed`,
+`NotApplied`) overwrites the unresolved one and stays, so a later `get`
+still finds the answer.
 
-`put` is serialized by a semaphore of one permit held across **both** writes,
-because the index write is a read-modify-write over a store that offers no
-compare-and-set: two concurrent `Tx.run`s from different senders would
-otherwise each read the same index, each append their own digest, and the
-second write would drop the first. The semaphore is keyed by the store prefix
-at module level, so two journals built over one prefix share it.
+There is no index and no lock. `listUnresolved` enumerates the store with
+`KeyValueStore.keys`, so the only thing a `put` writes is the entry itself:
+no read-modify-write, nothing for two writers — two fibers, two layer
+instances, two processes over one store — to lose between them, and no
+crash between two writes to order around. Two writers that put the **same**
+digest at once still race, and the last `set` wins; the lifecycle never does
+that, because one submission is one fiber.
 
-**The order of the two writes depends on which way a crash between them is
-survivable:**
+**The cost is a scan.** `listUnresolved` reads every entry under the prefix,
+terminal ones included (`keys` is O(n) in the prefix, and each entry is one
+`get`, eight at a time). A journal that keeps every settled entry forever
+makes startup recovery slower without bound; `pruneSettled` is how a
+long-lived service keeps it short.
 
-- an **unresolved** entry (`Signed`, `Unknown`) writes the **index first**, so
-  a crash leaves a digest whose entry is missing — `listUnresolved` skips it —
-  rather than an entry nothing points at;
-- a **terminal** entry (`Executed`, `Failed`, `NotApplied`) writes the
-  **entry first** and only then drops the digest from the index, so a crash
-  leaves the digest still indexed with its terminal answer already stored:
-  `listUnresolved` reads the entry, sees it is resolved, and skips it. Doing
-  it the other way round is how a settled transaction reverted to the stale
-  `Signed` entry that startup recovery could no longer find.
+A store written by 0.3 or earlier also holds an `index` key. It is dead data
+here: never read, never rewritten, never an error. It is left alone so that
+a rollback to 0.3 still finds its index; remove it by hand once nothing
+older reads the store.
 
 Every member fails with `JournalError` and nothing else.
+
+### `pruneSettled` (const)
+
+```ts
+declare const pruneSettled: (before: DateTime.DateTime, options?: {
+    readonly prefix?: string;
+} | undefined) => Effect.Effect<number, JournalError, KeyValueStore.KeyValueStore>
+```
+
+Deletes every **settled** entry (`Executed`, `Failed`, `NotApplied`) whose
+answer was recorded strictly before `before`, and answers how many it
+deleted. `Signed` and `Unknown` entries are never deleted, however old.
+
+This is what keeps `make`'s scan short in a service that runs for
+months. After it, `Journal.get` and `Tx.recorded` answer `None` for a pruned
+digest, so choose `before` older than anything you still look up by digest —
+and older than any bytes you might still hand to `Tx.submit` again, because a
+resubmission puts a fresh `Signed` entry that a concurrent prune of the same
+digest could delete. `Tx.build` bounds a transaction to two epochs, so a
+cutoff of a few days is far outside that window.
+
+It reads the same `KeyValueStore` the journal layer was built over; pass the
+same `prefix`. The dead `index` key a 0.3 journal kept is not touched.
+
+**Fails with: `JournalError`, when the store cannot be listed, read or written, or holds an entry that does not decode (nothing is deleted on the strength of an entry it could not read).**
 
 ## `@unconfirmed/sui-effect/extension`
 

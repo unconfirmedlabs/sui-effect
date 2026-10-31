@@ -424,17 +424,37 @@ describe("6. reconciliation refuses evidence from another chain", () => {
   })
 })
 
-describe("7. the durable journal writes terminal entries before de-indexing", () => {
-  test("a store that fails the index write keeps the terminal entry readable", async () => {
-    // Fault injection, the audit's own: the failure lands between the two
-    // writes. Writing the index first left the store holding a stale `Signed`
-    // entry with no index membership, which startup recovery could never find.
+describe("7. the durable journal: one write per entry, no index to fall out of step", () => {
+  // The audit's finding was an ordering bug between the entry write and the
+  // index write. 0.4.0 removed the index: `listUnresolved` enumerates the store
+  // through `KeyValueStore.keys`, so a `put` is a single `set` and there is no
+  // second write for a crash to land before.
+  const signedEntry = (suffix: string) => {
+    const digest = Schema.decodeUnknownSync(JournalEntry.cases.Signed.fields.digest)(
+      `${"1".repeat(31)}${suffix}`
+    )
+    return JournalEntry.cases.Signed.make({
+      _tag: "Signed",
+      digest,
+      signed: {
+        digest,
+        bytes: new Uint8Array([1]),
+        signatures: [],
+        sender: SuiAddress.make(SENDER)
+      },
+      signedAt: DateTime.makeUnsafe(0)
+    })
+  }
+
+  test("a failed terminal write leaves the Signed entry unresolved for recovery", async () => {
+    // Fault injection at the only write there is: the terminal answer never
+    // lands, so the store still says `Signed` and startup recovery finds it.
     const store = new Map<string, string>()
-    let failIndex = false
+    let failWrites = false
     const kv = KeyValueStore.makeStringOnly({
       get: (key: string) => Effect.succeed(store.get(key)),
       set: (key: string, value: string) =>
-        key.endsWith("index") && failIndex
+        failWrites
           ? Effect.fail(
             new KeyValueStore.KeyValueStoreError({ method: "set", message: "the disk is gone" })
           )
@@ -450,50 +470,36 @@ describe("7. the durable journal writes terminal entries before de-indexing", ()
       keys: Effect.sync(() => Array.from(store.keys()))
     })
     const journal = makeKeyValueJournal(kv)
-    const digest = Schema.decodeUnknownSync(JournalEntry.cases.Signed.fields.digest)(OTHER_DIGEST)
-    const at = DateTime.makeUnsafe(0)
+    const signed = signedEntry("2")
     const outcome = await Effect.runPromise(
       Effect.gen(function*() {
-        yield* journal.put(
-          JournalEntry.cases.Signed.make({
-            _tag: "Signed",
-            digest,
-            signed: {
-              digest,
-              bytes: new Uint8Array([1, 2, 3]),
-              signatures: [],
-              sender: SuiAddress.make(SENDER)
-            },
-            signedAt: at
-          })
-        )
-        failIndex = true
+        yield* journal.put(signed)
+        failWrites = true
         const crashed = yield* Effect.result(
           journal.put(
-            JournalEntry.cases.Executed.make({ _tag: "Executed", digest, at })
+            JournalEntry.cases.Executed.make({ _tag: "Executed", digest: signed.digest, at: DateTime.makeUnsafe(0) })
           )
         )
-        failIndex = false
-        return { crashed, entry: yield* journal.get(digest), unresolved: yield* journal.listUnresolved }
+        failWrites = false
+        return { crashed, entry: yield* journal.get(signed.digest), unresolved: yield* journal.listUnresolved }
       })
     )
     expect(outcome.crashed._tag).toBe("Failure")
-    // The terminal answer is durable even though the index write failed …
     expect(outcome.entry._tag).toBe("Some")
-    if (outcome.entry._tag === "Some") expect(outcome.entry.value._tag).toBe("Executed")
-    // … and `listUnresolved` filters it out, so nothing is lost either way.
-    expect(outcome.unresolved).toHaveLength(0)
+    if (outcome.entry._tag === "Some") expect(outcome.entry.value._tag).toBe("Signed")
+    expect(outcome.unresolved.map((entry) => entry.digest)).toEqual([signed.digest])
+    // One key per digest, and nothing else.
+    expect([...store.keys()]).toEqual([`entry:${signed.digest}`])
   })
 
-  test("two journals over one prefix share a write permit", async () => {
-    // The semaphore is module-level per prefix, so two layer instances in one
-    // process cannot interleave their index read-modify-writes.
+  test("two journals over one prefix, with yielding writes, lose nothing", async () => {
+    // The 0.3 journal needed a module-level semaphore per prefix because its
+    // index was a read-modify-write. Without the index there is nothing to
+    // interleave, so two layer instances need no shared permit.
     const store = new Map<string, string>()
     const kv = KeyValueStore.makeStringOnly({
-      get: (key: string) => Effect.succeed(store.get(key)),
+      get: (key: string) => Effect.andThen(Effect.yieldNow, Effect.sync(() => store.get(key))),
       set: (key: string, value: string) =>
-        // A yield in the middle of every write is what lets two interleaving
-        // writers lose an index entry.
         Effect.andThen(Effect.yieldNow, Effect.sync(() => {
           store.set(key, value)
         })),
@@ -507,31 +513,18 @@ describe("7. the durable journal writes terminal entries before de-indexing", ()
     })
     const first = makeKeyValueJournal(kv, { prefix: "shared:" })
     const second = makeKeyValueJournal(kv, { prefix: "shared:" })
-    const entry = (suffix: string) => {
-      const digest = Schema.decodeUnknownSync(JournalEntry.cases.Signed.fields.digest)(
-        `${"1".repeat(31)}${suffix}`
-      )
-      return JournalEntry.cases.Signed.make({
-        _tag: "Signed",
-        digest,
-        signed: {
-          digest,
-          bytes: new Uint8Array([1]),
-          signatures: [],
-          sender: SuiAddress.make(SENDER)
-        },
-        signedAt: DateTime.makeUnsafe(0)
-      })
-    }
     const unresolved = await Effect.runPromise(
       Effect.gen(function*() {
-        yield* Effect.all([first.put(entry("2")), second.put(entry("3"))], {
-          concurrency: "unbounded"
-        })
-        return yield* first.listUnresolved
+        yield* Effect.all([
+          first.put(signedEntry("2")),
+          second.put(signedEntry("3")),
+          first.put(signedEntry("4")),
+          second.put(signedEntry("5"))
+        ], { concurrency: "unbounded" })
+        return yield* second.listUnresolved
       })
     )
-    expect(unresolved).toHaveLength(2)
+    expect(unresolved).toHaveLength(4)
   })
 })
 
