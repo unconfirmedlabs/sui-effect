@@ -687,7 +687,7 @@ const NullableU64 = Schema.NullOr(U64)
  * is a `u32` on the wire, so anything outside `[0, 2^32)` is a schema issue
  * rather than bytes the validator will reject later.
  */
-const Nonce = Schema.Finite.pipe(
+export const Nonce = Schema.Finite.pipe(
   Schema.check(Schema.isInt(), Schema.isBetween({ minimum: 0, maximum: U32_MAX }))
 )
 
@@ -782,11 +782,12 @@ export interface SignedTransaction extends SignedTransactionType {}
  * by more than `SubmitConfig.expiryMargin` — around a `getTransaction` miss,
  * twice. `"inputConsumed"`: a **different** transaction's own effects report
  * that it took an object these bytes pinned at exactly the version they pinned.
+ * `"refused"`: the node refused the first send outright (gRPC `INVALID_ARGUMENT`).
  *
  * Shared by `NotApplied` and by the journal entry that records it, so the two
  * cannot drift.
  */
-export const NotAppliedEvidence = Schema.Literals(["expired", "inputConsumed"])
+export const NotAppliedEvidence = Schema.Literals(["expired", "inputConsumed", "refused"])
 export type NotAppliedEvidence = typeof NotAppliedEvidence.Type
 
 /**

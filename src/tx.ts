@@ -43,7 +43,6 @@ export {
   gaslessStablecoinTransfer,
   type Built,
   Reconciled,
-  type ReconciledOutcome,
   type ReconcileInput,
   type RunError,
   type SubmitError,
