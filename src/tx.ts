@@ -30,6 +30,7 @@ export {
   type ExpirationPolicy,
   type ExpiryEvidencePolicy,
   SubmitConfig,
+  type SubmitConfigOverrides,
   type SubmitConfigService
 } from "./services/SubmitConfig.ts"
 
