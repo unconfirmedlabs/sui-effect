@@ -529,7 +529,8 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  * `client.ext.doThing()` as a statement — cannot abort the process with an
  * unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
  *
- * Never fails, except a `warm` registration. A warm registration builds the
+ * Never fails, except that a `warm` registration throws any failure of its
+ * layer synchronously out of `register`. A warm registration builds the
  * **whole layer** synchronously inside `register`, so **any** failure of that
  * layer — a missing deployment for the network, a configuration error, a
  * `NetworkMismatch`, not only an asynchronous step or an unknown chain

@@ -171,25 +171,7 @@ export const defaults: SubmitConfigService = {
   nonce: Random.nextIntBetween(0, U32_MAX)
 }
 
-/**
- * The lifecycle settings.
- *
- * Because this is a `Context.Reference` and not a service, it never appears in
- * an `R`: a one-shot script gets the defaults with no wiring, and an
- * application overrides what it cares about with
- * {@link SubmitConfig.with} (one effect) or {@link SubmitConfig.layer} (a whole
- * application), both of which spread {@link SubmitConfig.defaults} for you.
- *
- * @example
- * ```ts
- * import { Effect } from "effect"
- * import { Mist } from "@unconfirmed/sui-effect"
- * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
- *
- * const strict = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
- *   effect.pipe(SubmitConfig.with({ maxGasBudget: Mist.make(100_000_000n) }))
- * ```
- */
+/** The reference itself; {@link SubmitConfig} is it with the constructors attached. */
 const SubmitConfigRef = Context.Reference<SubmitConfigService>(
   "@unconfirmed/sui-effect/SubmitConfig",
   { defaultValue: () => defaults }
@@ -244,8 +226,37 @@ const withOverrides =
   <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
     Effect.provideService(effect, SubmitConfigRef, { ...defaults, ...overrides })
 
+/**
+ * The lifecycle settings.
+ *
+ * Because this is a `Context.Reference` and not a service, it never appears in
+ * an `R`: a one-shot script gets the defaults with no wiring, and an
+ * application overrides what it cares about with
+ * {@link SubmitConfig.with} (one effect) or {@link SubmitConfig.layer} (a whole
+ * application), both of which spread {@link SubmitConfig.defaults} for you.
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { Mist } from "@unconfirmed/sui-effect"
+ * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
+ *
+ * const strict = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+ *   effect.pipe(SubmitConfig.with({ maxGasBudget: Mist.make(100_000_000n) }))
+ * ```
+ */
 export const SubmitConfig = Object.assign(SubmitConfigRef, {
+  /** The settings in force when nothing overrides them. */
   defaults,
+  /**
+   * A `Layer` that puts `defaults` in force with `overrides` applied, for an
+   * application or a test that sets its lifecycle policy once at the edge.
+   * Never fails, requires nothing.
+   */
   layer,
+  /**
+   * `defaults` with `overrides` applied, provided to one effect: the
+   * `.pipe`-able form of `layer`. Never fails, requires nothing.
+   */
   with: withOverrides
 })

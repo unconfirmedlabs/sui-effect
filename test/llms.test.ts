@@ -13,9 +13,34 @@ import { describe, expect, setDefaultTimeout, test } from "bun:test"
 // The generators shell out to the TypeScript checker over dist/; five seconds is tight on a CI runner.
 setDefaultTimeout(120_000)
 import { existsSync, readFileSync } from "node:fs"
-import { missingDeclaration, render } from "../scripts/llms.ts"
+import { errorsOf, missingDeclaration, render, summaryOf } from "../scripts/llms.ts"
 
 const missing = missingDeclaration()
+
+describe("the error sentence", () => {
+  test("Fails with: is printed whole and taken out of the prose", () => {
+    const doc = "Reads one object.\n\nFails with: `ObjectNotFound`,\n`TransportError`."
+    expect(errorsOf(doc)).toBe("Fails with: `ObjectNotFound`, `TransportError`.")
+    expect(summaryOf(doc)).toBe("Reads one object.")
+  })
+
+  test("a qualified never-fails sentence is printed whole, not as a bare Never fails.", () => {
+    const doc = "Builds a recipe.\n\nNever fails; the recipe it returns throws only if\nthe SDK does, which `Tx.build` reports.\n\nMore prose."
+    expect(errorsOf(doc)).toBe("Never fails; the recipe it returns throws only if the SDK does, which `Tx.build` reports.")
+    expect(summaryOf(doc)).toBe("Builds a recipe.\n\nMore prose.")
+    expect(errorsOf("Wraps it. Otherwise never fails: a bad key is a `SigningError`.")).toBe(
+      "Otherwise never fails: a bad key is a `SigningError`."
+    )
+    expect(errorsOf("Never fails, except a {@link warm} one.")).toBe("Never fails, except a `warm` one.")
+  })
+
+  test("a prose line starting with @ does not truncate the summary; a block tag does", () => {
+    expect(summaryOf("The durable journal lives in\n@unconfirmed/sui-effect/journal.")).toBe(
+      "The durable journal lives in\n@unconfirmed/sui-effect/journal."
+    )
+    expect(summaryOf("Prose.\n@example\n```ts\nx\n```")).toBe("Prose.")
+  })
+})
 
 describe("LLMS.md", () => {
   test("is committed", () => {

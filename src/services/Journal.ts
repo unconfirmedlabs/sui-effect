@@ -91,9 +91,9 @@ const JournalRef = Context.Reference<JournalService>("@unconfirmed/sui-effect/Jo
  * ```
  */
 export const Journal = Object.assign(JournalRef, {
-  /** A fresh in-memory journal, for a test or a process that wants its own. */
+  /** A fresh in-memory journal, for a test or a process that wants its own. Never fails. */
   layerMemory: Layer.sync(JournalRef, makeMemoryUnsafe),
-  /** The in-memory implementation, for building one directly. */
+  /** The in-memory implementation, for building one directly. Never fails. */
   makeMemoryUnsafe
 })
 

@@ -561,11 +561,11 @@ export interface SuiCoreService {
  * ```
  */
 export class SuiCore extends Context.Service<SuiCore, SuiCoreService>()("@unconfirmed/sui-effect/SuiCore") {
-  /** Wraps a client the caller already built and configured. */
+  /** Wraps a client the caller already built and configured. Never fails. */
   static readonly layerFromClient = (client: ClientWithCoreApi): Layer.Layer<SuiCore> =>
     Layer.succeed(SuiCore, makeFromClient(client))
 
-  /** Builds a `SuiGrpcClient` and wraps it. */
+  /** Builds a `SuiGrpcClient` and wraps it. Never fails. */
   static readonly layerGrpc = (options: SuiGrpcLayerOptions): Layer.Layer<SuiCore> =>
     Layer.sync(SuiCore, () => makeFromClient(makeGrpcClient(options)))
 
@@ -573,8 +573,8 @@ export class SuiCore extends Context.Service<SuiCore, SuiCoreService>()("@unconf
    * Reads `SUI_NETWORK` (required, no default) and `SUI_RPC_URL` (optional,
    * defaulted from {@link defaultGrpcUrl} for the four known networks).
    *
-   * The layer fails with `ConfigError` when `SUI_NETWORK` is missing, or when
-   * it names a network with no built-in URL and `SUI_RPC_URL` is not set.
+   * Fails with: `ConfigError` (the layer) when `SUI_NETWORK` is missing, or
+   * when it names a network with no built-in URL and `SUI_RPC_URL` is not set.
    */
   static readonly layerConfig: Layer.Layer<SuiCore, Config.ConfigError> = Layer.effect(
     SuiCore,

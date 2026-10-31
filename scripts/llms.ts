@@ -268,7 +268,7 @@ const signatureOf = (
   declaration: ts.Declaration,
   checker: ts.TypeChecker
 ): string => {
-  const text = withoutPrivateMembers(withBrandNames(declaration.getText()))
+  const text = withoutLinks(withoutPrivateMembers(withBrandNames(declaration.getText())))
   if (ts.isClassDeclaration(declaration) && declaration.members.length === 0) {
     // A `Schema.TaggedError` class has an empty body and an extends clause the
     // emitter names `X_base`, so the fields are only visible on the type.
@@ -313,29 +313,54 @@ const docOfDeclaration = (declaration: ts.Declaration): string =>
     .join("\n\n")
     .trim()
 
+/** `{@link X}` is for an IDE, not for a reader of plain markdown. */
+const withoutLinks = (text: string): string => text.replace(/\{@link\s+([^}]+)\}/g, "`$1`")
+
+const FAILS_WITH = /Fails with:[\s\S]*?(?:\.\s*$|\.\n|\.$)/m
+
 /**
- * The "Fails with: …" sentence every public function's JSDoc carries, or the
- * "Never fails." it carries instead, as one line.
+ * A "never fails" sentence in any of the spellings the sources use: the bare
+ * "Never fails.", and the qualified "Never fails; …", "Never fails, except …",
+ * "Never fails to build; …", "Otherwise never fails: …". It runs to the first
+ * period followed by whitespace, so a dotted name like `Tx.run` inside it does
+ * not end it.
  */
-const errorsOf = (doc: string): string | undefined => {
-  const fails = /Fails with:[\s\S]*?(?:\.\s*$|\.\n|\.$)/m.exec(doc)
-  if (fails !== null) return fails[0].replace(/\s+/g, " ").trim()
-  // The period is required. `fromService` says "Never fails, except a `warm`
-  // registration, which throws ...", and printing **Never fails.** under it
-  // contradicted the paragraph directly above.
-  return /Never fails\./.test(doc) ? "Never fails." : undefined
+const NEVER_FAILS = /(?:Otherwise never|Never) fails\b[\s\S]*?\.(?=\s|$)/
+
+/**
+ * The error sentence every public function's JSDoc carries — "Fails with: …",
+ * or one of the "never fails" spellings — as one line, whole.
+ *
+ * A qualified sentence is printed whole rather than as a bare **Never fails.**:
+ * `fromService` says "Never fails, except a `warm` registration …", and the
+ * bare form under it would contradict the paragraph directly above.
+ */
+export const errorsOf = (doc: string): string | undefined => {
+  const found = FAILS_WITH.exec(doc) ?? NEVER_FAILS.exec(doc)
+  return found === null ? undefined : withoutLinks(found[0].replace(/\s+/g, " ").trim())
 }
 
+/**
+ * Where a JSDoc's prose ends: the first block tag. Only a known tag counts,
+ * so a prose line that happens to start with `@` — a scoped package name —
+ * does not cut the summary short.
+ */
+const FIRST_TAG = /\n@(?:example|since|deprecated|param|returns|throws|see|remarks|internal|template)\b/
+
 /** The JSDoc without the error sentence, which is printed on its own. */
-const summaryOf = (doc: string): string => {
-  const withoutErrors = doc.replace(/Fails with:[\s\S]*?(?:\.\s*$|\.\n|\.$)/m, "").trim()
-  // A bare trailing "Never fails." is printed on its own as the error line;
-  // leaving it in the prose too said it twice. "Never fails: …" and
-  // "Never fails; …" carry more than the line does and stay.
-  const withoutNeverFails = withoutErrors.replace(/\s*Never fails\.(?=\s*$)/, "").trim()
-  const withoutExamples = withoutNeverFails.split("\n@")[0] ?? withoutNeverFails
-  // `{@link X}` is for an IDE, not for a reader of plain markdown.
-  return withoutExamples.replace(/\{@link\s+([^}]+)\}/g, "`$1`").trim()
+export const summaryOf = (doc: string): string => {
+  const sentence = FAILS_WITH.exec(doc) ?? NEVER_FAILS.exec(doc)
+  // The space that followed the sentence goes with it, so the prose after it on
+  // the same line does not start with one.
+  const withoutErrors = sentence === null
+    ? doc
+    : doc.slice(0, sentence.index) + doc.slice(sentence.index + sentence[0].length).replace(/^[ \t]+/, "")
+  // A bare trailing "Never fails." beside a "Fails with:" sentence says the
+  // same thing twice; drop it too.
+  const withoutNeverFails = withoutErrors.replace(/\s*Never fails\.(?=\s*$)/, "")
+  const tag = FIRST_TAG.exec(withoutNeverFails)
+  const prose = tag === null ? withoutNeverFails : withoutNeverFails.slice(0, tag.index)
+  return withoutLinks(prose.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n")).trim()
 }
 
 /**
