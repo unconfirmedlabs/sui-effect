@@ -493,6 +493,27 @@ describe("Script.run", () => {
     expect(result.lines).toContain(`digest: ${DIGEST}`)
   })
 
+  test("a stderr writer that throws still reaches exit with the failure's code", async () => {
+    const codes: Array<number> = []
+    const layer = Script.layerNoDeps.pipe(
+      Layer.provideMerge(layerTest({ chainId: CHAIN_ID })),
+      Layer.provide(env())
+    )
+    const code = await Script.run(
+      Effect.fail(new ExecutionFailed({ digest: DIGEST, reason: UNKNOWN_REASON, effects })),
+      {
+        layer,
+        exit: (code) => codes.push(code),
+        stderr: () => {
+          throw new Error("EPIPE")
+        },
+        signals: { on: () => undefined }
+      }
+    )
+    expect(code).toBe(5)
+    expect(codes).toEqual([5])
+  })
+
   test("an unknown submission prints the bytes and a reconcile hint", async () => {
     const result = await runScript(
       Effect.fail(new SubmissionUnknown({ digest: DIGEST, signed, cause: "timeout" }))
