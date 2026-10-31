@@ -573,19 +573,14 @@ describe("SuiError.describe accepts a foreign error", () => {
 })
 
 describe("Sui.getObjectsStrict (item 1)", () => {
-  test("the new name and the deprecated one are the same function", async () => {
-    const [strict, legacy] = await run(
+  test("reads every id or fails; the 0.1.x alias getObjectsOrFail is gone (0.4.0)", async () => {
+    const strict = await run(
       Effect.gen(function*() {
         const sui = yield* Sui
-        return [
-          yield* sui.getObjectsStrict([ObjectId.make(ESCROW_ID)]),
-          yield* sui.getObjectsOrFail([ObjectId.make(ESCROW_ID)])
-        ] as const
+        return yield* sui.getObjectsStrict([ObjectId.make(ESCROW_ID)])
       })
     )
     expect(strict).toHaveLength(1)
-    expect(legacy).toHaveLength(1)
-    expect(strict[0]?.id).toBe(legacy[0]!.id)
   })
 })
 

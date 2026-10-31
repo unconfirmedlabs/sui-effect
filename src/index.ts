@@ -46,6 +46,8 @@ export {
   Built,
   ChangedObject,
   CleverError,
+  Coin,
+  CoinMetadata,
   CoinType,
   CommandResult,
   Digest,
@@ -53,6 +55,7 @@ export {
   DynamicFieldEntry,
   DynamicFieldName,
   Event,
+  EventEntry,
   ExecutionReason,
   ExecutionStatus,
   GasCostSummary,
@@ -95,11 +98,14 @@ export {
 /** The opinionated tier. */
 export {
   type BatchItemError,
+  type EventFilter,
   type GetObjectError,
+  type ListOrder,
   type Recipe,
   Sui,
   type SuiLayerOptions,
-  type SuiService
+  type SuiService,
+  type TransactionFilter
 } from "./services/Sui.ts"
 
 /** The mechanical tier. */

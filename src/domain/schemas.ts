@@ -17,13 +17,52 @@ import {
   normalizeSuiAddress
 } from "@mysten/sui/utils"
 
-const normalizeStructTagSafe = (value: string): string => {
+/**
+ * `normalizeStructTag`, or the value unchanged when it does not parse as a
+ * struct tag (a primitive such as `u64`, or plain nonsense the check after it
+ * rejects). The one copy: `bcs.ts` imports it from here. Never fails.
+ */
+export const normalizeStructTagSafe = (value: string): string => {
   try {
     return normalizeStructTag(value)
   } catch {
     return value
   }
 }
+
+/**
+ * The pipeline every 32-byte hex id shares: normalize with
+ * `normalizeSuiAddress` on decode, check with `isValidSuiAddress`. The caller brands it
+ * (`Schema.brand` needs a literal): `SuiAddress` and `ObjectId` differ only in
+ * brand and wording.
+ */
+const hexId = (identifier: string, description: string, expected: string) =>
+  Schema.String.annotate({ identifier, description }).pipe(
+    Schema.decode({
+      decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
+      encode: SchemaGetter.passthrough()
+    }),
+    Schema.check(
+      Schema.makeFilter((value: string) => isValidSuiAddress(value) ? undefined : expected)
+    )
+  )
+
+/**
+ * The pipeline every struct-tag-like string shares: normalize with
+ * `normalizeStructTag` on decode (leaving what does not parse for the check to
+ * reject), check with `isValidStructTag`. The caller brands it. `StructTag` and
+ * `CoinType` differ only in brand and wording.
+ */
+const structTagLike = (identifier: string, description: string, expected: string) =>
+  Schema.String.annotate({ identifier, description }).pipe(
+    Schema.decode({
+      decode: SchemaGetter.transform(normalizeStructTagSafe),
+      encode: SchemaGetter.passthrough()
+    }),
+    Schema.check(
+      Schema.makeFilter((value: string) => isValidStructTag(value) ? undefined : expected)
+    )
+  )
 
 /**
  * A 32-byte Sui account address, normalized to the padded lowercase `0x` form on
@@ -34,21 +73,11 @@ const normalizeStructTagSafe = (value: string): string => {
  * `SuiAddress.make("0x1")` throws. `SuiAddress.normalize("0x1")` is the one
  * that accepts every spelling a human writes, because it decodes first.
  */
-const SuiAddressSchema = Schema.String.annotate({
-  identifier: "SuiAddress",
-  description: "A 32-byte Sui account address in the padded lowercase 0x form"
-}).pipe(
-  Schema.decode({
-    decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
-    encode: SchemaGetter.passthrough()
-  }),
-  Schema.check(
-    Schema.makeFilter((value: string) =>
-      isValidSuiAddress(value) ? undefined : "Expected a 32-byte Sui address"
-    )
-  ),
-  Schema.brand("SuiAddress")
-)
+const SuiAddressSchema = hexId(
+  "SuiAddress",
+  "A 32-byte Sui account address in the padded lowercase 0x form",
+  "Expected a 32-byte Sui address"
+).pipe(Schema.brand("SuiAddress"))
 
 /**
  * A branded {@link SuiAddress} from **any** spelling the SDK accepts: `"0x1"`,
@@ -97,21 +126,11 @@ export type SuiAddress = typeof SuiAddressSchema.Type
  * `ObjectId.make` validates without decoding; `ObjectId.normalize` decodes
  * first and is what takes `"0x6"`.
  */
-const ObjectIdSchema = Schema.String.annotate({
-  identifier: "ObjectId",
-  description: "A 32-byte Sui object id in the padded lowercase 0x form"
-}).pipe(
-  Schema.decode({
-    decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
-    encode: SchemaGetter.passthrough()
-  }),
-  Schema.check(
-    Schema.makeFilter((value: string) =>
-      isValidSuiAddress(value) ? undefined : "Expected a 32-byte Sui object id"
-    )
-  ),
-  Schema.brand("ObjectId")
-)
+const ObjectIdSchema = hexId(
+  "ObjectId",
+  "A 32-byte Sui object id in the padded lowercase 0x form",
+  "Expected a 32-byte Sui object id"
+).pipe(Schema.brand("ObjectId"))
 
 /**
  * A branded {@link ObjectId} from any spelling the SDK accepts, decoding first
@@ -165,39 +184,19 @@ export type Digest = typeof Digest.Type
  * A fully qualified Move struct tag, normalized with `normalizeStructTag` on
  * decode so `0x2::sui::SUI` and its padded form compare equal.
  */
-export const StructTag = Schema.String.annotate({
-  identifier: "StructTag",
-  description: "A fully qualified Move struct tag, normalized"
-}).pipe(
-  Schema.decode({
-    decode: SchemaGetter.transform(normalizeStructTagSafe),
-    encode: SchemaGetter.passthrough()
-  }),
-  Schema.check(
-    Schema.makeFilter((value: string) =>
-      isValidStructTag(value) ? undefined : "Expected a fully qualified Move struct tag"
-    )
-  ),
-  Schema.brand("StructTag")
-)
+export const StructTag = structTagLike(
+  "StructTag",
+  "A fully qualified Move struct tag, normalized",
+  "Expected a fully qualified Move struct tag"
+).pipe(Schema.brand("StructTag"))
 export type StructTag = typeof StructTag.Type
 
 /** A coin type: a struct tag used as the type argument of `0x2::coin::Coin`. */
-export const CoinType = Schema.String.annotate({
-  identifier: "CoinType",
-  description: "A struct tag used as the type argument of 0x2::coin::Coin"
-}).pipe(
-  Schema.decode({
-    decode: SchemaGetter.transform(normalizeStructTagSafe),
-    encode: SchemaGetter.passthrough()
-  }),
-  Schema.check(
-    Schema.makeFilter((value: string) =>
-      isValidStructTag(value) ? undefined : "Expected a fully qualified Move coin type"
-    )
-  ),
-  Schema.brand("CoinType")
-)
+export const CoinType = structTagLike(
+  "CoinType",
+  "A struct tag used as the type argument of 0x2::coin::Coin",
+  "Expected a fully qualified Move coin type"
+).pipe(Schema.brand("CoinType"))
 export type CoinType = typeof CoinType.Type
 
 /**
@@ -328,6 +327,60 @@ type BalanceType = typeof Balance.Type
  * into its structure. Structurally identical to the type alias it replaces.
  */
 export interface Balance extends BalanceType {}
+
+/**
+ * A coin object. Mirrors `SuiClientTypes.Coin`: `type` is the full object type
+ * (`0x2::coin::Coin<T>`), `balance` the coin's value in its smallest unit.
+ *
+ * @since 0.4.0
+ */
+export const Coin = Schema.Struct({
+  objectId: ObjectId,
+  version: Version,
+  digest: Schema.String,
+  owner: Owner,
+  type: StructTag,
+  balance: Mist
+}).annotate({
+  identifier: "Coin",
+  description: "A coin object"
+})
+type CoinSchemaType = typeof Coin.Type
+/**
+ * The decoded shape of {@link Coin}.
+ *
+ * Declared as an interface rather than as `typeof Coin.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface Coin extends CoinSchemaType {}
+
+/**
+ * The metadata of a coin type. Mirrors `SuiClientTypes.CoinMetadata`: `id` is
+ * the metadata object's id, `null` when the node does not report one.
+ *
+ * @since 0.4.0
+ */
+export const CoinMetadata = Schema.Struct({
+  id: Schema.NullOr(ObjectId),
+  decimals: Schema.Finite.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))),
+  name: Schema.String,
+  symbol: Schema.String,
+  description: Schema.String,
+  iconUrl: Schema.NullOr(Schema.String)
+}).annotate({
+  identifier: "CoinMetadata",
+  description: "The metadata of a coin type"
+})
+type CoinMetadataType = typeof CoinMetadata.Type
+/**
+ * The decoded shape of {@link CoinMetadata}.
+ *
+ * Declared as an interface rather than as `typeof CoinMetadata.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface CoinMetadata extends CoinMetadataType {}
 
 /** The BCS-encoded name of a dynamic field. Mirrors `SuiClientTypes.DynamicFieldName`. */
 export const DynamicFieldName = Schema.Struct({
@@ -478,6 +531,33 @@ export const Event = Schema.Struct({
   json: Schema.optional(Schema.Unknown)
 })
 export type Event = typeof Event.Type
+
+/**
+ * An event read from a listing, with its place in the ledger. Mirrors
+ * `SuiClientTypes.EventEntry`: an {@link Event} plus the checkpoint that
+ * contains the emitting transaction (`null` where the transport does not say),
+ * that transaction's digest, and the event's index in its list.
+ *
+ * @since 0.4.0
+ */
+export const EventEntry = Schema.Struct({
+  ...Event.fields,
+  checkpoint: Schema.NullOr(Schema.BigIntFromString),
+  transactionDigest: Digest,
+  eventIndex: Schema.Finite.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)))
+}).annotate({
+  identifier: "EventEntry",
+  description: "An event read from a listing, with its place in the ledger"
+})
+type EventEntryType = typeof EventEntry.Type
+/**
+ * The decoded shape of {@link EventEntry}.
+ *
+ * Declared as an interface rather than as `typeof EventEntry.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface EventEntry extends EventEntryType {}
 
 /**
  * Where a Move abort happened. Mirrors `SuiClientTypes.MoveLocation`.
