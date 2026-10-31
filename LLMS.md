@@ -2831,7 +2831,7 @@ export declare class SuiGraphQL extends SuiGraphQL_base {
      * import { SuiGraphQL } from "@unconfirmed/sui-effect"
      *
      * const chain = SuiGraphQL.query(
-     *   (client, signal) => client.query({ query: "{ chainIdentifier }", signal }),
+     *   (client, signal) => client.query({ query: "{ chainIdentifier }", variables: {}, signal }),
      *   "chainIdentifier"
      * )
      * ```

@@ -1780,12 +1780,13 @@ import { SuiGrpcClient } from "@mysten/sui/grpc"
 import { Sui, SuiCore } from "@unconfirmed/sui-effect"
 import { Effect, Layer, ManagedRuntime } from "effect"
 
-const client = new SuiGrpcClient({ network: deployment.network, url: deployment.url })
+const client = new SuiGrpcClient({ network: deployment.network, baseUrl: deployment.url })
 
 // `layerNoDepsWith({ chainId })` over the client you already have: the chain id
 // asserted is the deployment's, not the built-in table's entry for the network.
+// `provideMerge`, not `provide`: `runSui` hands the program `SuiCore` as well.
 const layer = Sui.layerNoDepsWith({ chainId: deployment.chainIdentifier }).pipe(
-  Layer.provide(SuiCore.layerFromClient(client))
+  Layer.provideMerge(SuiCore.layerFromClient(client))
 )
 
 export const runtime = ManagedRuntime.make(layer)
