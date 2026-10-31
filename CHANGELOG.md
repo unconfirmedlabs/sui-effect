@@ -172,7 +172,11 @@ package did not. Several signatures and one stored shape change; read
   `tailEvents` / `tailTransactions` / `tailEventPages` / `tailTransactionPages`,
   which never end, poll (1 s by default), retry a retryable error from the last
   cursor, and advance a filtered cursor to the unfiltered head so a pruning node
-  does not strand it (`TailOptions`). A full `eventType` filter is normalized.
+  does not strand it (`TailOptions`). That move reads the head and the filtered
+  page as two requests and is sound only when both reach one node (or nodes at
+  the same height): behind a load-balanced endpoint (the public fullnodes) it
+  can skip matches for good, so run a filtered tail whose completeness matters
+  against a single, sticky node. A full `eventType` filter is normalized.
 - **A per-attempt read `requestTimeout`** (30 s by default, `"Infinity"` off,
   `SUI_RPC_TIMEOUT` under `layerConfig`) ending in a retryable
   `DEADLINE_EXCEEDED`, and a `readRetry` schedule option; each read retry is

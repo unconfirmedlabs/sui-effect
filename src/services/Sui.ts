@@ -221,6 +221,16 @@ const DEFAULT_POLL: Duration.Input = "1 second"
  * lies between the cursor and the head, and the cursor moves to the head. The
  * order matters: reading the head after the page could skip a match that
  * landed in between.
+ *
+ * **That is only sound when both reads see the same ledger**: one node, or
+ * nodes at the same height. Behind a load-balanced endpoint (the public
+ * fullnodes) the head can come from a node that is ahead and the filtered page
+ * from one that lags; the empty page then says nothing about the stretch the
+ * lagging node has not reached, and the cursor jumps past matches in it —
+ * permanently, since the tail never reads behind its cursor. A filtered tail
+ * whose completeness matters belongs on a single (sticky) node. The behaviour
+ * is deliberate (without it a pruning node strands the cursor) and documented
+ * on `tailEvents` / `tailTransactions` and their `…Pages`.
  */
 const tailOf = <A>(
   span: string,
@@ -842,7 +852,14 @@ export interface SuiService {
    * It survives a node restart: a retryable `TransportError` is retried every
    * `poll` from the last cursor, logged at warning level. On a filtered tail it
    * also keeps its cursor near the ledger head while nothing matches (see
-   * `ListPage`), so a pruning node does not prune past it. `Stream.retry` on
+   * `ListPage`), so a pruning node does not prune past it. **That reads the
+   * unfiltered head and the filtered page as two requests**, which agree only
+   * when they reach the same node (or nodes at the same height): behind a
+   * load-balanced endpoint such as a public fullnode, a head from a node that
+   * is ahead plus an empty page from one that lags moves the cursor past
+   * matches the lagging node had not reached, and they are never read. Point a
+   * filtered tail whose completeness matters at a single (sticky) node.
+   * `Stream.retry` on
    * the result starts again from `opts.after`, not from where it stopped: for a
    * restartable indexer use `tailEventPages` and commit each page's
    * `endCursor`.
@@ -860,7 +877,11 @@ export interface SuiService {
   /**
    * `tailEvents` a page at a time, each page carrying the cursor to resume
    * from. A caught-up filtered tail emits an **empty** page whenever it moves
-   * its cursor to the ledger head, so that position can be committed too.
+   * its cursor to the ledger head, so that position can be committed too —
+   * with `tailEvents`' caveat: that move is sound only when the head and the
+   * page come from one node (or nodes at the same height), so a filtered tail
+   * whose completeness matters uses a single (sticky) node, not a
+   * load-balanced endpoint.
    *
    * Fails with: `TransportError`, only when it is not retryable.
    *
@@ -913,7 +934,11 @@ export interface SuiService {
    * Every transaction matching `filter`, oldest first, without end — the
    * transaction twin of `tailEvents`, with the same polling, retry and
    * filtered-cursor behaviour, and `streamTransactions`' rule for function
-   * filters.
+   * filters. The same caveat holds: a filtered tail advances its cursor to the
+   * unfiltered head read just before an empty page, which is sound only when
+   * both reads reach one node (or nodes at the same height). Behind a
+   * load-balanced endpoint it can skip matches for good, so a filtered tail
+   * whose completeness matters uses a single (sticky) node.
    *
    * Fails with: `TransportError`, only when it is not retryable.
    *
@@ -925,7 +950,10 @@ export interface SuiService {
   ) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>
 
   /**
-   * `tailTransactions` a page at a time (see `tailEventPages`).
+   * `tailTransactions` a page at a time (see `tailEventPages`), with the
+   * same caveat: a filtered tail whose completeness matters uses a single
+   * (sticky) node, because its move to the head is sound only when the head
+   * and the page come from the same ledger height.
    *
    * Fails with: `TransportError`, only when it is not retryable.
    *
