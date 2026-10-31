@@ -144,7 +144,7 @@ export interface FakeExecution {
 export type FakeOutcome =
   | { readonly _tag: "succeed"; readonly value: FakeExecution }
   | { readonly _tag: "failWith"; readonly reason: SuiClientTypes.ExecutionError; readonly value: FakeExecution }
-  | { readonly _tag: "transportError"; readonly status: string }
+  | { readonly _tag: "transportError"; readonly status: string; readonly message?: string }
   | { readonly _tag: "notFound" }
   | { readonly _tag: "timeoutThen"; readonly found: boolean }
 
@@ -209,8 +209,14 @@ export const FakeOutcome = {
     reason: SuiClientTypes.ExecutionError | ExecutionReason,
     value: FakeExecution = {}
   ): FakeOutcome => ({ _tag: "failWith", reason: executionErrorOf(reason), value }),
-  /** The call rejects with a gRPC status, as `RpcError` would. */
-  transportError: (status: string): FakeOutcome => ({ _tag: "transportError", status }),
+  /**
+   * The call rejects with a gRPC status, as `RpcError` would. `message` is the
+   * node's text, for a test about what a refusal *says* — a validator's
+   * "already locked by a different transaction" is a `FAILED_PRECONDITION`
+   * whose message names the conflicting digest.
+   */
+  transportError: (status: string, message?: string): FakeOutcome =>
+    message === undefined ? { _tag: "transportError", status } : { _tag: "transportError", status, message },
   /** The call rejects the way a missing transaction does. */
   notFound: (): FakeOutcome => ({ _tag: "notFound" }),
   /**
@@ -356,6 +362,24 @@ export interface FakeScript {
    * `NotApplied { inputConsumed }` rule.
    */
   readonly transactions?: Readonly<Record<string, FakeOutcome>>
+  /**
+   * The history the node still holds, served through `client.ledgerService`
+   * the way a gRPC node serves `GetServiceInfo.lowestAvailableCheckpoint` and
+   * `GetEpoch.firstCheckpoint`.
+   *
+   * `Tx.reconcile` reads it before it calls a `getTransaction` miss evidence
+   * of expiry: a node that has pruned into a transaction's validity window
+   * misses transactions that did apply. `firstCheckpoints` is keyed by epoch;
+   * an epoch it does not name answers `NOT_FOUND`, the way a node that pruned
+   * the epoch does. Unscripted, the client has no `ledgerService` at all, which
+   * is what a JSON-RPC or GraphQL transport looks like.
+   *
+   * @since 0.4.0
+   */
+  readonly ledger?: {
+    readonly lowestAvailableCheckpoint?: bigint
+    readonly firstCheckpoints?: Readonly<Record<string, bigint>>
+  }
 }
 
 /** One call the fake received, in order. */
@@ -664,8 +688,8 @@ const sameBytes = (left: Uint8Array | undefined, right: Uint8Array | undefined):
   return true
 }
 
-const rpcError = (status: string): Error => {
-  const error = new Error(`fake transport error: ${status}`)
+const rpcError = (status: string, message?: string): Error => {
+  const error = new Error(message ?? `fake transport error: ${status}`)
   Object.assign(error, { code: status, name: "RpcError" })
   return error
 }
@@ -948,7 +972,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   ): Promise<SettledTransaction> => {
     switch (outcome._tag) {
       case "transportError":
-        throw rpcError(outcome.status)
+        throw rpcError(outcome.status, outcome.message)
       case "notFound":
         throw new TransactionError("notFound", digest)
       case "timeoutThen":
@@ -1346,7 +1370,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     if (outcome === undefined) return
     switch (outcome._tag) {
       case "transportError":
-        throw rpcError(outcome.status)
+        throw rpcError(outcome.status, outcome.message)
       case "notFound":
         throw new ObjectError("notFound", `object ${options.objectId} does not exist`, {
           reason: "notFound",
@@ -1861,11 +1885,37 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     }
   }
 
+  const ledger = script.ledger
+  // The two `LedgerService` calls `Tx.reconcile` makes, in the `UnaryCall`
+  // shape the gRPC client returns (`{ response: Promise<…> }`).
+  const ledgerService = ledger === undefined ? undefined : {
+    getServiceInfo: (input: unknown) => {
+      record("getServiceInfo", input)
+      return {
+        response: Promise.resolve(
+          ledger.lowestAvailableCheckpoint === undefined
+            ? {}
+            : { lowestAvailableCheckpoint: ledger.lowestAvailableCheckpoint }
+        )
+      }
+    },
+    getEpoch: (input: { readonly epoch?: bigint }) => {
+      record("getEpoch", input)
+      const first = input.epoch === undefined ? undefined : ledger.firstCheckpoints?.[String(input.epoch)]
+      return {
+        response: first === undefined
+          ? Promise.reject(rpcError("NOT_FOUND", `epoch ${String(input.epoch)} is not available`))
+          : Promise.resolve({ epoch: { epoch: input.epoch, firstCheckpoint: first } })
+      }
+    }
+  }
+
   const client: ClientWithCoreApi = {
     network: script.network ?? "localnet",
     cache: undefined,
     core,
     tryGetPastObject,
+    ...(ledgerService === undefined ? {} : { ledgerService }),
     // The SDK's registration mechanism, implemented so an extension's derived
     // Promise face can be tested exactly the way a consumer writes it:
     // `client.$extend(myExtension())` — variadic, and chainable, because the
