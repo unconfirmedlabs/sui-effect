@@ -75,7 +75,7 @@ with no handling lines anywhere.
 | Part | Import | One line |
 |---|---|---|
 | [The two tiers](#the-two-tiers) | `@unconfirmed/sui-effect` | `Sui` for reads (positional arguments, decoded content, `Option`, `Stream`); `SuiCore`, the SDK's Core API one-to-one (the SDK's options objects) |
-| [The transaction lifecycle](#the-transaction-lifecycle) | `@unconfirmed/sui-effect/tx` | `Tx.run`, or `build` / `sign` / `cosign` / `submit` / `reconcile` by hand; `Signer` values; `Verify` |
+| [The transaction lifecycle](#the-transaction-lifecycle) | `@unconfirmed/sui-effect/tx` | `Tx.run`, or `build` / `sign` / `cosign` / `submit` / `reconcile` by hand; `fromBytes` / `attach` for a sponsor; `resubmit`; `Signer` values; `Verify` |
 | [`SubmitConfig`](#submitconfig) | `@unconfirmed/sui-effect/tx` | Every lifecycle decision, with defaults, overridable per effect or per layer |
 | [The journal](#the-journal) | `@unconfirmed/sui-effect/journal` | The record of signed bytes; in memory by default, durable over a `KeyValueStore` |
 | [Errors](#errors) | `@unconfirmed/sui-effect` | One flat tagged error per failure, `SuiError.outcome` and the exit codes |
@@ -92,7 +92,10 @@ plain SDK and against this package.
 `ClientWithCoreApi`, with every transport method present, the SDK's `Include`
 generics preserved, every call cancellable through the Effect's `AbortSignal`,
 every failure mapped into one tagged error by one mapper, a span per method, and
-retries on transient transport failures for reads only. Reach for it when you
+retries on transient transport failures for reads only — each attempt bounded
+by `requestTimeout` (30 s by default; `SUI_RPC_TIMEOUT` under `layerConfig`,
+`"Infinity"` to turn it off), because the SDK's own `timeout` only sets a gRPC
+header and a hung node would otherwise hang a read forever. Reach for it when you
 need a field or a method the tier above does not expose, and through
 `core.use(client => …)` when an upstream package wants the client object itself.
 
@@ -115,11 +118,32 @@ object.** `sui.getObject(id, { schema })` and `sui.getBalance(owner, coinType)`,
 but `sui.core.getObject({ objectId, include })`. The SDK habit,
 `sui.getObject({ objectId })`, does not typecheck.
 
+**The SDK's `listX` is `sui.streamX`**: `listOwnedObjects` → `streamOwnedObjects`,
+`listCoins` → `streamCoins`, `listBalances` → `streamBalances`,
+`listDynamicFields` → `streamDynamicFields`, `listEvents` → `streamEvents`,
+`listTransactions` → `streamTransactions`. The two ledger streams also take
+`after`/`before`, come as pages (`streamEventPages`, `streamTransactionPages`:
+`{ items, endCursor }`, so an indexer commits its cursor with its rows), and
+have never-ending `tail…` forms that poll, retry from the last cursor, and keep
+a filtered cursor ahead of a pruning node. A transaction `function` filter must
+be fully qualified (`pkg::module::function`); the SDK cannot page past the
+first page of a `pkg` or `pkg::module` filter, so the streams refuse those up
+front, and one page of one is `sui.core.listTransactions`.
+
+**Ids from a user go through `.Strict`.** `Schema.decodeUnknownEffect(SuiAddress)`
+pads (`"2"` is `0x…02`), which is right for a node and wrong for a recipient a
+human typed; `SuiAddress.Strict` and `ObjectId.Strict` take exactly 64 hex
+digits. `.normalize` is for a shorthand literal (`"0x6"`), `.make` for the
+padded form. Reads that take a Move type (`getBalance`, `streamCoins`,
+`getCoinMetadataOption`, `streamOwnedObjects({ type })`) and
+`executed.balanceChange` accept a plain string; `CoinType.SUI` is the padded
+SUI type.
+
 ## The transaction lifecycle
 
-`Tx` is the lifecycle as functions — `build`, `sign`, `cosign`, `sponsored`,
-`gaslessStablecoinTransfer`, `submit`, `submitVia`, `reconcile`, `recorded`,
-`run`, `reconcileAll` — each with a closed error union
+`Tx` is the lifecycle as functions — `build`, `sign`, `cosign`, `fromBytes`,
+`attach`, `sponsored`, `gaslessStablecoinTransfer`, `submit`, `submitVia`,
+`reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll` — each with a closed error union
 and `R = Sui`. `Tx.run` holds the sender lock from build through submit, builds
 (which always simulates before anything is signed — the SDK's resolver does it
 when it has a budget to choose, and `Tx.build` runs one explicitly whenever it
@@ -141,7 +165,10 @@ a transaction that was never sent — and settles the journal entry as
 `NotApplied { evidence: "refused" }`. A refusal after a timeout or a retryable
 failure is not that: the earlier send may have landed, so it reconciles.
 `Tx.build` retries its resolver call on a retryable `TransportError`, the way
-`SuiCore` retries a read, because nothing has been signed yet. `Signer` is a
+`SuiCore` retries a read, because nothing has been signed yet; a resolver
+**refusal** — an input owned by someone else, a function that does not exist,
+no coin to pay gas with — is a `BuildError` carrying the node's message, and a
+budget over `SubmitConfig.maxGasBudget` is `PolicyDenied { rule: "maxGasBudget" }`. `Signer` is a
 value, not a service, so one process can hold two credentials; `SubmitConfig`
 and `Journal` are `Context.Reference`s with working defaults, so none of this
 needs wiring (both have their own sections below). `SignatureScheme` is the
@@ -185,7 +212,12 @@ requires the epoch (or timestamp) bound to be observed as passed, then a
 `getTransaction` miss, then — after `SubmitConfig.reconcileRecheck` — both
 again; a single observation is `SubmissionUnknown`, and
 `SubmitConfig.expiryEvidence: "never"` turns the rule off for a deployment
-behind a mixed-node load balancer. `"inputConsumed"` requires a *different*
+behind a mixed-node load balancer. Positive evidence vetoes it — a pinned object
+that names this very digest as its last mutation means it applied — and on gRPC
+a node that has pruned into the transaction's validity window cannot prove a
+miss, so the answer there is `SubmissionUnknown`; JSON-RPC and GraphQL cannot
+report their history, so behind a pruning node on those set
+`expiryEvidence: "never"`. `"inputConsumed"` requires a *different*
 transaction's **own effects** to report that it took a pinned object at exactly
 the version the bytes pinned: reconcile follows the live object's
 `previousTransaction` — which names the latest mutation, not the consumer of the
@@ -203,6 +235,18 @@ older than the gas coin. Plan an operator path or a `reconcileAll` at startup;
 do not build a retry loop that expects `NotApplied { inputConsumed }`. Before
 any of this, reconcile compares the chain the bytes were built for with
 `sui.chainId` and refuses to reason across chains.
+
+**Re-sending a lost submission.** A `SubmissionUnknown` carries the signed
+bytes, and sending identical bytes again is safe — one digest, one execution.
+`Tx.resubmit(error)` does exactly that: it re-sends the same bytes, never a
+rebuild, refuses when the journal already says `NotApplied`, and reconciles
+instead when the journal says it executed, when the bytes name another chain or
+when their window has closed. `Tx.reconcileAll({ resubmit: true })` at startup
+re-sends every entry still unknown after reconciling, so a CLI that obeys
+"reconcile before sending anything else" is not stuck for two epochs. A
+first-send validator lock conflict ("already locked by a different
+transaction") is rechecked three times before `Tx.submit` answers, and a
+`SubmissionUnknown` from a send names that send's own error.
 
 **`Tx.run` has a hook between signing and sending.** `onSigned(signed)` runs
 inside the sender lock, after the last signature and before the first
@@ -231,11 +275,26 @@ that entry (`Option<JournalEntry>`).
 **A sponsored `Tx.run` needs both signatures.** When the gas owner is not the
 sender, pass `sponsor`: `Tx.run(recipe, { signer, gasOwner, sponsor })`. Without
 it the run fails with `SigningError` before anything is built, because one
-signature on sponsored bytes is something a validator rejects outright. Pass the
-gas owner as `gasOwner` even when the recipe sets it (`Tx.sponsored` does): the
-locks are chosen before the build, from the options, so a gas owner only the
-recipe names is not locked. Two parties that cannot both sign in one process
-use `build`, `sign`, `cosign` and `submit` directly.
+signature on sponsored bytes is something a validator rejects outright. The
+recipe is applied before any lock is chosen, so a gas owner it sets itself
+(`Tx.sponsored` does) is known without `opts.gasOwner`.
+
+**Two ways to sponsor.** `Tx.sponsored({ sender, gasOwner })` leaves the gas
+payment empty: the sponsor's **SUI address balance** pays, no coin is selected,
+and so `Tx.run` takes only the sender's lock — one sponsor serves many senders
+concurrently. That balance has to cover the budget, and faucets pay coins, so a
+sponsor deposits first (`coin::into_balance` then `balance::send_funds<SUI>` to
+itself); `Tx.build` checks before signing and fails with `BuildError` when it
+falls short. Without `Tx.sponsored`, `Tx.run(recipe, { signer, gasOwner,
+sponsor })` pays from the sponsor's **coins**, and then the sponsor's lock is
+held too, because two runs could pick the same coin.
+
+**A sponsor service that only sees bytes** rebuilds nothing: `Tx.fromBytes(bytes)`
+is a `Built` with the chain and expiration read off the bytes (other-chain bytes
+refused), `Tx.attach(built, senderSignature)` verifies and adds the sender's
+signature, then `Tx.cosign(signed, sponsor)` and `Tx.submit`. Two parties that
+cannot both sign in one process use `build`, `sign`, `cosign` and `submit`
+directly.
 
 When the recipe sets no expiration, `Tx.build` sets one: `ValidDuring` bounded
 to the current epoch and the next, carrying the chain identifier as a replay
@@ -260,10 +319,14 @@ program.pipe(SubmitConfig.with({
 }))
 ```
 
-`SubmitConfig.with(overrides)` spreads `SubmitConfig.defaults` for you and
-provides the whole value, which is what a `Context.Reference` holds;
-`SubmitConfig.layer(overrides)` is the same thing as a `Layer`, for an
-application that sets its policy once where the runtime is built.
+`SubmitConfig.with(overrides)` merges the overrides over the config **in
+force** — an inner `with({ executeTimeout })` keeps an outer `maxGasBudget`
+(before 0.4.0 it reset everything to the defaults) — and provides the whole
+value, which is what a `Context.Reference` holds; `SubmitConfig.layer(overrides)`
+spreads the defaults, as a `Layer`, for an application that sets its policy once
+where the runtime is built. Durations take `Duration.Input`, so
+`executeTimeout: "10 seconds"` typechecks. A budget over `maxGasBudget` fails
+`Tx.build` with `PolicyDenied { rule: "maxGasBudget" }`.
 
 `lockSender` is the other one worth a decision. The lock exists because two
 concurrent builds from one address can pick the same gas coin; with
@@ -272,6 +335,9 @@ balance — and the lock buys nothing. That is the case for every transaction
 built with `Tx.sponsored`, whose empty gas payment `Tx.build` preserves through
 the resolver, and it is the only setting that makes sense across isolates
 (Workers, Durable Objects), where a per-runtime semaphore is not a lock at all.
+`awaitVisibility` delays every return of `Tx.submit` either way — with
+`lockSender: false` too — and that default is right: without it the caller's
+next read can miss the object it just wrote.
 
 The fields and their defaults: `expiration` (`"validDuring"`: the current epoch
 and the next, plus the chain id), `validFor` (unset; no network accepts a
@@ -315,6 +381,14 @@ runs for months calls `pruneSettled(before)`, which deletes settled entries
 recorded before the cutoff and never an unresolved one. `makeKeyValueStore(store)`
 is the same journal as a plain `JournalService`.
 
+**A script with a durable journal** gives it to `Script.run` in
+`options.layer` (`Layer.merge(Script.layer, journal)`; the option accepts any
+error type) or provides it inside the program — `Script.run` finds the journal
+either way, and on a failure reports only the entries this run wrote. Sweep
+before sending anything new: `yield* Tx.reconcileAll({ resubmit: true })` first
+in the program. `examples/recipes/durable-journal-script.ts` (quoted in
+`LLMS.md`) is that script, tested.
+
 A store written by 0.3 reads unchanged (its old `index` key is ignored and left
 in place). The other direction does not hold for one kind of entry: a 0.3
 reader cannot decode `NotApplied { evidence: "refused" }`, which 0.4 writes.
@@ -334,23 +408,31 @@ ships inside the published package, so
 `node_modules/@unconfirmed/sui-effect/examples/extension-template/` is there to copy without
 a checkout.
 
-Four things an extension author should know before reading the guide. A layer
+Five things an extension author should know before reading the guide. A layer
 may require `Sui | SuiCore` and must provide everything else itself, including
 another extension's service — the guide's "composing extensions" section is that
 pattern. A Promise face's **synchronous** members (recipe builders, a package
 id) are real only once the runtime exists, so either `await client.<name>.$ready()`
 once or register with `warm`; calling one before that fails with
 `ExtensionNotReady` rather than returning a Promise the type does not mention
-(`Effect` and `Stream` members work cold: a cold call is a real `Promise` that
-is also an `AsyncIterable`, and its rejection is pre-handled so an un-awaited
-one cannot abort the process). A namespace member may be an `interface` — the
+(`Effect` and `Stream` members work cold: a cold call is a callable `Promise`
+that is also an `AsyncIterable` — applying a cold recipe builder's result
+throws `ExtensionNotReady`, a cold plain value throws on `.length`,
+`.startsWith` and the like — and its rejection is pre-handled so an un-awaited
+one cannot abort the process). An `Effect<Option<A>>` member resolves to
+`A | undefined` on the face. A namespace member may be an `interface` — the
 face maps it by type, not by declaration style — while a class instance with
 `Effect`-returning methods is declared `SuiExtension.Leaf<T>` and built with
 `SuiExtension.leaf(value)`.
-Every registration on one client **shares one `Sui`**, and therefore one
-sender-lock map, so two extensions never select gas for the same address at
-once; `$dispose()` releases that shared base only when the last registration on
-the client is disposed, and it is not final — the next call builds a fresh one.
+Every registration on one client and chain id **shares one `Sui`** (one
+transport, one chain-id read), and the **sender lock is process-wide** — every
+registration on every client takes the same lock per address — so two
+extensions never select gas for the same address at once; `$dispose()` releases
+the shared base only when the last registration on the client is disposed, and
+it is not final — the next call builds a fresh one. A Promise consumer sets the
+lifecycle on the registration — `submit` (the `SubmitConfig.with` overrides)
+and `journal` (e.g. a durable one) — and settles that journal at startup with
+`client.<name>.$reconcileAll()`.
 And `SuiGraphQL` is sui-effect's tag over the SDK's `SuiGraphQLClient` — one
 client shared by every extension that reads GraphQL; sui-effect wraps no GraphQL
 API of its own.
@@ -366,21 +448,24 @@ no error inheritance to match on.
 | `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | `objectId`, `version?` | The three `ObjectError.reason` values |
 | `TransactionNotFound` | `digest` | No transaction with that digest is known |
 | `NetworkMismatch` | `expected`, `actual` | The node is on another chain than the layer was built for |
-| `DecodeError` | `objectId?`, `expectedType?`, `kind`, `issue` | BCS content or a schema boundary did not decode. `kind` is `"type"` (the Move type was not the one expected — nothing was parsed, and the one a caller may answer with a 404), `"bytes"` (the BCS parse failed: a layout mismatch, never safe to swallow) or `"shape"` (a domain schema refused a parsed or JSON value). Branch on `kind`, never on `issue`, whose wording changes between releases |
-| `SimulationFailed` | `reason`, `message` | Simulation reported an execution failure. No gas charged |
+| `DecodeError` | `objectId?`, `expectedType?`, `actualType?`, `kind`, `issue` | BCS content or a schema boundary did not decode. `kind` is `"type"` (the Move type was not the one expected — nothing was parsed, and the one a caller may answer with a 404), `"bytes"` (the BCS parse failed: a layout mismatch, never safe to swallow) or `"shape"` (a domain schema refused a parsed or JSON value). Branch on `kind`, never on `issue`, whose wording changes between releases |
+| `SimulationFailed` | `reason`, `message`, `command?` | Simulation reported an execution failure. No gas charged |
 | `ExecutionFailed` | `digest`, `reason`, `command?`, `effects` | Applied on chain and failed. Gas charged |
 | `SubmissionUnknown` | `digest`, `signed?`, `cause` | Bytes may have been sent; the outcome is unknown. Carries them, unless it came from reconciling a bare digest |
 | `NotApplied` | `digest`, `evidence: "expired" \| "inputConsumed" \| "refused"` | Provably never applied, and never will be. `refused` is a node's `INVALID_ARGUMENT` on the first send, or a `submitVia` sender error that declared `not_applied` |
 | `SigningError` | `cause` | A signer refused or failed |
-| `BuildError` | `message`, `cause` | The transaction could not be built |
-| `PolicyDenied` | `rule`, `message` | A preflight policy refused it before it was signed |
+| `BuildError` | `message`, `cause` | The transaction could not be built: the recipe threw, the resolver refused (with the node's message), or the payer's address balance is below the budget |
+| `PolicyDenied` | `rule`, `message` | A preflight policy refused it before it was signed, or its budget is over `maxGasBudget` (`rule: "maxGasBudget"`) |
 | `JournalError` | `cause` | The journal could not be read or written. It escapes `Tx.submit` only from the write that happens **before** the first send; after the network has answered, a failed write is logged and the answer stands |
 | `UnexpectedEffects` | `digest`, `expected`, `found` | The effects did not contain what the caller expected. Outcome `applied` and exit 5: it comes from an `Executed`, so the transaction ran and gas was charged; only the receipt is missing |
 | `GraphQLUnavailable` | `method`, `reason` | The GraphQL endpoint an extension needs is not usable. What `SuiGraphQL.layerUnavailable` rejects every call with |
 | `ExtensionNotReady` | `extension`, `member` | A synchronous member of a Promise face was called before its runtime existed: `await client.<name>.$ready()`, or register with `warm` |
 
 `ExecutionReason` mirrors the SDK's `ExecutionError` variant for variant, with
-`MoveAbort.abortCode` as a `bigint` and clever-error constant names decoded.
+`MoveAbort.abortCode` as a `bigint` and clever-error constant names decoded;
+`Unknown` keeps the node's `message` and `command`, because that sentence
+(`InsufficientCoinBalance in command 0`) is all the gRPC parser gives for many
+kinds.
 **Every one of them has a readable `.message`**: for the classes that carry no
 `message` field of their own it is a getter returning `SuiError.describe(this)`,
 so anything that surfaces `error.message` — a log line, a UI, another library's
@@ -388,8 +473,24 @@ formatter — shows the actionable line instead of an empty string. It is not a
 schema field and does not appear in `SuiError.toJson`'s output.
 
 `SuiError.isRetryable`, `SuiError.outcome`, `SuiError.isTaxonomy`,
-`SuiError.describe` and `SuiError.toJson` are the helpers every repo otherwise
-hand-rolls;
+`SuiError.describe`, `SuiError.toJson`, `SuiError.digestOf`,
+`SuiError.moveAbort` and `SuiError.isMoveAbort` are the helpers every repo
+otherwise hand-rolls, and **every one takes `unknown`**, so a Promise `catch
+(e)` needs no cast. `describe(e)` is one line that says what to do next —
+`ExecutionFailed MoveAbort 0x…::escrow::claim EAlreadyClaimed "already claimed" (line 42) in command 1`,
+`SimulationFailed InsufficientCoinBalance in command 0`, a `BuildError` with
+the exception the recipe threw, `ConfigError missing SUI_NETWORK` — never
+bytes, and `{ tag: false }` drops the leading tag.
+
+**Mapping a Move abort to your own error** is
+`SuiError.isMoveAbort(e, { module: "escrow", constant: "EAlreadyClaimed" })`
+(any of `package`, `module`, `function`, `constant`, `code`), or
+`SuiError.moveAbort(e)` for the whole location as an `Option`. It matches a
+`SimulationFailed` and an `ExecutionFailed` alike; keep the outcome of the one
+you got. After an upgrade the abort's `package` is the **latest** package id,
+so match on `module` and `constant`.
+
+The helpers:
 `outcome` puts every failure on the `"applied" | "not_applied" | "unknown"`
 axis, and an extension error may declare its own. An error that is neither a tag
 above nor declares an `outcome` is *unclassified*: `outcome` answers `"unknown"`,
@@ -424,13 +525,15 @@ the wrapper retries a transaction that already ran.
 | `SUI_NETWORK` | yes, no default | `mainnet`, `testnet`, `devnet`, `localnet` or your own |
 | `SUI_ALLOW_MAINNET` | only for mainnet | `1` or `true`; a script that means mainnet has to say so twice |
 | `SUI_RPC_URL` | no | The gRPC endpoint; defaulted per known network |
+| `SUI_RPC_TIMEOUT` | no | The per-attempt read timeout, a duration (`30 seconds`, the default) or `Infinity`. A read that runs out is a retryable `DEADLINE_EXCEEDED` and is retried; it never bounds an execute |
 | `SUI_PRIVATE_KEY` | `Script` only | A Bech32 `suiprivkey1…` key of any of the four schemes (Ed25519, Secp256k1, Secp256r1, and ML-DSA-65 on `@mysten/sui` 2.36 or later) **or a 32-byte hex seed** (64 hex characters, `0x` optional, read as Ed25519), through `Config.Redacted`. A key that does not decode fails with one fixed sentence and no cause: the Bech32 decoder quotes the whole input it rejected, so nothing derived from it is ever printed |
 
 `Script.layerReadOnly` provides `ScriptReadOnly`, which has no signer at all —
 a separate service key, so a script written to sign cannot silently build over a
 layer that cannot. `Script.run` installs SIGINT and SIGTERM handlers, interrupts
 the root fiber so finalizers run, writes one diagnostic line per failure to
-stderr, and exits. stdout carries only what the script itself printed: the
+stderr (through `SuiError.describe`, so a missing variable reads `ConfigError
+missing SUI_NETWORK`), and exits. stdout carries only what the script itself printed: the
 logger is bound to stderr for the whole run, so an `Effect.log` anywhere in the
 call tree cannot corrupt the output. On every non-zero exit the unresolved
 entries of the journal the script ran with are printed too, so a script killed
@@ -448,10 +551,24 @@ bytes finish.
 | 5 | applied on chain: `ExecutionFailed` (gas charged) or `UnexpectedEffects` (it ran; the receipt is missing) |
 | 130 | interrupted, with nothing outstanding in the journal |
 
+Two rules sit on top of the table. **An error may declare its own exit code**:
+an integer `exitCode` (1–255) is honoured after `ConfigError` and before
+`outcome`, which is how a bad-input error of your own exits 2 instead of 4.
+And **once this run applied a transaction, nothing exits 2, 4 or 130**: the exit
+is 5, and the applied digests are printed with "do not send them again" — a
+timeout or a Ctrl-C after the execute answered must not read as "safe to
+retry". `Script.run` finds the journal wherever the program provided it, so
+this holds for a durable journal provided inside the program too.
+
 **`Script.report(exit, { stderr?, journal? })`** is those last two steps on
 their own — the diagnostic lines and the unresolved entries, with the exit code
 as the answer — for a CLI that owns its own argv parsing and process. Assign it
-to `process.exitCode` rather than calling `process.exit`.
+to `process.exitCode` rather than calling `process.exit`. It lists **every**
+unresolved entry of the journal it is given, another process's included in a
+shared store; `Script.run` lists only the entries its own program wrote.
+`Script.layerNoDeps`, `layerWithSigner` and `layerReadOnlyNoDeps` take the
+network from the `SuiCore` underneath, not from `SUI_NETWORK`, so they build
+over `layerTest` with no environment.
 
 A timeout or an interrupt asks the journal: with an unresolved submission in it
 the exit is 3, not 4 or 130, because an `Effect.timeout` wrapped around a
@@ -492,9 +609,16 @@ does not change when the sponsor adds its signature, so `signed.digest` is what
 to record. `docs/extensions.md` has the section.
 
 **`Executed.events` is `ReadonlyArray<Event>`, not `SuiClientTypes.Event[]`**:
-the same fields with branded ids, and `json` present only when whatever produced
-the `Executed` carried one (a relay envelope, never a gRPC execute). Decode an
-event with `SuiSchema.decode(codec, event.bcs)`. Code typed against the SDK's
+the same fields with branded ids, and an optional `json` present only when
+whatever produced the `Executed` carried one (a relay envelope may; a gRPC
+execute never does) — do not branch on it. Decode events with
+`executed.eventsOf(codec)` (every match, decoded) or `executed.expectEvent(codec)`
+(exactly one, else `UnexpectedEffects`). **After an upgrade an event struct
+keeps its original package id**: a v1 struct emitted by v2 code is still
+`ORIGINAL::module::T`, so codecs and `eventType` filters use the original id,
+while a struct added in v2 lives under the v2 id. A publish or an upgrade reads
+back with `executed.expectPublished()` → `{ packageId, package, upgradeCap }`
+(`examples/recipes/publish-and-upgrade.ts`). Code typed against the SDK's
 `Event[]` does not accept these.
 
 **`bigint` throws in `JSON.stringify`.** Gas, balances, versions and
@@ -538,7 +662,15 @@ else the extension's layer requires), and `SuiTest`
 for driving the fake's state and reading back what it was sent. No test in this
 repository touches the network, and neither should yours.
 
-Four things a test on the fake has to know. `layerTest` is the production layer,
+`SuiTest.provide(layer)` is the wiring: it provides the layer with a fresh
+`Journal.layerMemory` and Effect's `TestClock`, all local to the test.
+`layerTest` re-sends with no delay (`testSubmitConfig`), so a resubmit test
+does not sleep on the real clock. `fakeDigest(n)` is a branded `Digest`,
+`fakeCoin({ … })` a coin fixture, and a scripted event's `json` is optional.
+`FakeScript.visibilityDelay` holds `waitForTransaction` after an execute, which
+is how a test interrupts a submission that already landed.
+
+Six things a test on the fake has to know. `layerTest` is the production layer,
 so a script naming `mainnet` or `testnet` must report that network's real chain
 identifier — use `localnet` (the default) in fixtures. `Tx.submit` reconciles
 through `getTransaction`, so a submit test that does not mean "this landed"
@@ -549,13 +681,18 @@ simulate is the resolver's — recorded, so `SuiTest.calls("simulateTransaction"
 sees it, and answered by `FakeScript.buildSimulate` if there is one and by the
 ordered `simulate` script otherwise; like the SDK's core resolver, it runs only
 when the recipe left the budget unset, and `Tx.build` simulates explicitly
-otherwise.
+otherwise. An execute outcome scripted with a digest other than the bytes' own
+stops the test with a defect — a node never answers with another transaction's
+digest. And an owner with no scripted balance has zero, so a **sponsored**
+(`Tx.sponsored`) build needs a balance with an `addressBalance` covering the
+budget, or `Tx.build` fails with `BuildError`.
 
 The fake also serves the ledger reads: `listTransactions` and `listEvents`
 page through every transaction it was scripted with or executed, filtered by
 the sender and Move calls in the bytes, and `FakeScript.scanLimit` makes pages
 come back short or empty the way a scan-limited node's do. `FakeScript.names`
-answers the name-service reads.
+answers the name-service reads, and `FakeScript.ledger` serves the pruning
+history reconcile asks a gRPC node for.
 
 ## Versions
 
@@ -589,13 +726,17 @@ check.
 ## For agents
 
 `LLMS.md` ships in the package. It opens with a "start here" section — the
-subpath map, five tested recipes, the error table with outcomes and exit codes,
-`SubmitConfig`'s defaults, ten invariants and an index of every export — then
+subpath map, thirteen tested recipes (reads, a payment, sponsorship by address
+balance, by coins and by a stateless service, publish and upgrade, typed events,
+a resumable indexer, a durable journal in a script, re-sending a lost
+submission, mapping a Move abort, an extension and its Promise face called from
+plain TypeScript, a test on the fake), the error table with outcomes and exit
+codes, `SubmitConfig`'s defaults, ten invariants and an index of every export — then
 every public export with its signature and the error union its JSDoc states,
 plus every example verbatim. It is generated by
 `bun run llms` and a test fails when it is stale. `AGENTS.md` is the short list
 of invariants to read before the code, `DESIGN.md` the specification, and
-`docs/extensions.md` the extension contract.
+`docs/extensions.md` the extension contract; all four ship in the package.
 
 ## Side by side
 
