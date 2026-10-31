@@ -660,7 +660,10 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  * id and the extension's own layer is built on the first call and shared by
  * every call after it. The `Sui` and `SuiCore` underneath are shared with every
  * other registration on that client that names the same chain id — one
- * transport, one chain identity and one sender-lock map. A rejection carries
+ * transport and one chain identity — and the sender lock is **process-wide**:
+ * every registration, on every client, takes the same lock per address, so a
+ * warm and a lazy registration (or two clients) cannot race one gas coin. A
+ * rejection carries
  * the original tagged error instance, so a Promise consumer can still switch on
  * `_tag`.
  *
@@ -700,13 +703,23 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  *   copies of whatever the layer holds (a cache, a connection). Register once
  *   per client and keep the extended client.
  *
- * **A cold call is a real `Promise`.** The placeholder a member call returns
- * before the runtime exists is a `Promise` subclass that also implements
- * `Symbol.asyncIterator`, so `instanceof Promise` holds and `bun:test`'s
- * `expect(...).rejects` recognises it. Its rejection is **pre-handled** (a
- * no-op `catch` is attached at creation), so a cold call nobody awaits —
+ * **A cold call is a callable Promise.** The placeholder a member call returns
+ * before the runtime exists is a `Proxy` over a function whose prototype is a
+ * `Promise` subclass that also implements `Symbol.asyncIterator`:
+ * `instanceof Promise` holds, `await` and `then` work, iteration works, and
+ * applying it — a cold recipe builder's result used as `recipe(tx)` — throws
+ * `ExtensionNotReady` naming the member. `typeof` is `"function"`, so
+ * `bun:test`'s `expect(...).rejects`, which wants a native Promise, takes
+ * `Promise.resolve(cold)`. Its rejection is **pre-handled** (a no-op `catch`
+ * is attached at creation), so a cold call nobody awaits —
  * `client.ext.doThing()` as a statement — cannot abort the process with an
  * unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
+ *
+ * **A cold value placeholder refuses value-only use.** A plain value member
+ * read before the runtime exists throws `ExtensionNotReady` on the names only
+ * a value has (`.length`, `.startsWith`, `toString`, `valueOf`, `toJSON`, …),
+ * on spread and on string conversion, and prints as
+ * `<ExtensionNotReady ext.member>`.
  *
  * Never fails, except that a `warm` registration throws any failure of its
  * layer synchronously out of `register`. A warm registration builds the
