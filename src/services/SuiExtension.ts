@@ -180,8 +180,6 @@ export interface ExtensionFace {
    * the next call builds a fresh one.
    */
   readonly $dispose: () => Promise<void>
-  /** The name `$dispose` had first. The same function. */
-  readonly dispose: () => Promise<void>
 }
 
 /** What `fromService` needs to know beyond the service key itself. */
@@ -266,7 +264,7 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
 }
 
 /** The names the face adds to every service, which a member cannot shadow. */
-const RESERVED = ["$ready", "$dispose", "dispose"] as const
+const RESERVED = ["$ready", "$dispose"] as const
 
 const isEffect = (value: unknown): value is Effect.Effect<unknown, unknown, unknown> =>
   typeof value === "object" && value !== null && Effect.isEffect(value)
@@ -517,8 +515,7 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  *   long-lived page wants (a disposed extension is usable again after a
  *   reconnect) and it does mean a `$dispose()` that races an in-flight call can
  *   leave the caller's Promise rejected while a new runtime starts behind it.
- *   Dispose when the consumer is done, not between calls. `dispose()` is the
- *   same function under the name it had first.
+ *   Dispose when the consumer is done, not between calls.
  * - **Each `register` is independent.** Registering the same extension on two
  *   clients — or twice on one — gives two runtimes, two layer builds and two
  *   copies of whatever the layer holds (a cache, a connection). Register once
@@ -759,7 +756,7 @@ export const fromService = <Self, Shape, E, const Name extends string>(
 
     const own = (key: string): unknown => {
       if (key === "$ready") return ready
-      if (key === "$dispose" || key === "dispose") return dispose
+      if (key === "$dispose") return dispose
       return undefined
     }
 
@@ -776,7 +773,7 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         return lazy([key])
       },
       has: (_target, key) => {
-        if (key === "$ready" || key === "$dispose" || key === "dispose") return true
+        if (key === "$ready" || key === "$dispose") return true
         ensureWarm()
         return instance !== undefined && typeof key === "string" && key in (instance as object)
       },
@@ -784,9 +781,7 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         ensureWarm(),
         instance === undefined
           ? [...RESERVED]
-          // A `Proxy` refuses duplicate keys, so a service member that happens
-          // to be called `dispose` must not be listed twice.
-          : [...new Set([...Object.keys(instance as object), ...RESERVED])]
+          : [...Object.keys(instance as object), ...RESERVED]
       ),
       getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true })
     }) as PromiseFace<Shape> & ExtensionFace

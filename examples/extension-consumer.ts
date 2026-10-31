@@ -137,7 +137,7 @@ export const readWithPromises = async (
     const found = await api.get(ObjectId.make(id))
     return BigInt(found.content.amount)
   } finally {
-    await api.dispose()
+    await api.$dispose()
   }
 }
 
