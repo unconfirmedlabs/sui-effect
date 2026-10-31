@@ -16,6 +16,8 @@ every code block in it is copied from this directory.
 | `src/Escrow.ts` | The service: a read, a recipe fragment, a submit-on-behalf operation, a nested namespace, and `layer` / `layerConfig` / `layerTest` |
 | `src/upstream.ts` | A stand-in for a third-party Promise SDK, wrapped in `src/Escrow.ts` with `SuiCore.use` and `Effect.tryPromise` |
 | `src/extension.ts` | `SuiExtension.fromService`: the Promise face, derived, never hand-written |
+| `recipes/durable-object.ts` | Not part of the package (outside `src/`, so neither built nor shipped): the `KeyValueStore` over Durable Object storage that backs `@unconfirmed/sui-effect/journal` in a Worker, compiled here so the guide's copy of it compiles |
+| `test/durable-object.test.ts` | The durable journal running over that adapter, against an in-memory stand-in for `ctx.storage` |
 | `test/escrow.test.ts` | The whole test suite on `layerExtensionTest` and `SuiTest` from `@unconfirmed/sui-effect/testing`. No network, no mocks of its own |
 
 ## Running it here
