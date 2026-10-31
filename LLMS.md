@@ -626,9 +626,15 @@ The full entries follow under "API".
 - `Built` — re-exported from `@unconfirmed/sui-effect`.
 - `ExpirationPolicy` — How `Tx.build` sets an expiration when the recipe left one unset.
 - `ExpiryEvidencePolicy` — Whether `Tx.reconcile` is allowed to conclude that an expiration window closed on a transaction the node does not know.
+- `FoldBatch` — One fold transaction's worth of coins: what `fold` turns into a recipe.
+- `FoldGas` — How one fold transaction pays for gas.
+- `FoldPlan` — What `planFold` answers: the transactions that fold an owner's coins, in the order they must run, and the SUI dust that cannot pay for its own fold.
+- `FoldResult` — What `foldCoins` did: the plan it ran, and one `Executed` per batch, in order.
+- `GasPaymentPolicy` — How `Tx.build` treats a gas payment the recipe left unset.
 - `Journal` — The submission journal.
 - `JournalEntry` — One line of the submission journal.
 - `JournalService` — Reading and writing the submission journal.
+- `LockSenderPolicy` — When `Tx.run` holds the sender lock.
 - `ReconcileInput` — What `Tx.reconcile` can be asked about.
 - `Reconciled` — What one entry of `Tx.reconcileAll` settled to, as a tagged union.
 - `RemoteSigner` — What `remote` needs to know about a credential it does not hold.
@@ -644,7 +650,7 @@ The full entries follow under "API".
 - `SubmitViaError` — Everything `submitVia` can fail with, before the sender's own errors.
 - `SubmitViaReply` — What a third party answers when it has submitted your bytes.
 - `TransactionExpiration` — re-exported from `@unconfirmed/sui-effect`.
-- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 - `UNRESOLVED_TAGS` — The tags whose entries still need an answer from the network.
 - `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
 - `VerifyOptions` — The options both verifiers take.
@@ -653,6 +659,8 @@ The full entries follow under "API".
 - `chainOf` — re-exported from `@unconfirmed/sui-effect`.
 - `cosign` — Adds one more signature to already signed bytes, for a sponsored or multi-party transaction.
 - `ephemeral` — A fresh Ed25519 credential that exists only for this process.
+- `fold` — The recipe for one fold transaction: merge the batch's coins and deposit them into the owner's address balance with `0x2::coin::send_funds<T>`.
+- `foldCoins` — Folds the signer's coin objects into its address balance: `planFold` for `signer.address`, then one `run` of `fold` per batch, in order — SUI first, paying for its own fold, so a fresh account whose SUI is all coins needs no address balance to start.
 - `fromBytes` — Turns transaction bytes that came from somewhere else into a `Built`, reading everything the lifecycle needs out of the bytes themselves.
 - `fromConfig` — Reads a secret key from configuration and builds its signer.
 - `fromKeypair` — `fromSdkSigner` under the name the spec gave it when a keypair was the only thing it took.
@@ -661,12 +669,14 @@ The full entries follow under "API".
 - `isUnresolved` — Whether this entry is still waiting for an answer, and therefore something `Tx.reconcileAll` has work to do about.
 - `maxEpochOf` — re-exported from `@unconfirmed/sui-effect`.
 - `maxTimestampMsOf` — re-exported from `@unconfirmed/sui-effect`.
+- `planFold` — Plans the transactions that fold an owner's coin objects into its address balance.
 - `reconcile` — Finds out what happened to a transaction that was sent but never answered for.
 - `reconcileAll` — Settles every unresolved entry in the journal: the explicit startup call a long-lived application makes after building a durable `Journal`.
 - `recorded` — What the journal recorded for one digest, if anything.
 - `remote` — Builds a signer around something that signs elsewhere: a KMS, a wallet, a hardware device, another process.
 - `resubmit` — Re-sends signed bytes whose outcome is unknown — the **identical** bytes, never a rebuild — and settles them the way `submit` does.
-- `run` — Build, preflight, sign and submit, with the sender lock held throughout.
+- `run` — Build, preflight, sign and submit, under the sender lock wherever two runs could race.
+- `sendFunds` — Sends `amount` of a coin type into `recipient`'s **address balance**: `0x2::balance::send_funds<T>(tx.balance({ type, balance: amount }), recipient)`, the canonical transfer on an address-balance account.
 - `sign` — Signs built bytes.
 - `sponsored` — Turns a recipe into a sponsored one: the sender owns the transaction, the gas owner pays, and gas comes from the sponsor's address balance rather than from coin objects, so the two parties never have to agree on a gas coin and can sign in either order.
 - `submit` — Sends signed bytes, and does not stop caring until it knows what happened.
@@ -3970,7 +3980,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-48 exported symbols.
+58 exported symbols.
 
 ### `Built` (const)
 
@@ -4011,6 +4021,96 @@ lags its epoch view can report the new epoch and miss a transaction it has in
 fact executed, twice in a row. The recheck delay makes that unlikely, not
 impossible; a deployment that cannot tolerate it sets `"never"` and settles
 unknown submissions by hand.
+
+### `FoldBatch` (interface)
+
+```ts
+export interface FoldBatch {
+    /** Whose coins these are, and whose address balance receives them. */
+    readonly owner: SuiAddress;
+    /** The coin type, normalized: the `T` of `0x2::coin::Coin<T>`. */
+    readonly coinType: CoinType;
+    /** The coins, largest first, at the versions the plan read. */
+    readonly coins: ReadonlyArray<Coin>;
+    /** Their total, in the coin type's smallest unit. */
+    readonly amount: bigint;
+    readonly gas: FoldGas;
+}
+```
+
+One fold transaction's worth of coins: what `fold` turns into a
+recipe.
+
+### `FoldGas` (type)
+
+```ts
+export type FoldGas = "foldedCoins" | "addressBalance" | "auto";
+```
+
+How one fold transaction pays for gas.
+
+- `"foldedCoins"`: SUI only. The batch **is** the gas payment and
+  `0x2::coin::send_funds<SUI>(GasCoin, owner)` deposits the whole gas coin,
+  so the fold pays for itself and needs no address balance — the bootstrap
+  for a fresh, coin-funded account.
+- `"addressBalance"`: the coins are inputs and gas comes from the SUI
+  address balance (payment `[]`); what a SUI batch too small to cover its
+  own budget gets when the balance can.
+- `"auto"`: any other coin type. The payment is left to the resolver, which
+  pays from the SUI balance when it covers the budget and from SUI coins
+  otherwise.
+
+### `FoldPlan` (interface)
+
+```ts
+export interface FoldPlan {
+    readonly owner: SuiAddress;
+    /** SUI batches first: their deposits fund the gas of everything after them. */
+    readonly batches: ReadonlyArray<FoldBatch>;
+    /**
+     * SUI coins worth less together than the estimated budget of folding them,
+     * with no address balance to pay for it either. Folding them would cost more
+     * than they hold, or could not be paid for at all.
+     */
+    readonly skipped: ReadonlyArray<Coin>;
+}
+```
+
+What `planFold` answers: the transactions that fold an owner's coins,
+in the order they must run, and the SUI dust that cannot pay for its own
+fold.
+
+### `FoldResult` (interface)
+
+```ts
+export interface FoldResult {
+    readonly plan: FoldPlan;
+    readonly executed: ReadonlyArray<Executed>;
+}
+```
+
+What `foldCoins` did: the plan it ran, and one `Executed` per batch, in
+order.
+
+### `GasPaymentPolicy` (type)
+
+```ts
+export type GasPaymentPolicy = "preferAddressBalance" | "requireAddressBalance";
+```
+
+How `Tx.build` treats a gas payment the recipe left unset.
+
+- `"preferAddressBalance"` (the default): the resolver decides, and every
+  SDK resolver pays from the payer's SUI address balance when it covers the
+  budget and the transaction does not use `tx.gas`, and from coins
+  otherwise.
+- `"requireAddressBalance"`: the payment is pinned to the address balance
+  (`[]`) before the build, unless the transaction uses `tx.gas`, and the
+  build fails with `BuildError` when the balance cannot cover the budget or
+  the resolver paid with coin objects. Fold coins first with
+  `Tx.foldCoins`.
+
+A payment the recipe set itself is the recipe's choice under either policy.
 
 ### `Journal` (const)
 
@@ -4262,6 +4362,23 @@ export interface JournalService {
 
 Reading and writing the submission journal.
 
+### `LockSenderPolicy` (type)
+
+```ts
+export type LockSenderPolicy = "whenPinned" | "always" | "never";
+```
+
+When `Tx.run` holds the sender lock.
+
+- `"whenPinned"` (the default): for **every build**, and on through signing,
+  `onSigned` and submission **only when the built bytes pin a versioned
+  object** — an owned or receiving input, or a gas coin. Bytes that pin
+  nothing (gas from an address balance; pure, shared and `FundsWithdrawal`
+  inputs) release it before signing, so address-balance transactions from
+  one sender are sent and awaited concurrently.
+- `"always"`: from build through submit on every run, the rule before 0.4.0.
+- `"never"`: no lock at all.
+
 ### `ReconcileInput` (type)
 
 ```ts
@@ -4463,7 +4580,7 @@ force** so an outer override survives an inner one, or
 
 ```ts
 export type SubmitConfigOverrides = {
-    readonly [K in keyof SubmitConfigService]?: K extends DurationField ? Duration.Input : SubmitConfigService[K];
+    readonly [K in keyof SubmitConfigService]?: K extends DurationField ? Duration.Input : K extends "lockSender" ? LockSenderPolicy | boolean : SubmitConfigService[K];
 };
 ```
 
@@ -4471,7 +4588,9 @@ What `SubmitConfig.with` and `SubmitConfig.layer` accept: any
 subset of `SubmitConfigService`, with every duration given as a
 `Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of
 milliseconds — and converted on the way in. The value in force (what
-`yield* SubmitConfig` answers) always holds `Duration`s.
+`yield* SubmitConfig` answers) always holds `Duration`s. `lockSender` also
+takes the boolean it was before 0.4.0: `true` is `"always"`, `false`
+`"never"`.
 
 ### `SubmitConfigService` (interface)
 
@@ -4516,8 +4635,19 @@ export interface SubmitConfigService {
      * `Tx.run` stays typed.
      */
     readonly preflight?: (simulation: Simulation) => Effect.Effect<void, PolicyDenied>;
-    /** Whether `Tx.run` holds the sender lock from build through submit. */
-    readonly lockSender: boolean;
+    /**
+     * When `Tx.run` holds the sender lock; see `LockSenderPolicy`.
+     * Defaults to `"whenPinned"`. Before 0.4.0 this was a boolean, and `true` /
+     * `false` given as overrides still mean `"always"` / `"never"`.
+     */
+    readonly lockSender: LockSenderPolicy;
+    /**
+     * How an unset gas payment is chosen; see `GasPaymentPolicy`.
+     * Defaults to `"preferAddressBalance"`.
+     *
+     * @since 0.4.0
+     */
+    readonly gasPayment: GasPaymentPolicy;
     /**
      * How `Tx.submit` re-sends the identical bytes after a retryable transport
      * failure or a timeout. It never rebuilds, so a retry can only ever land the
@@ -4658,6 +4788,25 @@ declare const Tx: {
          */
         readonly requireZeroGas?: boolean;
     }) => Recipe;
+    readonly sendFunds: (opts: {
+        readonly coinType?: CoinType;
+        readonly amount: bigint;
+        readonly recipient: SuiAddress;
+        readonly useGasCoin?: boolean;
+    }) => Recipe;
+    readonly planFold: (opts: {
+        readonly owner: SuiAddress;
+        readonly coinType?: CoinType;
+        readonly maxCoinsPerTransaction?: number;
+    }) => Effect.Effect<FoldPlan, TransportError, Sui>;
+    readonly fold: (batch: import("./Fold.ts").FoldBatch) => Recipe;
+    readonly foldCoins: (opts: {
+        readonly signer: Signer;
+        /** One coin type to fold; every coin type the signer holds coins of when omitted. */
+        readonly coinType?: CoinType;
+        /** At most this many coins per transaction: 1 to 500, 500 by default. */
+        readonly maxCoinsPerTransaction?: number;
+    }) => Effect.Effect<FoldResult, RunError, Sui>;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
     readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
@@ -4720,7 +4869,8 @@ declare const Tx: {
 
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
 `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
-`Tx.gaslessStablecoinTransfer`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
+`Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
+`Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
 `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 
 ### `UNRESOLVED_TAGS` (const)
@@ -4827,9 +4977,9 @@ transaction carrying one. The expiration that ends up in the bytes is
 recorded on the result, because it is what `Tx.reconcile` needs later to
 prove a transaction can no longer land.
 
-`Tx.build` takes no sender lock; `Tx.run` is what holds one from build
-through submit. Called on its own, two concurrent builds for one address can
-pick the same gas coin.
+`Tx.build` takes no sender lock; `Tx.run` is what holds one around every
+build (and through submit when the bytes pin anything). Called on its own,
+two concurrent builds for one address can pick the same gas coin.
 
 **A refusal from the resolver is a `BuildError`.** The SDK resolves inputs
 and gas through the node, and a node that refuses the transaction itself —
@@ -4841,18 +4991,30 @@ SDK resolver's own refusal ("Insufficient balance of <coin> for owner
 <address>"). A `TransportError` that remains is the network, named
 `"Tx.build"`.
 
+**Gas comes from the address balance by default.** A payment the recipe
+left unset is the resolver's choice, and every SDK resolver pays from the
+payer's SUI address balance when it covers the budget and the transaction
+does not use `tx.gas`, and from coins otherwise; the span attribute
+`sui.gas_payment` says which (`"addressBalance"`, `"coinReservation"`,
+`"coins"`). Under `SubmitConfig.gasPayment: "requireAddressBalance"` an unset
+payment is pinned to the balance before the build (unless the transaction
+uses `tx.gas`), and coins chosen for a `tx.gas` user fail the build.
+
 **Gas from an address balance is checked before anything is signed.** When
-the gas payment is an explicit empty list (what `Tx.sponsored` sets), the
-payer — the gas owner, or the sender — must hold at least the gas budget in
-its SUI address balance, coins not counted; the simulation does not check
-it and the node refuses the bytes at execution. That costs one
-`getBalance` read, for those transactions only.
+the gas payment is an explicit empty list (what `Tx.sponsored` sets, or the
+`"requireAddressBalance"` policy), the payer — the gas owner, or the sender —
+must hold at least the gas budget plus the SUI the bytes withdraw from it in
+its SUI address balance, coins not counted; the simulation does not check it
+and the node refuses the bytes at execution. That costs one `getBalance`
+read, for those transactions only. And bytes paying from an address balance
+with no address-owned input need a `ValidDuring` expiration, which a node
+otherwise refuses outright; the default expiration is one.
 
 `Built.gasOwner` is read out of the bytes: it is present whenever the bytes
 name a gas owner other than the sender, whether `opts.gasOwner` or the
 recipe set it.
 
-**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the node refused to resolve the transaction, a zero-gas requirement was not met, or the payer's address balance cannot cover the budget), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
+**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the node refused to resolve the transaction, a zero-gas requirement was not met, the payer's address balance cannot cover the budget and withdrawals, coins were chosen under `gasPayment: "requireAddressBalance"`, or an address-balance payment lacks an epoch-bounded expiration), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
 
 ### `chainOf` (const)
 
@@ -4890,6 +5052,55 @@ over `crypto.getRandomValues`). A `TestClock`-style deterministic key would
 be a security bug, not a convenience.
 
 **Never fails.**
+
+### `fold` (const)
+
+```ts
+declare const fold: (batch: FoldBatch) => Recipe
+```
+
+The recipe for one fold transaction: merge the batch's coins and deposit
+them into the owner's address balance with `0x2::coin::send_funds<T>`.
+
+- `gas: "foldedCoins"` (SUI): the first 256 coins are the gas payment, the
+  rest are merged into the gas coin, and the gas coin itself is deposited —
+  no SUI coin is left.
+- `gas: "addressBalance"`: the coins are merged into the first and it is
+  deposited; the payment is `[]`, so gas comes from the SUI address balance,
+  which `Tx.build` checks covers the budget.
+- `gas: "auto"`: the same, with the payment left to the resolver.
+
+The coins are pinned at the versions the plan read (`tx.objectRef`), so a
+coin that moved since fails the build rather than folding something else.
+
+**Never fails; the recipe throws for an empty batch, more than 500 coins, or `"foldedCoins"` on a coin type that is not SUI, which `Tx.build` reports as `BuildError`.**
+
+### `foldCoins` (const)
+
+```ts
+declare const foldCoins: (opts: {
+    readonly signer: Signer;
+    /** One coin type to fold; every coin type the signer holds coins of when omitted. */
+    readonly coinType?: CoinType;
+    /** At most this many coins per transaction: 1 to 500, 500 by default. */
+    readonly maxCoinsPerTransaction?: number;
+}) => Effect.Effect<FoldResult, RunError, Sui>
+```
+
+Folds the signer's coin objects into its address balance: `planFold`
+for `signer.address`, then one `run` of `fold` per batch, in
+order — SUI first, paying for its own fold, so a fresh account whose SUI is
+all coins needs no address balance to start. Afterwards gas comes from the
+balance, and transactions that pin nothing else run without holding the
+sender lock past their build.
+
+Each batch pins its coins, so it runs under the sender lock. It stops at the
+first batch that fails, with that failure; the batches before it executed and
+stay executed. Calling it again re-plans from what is left, so it is safe to
+repeat. Dust that cannot pay for its own fold is in `plan.skipped`, and an
+owner with no coins answers an empty plan with nothing executed.
+
+**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` — exactly `run`'s, for the batch that failed.**
 
 ### `fromBytes` (const)
 
@@ -5321,6 +5532,41 @@ Re-exported from `@unconfirmed/sui-effect`.
 
 Re-exported from `@unconfirmed/sui-effect`.
 
+### `planFold` (const)
+
+```ts
+declare const planFold: (opts: {
+    readonly owner: SuiAddress;
+    /** One coin type to fold; every coin type the owner holds coins of when omitted. */
+    readonly coinType?: CoinType;
+    /** At most this many coins per transaction: 1 to 500, 500 by default. */
+    readonly maxCoinsPerTransaction?: number;
+}) => Effect.Effect<FoldPlan, TransportError, Sui>
+```
+
+Plans the transactions that fold an owner's coin objects into its address
+balance. Reads only; nothing is built or signed.
+
+It reads the owner's coins of `coinType` — or, when `coinType` is omitted, of
+every coin type the owner holds coins of — the owner's SUI address balance
+and the reference gas price. Coins are folded largest first, at most
+`maxCoinsPerTransaction` per transaction (default and maximum
+`MAX_FOLD_COINS`; values outside 1 to 500 are clamped).
+
+**SUI pays for its own fold** (`gas: "foldedCoins"`), so an account whose
+SUI is all coins — a localnet faucet's, say — folds with no address balance
+at all. A SUI batch worth less than its estimated budget,
+`referenceGasPrice × (10,000 + 1,000 × coins)` MIST, is paid from the
+address balance instead (`gas: "addressBalance"`) when the balance projected
+after the earlier batches covers that estimate, and is `skipped` otherwise.
+Other coin types fold with `gas: "auto"`, after every SUI batch, so the SUI
+just folded pays for them.
+
+Preview a batch with `Tx.build(Tx.fold(batch), { sender })` and then
+`Sui.simulate` of the bytes, with nothing signed.
+
+**Fails with: `TransportError`.**
+
 ### `reconcile` (const)
 
 ```ts
@@ -5565,27 +5811,36 @@ declare const run: (recipe: Transaction | Recipe, opts: {
 }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>
 ```
 
-Build, preflight, sign and submit, with the sender lock held throughout.
+Build, preflight, sign and submit, under the sender lock wherever two runs
+could race.
 
-Gas coins are chosen during build, so two transactions from one address that
-overlap can pick the same coin and one of them will fail on chain. `Tx.run`
-holds the sender lock from build through submit, which is the whole reason to
-prefer it over calling the steps separately.
+Owned objects and gas coins are resolved during build, so two transactions
+from one address that overlap can pin the same one at the same version and
+one of them will fail on chain. Under `SubmitConfig.lockSender: "whenPinned"`
+(the default) `Tx.run` holds the sender lock for **every build**, and on
+through signing and submission **only when the built bytes pin** an owned or
+receiving input or a gas coin. Bytes that pin nothing — gas from an address
+balance, inputs that are pure values, shared objects or withdrawals — are
+signed and sent with the lock released, so address-balance transactions from
+one sender run concurrently, serialized only for the length of a build. The
+span attribute `sui.sender_lock` says which happened (`"held"`, `"build"`).
+`"always"` holds the lock from build through submit on every run (the rule
+before 0.4.0), `"never"` takes none. This is the whole reason to prefer
+`Tx.run` over calling the steps separately.
 
-The address that matters is the one whose coins are being spent, which is the
-**gas owner** when there is one: two sponsored runs for different senders
-paid by one sponsor are exactly the case that picks the same coin twice. When
-sender and gas owner differ, both locks are held, in ascending address order
-— a fixed order, so two runs that each need the same pair cannot deadlock by
-taking them the other way round.
+Lock-free runs can together withdraw more than one balance holds; the node
+then executes the one that overdraws as a failure (`InsufficientFundsForWithdraw`,
+no gas charged), which is `ExecutionFailed`. A flow that spends a balance
+down to zero uses `lockSender: "always"`.
 
-**Except when gas comes from an address balance.** A transaction whose gas
-payment is an explicit empty list — `Tx.sponsored` sets one — selects no
-coins, so there is nothing for two runs to race over and the gas owner's
-lock is not taken: one sponsor can pay for many senders at once, each run
-serialized only on its own sender. (Before 0.4.0 every such run waited for
-the sponsor's lock, which made twenty concurrent sponsored runs take as long
-as twenty sequential ones.)
+The address whose coins may be spent is the **gas owner** when there is one:
+two sponsored runs for different senders paid by one sponsor are exactly the
+case that picks the same coin twice. When sender and gas owner differ, both
+locks are taken, in ascending address order — a fixed order, so two runs that
+each need the same pair cannot deadlock by taking them the other way round —
+**except when the recipe pays from an address balance**: an explicit empty
+payment, which `Tx.sponsored` sets, selects no coin, so the gas owner's lock
+is not taken and one sponsor serves many senders at once.
 
 When `SubmitConfig.preflight` is set it costs one extra simulate, and is
 where spend limits and target policies refuse a transaction before anything
@@ -5618,6 +5873,39 @@ signature and before `Tx.submit`'s first `executeTransaction`, and failing it
 fails the run with nothing sent.
 
 **Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`).**
+
+### `sendFunds` (const)
+
+```ts
+declare const sendFunds: (opts: {
+    readonly coinType?: CoinType;
+    readonly amount: bigint;
+    readonly recipient: SuiAddress;
+    /** Whether SUI the balance does not cover may be split from the gas coin. Default `true`. */
+    readonly useGasCoin?: boolean;
+}) => Recipe
+```
+
+Sends `amount` of a coin type into `recipient`'s **address balance**:
+`0x2::balance::send_funds<T>(tx.balance({ type, balance: amount }), recipient)`,
+the canonical transfer on an address-balance account.
+
+The amount comes from the sender's address balance when that covers it — a
+`FundsWithdrawal`, no versioned input at all, so with gas from the balance
+too the transaction pins nothing. Otherwise it comes from coins: for SUI,
+split from the gas coin, the SDK's default; for another type, the sender's
+coins merged and split, the remainder returned to its balance. The recipient
+receives a balance rather than a coin object it would have to fold.
+`coinType` defaults to SUI; `amount` is in the type's smallest unit.
+
+`useGasCoin` is the SDK's option of that name and only matters for SUI that
+the balance does not cover. Leave it `true` for the sender's own
+transactions: `false` makes every SUI coin an input of the PTB, which leaves
+none to pay gas with on an account whose SUI is all coins (a node refuses gas
+selection then). Set it `false` under `Tx.sponsored`, where the gas coin
+belongs to the sponsor.
+
+**Never fails; the recipe throws only if the SDK rejects an input, which `Tx.build` reports as `BuildError`.**
 
 ### `sign` (const)
 
@@ -5654,7 +5942,11 @@ objects: gas is drawn from that balance, and `Tx.build` refuses with
 faucet holds coins; move SUI into the balance once with
 `0x2::balance::send_funds<0x2::sui::SUI>`, or sponsor with coins instead by
 passing `gasOwner` to `Tx.run`/`Tx.build` without `Tx.sponsored` (the gas
-owner's coins are then selected under its sender lock).
+owner's coins are then selected under its sender lock). `Tx.foldCoins` with
+the sponsor's signer deposits its coins.
+
+A sponsored transaction with no owned input pins nothing, so `Tx.run` sends
+it without holding either party's lock past the build.
 
 **Never fails; the recipe it returns throws only if the recipe it wraps does, which `Tx.build` reports as `BuildError`.**
 
@@ -6554,6 +6846,15 @@ A balance the fake serves, optionally for one owner.
 `owner` is the address this balance belongs to. Left out, the entry answers
 for **any** owner, which is what every script written before 0.1.2 assumed.
 
+Since 0.4.0 `addressBalance` is a **seed**, not a constant: it is the
+starting value of the fake's address balance for that owner and coin type,
+which an execution then moves (gas paid from the balance, `FundsWithdrawal`
+debits, `send_funds` deposits) and `SuiTest.setAddressBalance` replaces. An
+owner-specific entry seeds its owner; otherwise the first owner-less entry of
+the coin type seeds every owner. `coinBalance` is served as written, and
+`balance` is served as `balance - addressBalance + <current address balance>`,
+so an entry nothing has touched comes back verbatim.
+
 ### `FakeChange` (interface)
 
 ```ts
@@ -6763,13 +7064,23 @@ export interface FakeScript {
     /** The gas budget the resolve plugin sets when a transaction has none. */
     readonly gasBudget?: bigint;
     /**
-     * The balances `getBalance` and `listBalances` serve.
+     * The balances `getBalance` and `listBalances` serve, and the seeds of the
+     * fake's **address balances**.
      *
      * Keyed by **owner and coin type**: an entry with an `owner` answers only for
      * that address, and one without answers for any, which is what a script
-     * written before 0.1.2 meant. A `getBalance` for an owner and coin type no
-     * entry names answers zero, the way a node does for an address that holds
-     * none of that coin.
+     * written before 0.1.2 meant. An owner-specific entry wins over an owner-less
+     * one of the same coin type.
+     *
+     * Since 0.4.0 the fake keeps one address balance per owner and coin type,
+     * seeded lazily from the entry's `addressBalance` (0 when no entry names the
+     * type) and moved by every execution it settles (see `FakeBalance`).
+     * For an owner and coin type no entry names, `coinBalance` is the sum of the
+     * owner's coins of that type in the fake's coin set and `balance` is that
+     * plus the address balance — so an address that holds none of the coin
+     * answers zero, the way a node does. `listBalances` serves the matching
+     * entries, then every coin type the owner holds coins of or has a non-zero
+     * address balance in that no entry names.
      */
     readonly balances?: ReadonlyArray<FakeBalance>;
     /**
@@ -7004,6 +7315,12 @@ outside:
   `TransactionDataBuilder.getDigestFromBytes`, the way a node does, and an
   execute outcome scripted with a different `digest` is a broken fixture: the
   call dies saying so rather than handing `Tx.submit` another transaction.
+- **It models address balances** (since 0.4.0): one per owner and coin type,
+  seeded from `FakeScript.balances` and set with `SuiTest.setAddressBalance`.
+  The resolver pays gas from it the way the SDK does, an execution it cannot
+  fund is refused with `INVALID_ARGUMENT` like a node refuses it, and a
+  settled execution moves it (gas, `FundsWithdrawal`, `send_funds`) — see
+  `applyBalanceEffects` for exactly which shapes it follows without Move.
 - **Visibility is instant unless scripted.** `FakeScript.visibilityDelay`
   (or `SuiTest.setVisibilityDelay`) holds `waitForTransaction` for an executed
   transaction, which is how a test reaches the window after the execute
@@ -7051,6 +7368,21 @@ export interface SuiCoreFakeState {
      * `FakeScript.transactions` does for a script written up front.
      */
     readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void>;
+    /**
+     * Replaces the fake's address balance of one owner in one coin type (a full
+     * coin type, e.g. `0x2::sui::SUI`). Never fails.
+     *
+     * @since 0.4.0
+     */
+    readonly setAddressBalance: (owner: string, coinType: string, amount: bigint) => Effect.Effect<void>;
+    /**
+     * The fake's current address balance of one owner in one coin type: the
+     * value an execution or `setAddressBalance` last wrote, else the scripted
+     * seed, else 0. Never fails.
+     *
+     * @since 0.4.0
+     */
+    readonly readAddressBalance: (owner: string, coinType: string) => Effect.Effect<bigint>;
     /** Replaces the remaining scripted outcomes of a method. */
     readonly setOutcomes: (method: "simulate" | "execute" | "getTransaction" | "buildSimulate" | "getObject", outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void>;
 }
@@ -7076,6 +7408,8 @@ declare const SuiTest: {
     readonly scriptGetTransaction: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
     readonly scriptGetObject: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
     readonly setVisibilityDelay: (delay: number | "never" | undefined) => Effect.Effect<void, never, SuiCoreFake>;
+    readonly setAddressBalance: (owner: string, amount: bigint, coinType?: string) => Effect.Effect<void, never, SuiCoreFake>;
+    readonly addressBalance: (owner: string, coinType?: string) => Effect.Effect<bigint, never, SuiCoreFake>;
     readonly calls: (method?: string) => Effect.Effect<ReadonlyArray<RecordedCall>, never, SuiCoreFake>;
     readonly provide: <ROut, E>(layer: Layer.Layer<ROut, E>) => <A, E2, R>(effect: Effect.Effect<A, E2, R>) => Effect.Effect<A, E | E2, Exclude<R, ROut | TestClock.TestClock>>;
 }

@@ -18,7 +18,7 @@ import type { SuiGrpcClient } from "@mysten/sui/grpc"
 import { GrpcCoreClient, isSuiGrpcClient } from "@mysten/sui/grpc"
 import type { TransactionPlugin } from "@mysten/sui/transactions"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
-import { fromBase58, normalizeSuiAddress } from "@mysten/sui/utils"
+import { fromBase58, normalizeStructTag, normalizeSuiAddress, SUI_TYPE_ARG } from "@mysten/sui/utils"
 
 /** The shape `Transaction#setExpiration` accepts, which the SDK does not export. */
 type SdkExpiration = NonNullable<Parameters<Transaction["setExpiration"]>[0]>
@@ -59,6 +59,8 @@ import { Journal } from "./Journal.ts"
 import { defaultReadPolicy } from "./SuiCore.ts"
 import { verifyTransactionSignature } from "./Verify.ts"
 import type { Signer } from "./Signer.ts"
+import type { FoldPlan } from "./Fold.ts"
+import { fold, planFold, sendFunds } from "./Fold.ts"
 import { forgetEntry, recordEntry } from "./RunRecord.ts"
 import type { SubmitConfigService } from "./SubmitConfig.ts"
 import { SubmitConfig } from "./SubmitConfig.ts"
@@ -537,16 +539,95 @@ const gasOwnerOf = (data: TransactionDataBuilder): SuiAddress | undefined => {
 }
 
 /**
- * Whether gas comes from the payer's **address balance**: the payment is an
- * explicit empty list, which is what `Tx.sponsored` sets. Such a transaction
- * selects no gas coins, so it cannot race another one for a coin. A coin
- * reservation ref is the resolver drawing on the address balance too, but the
- * resolver chose it and checked the balance itself; it is not this case.
+ * The gas payment a not-yet-built transaction carries: `undefined` when the
+ * recipe left it to the resolver (or the data cannot be read), else how many
+ * refs it set — `0` is an explicit address-balance payment. Never fails.
  */
-const paysFromAddressBalance = (data: TransactionDataBuilder): boolean => {
-  const payment = data.gasData.payment
-  return payment !== null && payment !== undefined && payment.length === 0
+const paymentLengthOf = (tx: Transaction): number | undefined => {
+  try {
+    const payment = tx.getData().gasData.payment
+    return payment === null || payment === undefined ? undefined : payment.length
+  } catch {
+    return undefined
+  }
 }
+
+/**
+ * How built bytes pay for gas, as the span attribute `sui.gas_payment` names
+ * it: `"addressBalance"` for an empty payment, `"coinReservation"` when every
+ * ref is a coin reservation (gas drawn from the balance through a synthetic
+ * coin, which a `tx.gas` user gets), `"coins"` as soon as one coin object is
+ * in it. Never fails.
+ */
+type GasPaymentKind = "addressBalance" | "coinReservation" | "coins"
+const gasPaymentKindOf = (data: TransactionDataBuilder): GasPaymentKind => {
+  const payment = data.gasData.payment ?? []
+  if (payment.length === 0) return "addressBalance"
+  return payment.every((ref) => isCoinReservationRef(ref)) ? "coinReservation" : "coins"
+}
+
+/**
+ * Whether any argument of any command is the gas coin. Mirrors the SDK's
+ * `transactionUsesGasCoin`, which is not exported, over the plain data a
+ * `Transaction` gives before it is built. Never fails; data this version
+ * cannot read answers `true`, which keeps an unset payment unset.
+ */
+const usesGasCoin = (tx: Transaction): boolean => {
+  const walk = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.some(walk)
+    if (typeof value !== "object" || value === null) return false
+    if ((value as { readonly $kind?: unknown }).$kind === "GasCoin") return true
+    return Object.values(value).some(walk)
+  }
+  try {
+    return walk(tx.getData().commands)
+  } catch {
+    return true
+  }
+}
+
+/**
+ * The SUI the bytes reserve from `payer`'s address balance through
+ * `FundsWithdrawal` inputs, which comes out of the same balance as the gas: the
+ * SDK's resolver adds it to the budget before it pays gas from the balance,
+ * and so does `Tx.build`'s check. Never fails.
+ */
+const suiWithdrawalsFrom = (data: TransactionDataBuilder, payer: string): bigint => {
+  const target = normalizeSuiAddress(payer)
+  const sui = normalizeStructTag(SUI_TYPE_ARG)
+  let total = 0n
+  for (const input of data.inputs) {
+    const withdrawal = input.FundsWithdrawal
+    if (withdrawal === undefined) continue
+    try {
+      if (normalizeStructTag(withdrawal.typeArg.Balance) !== sui) continue
+      const source = withdrawal.withdrawFrom
+      const owner = source.SenderAllowance !== undefined
+        ? source.SenderAllowance.funder
+        : source.Sender !== undefined
+        ? data.sender
+        : data.gasData.owner ?? data.sender
+      if (typeof owner !== "string" || normalizeSuiAddress(owner) !== target) continue
+      if (withdrawal.reservation.$kind === "MaxAmountU64") total += BigInt(withdrawal.reservation.MaxAmountU64)
+    } catch {
+      continue
+    }
+  }
+  return total
+}
+
+/**
+ * Whether bytes pin a versioned object: an owned or receiving input, or a gas
+ * coin (a coin reservation is not one). This is what decides, under
+ * `lockSender: "whenPinned"`, whether `Tx.run` keeps the sender lock through
+ * signing and submission. Bytes this version cannot read answer `true`, which
+ * keeps the lock. Never fails.
+ */
+const pinsAnything = (bytes: Uint8Array): boolean =>
+  Option.match(dataOfBytes(bytes), {
+    onNone: () => true,
+    onSome: (data) => ownedInputsOf(data).length > 0 || gasPaymentOf(data).length > 0
+  })
 
 /**
  * The statuses with which a node refuses to **resolve** a transaction: the
@@ -688,9 +769,9 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  * recorded on the result, because it is what `Tx.reconcile` needs later to
  * prove a transaction can no longer land.
  *
- * `Tx.build` takes no sender lock; `Tx.run` is what holds one from build
- * through submit. Called on its own, two concurrent builds for one address can
- * pick the same gas coin.
+ * `Tx.build` takes no sender lock; `Tx.run` is what holds one around every
+ * build (and through submit when the bytes pin anything). Called on its own,
+ * two concurrent builds for one address can pick the same gas coin.
  *
  * **A refusal from the resolver is a `BuildError`.** The SDK resolves inputs
  * and gas through the node, and a node that refuses the transaction itself —
@@ -702,12 +783,24 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  * <address>"). A `TransportError` that remains is the network, named
  * `"Tx.build"`.
  *
+ * **Gas comes from the address balance by default.** A payment the recipe
+ * left unset is the resolver's choice, and every SDK resolver pays from the
+ * payer's SUI address balance when it covers the budget and the transaction
+ * does not use `tx.gas`, and from coins otherwise; the span attribute
+ * `sui.gas_payment` says which (`"addressBalance"`, `"coinReservation"`,
+ * `"coins"`). Under `SubmitConfig.gasPayment: "requireAddressBalance"` an unset
+ * payment is pinned to the balance before the build (unless the transaction
+ * uses `tx.gas`), and coins chosen for a `tx.gas` user fail the build.
+ *
  * **Gas from an address balance is checked before anything is signed.** When
- * the gas payment is an explicit empty list (what `Tx.sponsored` sets), the
- * payer — the gas owner, or the sender — must hold at least the gas budget in
- * its SUI address balance, coins not counted; the simulation does not check
- * it and the node refuses the bytes at execution. That costs one
- * `getBalance` read, for those transactions only.
+ * the gas payment is an explicit empty list (what `Tx.sponsored` sets, or the
+ * `"requireAddressBalance"` policy), the payer — the gas owner, or the sender —
+ * must hold at least the gas budget plus the SUI the bytes withdraw from it in
+ * its SUI address balance, coins not counted; the simulation does not check it
+ * and the node refuses the bytes at execution. That costs one `getBalance`
+ * read, for those transactions only. And bytes paying from an address balance
+ * with no address-owned input need a `ValidDuring` expiration, which a node
+ * otherwise refuses outright; the default expiration is one.
  *
  * `Built.gasOwner` is read out of the bytes: it is present whenever the bytes
  * name a gas owner other than the sender, whether `opts.gasOwner` or the
@@ -715,7 +808,9 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  *
  * Fails with: `BuildError` (the recipe threw, an input could not be resolved,
  * the node refused to resolve the transaction, a zero-gas requirement was not
- * met, or the payer's address balance cannot cover the budget),
+ * met, the payer's address balance cannot cover the budget and withdrawals,
+ * coins were chosen under `gasPayment: "requireAddressBalance"`, or an
+ * address-balance payment lacks an epoch-bounded expiration),
  * `SimulationFailed` (the transaction would abort on chain), `PolicyDenied`
  * (rule `"maxGasBudget"`: the budget the node chose is over
  * `SubmitConfig.maxGasBudget`), `TransportError`.
@@ -749,6 +844,23 @@ export const build = Effect.fn("Tx.build")(function*(
       })
     }
   }
+
+  // Whether the payment was the recipe's choice: the address-balance checks
+  // below apply to an empty payment someone **set**, and the policy applies
+  // only to one that was left to the resolver.
+  const paymentLength = paymentLengthOf(tx)
+  const paymentSet = paymentLength !== undefined
+  const explicitlyEmpty = !paymentSet && config.gasPayment === "requireAddressBalance" && !usesGasCoin(tx)
+    ? yield* Effect.try({
+      // Pinned before the build, so the resolver lists no coins at all and a
+      // balance that cannot cover the budget is the check's `BuildError`.
+      try: () => {
+        tx.setGasPayment([])
+        return true
+      },
+      catch: buildError("the transaction rejected an address-balance gas payment")
+    })
+    : paymentLength === 0
 
   const unresolved = unresolvedObjectIdsOf(tx)
   const { bytes, simulated } = yield* sui.core
@@ -817,20 +929,60 @@ export const build = Effect.fn("Tx.build")(function*(
     onSome: gasOwnerOf
   })
 
-  if (Option.isSome(data) && paysFromAddressBalance(data.value) && budget !== undefined && budget > 0n) {
-    // Gas from an address balance is not something the build simulation
-    // checks: a sponsor whose SUI is all in coin objects builds, signs and
-    // sends bytes the node then refuses with "Insufficient address balance".
-    // One balance read here makes that a `BuildError` before anyone signs.
+  if (Option.isSome(data)) {
     const payer = gasOwner ?? opts.sender
-    const { addressBalance } = yield* sui.getBalance(payer)
-    if (addressBalance < budget) {
-      return yield* new BuildError({
-        message: `${payer} pays for gas from its address balance, which holds ${addressBalance} MIST,` +
-          ` less than the gas budget ${budget} MIST: deposit SUI into it first` +
-          " (0x2::balance::send_funds<0x2::sui::SUI>), or pay with coins by leaving the gas payment unset",
-        cause: { payer, addressBalance, budget }
-      })
+    const kind = gasPaymentKindOf(data.value)
+    yield* Effect.annotateCurrentSpan({ "sui.gas_payment": kind })
+    if (!paymentSet && kind === "coins") {
+      // The resolver fell back to coins: the balance did not cover the budget,
+      // or the transaction uses `tx.gas`. Correct, but the run now pins a gas
+      // coin and holds the sender lock through its submission.
+      if (config.gasPayment === "requireAddressBalance") {
+        return yield* new BuildError({
+          message: `${payer} pays for gas with coin objects, and SubmitConfig.gasPayment is` +
+            ' "requireAddressBalance": fold its coins into its address balance first (Tx.foldCoins),' +
+            " or build the transaction without tx.gas (tx.coin({ balance }) instead of tx.splitCoins(tx.gas, ...))",
+          cause: { payer, payment: kind }
+        })
+      }
+      yield* Effect.logDebug(
+        `${payer} pays for gas with coin objects rather than its address balance; Tx.foldCoins moves them into it`
+      ).pipe(Effect.annotateLogs({ payer }))
+    }
+    if (kind === "addressBalance" && ownedInputsOf(data.value).length === 0) {
+      // A node refuses such bytes outright: "Transactions must either have
+      // address-owned inputs, or a ValidDuring expiration with at most two
+      // epochs of validity". Caught here, before anyone signs them.
+      const variant = data.value.expiration?.$kind
+      if (variant !== "ValidDuring" && variant !== "Validity") {
+        return yield* new BuildError({
+          message: `the transaction pays for gas from an address balance and has no address-owned input,` +
+            ` so a node requires a ValidDuring expiration of at most two epochs, but it has` +
+            ` ${variant === undefined ? "none" : `a ${variant} expiration`}: leave SubmitConfig.expiration` +
+            ' at "validDuring"',
+          cause: { expiration: variant ?? "None" }
+        })
+      }
+    }
+    if (explicitlyEmpty && budget !== undefined && budget > 0n) {
+      // An empty payment someone set is not something the build simulation
+      // checks: a node simulates it against an empty balance successfully and
+      // refuses the signed bytes at execution with "Insufficient address
+      // balance". One balance read here makes that a `BuildError` before anyone
+      // signs. The SUI the bytes withdraw from the same balance counts too.
+      const withdrawals = suiWithdrawalsFrom(data.value, payer)
+      const required = budget + withdrawals
+      const { addressBalance } = yield* sui.getBalance(payer)
+      if (addressBalance < required) {
+        return yield* new BuildError({
+          message: `${payer} pays for gas from its address balance, which holds ${addressBalance} MIST,` +
+            ` less than the gas budget ${budget} MIST` +
+            (withdrawals === 0n ? "" : ` plus the ${withdrawals} MIST the transaction withdraws from it`) +
+            ": fold its coins into it first (Tx.foldCoins), deposit SUI with" +
+            " 0x2::balance::send_funds<0x2::sui::SUI>, or pay with coins by leaving the gas payment unset",
+          cause: { payer, addressBalance, budget, withdrawals }
+        })
+      }
     }
   }
 
@@ -1033,7 +1185,11 @@ export const cosign = Effect.fn("Tx.cosign")(function*(
  * faucet holds coins; move SUI into the balance once with
  * `0x2::balance::send_funds<0x2::sui::SUI>`, or sponsor with coins instead by
  * passing `gasOwner` to `Tx.run`/`Tx.build` without `Tx.sponsored` (the gas
- * owner's coins are then selected under its sender lock).
+ * owner's coins are then selected under its sender lock). `Tx.foldCoins` with
+ * the sponsor's signer deposits its coins.
+ *
+ * A sponsored transaction with no owned input pins nothing, so `Tx.run` sends
+ * it without holding either party's lock past the build.
  *
  * Never fails; the recipe it returns throws only if the recipe it wraps does,
  * which `Tx.build` reports as `BuildError`.
@@ -2556,27 +2712,36 @@ const assertSponsor = (
 }
 
 /**
- * Build, preflight, sign and submit, with the sender lock held throughout.
+ * Build, preflight, sign and submit, under the sender lock wherever two runs
+ * could race.
  *
- * Gas coins are chosen during build, so two transactions from one address that
- * overlap can pick the same coin and one of them will fail on chain. `Tx.run`
- * holds the sender lock from build through submit, which is the whole reason to
- * prefer it over calling the steps separately.
+ * Owned objects and gas coins are resolved during build, so two transactions
+ * from one address that overlap can pin the same one at the same version and
+ * one of them will fail on chain. Under `SubmitConfig.lockSender: "whenPinned"`
+ * (the default) `Tx.run` holds the sender lock for **every build**, and on
+ * through signing and submission **only when the built bytes pin** an owned or
+ * receiving input or a gas coin. Bytes that pin nothing — gas from an address
+ * balance, inputs that are pure values, shared objects or withdrawals — are
+ * signed and sent with the lock released, so address-balance transactions from
+ * one sender run concurrently, serialized only for the length of a build. The
+ * span attribute `sui.sender_lock` says which happened (`"held"`, `"build"`).
+ * `"always"` holds the lock from build through submit on every run (the rule
+ * before 0.4.0), `"never"` takes none. This is the whole reason to prefer
+ * `Tx.run` over calling the steps separately.
  *
- * The address that matters is the one whose coins are being spent, which is the
- * **gas owner** when there is one: two sponsored runs for different senders
- * paid by one sponsor are exactly the case that picks the same coin twice. When
- * sender and gas owner differ, both locks are held, in ascending address order
- * — a fixed order, so two runs that each need the same pair cannot deadlock by
- * taking them the other way round.
+ * Lock-free runs can together withdraw more than one balance holds; the node
+ * then executes the one that overdraws as a failure (`InsufficientFundsForWithdraw`,
+ * no gas charged), which is `ExecutionFailed`. A flow that spends a balance
+ * down to zero uses `lockSender: "always"`.
  *
- * **Except when gas comes from an address balance.** A transaction whose gas
- * payment is an explicit empty list — `Tx.sponsored` sets one — selects no
- * coins, so there is nothing for two runs to race over and the gas owner's
- * lock is not taken: one sponsor can pay for many senders at once, each run
- * serialized only on its own sender. (Before 0.4.0 every such run waited for
- * the sponsor's lock, which made twenty concurrent sponsored runs take as long
- * as twenty sequential ones.)
+ * The address whose coins may be spent is the **gas owner** when there is one:
+ * two sponsored runs for different senders paid by one sponsor are exactly the
+ * case that picks the same coin twice. When sender and gas owner differ, both
+ * locks are taken, in ascending address order — a fixed order, so two runs that
+ * each need the same pair cannot deadlock by taking them the other way round —
+ * **except when the recipe pays from an address balance**: an explicit empty
+ * payment, which `Tx.sponsored` sets, selects no coin, so the gas owner's lock
+ * is not taken and one sponsor serves many senders at once.
  *
  * When `SubmitConfig.preflight` is set it costs one extra simulate, and is
  * where spend limits and target policies refuse a transaction before anything
@@ -2693,35 +2858,66 @@ export const run = Effect.fn("Tx.run")(function*(
     yield* assertSponsor(payer, opts.sponsor)
   }
 
-  const body = Effect.gen(function*() {
-    const built = yield* build(tx, {
-      sender,
-      ...(opts.gasOwner === undefined ? {} : { gasOwner: opts.gasOwner })
-    })
-    const preflight = config.preflight
-    if (preflight !== undefined) {
-      const simulation = yield* sui.simulate(built.bytes)
-      yield* preflight(simulation)
-    }
-    let signed = yield* sign(built, opts.signer)
-    // Read back out of the bytes, so a recipe that set its own gas owner —
-    // which `Tx.sponsored` does — is covered as well as the option.
-    for (const required of signersOfBytes(built.bytes)) {
-      if (required === normalizeSuiAddress(sender)) continue
-      const sponsor = yield* assertSponsor(required, opts.sponsor)
-      signed = yield* cosign(signed, sponsor)
-    }
-    // Every signature is on: the digest is final and nothing has been sent.
-    if (opts.onSigned !== undefined) yield* opts.onSigned(signed)
-    return yield* submit(signed)
+  const buildIt = build(tx, {
+    sender,
+    ...(opts.gasOwner === undefined ? {} : { gasOwner: opts.gasOwner })
   })
-
-  return yield* config.lockSender
-    ? locked.reduceRight<typeof body>(
+  // Everything after the build, which is what `"whenPinned"` runs outside the
+  // lock when the bytes pin nothing.
+  const finish = (built: Built) =>
+    Effect.gen(function*() {
+      const preflight = config.preflight
+      if (preflight !== undefined) {
+        const simulation = yield* sui.simulate(built.bytes)
+        yield* preflight(simulation)
+      }
+      let signed = yield* sign(built, opts.signer)
+      // Read back out of the bytes, so a recipe that set its own gas owner —
+      // which `Tx.sponsored` does — is covered as well as the option.
+      for (const required of signersOfBytes(built.bytes)) {
+        if (required === normalizeSuiAddress(sender)) continue
+        const sponsor = yield* assertSponsor(required, opts.sponsor)
+        signed = yield* cosign(signed, sponsor)
+      }
+      // Every signature is on: the digest is final and nothing has been sent.
+      if (opts.onSigned !== undefined) yield* opts.onSigned(signed)
+      return yield* submit(signed)
+    })
+  const withLocks = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    locked.reduceRight<Effect.Effect<A, E, R>>(
       (inner, address) => sui.withSenderLock(address)(inner),
-      body
+      effect
     )
-    : body
+
+  switch (config.lockSender) {
+    case "never": {
+      yield* Effect.annotateCurrentSpan({ "sui.sender_lock": "none" })
+      return yield* Effect.flatMap(buildIt, finish)
+    }
+    case "always": {
+      yield* Effect.annotateCurrentSpan({ "sui.sender_lock": "held" })
+      return yield* withLocks(Effect.flatMap(buildIt, finish))
+    }
+    case "whenPinned": {
+      // Every build under the lock: whether the bytes will pin a coin or an
+      // owned object is known only once the resolver has chosen. The lock is
+      // kept through submission only when they do; bytes that pin nothing —
+      // address-balance gas, pure, shared and withdrawal inputs — cannot race
+      // another run, so they are signed and sent with the lock released.
+      const step = yield* withLocks(Effect.gen(function*() {
+        const built = yield* buildIt
+        if (pinsAnything(built.bytes)) {
+          return { _tag: "Executed" as const, executed: yield* finish(built) }
+        }
+        return { _tag: "Built" as const, built }
+      }))
+      // On `Tx.run`'s own span: inside the lock the current span is
+      // `Sui.withSenderLock`'s.
+      yield* Effect.annotateCurrentSpan({ "sui.sender_lock": step._tag === "Executed" ? "held" : "build" })
+      if (step._tag === "Executed") return step.executed
+      return yield* finish(step.built)
+    }
+  }
 })
 
 /**
@@ -2907,9 +3103,60 @@ export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(
 })
 
 /**
+ * What {@link foldCoins} did: the plan it ran, and one `Executed` per batch, in
+ * order.
+ *
+ * @since 0.4.0
+ */
+export interface FoldResult {
+  readonly plan: FoldPlan
+  readonly executed: ReadonlyArray<Executed>
+}
+
+/**
+ * Folds the signer's coin objects into its address balance: {@link planFold}
+ * for `signer.address`, then one {@link run} of {@link fold} per batch, in
+ * order — SUI first, paying for its own fold, so a fresh account whose SUI is
+ * all coins needs no address balance to start. Afterwards gas comes from the
+ * balance, and transactions that pin nothing else run without holding the
+ * sender lock past their build.
+ *
+ * Each batch pins its coins, so it runs under the sender lock. It stops at the
+ * first batch that fails, with that failure; the batches before it executed and
+ * stay executed. Calling it again re-plans from what is left, so it is safe to
+ * repeat. Dust that cannot pay for its own fold is in `plan.skipped`, and an
+ * owner with no coins answers an empty plan with nothing executed.
+ *
+ * Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`,
+ * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`,
+ * `TransportError` — exactly {@link run}'s, for the batch that failed.
+ *
+ * @since 0.4.0
+ */
+export const foldCoins = Effect.fn("Tx.foldCoins")(function*(opts: {
+  readonly signer: Signer
+  /** One coin type to fold; every coin type the signer holds coins of when omitted. */
+  readonly coinType?: CoinType
+  /** At most this many coins per transaction: 1 to 500, 500 by default. */
+  readonly maxCoinsPerTransaction?: number
+}): Effect.fn.Return<FoldResult, RunError, Sui> {
+  const plan = yield* planFold({
+    owner: opts.signer.address,
+    ...(opts.coinType === undefined ? {} : { coinType: opts.coinType }),
+    ...(opts.maxCoinsPerTransaction === undefined ? {} : { maxCoinsPerTransaction: opts.maxCoinsPerTransaction })
+  })
+  const executed: Array<Executed> = []
+  for (const batch of plan.batches) {
+    executed.push(yield* run(fold(batch), { signer: opts.signer }))
+  }
+  return { plan, executed }
+})
+
+/**
  * The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
  * `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
- * `Tx.gaslessStablecoinTransfer`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
+ * `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
+ * `Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
  * `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
  */
 export const Tx = {
@@ -2920,6 +3167,10 @@ export const Tx = {
   attach,
   sponsored,
   gaslessStablecoinTransfer,
+  sendFunds,
+  planFold,
+  fold,
+  foldCoins,
   submit,
   submitVia,
   reconcile,

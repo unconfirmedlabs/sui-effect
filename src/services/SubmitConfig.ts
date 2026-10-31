@@ -14,6 +14,41 @@ import { U32_MAX } from "../domain/schemas.ts"
 export type ExpirationPolicy = "validDuring" | "epoch" | "none"
 
 /**
+ * When `Tx.run` holds the sender lock.
+ *
+ * - `"whenPinned"` (the default): for **every build**, and on through signing,
+ *   `onSigned` and submission **only when the built bytes pin a versioned
+ *   object** — an owned or receiving input, or a gas coin. Bytes that pin
+ *   nothing (gas from an address balance; pure, shared and `FundsWithdrawal`
+ *   inputs) release it before signing, so address-balance transactions from
+ *   one sender are sent and awaited concurrently.
+ * - `"always"`: from build through submit on every run, the rule before 0.4.0.
+ * - `"never"`: no lock at all.
+ *
+ * @since 0.4.0
+ */
+export type LockSenderPolicy = "whenPinned" | "always" | "never"
+
+/**
+ * How `Tx.build` treats a gas payment the recipe left unset.
+ *
+ * - `"preferAddressBalance"` (the default): the resolver decides, and every
+ *   SDK resolver pays from the payer's SUI address balance when it covers the
+ *   budget and the transaction does not use `tx.gas`, and from coins
+ *   otherwise.
+ * - `"requireAddressBalance"`: the payment is pinned to the address balance
+ *   (`[]`) before the build, unless the transaction uses `tx.gas`, and the
+ *   build fails with `BuildError` when the balance cannot cover the budget or
+ *   the resolver paid with coin objects. Fold coins first with
+ *   `Tx.foldCoins`.
+ *
+ * A payment the recipe set itself is the recipe's choice under either policy.
+ *
+ * @since 0.4.0
+ */
+export type GasPaymentPolicy = "preferAddressBalance" | "requireAddressBalance"
+
+/**
  * Whether `Tx.reconcile` is allowed to conclude that an expiration window
  * closed on a transaction the node does not know.
  *
@@ -79,8 +114,19 @@ export interface SubmitConfigService {
    * `Tx.run` stays typed.
    */
   readonly preflight?: (simulation: Simulation) => Effect.Effect<void, PolicyDenied>
-  /** Whether `Tx.run` holds the sender lock from build through submit. */
-  readonly lockSender: boolean
+  /**
+   * When `Tx.run` holds the sender lock; see {@link LockSenderPolicy}.
+   * Defaults to `"whenPinned"`. Before 0.4.0 this was a boolean, and `true` /
+   * `false` given as overrides still mean `"always"` / `"never"`.
+   */
+  readonly lockSender: LockSenderPolicy
+  /**
+   * How an unset gas payment is chosen; see {@link GasPaymentPolicy}.
+   * Defaults to `"preferAddressBalance"`.
+   *
+   * @since 0.4.0
+   */
+  readonly gasPayment: GasPaymentPolicy
   /**
    * How `Tx.submit` re-sends the identical bytes after a retryable transport
    * failure or a timeout. It never rebuilds, so a retry can only ever land the
@@ -157,7 +203,8 @@ export const defaults: SubmitConfigService = {
   expiration: "validDuring",
   // The protocol's own maximum gas budget (50 SUI). Lower it to cap spend.
   maxGasBudget: 50_000_000_000n as Mist,
-  lockSender: true,
+  lockSender: "whenPinned",
+  gasPayment: "preferAddressBalance",
   resubmit: Schedule.min([
     Schedule.exponential("250 millis"),
     Schedule.spaced("30 seconds")
@@ -180,12 +227,15 @@ type DurationField = "validFor" | "executeTimeout" | "expiryMargin" | "reconcile
  * subset of {@link SubmitConfigService}, with every duration given as a
  * `Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of
  * milliseconds — and converted on the way in. The value in force (what
- * `yield* SubmitConfig` answers) always holds `Duration`s.
+ * `yield* SubmitConfig` answers) always holds `Duration`s. `lockSender` also
+ * takes the boolean it was before 0.4.0: `true` is `"always"`, `false`
+ * `"never"`.
  *
  * @since 0.4.0
  */
 export type SubmitConfigOverrides = {
   readonly [K in keyof SubmitConfigService]?: K extends DurationField ? Duration.Input
+    : K extends "lockSender" ? LockSenderPolicy | boolean
     : SubmitConfigService[K]
 }
 
@@ -213,6 +263,9 @@ const resolve = (
     const value = overrides[field]
     if (value !== undefined) merged[field] = Duration.fromInputUnsafe(value)
   }
+  // The boolean spelling from before 0.4.0: `true` was "lock from build
+  // through submit on every run", which is `"always"`.
+  if (typeof overrides.lockSender === "boolean") merged.lockSender = overrides.lockSender ? "always" : "never"
   return merged as unknown as SubmitConfigService
 }
 

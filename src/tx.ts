@@ -29,6 +29,8 @@ export { Verify, type VerifyOptions } from "./services/Verify.ts"
 export {
   type ExpirationPolicy,
   type ExpiryEvidencePolicy,
+  type GasPaymentPolicy,
+  type LockSenderPolicy,
   SubmitConfig,
   type SubmitConfigOverrides,
   type SubmitConfigService
@@ -40,7 +42,7 @@ export { Journal, type JournalService } from "./services/Journal.ts"
 /** The lifecycle as a serializable union, for what the journal holds. */
 export { isUnresolved, JournalEntry, UNRESOLVED_TAGS } from "./domain/journal-entry.ts"
 
-/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, reconcile, resubmit, run. */
+/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, reconcile, resubmit, run, foldCoins. */
 export {
   attach,
   build,
@@ -48,6 +50,8 @@ export {
   fromBytes,
   gaslessStablecoinTransfer,
   type Built,
+  foldCoins,
+  type FoldResult,
   Reconciled,
   type ReconcileInput,
   type RunError,
@@ -66,6 +70,9 @@ export {
   submitVia,
   Tx
 } from "./services/Tx.ts"
+
+/** Folding coins into the address balance, and sending into one. */
+export { fold, type FoldBatch, type FoldGas, type FoldPlan, planFold, sendFunds } from "./services/Fold.ts"
 
 /** The expiration union and the bounds `Tx.reconcile` reasons about. */
 export {
