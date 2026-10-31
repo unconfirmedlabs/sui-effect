@@ -11,19 +11,24 @@
  *
  * @since 0.1.0
  */
-import { bcs } from "@mysten/sui/bcs"
+import { bcs, TypeTagSerializer } from "@mysten/sui/bcs"
 import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
 import { Inputs, TransactionDataBuilder } from "@mysten/sui/transactions"
 import { parseSerializedSignature } from "@mysten/sui/cryptography"
 import { publicKeyFromRawBytes } from "@mysten/sui/verify"
-import type { TransactionPlugin } from "@mysten/sui/transactions"
+import type { Argument, TransactionPlugin } from "@mysten/sui/transactions"
 import {
+  deriveDynamicFieldID,
+  fromBase58,
+  fromBase64,
+  fromHex,
   normalizeStructTag,
   normalizeSuiAddress,
   SUI_CLOCK_OBJECT_ID,
   SUI_TYPE_ARG,
-  toBase58
+  toBase58,
+  toHex
 } from "@mysten/sui/utils"
 import { Context, Effect, Layer, Option, Result, Schema } from "effect"
 import { typeMatches } from "../domain/bcs.ts"
@@ -293,6 +298,15 @@ export const FakeOutcome = {
  * `owner` is the address this balance belongs to. Left out, the entry answers
  * for **any** owner, which is what every script written before 0.1.2 assumed.
  *
+ * Since 0.4.0 `addressBalance` is a **seed**, not a constant: it is the
+ * starting value of the fake's address balance for that owner and coin type,
+ * which an execution then moves (gas paid from the balance, `FundsWithdrawal`
+ * debits, `send_funds` deposits) and `SuiTest.setAddressBalance` replaces. An
+ * owner-specific entry seeds its owner; otherwise the first owner-less entry of
+ * the coin type seeds every owner. `coinBalance` is served as written, and
+ * `balance` is served as `balance - addressBalance + <current address balance>`,
+ * so an entry nothing has touched comes back verbatim.
+ *
  * @since 0.1.2
  */
 export interface FakeBalance extends SuiClientTypes.Balance {
@@ -316,13 +330,23 @@ export interface FakeScript {
   /** The gas budget the resolve plugin sets when a transaction has none. */
   readonly gasBudget?: bigint
   /**
-   * The balances `getBalance` and `listBalances` serve.
+   * The balances `getBalance` and `listBalances` serve, and the seeds of the
+   * fake's **address balances**.
    *
    * Keyed by **owner and coin type**: an entry with an `owner` answers only for
    * that address, and one without answers for any, which is what a script
-   * written before 0.1.2 meant. A `getBalance` for an owner and coin type no
-   * entry names answers zero, the way a node does for an address that holds
-   * none of that coin.
+   * written before 0.1.2 meant. An owner-specific entry wins over an owner-less
+   * one of the same coin type.
+   *
+   * Since 0.4.0 the fake keeps one address balance per owner and coin type,
+   * seeded lazily from the entry's `addressBalance` (0 when no entry names the
+   * type) and moved by every execution it settles (see {@link FakeBalance}).
+   * For an owner and coin type no entry names, `coinBalance` is the sum of the
+   * owner's coins of that type in the fake's coin set and `balance` is that
+   * plus the address balance — so an address that holds none of the coin
+   * answers zero, the way a node does. `listBalances` serves the matching
+   * entries, then every coin type the owner holds coins of or has a non-zero
+   * address balance in that no entry names.
    */
   readonly balances?: ReadonlyArray<FakeBalance>
   /**
@@ -530,6 +554,21 @@ export interface SuiCoreFakeState {
    * `FakeScript.transactions` does for a script written up front.
    */
   readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void>
+  /**
+   * Replaces the fake's address balance of one owner in one coin type (a full
+   * coin type, e.g. `0x2::sui::SUI`). Never fails.
+   *
+   * @since 0.4.0
+   */
+  readonly setAddressBalance: (owner: string, coinType: string, amount: bigint) => Effect.Effect<void>
+  /**
+   * The fake's current address balance of one owner in one coin type: the
+   * value an execution or `setAddressBalance` last wrote, else the scripted
+   * seed, else 0. Never fails.
+   *
+   * @since 0.4.0
+   */
+  readonly readAddressBalance: (owner: string, coinType: string) => Effect.Effect<bigint>
   /** Replaces the remaining scripted outcomes of a method. */
   readonly setOutcomes: (
     method: "simulate" | "execute" | "getTransaction" | "buildSimulate" | "getObject",
@@ -551,6 +590,12 @@ interface Mutable {
    */
   history: Map<string, Map<string, string | undefined>>
   coins: Array<SuiClientTypes.Coin>
+  /**
+   * The address balance of each owner in each coin type, keyed
+   * `<normalized owner>|<normalized coin type>`. A key that is absent has its
+   * scripted seed (or 0); once written, the value here wins.
+   */
+  addressBalances: Map<string, bigint>
   deleted: Set<string>
   clockTimestampMs: bigint
   epoch: bigint
@@ -597,6 +642,31 @@ const DEFAULT_GAS: SuiClientTypes.GasCostSummary = {
   storageCost: "2000000",
   storageRebate: "980000",
   nonRefundableStorageFee: "20000"
+}
+
+/** The accumulator root a coin reservation ref's object id is derived under. */
+const ACCUMULATOR_ROOT_ID = normalizeSuiAddress("0xacc")
+const ACCUMULATOR_KEY_TYPE_TAG = TypeTagSerializer.parseFromStr(
+  "0x2::accumulator::Key<0x2::balance::Balance<0x2::sui::SUI>>"
+)
+/** The byte a coin reservation digest repeats from offset 12. */
+const COIN_RESERVATION_MAGIC = 0xac
+
+/** Whether a payment ref is a coin reservation (version 0, magic digest tail). */
+const isReservationRef = (ref: { readonly version: string | number; readonly digest: string }): boolean => {
+  if (String(ref.version) !== "0") return false
+  try {
+    const bytes = fromBase58(ref.digest)
+    return bytes.length === 32 && bytes.slice(12).every((byte) => byte === COIN_RESERVATION_MAGIC)
+  } catch {
+    return false
+  }
+}
+
+/** The amount a coin reservation ref reserves: its digest's first eight bytes, u64 LE. */
+const reservedAmountOf = (ref: { readonly digest: string }): bigint => {
+  const bytes = fromBase58(ref.digest)
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(0, true)
 }
 
 const addressOwner = (address: string): SuiClientTypes.ObjectOwner => ({
@@ -874,6 +944,12 @@ const unimplemented = (method: string): never => {
  *   `TransactionDataBuilder.getDigestFromBytes`, the way a node does, and an
  *   execute outcome scripted with a different `digest` is a broken fixture: the
  *   call dies saying so rather than handing `Tx.submit` another transaction.
+ * - **It models address balances** (since 0.4.0): one per owner and coin type,
+ *   seeded from `FakeScript.balances` and set with `SuiTest.setAddressBalance`.
+ *   The resolver pays gas from it the way the SDK does, an execution it cannot
+ *   fund is refused with `INVALID_ARGUMENT` like a node refuses it, and a
+ *   settled execution moves it (gas, `FundsWithdrawal`, `send_funds`) — see
+ *   `applyBalanceEffects` for exactly which shapes it follows without Move.
  * - **Visibility is instant unless scripted.** `FakeScript.visibilityDelay`
  *   (or `SuiTest.setVisibilityDelay`) holds `waitForTransaction` for an executed
  *   transaction, which is how a test reaches the window after the execute
@@ -926,6 +1002,7 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
       objects,
       history,
       coins: [...(script.coins ?? [])],
+      addressBalances: new Map(),
       deleted: new Set(),
       clockTimestampMs: script.clockTimestampMs ?? 1_700_000_000_000n,
       epoch: script.epoch ?? DEFAULT_EPOCH,
@@ -1098,6 +1175,9 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     return object
   }
 
+  /** The scripted execution the last `execute` outcome applied, for its `FakeChange`s. */
+  let lastExecution: FakeExecution | undefined
+
   const applyOutcome = async (
     outcome: FakeOutcome,
     method: "simulate" | "execute" | "getTransaction",
@@ -1113,6 +1193,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         return unimplemented("timeoutThen is handled before applyOutcome")
       case "failWith": {
         const resolved = outcome.value.digest ?? digest
+        if (method === "execute") lastExecution = outcome.value
         if (method === "simulate") {
           throw new SimulationError(`Transaction resolution failed: ${outcome.reason.message}`, {
             executionError: outcome.reason
@@ -1131,6 +1212,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       case "succeed": {
         const resolved = outcome.value.digest ?? digest
         if (method === "execute") {
+          lastExecution = outcome.value
           for (const change of [
             ...(outcome.value.created ?? []),
             ...(outcome.value.mutated ?? [])
@@ -1272,29 +1354,120 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       ? { $kind: "FailedTransaction", FailedTransaction: result.transaction }
       : { $kind: "Transaction", Transaction: result.transaction }
 
-  /** Whether two coin types name the same coin, comparing normalized tags. */
-  const sameCoinType = (left: string, right: string): boolean => {
-    if (left === right) return true
+  /** A coin type in its normalized spelling, or as given when it does not parse. */
+  const normalizeCoinType = (coinType: string): string => {
     try {
-      return normalizeStructTag(left) === normalizeStructTag(right)
+      return normalizeStructTag(coinType)
     } catch {
-      return false
+      return coinType
     }
   }
 
+  const balanceKey = (owner: string, coinType: string): string =>
+    `${normalizeSuiAddress(owner)}|${normalizeCoinType(coinType)}`
+
   /**
-   * The balances this owner has, with the owner stripped: an entry that names
-   * no owner answers for everyone, which is what a pre-0.1.2 script meant.
+   * The scripted entry that answers for this owner and coin type: an entry that
+   * names the owner wins over an owner-less one, which answers for everyone.
+   */
+  const scriptedBalanceOf = (owner: string, coinType: string): FakeBalance | undefined => {
+    const address = normalizeSuiAddress(owner)
+    const type = normalizeCoinType(coinType)
+    const entries = script.balances ?? []
+    return entries.find((entry) =>
+      entry.owner !== undefined && normalizeSuiAddress(entry.owner) === address &&
+      normalizeCoinType(entry.coinType) === type
+    ) ?? entries.find((entry) => entry.owner === undefined && normalizeCoinType(entry.coinType) === type)
+  }
+
+  /** The current address balance: written state, else the scripted seed, else 0. */
+  const addressBalanceOf = (owner: string, coinType: string): bigint => {
+    const written = state.addressBalances.get(balanceKey(owner, coinType))
+    if (written !== undefined) return written
+    const seed = scriptedBalanceOf(owner, coinType)?.addressBalance
+    try {
+      return seed === undefined ? 0n : BigInt(seed)
+    } catch {
+      // A fixture that scripts a malformed balance to test the decode boundary.
+      return 0n
+    }
+  }
+
+  const setAddressBalanceOf = (owner: string, coinType: string, amount: bigint): void => {
+    state.addressBalances.set(balanceKey(owner, coinType), amount)
+  }
+
+  /** Moves an address balance by `delta`, never below zero. */
+  const adjustAddressBalance = (owner: string, coinType: string, delta: bigint): void => {
+    const next = addressBalanceOf(owner, coinType) + delta
+    setAddressBalanceOf(owner, coinType, next < 0n ? 0n : next)
+  }
+
+  /**
+   * The balance `getBalance` serves: a scripted entry with its address balance
+   * swapped for the current one, or the owner's coins plus its address balance.
+   */
+  const balanceOf = (owner: string, coinType: string): SuiClientTypes.Balance => {
+    const addressBalance = addressBalanceOf(owner, coinType)
+    const scripted = scriptedBalanceOf(owner, coinType)
+    if (scripted !== undefined) {
+      const { owner: _owner, ...balance } = scripted
+      // Untouched, the entry is served verbatim — malformed fields included,
+      // which is how a test reaches the decode boundary.
+      if (!state.addressBalances.has(balanceKey(owner, coinType))) return balance
+      return {
+        ...balance,
+        balance: (BigInt(scripted.balance) - BigInt(scripted.addressBalance) + addressBalance).toString(),
+        addressBalance: addressBalance.toString()
+      }
+    }
+    const coinBalance = coinsOf(owner, coinType).reduce((sum, coin) => sum + BigInt(coin.balance), 0n)
+    return {
+      coinType,
+      balance: (coinBalance + addressBalance).toString(),
+      coinBalance: coinBalance.toString(),
+      addressBalance: addressBalance.toString()
+    }
+  }
+
+  /** `T` out of a `0x2::coin::Coin<T>` object type, normalized, or `undefined`. */
+  const coinTypeOfCoin = (type: string): string | undefined => {
+    if (!isCoin(type)) return undefined
+    const normalized = normalizeStructTag(type)
+    return normalized.slice(normalized.indexOf("<") + 1, normalized.lastIndexOf(">"))
+  }
+
+  /**
+   * Every balance this owner has, the way `listBalances` serves them: the
+   * scripted entries that answer for it (one per coin type), then each coin
+   * type it has a non-zero address balance in or holds coins of that no entry
+   * names.
    */
   const balancesOf = (owner: string): ReadonlyArray<SuiClientTypes.Balance> => {
     const address = normalizeSuiAddress(owner)
-    const matching: Array<SuiClientTypes.Balance> = []
+    const seen = new Set<string>()
+    const out: Array<SuiClientTypes.Balance> = []
+    const add = (coinType: string): void => {
+      const type = normalizeCoinType(coinType)
+      if (seen.has(type)) return
+      seen.add(type)
+      out.push(balanceOf(address, coinType))
+    }
     for (const entry of script.balances ?? []) {
       if (entry.owner !== undefined && normalizeSuiAddress(entry.owner) !== address) continue
-      const { owner: _owner, ...balance } = entry
-      matching.push(balance)
+      add(entry.coinType)
     }
-    return matching
+    for (const [key, amount] of state.addressBalances) {
+      const [keyOwner, type] = key.split("|") as [string, string]
+      if (keyOwner === address && amount !== 0n) add(type)
+    }
+    for (const coin of state.coins) {
+      if (coin.owner.$kind !== "AddressOwner") continue
+      if (normalizeSuiAddress(coin.owner.AddressOwner) !== address) continue
+      const type = coinTypeOfCoin(coin.type)
+      if (type !== undefined) add(type)
+    }
+    return out
   }
 
   const coinsOf = (
@@ -1314,17 +1487,121 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     })
   }
 
+  /** Whether any command reads `tx.gas`, the SDK's `transactionUsesGasCoin`. */
+  const usesGasCoinOf = (data: TransactionDataBuilder): boolean => {
+    let uses = false
+    data.mapArguments((argument) => {
+      if (argument.$kind === "GasCoin") uses = true
+      return argument
+    })
+    return uses
+  }
+
+  /** One `FundsWithdrawal` input: who it draws from, in which coin type, how much. */
+  interface Withdrawal {
+    readonly source: string
+    readonly coinType: string
+    readonly amount: bigint
+  }
+
+  /**
+   * Every `FundsWithdrawal` input with a `MaxAmountU64` reservation, with its
+   * source resolved the way the SDK resolves it: `Sender` is the sender,
+   * `Sponsor` the gas owner (or the sender), `SenderAllowance` its funder.
+   */
+  const withdrawalsOf = (data: TransactionDataBuilder): ReadonlyArray<Withdrawal> => {
+    const out: Array<Withdrawal> = []
+    for (const input of data.inputs) {
+      if (input.$kind !== "FundsWithdrawal") continue
+      const withdrawal = input.FundsWithdrawal
+      if (withdrawal.reservation.$kind !== "MaxAmountU64") continue
+      const from = withdrawal.withdrawFrom
+      const source = from.SenderAllowance
+        ? from.SenderAllowance.funder
+        : from.Sender
+        ? data.sender
+        : data.gasData.owner ?? data.sender
+      if (source === null || source === undefined) continue
+      out.push({
+        source: normalizeSuiAddress(source),
+        coinType: normalizeCoinType(withdrawal.typeArg.Balance),
+        amount: BigInt(withdrawal.reservation.MaxAmountU64)
+      })
+    }
+    return out
+  }
+
+  /** The SUI the transaction withdraws from `payer`'s address balance. */
+  const suiWithdrawalsFrom = (data: TransactionDataBuilder, payer: string): bigint => {
+    const address = normalizeSuiAddress(payer)
+    const sui = normalizeCoinType(SUI_TYPE_ARG)
+    return withdrawalsOf(data)
+      .filter((withdrawal) => withdrawal.source === address && withdrawal.coinType === sui)
+      .reduce((sum, withdrawal) => sum + withdrawal.amount, 0n)
+  }
+
+  /**
+   * A coin reservation ref, the SDK's `createCoinReservationRef`: version `0`,
+   * a digest of the amount (u64 LE), the epoch (u32 LE) and twenty `0xAC`
+   * bytes, and the owner's SUI accumulator field id XOR the chain identifier
+   * (left as the field id when the chain id is not 32 base58 bytes).
+   */
+  const coinReservationRef = (
+    amount: bigint,
+    owner: string
+  ): { objectId: string; version: string; digest: string } => {
+    const field = fromHex(
+      deriveDynamicFieldID(
+        ACCUMULATOR_ROOT_ID,
+        ACCUMULATOR_KEY_TYPE_TAG,
+        bcs.Address.serialize(normalizeSuiAddress(owner)).toBytes()
+      ).slice(2)
+    )
+    let chain: Uint8Array | undefined
+    try {
+      chain = fromBase58(chainId)
+    } catch {
+      chain = undefined
+    }
+    const id = new Uint8Array(32)
+    for (let index = 0; index < 32; index++) {
+      id[index] = (field[index] ?? 0) ^ (chain?.length === 32 ? (chain[index] ?? 0) : 0)
+    }
+    const digest = new Uint8Array(32)
+    const view = new DataView(digest.buffer)
+    view.setBigUint64(0, amount, true)
+    view.setUint32(8, Number(state.epoch & 0xffffffffn), true)
+    digest.fill(COIN_RESERVATION_MAGIC, 12)
+    return { objectId: `0x${toHex(id)}`, version: "0", digest: toBase58(digest) }
+  }
+
   /**
    * The fake's stand-in for the transport's resolve plugin, so
    * `transaction.build({ client })` works with no network.
    *
    * It fills the gas price from the scripted reference gas price, the gas
    * budget from `script.gasBudget` (default 50 MIST-per-unit times the price),
-   * gas payment from the scripted coins the payer owns when it is unset (an
-   * explicit `[]` is left alone, the way a sponsored transaction wants it), and
    * resolves every `UnresolvedObject` input from the object map, choosing a
-   * shared, immutable or owned reference from the stored owner. Everything else
-   * — argument normalization, BCS layout, validation — is the SDK's own
+   * shared, immutable or owned reference from the stored owner, and — when the
+   * payment is unset — chooses it the way the SDK core resolver's
+   * `setGasPayment` does, over the fake's balances (since 0.4.0). The payer is
+   * the gas owner, else the sender:
+   *
+   * - `[]` (the address balance pays) when the budget is zero, or when no
+   *   command reads `tx.gas` and the payer's SUI address balance covers the
+   *   budget plus the SUI its `FundsWithdrawal` inputs draw from the payer;
+   * - otherwise the payer's SUI coins that are not inputs of the transaction,
+   *   preceded — for a `tx.gas` user whose address balance exceeds those
+   *   withdrawals — by a coin reservation ref for the difference (version `0`,
+   *   the SDK's digest layout and object-id derivation, the fake's epoch);
+   * - and with neither coins nor a reservation it throws the SDK's own
+   *   `"No valid gas coins found for the transaction."`, which `Tx.build`
+   *   reports as a `BuildError`.
+   *
+   * An explicit payment, `[]` included, is left alone, the way a sponsored
+   * transaction wants it; a transaction with no sender and no gas owner gets
+   * `[]`. Unlike the SDK, it never sets an expiration: `Tx.build` does. Everything
+   * else — argument normalization, BCS layout, validation — is the SDK's own
    * `TransactionDataBuilder`.
    *
    * It does not run Move, so it cannot resolve an `UnresolvedPure` whose type
@@ -1427,14 +1704,37 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         const owned = input.Object?.ImmOrOwnedObject ?? input.Object?.Receiving
         if (owned !== undefined) inputIds.add(normalizeSuiAddress(owned.objectId))
       }
-      const coins = payer === null
+      const coins = payer === null || payer === undefined
         ? []
         : coinsOf(payer).filter((coin) => !inputIds.has(normalizeSuiAddress(coin.objectId)))
-      transactionData.gasData.payment = coins.map((coin) => ({
+      const refs = coins.map((coin) => ({
         objectId: coin.objectId,
         version: coin.version,
         digest: coin.digest
       }))
+      if (payer === null || payer === undefined) {
+        // Nobody to pay: what the fake has always answered, rather than the
+        // SDK's "a gas owner or sender must be set".
+        transactionData.gasData.payment = []
+      } else {
+        // The SDK core resolver's `setGasPayment`, over the fake's balances.
+        const budget = BigInt(transactionData.gasData.budget ?? 0)
+        const usesGasCoin = usesGasCoinOf(transactionData)
+        const withdrawals = suiWithdrawalsFrom(transactionData, payer)
+        const addressBalance = addressBalanceOf(payer, SUI_TYPE_ARG)
+        if (budget === 0n || (!usesGasCoin && addressBalance >= budget + withdrawals)) {
+          transactionData.gasData.payment = []
+        } else if (usesGasCoin && addressBalance - withdrawals > 0n) {
+          transactionData.gasData.payment = [
+            coinReservationRef(addressBalance - withdrawals, payer),
+            ...refs
+          ]
+        } else if (refs.length === 0) {
+          throw new Error("No valid gas coins found for the transaction.")
+        } else {
+          transactionData.gasData.payment = refs
+        }
+      }
     }
     await proceed()
   }
@@ -1526,6 +1826,334 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
           ` from ${missing.length === 1 ? "that address" : "those addresses"}` +
           ` (the signatures are from ${signed.join(", ")})`
       )
+    }
+  }
+
+  /** The bytes as transaction data, or `undefined` for a fixture that is not one. */
+  const dataOfBytes = (bytes: Uint8Array): TransactionDataBuilder | undefined => {
+    try {
+      return TransactionDataBuilder.fromBytes(bytes)
+    } catch {
+      return undefined
+    }
+  }
+
+  /** A coin type the way a node's message spells it: `0x2::sui::SUI` for SUI. */
+  const displayCoinType = (coinType: string): string =>
+    normalizeCoinType(coinType) === normalizeCoinType(SUI_TYPE_ARG) ? "0x2::sui::SUI" : coinType
+
+  /** A node's own refusal: an `RpcError` carrying `INVALID_ARGUMENT` and the node's text. */
+  const refuseLikeNode = (message: string): never => {
+    throw rpcError("INVALID_ARGUMENT", message)
+  }
+
+  const insufficient = (coinType: string, address: string, required: bigint, available: bigint): never =>
+    refuseLikeNode(
+      `Invalid withdraw reservation: Insufficient address balance of coin type ${displayCoinType(coinType)}` +
+        ` for address ${address}: the transaction requires ${required} but only ${available} is available`
+    )
+
+  /**
+   * Refuses, the way a node does, an execution its balances cannot fund: an
+   * empty gas payment the payer's SUI address balance does not cover (budget
+   * plus the SUI it withdraws from the payer), a `FundsWithdrawal` its
+   * source's balance does not cover, and an empty payment with neither an
+   * address-owned input nor a `ValidDuring`/`Validity` expiration (nothing
+   * would stop it replaying).
+   */
+  const refuseUnfunded = (data: TransactionDataBuilder): void => {
+    const payment = data.gasData.payment ?? []
+    const budget = BigInt(data.gasData.budget ?? 0)
+    const payer = data.gasData.owner ?? data.sender
+    const withdrawals = withdrawalsOf(data)
+    if (payment.length === 0 && budget > 0n && payer !== null && payer !== undefined) {
+      const required = budget + suiWithdrawalsFrom(data, payer)
+      const available = addressBalanceOf(payer, SUI_TYPE_ARG)
+      if (available < required) insufficient(SUI_TYPE_ARG, normalizeSuiAddress(payer), required, available)
+    }
+    const reserved = new Map<string, Withdrawal>()
+    for (const withdrawal of withdrawals) {
+      const key = balanceKey(withdrawal.source, withdrawal.coinType)
+      const total = reserved.get(key)
+      reserved.set(key, { ...withdrawal, amount: (total?.amount ?? 0n) + withdrawal.amount })
+    }
+    for (const total of reserved.values()) {
+      const available = addressBalanceOf(total.source, total.coinType)
+      if (available < total.amount) insufficient(total.coinType, total.source, total.amount, available)
+    }
+    if (payment.length === 0) {
+      const owned = data.inputs.some((input) =>
+        input.Object?.ImmOrOwnedObject !== undefined || input.Object?.Receiving !== undefined
+      )
+      const kind = data.expiration?.$kind
+      if (!owned && kind !== "ValidDuring" && kind !== "Validity") {
+        refuseLikeNode(
+          "Transactions must either have address-owned inputs, or a ValidDuring expiration with at most two epochs of validity"
+        )
+      }
+    }
+  }
+
+  /** What one argument holds, as far as the fake can follow it without Move. */
+  interface Tracked {
+    readonly kind: "coin" | "balance" | "withdrawal"
+    readonly coinType: string
+    amount: bigint
+    /** The input coin this value is, which is deleted when it is consumed. */
+    readonly coinId?: string
+    /** Whether this is `tx.gas`. */
+    readonly gas?: boolean
+  }
+
+  const SUI_FRAMEWORK = normalizeSuiAddress("0x2")
+
+  /**
+   * Moves balances for a transaction the fake just settled, for the shapes it
+   * can follow without running Move:
+   *
+   * - the net gas charge (computation + storage − rebate of the effects it
+   *   returned) comes off the payer's SUI address balance when the payment is
+   *   empty or holds a coin reservation; this is all a **failed** execution does;
+   * - each `FundsWithdrawal` comes off its source's balance of its type;
+   * - `0x2::coin::send_funds<T>` / `0x2::balance::send_funds<T>` deposit what
+   *   flowed into them into the recipient's balance of `T`: an input coin, the
+   *   gas coin (the payment coins' total plus any reservation, less the gas
+   *   charge — a gas coin with a reservation in it moves the reservation off the
+   *   payer's balance instead of the gas charge), a `SplitCoins` amount,
+   *   `redeem_funds`, `into_balance`/`from_balance`, `zero` and `MergeCoins` of
+   *   those;
+   * - a consumed input coin (sent, merged in, `into_balance`, `destroy_zero`) is
+   *   deleted from the coin set, and a consumed gas coin deletes every payment
+   *   coin — unless a scripted `FakeChange` mutated it, which wins.
+   *
+   * It does **not** rewrite the balance of a coin that was split from or merged
+   * into: those come from the script (`FakeChange.balance`), as before.
+   */
+  const applyBalanceEffects = (
+    data: TransactionDataBuilder,
+    settled: SettledTransaction,
+    before: ReadonlyArray<SuiClientTypes.Coin>,
+    execution: FakeExecution | undefined
+  ): void => {
+    const effects = settled.transaction.effects as SuiClientTypes.TransactionEffects | undefined
+    const gasUsed = effects?.gasUsed ?? DEFAULT_GAS
+    const netGas = BigInt(gasUsed.computationCost) + BigInt(gasUsed.storageCost) -
+      BigInt(gasUsed.storageRebate)
+    const payment = data.gasData.payment ?? []
+    const reservation = payment.find(isReservationRef)
+    const reserved = reservation === undefined ? 0n : reservedAmountOf(reservation)
+    const paymentCoinIds = payment
+      .filter((ref) => !isReservationRef(ref))
+      .map((ref) => normalizeSuiAddress(ref.objectId))
+    const payer = data.gasData.owner ?? data.sender
+    const fromAddressBalance = payment.length === 0 || reservation !== undefined
+    const sui = normalizeCoinType(SUI_TYPE_ARG)
+    if (settled.failed) {
+      if (fromAddressBalance && payer) adjustAddressBalance(payer, sui, -netGas)
+      return
+    }
+    for (const withdrawal of withdrawalsOf(data)) {
+      adjustAddressBalance(withdrawal.source, withdrawal.coinType, -withdrawal.amount)
+    }
+
+    const coinsBefore = new Map(before.map((coin) => [normalizeSuiAddress(coin.objectId), coin]))
+    const values = new Map<string, Tracked>()
+    const consumedCoins = new Set<string>()
+    let gasConsumed = false
+    const deposits: Array<{ readonly recipient: string; readonly coinType: string; readonly amount: bigint }> = []
+
+    const keyOf = (argument: Argument): string | undefined => {
+      switch (argument.$kind) {
+        case "GasCoin":
+          return "gas"
+        case "Input":
+          return `input:${argument.Input}`
+        case "Result":
+          return `result:${argument.Result}:0`
+        case "NestedResult":
+          return `result:${argument.NestedResult[0]}:${argument.NestedResult[1]}`
+        default:
+          return undefined
+      }
+    }
+
+    const valueOf = (argument: Argument | undefined): Tracked | undefined => {
+      if (argument === undefined) return undefined
+      const key = keyOf(argument)
+      if (key === undefined) return undefined
+      const known = values.get(key)
+      if (known !== undefined) return known
+      let value: Tracked | undefined
+      if (argument.$kind === "GasCoin") {
+        const coins = paymentCoinIds.reduce(
+          (sum, id) => sum + BigInt(coinsBefore.get(id)?.balance ?? "0"),
+          0n
+        )
+        const amount = coins + reserved - netGas
+        value = { kind: "coin", coinType: sui, amount: amount < 0n ? 0n : amount, gas: true }
+      } else if (argument.$kind === "Input") {
+        const input = data.inputs[argument.Input]
+        const owned = input?.Object?.ImmOrOwnedObject
+        if (owned !== undefined) {
+          const id = normalizeSuiAddress(owned.objectId)
+          const coin = coinsBefore.get(id)
+          const coinType = coin === undefined ? undefined : coinTypeOfCoin(coin.type)
+          if (coin !== undefined && coinType !== undefined) {
+            value = { kind: "coin", coinType, amount: BigInt(coin.balance), coinId: id }
+          }
+        } else if (input?.$kind === "FundsWithdrawal" && input.FundsWithdrawal.reservation.$kind === "MaxAmountU64") {
+          value = {
+            kind: "withdrawal",
+            coinType: normalizeCoinType(input.FundsWithdrawal.typeArg.Balance),
+            amount: BigInt(input.FundsWithdrawal.reservation.MaxAmountU64)
+          }
+        }
+      }
+      if (value !== undefined) values.set(key, value)
+      return value
+    }
+
+    const consume = (argument: Argument | undefined): void => {
+      const value = valueOf(argument)
+      if (value === undefined) return
+      if (value.coinId !== undefined) consumedCoins.add(value.coinId)
+      if (value.gas === true) gasConsumed = true
+      value.amount = 0n
+    }
+
+    const pureOf = (argument: Argument | undefined): Uint8Array | undefined => {
+      if (argument === undefined || argument.$kind !== "Input") return undefined
+      const bytes = data.inputs[argument.Input]?.Pure?.bytes
+      return bytes === undefined ? undefined : fromBase64(bytes)
+    }
+
+    const u64Of = (argument: Argument | undefined): bigint | undefined => {
+      const bytes = pureOf(argument)
+      if (bytes === undefined) return undefined
+      try {
+        return BigInt(bcs.u64().parse(bytes))
+      } catch {
+        return undefined
+      }
+    }
+
+    const addressOf = (argument: Argument | undefined): string | undefined => {
+      const bytes = pureOf(argument)
+      if (bytes === undefined) return undefined
+      try {
+        return normalizeSuiAddress(bcs.Address.parse(bytes))
+      } catch {
+        return undefined
+      }
+    }
+
+    data.commands.forEach((command, index) => {
+      const result = (nested: number, value: Tracked): void => {
+        values.set(`result:${index}:${nested}`, value)
+      }
+      switch (command.$kind) {
+        case "SplitCoins": {
+          const source = valueOf(command.SplitCoins.coin)
+          command.SplitCoins.amounts.forEach((amountArgument, nested) => {
+            const amount = u64Of(amountArgument)
+            if (source === undefined || amount === undefined) return
+            source.amount = source.amount > amount ? source.amount - amount : 0n
+            result(nested, { kind: "coin", coinType: source.coinType, amount })
+          })
+          return
+        }
+        case "MergeCoins": {
+          const destination = valueOf(command.MergeCoins.destination)
+          for (const sourceArgument of command.MergeCoins.sources) {
+            const source = valueOf(sourceArgument)
+            if (destination !== undefined && source !== undefined) destination.amount += source.amount
+            consume(sourceArgument)
+          }
+          return
+        }
+        case "MoveCall": {
+          const call = command.MoveCall
+          let framework = false
+          try {
+            framework = normalizeSuiAddress(call.package) === SUI_FRAMEWORK
+          } catch {
+            framework = false
+          }
+          if (!framework) return
+          const typeArgument = call.typeArguments[0]
+          const coinType = typeArgument === undefined ? undefined : normalizeCoinType(typeArgument)
+          const name = `${call.module}::${call.function}`
+          const first = call.arguments[0]
+          switch (name) {
+            case "coin::redeem_funds":
+            case "balance::redeem_funds": {
+              const withdrawal = valueOf(first)
+              if (withdrawal === undefined) return
+              result(0, {
+                kind: call.module === "coin" ? "coin" : "balance",
+                coinType: coinType ?? withdrawal.coinType,
+                amount: withdrawal.amount
+              })
+              return
+            }
+            case "coin::into_balance":
+            case "coin::from_balance": {
+              const value = valueOf(first)
+              if (value === undefined) return
+              const amount = value.amount
+              consume(first)
+              result(0, {
+                kind: call.function === "into_balance" ? "balance" : "coin",
+                coinType: coinType ?? value.coinType,
+                amount
+              })
+              return
+            }
+            case "coin::zero":
+            case "balance::zero":
+              if (coinType !== undefined) {
+                result(0, { kind: call.module === "coin" ? "coin" : "balance", coinType, amount: 0n })
+              }
+              return
+            case "coin::send_funds":
+            case "balance::send_funds": {
+              const value = valueOf(first)
+              const recipient = addressOf(call.arguments[1])
+              if (value !== undefined && recipient !== undefined) {
+                deposits.push({ recipient, coinType: coinType ?? value.coinType, amount: value.amount })
+              }
+              consume(first)
+              return
+            }
+            case "coin::destroy_zero":
+              consume(first)
+              return
+            default:
+              return
+          }
+        }
+        default:
+          return
+      }
+    })
+
+    if (fromAddressBalance && payer) {
+      // A gas coin that carried a reservation and was sent away took the
+      // reservation with it, and the gas charge came out of the coin.
+      adjustAddressBalance(payer, sui, gasConsumed && reservation !== undefined ? -reserved : -netGas)
+    }
+    for (const deposit of deposits) {
+      if (deposit.amount !== 0n) adjustAddressBalance(deposit.recipient, deposit.coinType, deposit.amount)
+    }
+    if (gasConsumed) for (const id of paymentCoinIds) consumedCoins.add(id)
+    const scripted = new Set(
+      (execution?.mutated ?? []).map((change) => normalizeSuiAddress(change.objectId))
+    )
+    if (consumedCoins.size > 0) {
+      state.coins = state.coins.filter((coin) => {
+        const id = normalizeSuiAddress(coin.objectId)
+        return !consumedCoins.has(id) || scripted.has(id)
+      })
     }
   }
 
@@ -1850,11 +2478,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     getBalance: async (options: SuiClientTypes.GetBalanceOptions) => {
       record("getBalance", options)
-      const coinType = options.coinType ?? SUI_TYPE_ARG
-      const balance = balancesOf(options.owner).find((item) => sameCoinType(item.coinType, coinType))
-      return {
-        balance: balance ?? { coinType, balance: "0", coinBalance: "0", addressBalance: "0" }
-      }
+      return { balance: balanceOf(options.owner, options.coinType ?? SUI_TYPE_ARG) }
     },
     listBalances: async (options: SuiClientTypes.ListBalancesOptions) => {
       record("listBalances", options)
@@ -1904,6 +2528,13 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         // replay idempotency untestable.
         return asResult(known)
       }
+      // Balances are checked and moved only for bytes the fake can read, and
+      // only here — a replay of a known digest above moves nothing. A refusal
+      // throws before anything is settled or recorded as known.
+      const data = derived === undefined ? undefined : dataOfBytes(options.transaction)
+      if (data !== undefined) refuseUnfunded(data)
+      const before = [...state.coins]
+      lastExecution = undefined
       const settled = await settle(
         "execute",
         digest,
@@ -1911,6 +2542,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         paymentOfBytes(options.transaction),
         derived !== undefined
       )
+      if (data !== undefined) applyBalanceEffects(data, settled, before, lastExecution)
       state.knownTransactions.set(digest, settled)
       appendToLedger(digest)
       state.executedMeta.set(digest, metaOfBytes(options.transaction))
@@ -2178,6 +2810,11 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         state.byDigest.set(digest, outcome)
         appendToLedger(digest)
       }),
+    setAddressBalance: (owner, coinType, amount) =>
+      Effect.sync(() => {
+        setAddressBalanceOf(owner, coinType, amount)
+      }),
+    readAddressBalance: (owner, coinType) => Effect.sync(() => addressBalanceOf(owner, coinType)),
     setOutcomes: (method, outcomes) =>
       Effect.sync(() => {
         state.scripts = { ...state.scripts, [method]: outcomes }

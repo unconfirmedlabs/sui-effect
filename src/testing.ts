@@ -282,6 +282,43 @@ const setVisibilityDelay = (
 ): Effect.Effect<void, never, SuiCoreFake> =>
   withFake((fake) => fake.setVisibilityDelay(delay))
 
+/** The SUI coin type, the default of the address-balance helpers. */
+const SUI_COIN_TYPE = "0x2::sui::SUI"
+
+/**
+ * Sets the fake's address balance of `owner` in `coinType` (default SUI) to
+ * `amount` MIST, replacing the scripted seed and anything an execution moved.
+ *
+ * The fake's resolver pays gas from it when it covers the budget, an execution
+ * with an empty payment is refused when it does not, and the SDK's
+ * `tx.coin`/`tx.balance` intents redeem from it — so this is how a test moves
+ * a payer from coin gas to address-balance gas, or drains it, mid-test. Never
+ * fails.
+ *
+ * @since 0.4.0
+ */
+const setAddressBalance = (
+  owner: string,
+  amount: bigint,
+  coinType: string = SUI_COIN_TYPE
+): Effect.Effect<void, never, SuiCoreFake> =>
+  withFake((fake) => fake.setAddressBalance(owner, coinType, amount))
+
+/**
+ * The fake's current address balance of `owner` in `coinType` (default SUI),
+ * in MIST: what an execution or {@link setAddressBalance} last left there, else
+ * the scripted `FakeBalance.addressBalance` seed, else 0. What a test reads to
+ * assert a gas charge, a `FundsWithdrawal` debit or a `send_funds` deposit.
+ * Never fails.
+ *
+ * @since 0.4.0
+ */
+const addressBalance = (
+  owner: string,
+  coinType: string = SUI_COIN_TYPE
+): Effect.Effect<bigint, never, SuiCoreFake> =>
+  withFake((fake) => fake.readAddressBalance(owner, coinType))
+
 /**
  * The whole wiring of one test, as one `.pipe` step: provides `layer` (a
  * {@link layerTest} or {@link layerExtensionTest}) plus a **fresh**
@@ -351,6 +388,8 @@ export const SuiTest = {
   scriptGetTransaction,
   scriptGetObject,
   setVisibilityDelay,
+  setAddressBalance,
+  addressBalance,
   calls,
   provide
 } as const

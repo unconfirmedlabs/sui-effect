@@ -975,6 +975,9 @@ describe("Tx.reconcile", () => {
         // The coin has to be a readable object as well as a listed coin, so
         // that reconcile can see its version move.
         objects: [escrow(3n), coinObject],
+        // The sender pays gas with that coin, so it has no address balance to
+        // pay from instead.
+        balances: [{ owner: SENDER, coinType: "0x2::sui::SUI", balance: "0", coinBalance: "0", addressBalance: "0" }],
         getTransaction: [FakeOutcome.notFound()],
         transactions: consumedBySomeoneElse(COIN_ID, coin.type, 2n)
       }
