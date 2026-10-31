@@ -31,13 +31,39 @@ export const normalizeStructTagSafe = (value: string): string => {
 }
 
 /**
- * The pipeline every 32-byte hex id shares: normalize with
- * `normalizeSuiAddress` on decode, check with `isValidSuiAddress`. The caller brands it
- * (`Schema.brand` needs a literal): `SuiAddress` and `ObjectId` differ only in
- * brand and wording.
+ * What a hex id may look like **before** it is padded: an optional `0x`, then
+ * one to 64 hex digits. The empty string and a bare `0x` are not ids, although
+ * `normalizeSuiAddress` pads both to the zero address — which is how an empty
+ * CLI argument used to decode to `0x000…000` and receive funds.
  */
-const hexId = (identifier: string, description: string, expected: string) =>
+const SHORT_HEX_ID = /^(0x)?[0-9a-fA-F]{1,64}$/
+
+/** The only spelling the strict decoders take: an optional `0x` and exactly 64 hex digits. */
+const FULL_HEX_ID = /^(0x)?[0-9a-fA-F]{64}$/
+
+/**
+ * The pipeline every 32-byte hex id shares: refuse what is not a hex id at all
+ * (`""`, `"0x"`, non-hex), normalize with `normalizeSuiAddress` on decode,
+ * check with `isValidSuiAddress`. The caller brands it (`Schema.brand` needs a
+ * literal): `SuiAddress` and `ObjectId` differ only in brand and wording.
+ *
+ * `strict` is the user-input variant: exactly 64 hex digits, so a truncated
+ * paste is refused instead of being padded into a different, valid id.
+ */
+const hexId = (identifier: string, description: string, expected: string, strict = false) =>
   Schema.String.annotate({ identifier, description }).pipe(
+    Schema.check(
+      Schema.makeFilter((value: string) =>
+        (strict ? FULL_HEX_ID : SHORT_HEX_ID).test(value)
+          ? undefined
+          : strict
+          ? `${expected}: exactly 64 hex digits, with or without 0x`
+          : expected
+      )
+    )
+    // Again after the check, which is the node that reports a non-string (see
+    // `Digest`).
+  ).annotate({ identifier, description }).pipe(
     Schema.decode({
       decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
       encode: SchemaGetter.passthrough()
@@ -68,15 +94,52 @@ const structTagLike = (identifier: string, description: string, expected: string
  * A 32-byte Sui account address, normalized to the padded lowercase `0x` form on
  * decode. Rejects anything `isValidSuiAddress` rejects with a `SchemaError`.
  *
- * `SuiAddress.make(value)` is the branding constructor: it **validates without
- * decoding**, so it takes the padded 32-byte spelling and nothing else —
- * `SuiAddress.make("0x1")` throws. `SuiAddress.normalize("0x1")` is the one
- * that accepts every spelling a human writes, because it decodes first.
+ * **Decoding pads.** `Schema.decodeUnknownEffect(SuiAddress)` takes every
+ * spelling the SDK takes — `"0x2"`, `"2"`, an unpadded or mixed-case hex
+ * string — and left-pads it to 64 digits, so a truncated 60-digit paste decodes
+ * to a *different, valid* address. It refuses `""`, a bare `"0x"` and anything
+ * that is not hex. For an address a human typed — a CLI argument, a form field,
+ * a recipient — decode with {@link SuiAddress.Strict} instead, which takes
+ * exactly 64 hex digits and nothing shorter.
+ *
+ * The three ways in:
+ *
+ * - `SuiAddress.make(value)` brands: it **validates without decoding**, so it
+ *   takes the padded 32-byte spelling and nothing else — `SuiAddress.make("0x1")`
+ *   throws. For a value already in canonical form.
+ * - `SuiAddress.normalize(value)` decodes (pads) and brands, throwing a
+ *   `SchemaError`. For literals and configuration a caller controls, such as
+ *   `"0x2"`.
+ * - `Schema.decodeUnknownEffect(SuiAddress)` / `(SuiAddress.Strict)` for a value
+ *   from outside, with the failure in the error channel.
  */
 const SuiAddressSchema = hexId(
   "SuiAddress",
   "A 32-byte Sui account address in the padded lowercase 0x form",
   "Expected a 32-byte Sui address"
+).pipe(Schema.brand("SuiAddress"))
+
+/**
+ * {@link SuiAddress} for user input: an optional `0x` and **exactly** 64 hex
+ * digits, lowercased. Nothing is padded, so `""`, `"0x"`, `"0x2"` and a
+ * truncated paste are refused instead of becoming the zero address or somebody
+ * else's. The decoded value is the same `SuiAddress` brand.
+ *
+ * @since 0.4.0
+ *
+ * @example
+ * ```ts
+ * import { Schema } from "effect"
+ * import { SuiAddress } from "@unconfirmed/sui-effect"
+ *
+ * const recipient = Schema.decodeUnknownEffect(SuiAddress.Strict)(process.argv[2])
+ * ```
+ */
+const SuiAddressStrict = hexId(
+  "SuiAddress",
+  "A 32-byte Sui account address, exactly 64 hex digits",
+  "Expected a 32-byte Sui address",
+  true
 ).pipe(Schema.brand("SuiAddress"))
 
 /**
@@ -88,7 +151,8 @@ const SuiAddressSchema = hexId(
  * `isValidSuiAddress`, which only the padded 32-byte form passes, so
  * `SuiAddress.make("0x1")` throws while `"0x1"` is what every deployment
  * document, every CLI flag and every human writes. `normalize` runs the
- * schema's own decode — `normalizeSuiAddress` — and then the check.
+ * schema's own decode — `normalizeSuiAddress` — and then the check. It pads, so
+ * it is not for an address a human typed: that is {@link SuiAddress.Strict}.
  *
  * **It throws a `SchemaError`** — `Schema.isSchemaError(error)` is the guard —
  * whose `.issue` is the structured schema issue and whose `.message` is the
@@ -114,25 +178,42 @@ const normalizeSuiAddressValue: (input: string) => typeof SuiAddressSchema.Type 
 )
 
 /**
- * A 32-byte Sui account address in the padded lowercase `0x` form: the schema,
- * plus `SuiAddress.normalize` for a shorthand spelling such as `"0x2"`.
+ * A 32-byte Sui account address in the padded lowercase `0x` form: the schema
+ * (which pads on decode), plus `SuiAddress.normalize` for a shorthand spelling
+ * such as `"0x2"` and `SuiAddress.Strict` for user input.
  */
 export const SuiAddress = Object.assign(SuiAddressSchema, {
-  normalize: normalizeSuiAddressValue
+  normalize: normalizeSuiAddressValue,
+  Strict: SuiAddressStrict
 })
 export type SuiAddress = typeof SuiAddressSchema.Type
 
 /**
- * A 32-byte object id. Same encoding rules as {@link SuiAddress}; the brand is
- * separate so an address cannot be passed where an object id is expected.
+ * A 32-byte object id. Same encoding rules as {@link SuiAddress} — decoding
+ * pads, and refuses `""` and a bare `"0x"` — and the brand is separate so an
+ * address cannot be passed where an object id is expected.
  *
- * `ObjectId.make` validates without decoding; `ObjectId.normalize` decodes
- * first and is what takes `"0x6"`.
+ * `ObjectId.make` validates without decoding (padded form only);
+ * `ObjectId.normalize` decodes first and is what takes `"0x6"`;
+ * `ObjectId.Strict` is the exactly-64-digit decoder for an id a human typed.
  */
 const ObjectIdSchema = hexId(
   "ObjectId",
   "A 32-byte Sui object id in the padded lowercase 0x form",
   "Expected a 32-byte Sui object id"
+).pipe(Schema.brand("ObjectId"))
+
+/**
+ * {@link ObjectId} for user input: an optional `0x` and exactly 64 hex digits,
+ * never padded. The twin of {@link SuiAddress.Strict}.
+ *
+ * @since 0.4.0
+ */
+const ObjectIdStrict = hexId(
+  "ObjectId",
+  "A 32-byte Sui object id, exactly 64 hex digits",
+  "Expected a 32-byte Sui object id",
+  true
 ).pipe(Schema.brand("ObjectId"))
 
 /**
@@ -144,7 +225,8 @@ const ObjectIdSchema = hexId(
  * schema issue and whose `.message` is the formatted line, because it is
  * `Schema.decodeSync`; `.make` throws a plain `Error` with the issue in
  * `cause`. So it is for literals and configuration a caller controls; anything
- * from outside goes through `Schema.decodeUnknownEffect(ObjectId)`.
+ * from outside goes through `Schema.decodeUnknownEffect(ObjectId)` (or
+ * `ObjectId.Strict` when a human typed it).
  *
  * @since 0.1.1
  *
@@ -160,13 +242,24 @@ const normalizeObjectIdValue: (input: string) => typeof ObjectIdSchema.Type = Sc
 )
 
 /**
- * A 32-byte Sui object id in the padded lowercase `0x` form: the schema, plus
- * `ObjectId.normalize` for a shorthand spelling such as `"0x6"`.
+ * A 32-byte Sui object id in the padded lowercase `0x` form: the schema (which
+ * pads on decode), plus `ObjectId.normalize` for a shorthand spelling such as
+ * `"0x6"` and `ObjectId.Strict` for user input.
  */
-export const ObjectId = Object.assign(ObjectIdSchema, { normalize: normalizeObjectIdValue })
+export const ObjectId = Object.assign(ObjectIdSchema, {
+  normalize: normalizeObjectIdValue,
+  Strict: ObjectIdStrict
+})
 export type ObjectId = typeof ObjectIdSchema.Type
 
-/** A base58 transaction digest. Not normalized; rejected when not 32 bytes. */
+/**
+ * A base58 transaction digest. Not normalized — a digest has one spelling —
+ * and rejected when it is not 32 bytes.
+ *
+ * `Digest.make(value)` brands a value already known to be a digest (it
+ * validates and throws); `Schema.decodeUnknownEffect(Digest)` is for one from
+ * outside. There is no `normalize`, because there is nothing to normalize.
+ */
 export const Digest = Schema.String.annotate({
   identifier: "Digest",
   description: "A base58 32-byte transaction digest"
@@ -189,21 +282,87 @@ export type Digest = typeof Digest.Type
 /**
  * A fully qualified Move struct tag, normalized with `normalizeStructTag` on
  * decode so `0x2::sui::SUI` and its padded form compare equal.
+ *
+ * `StructTag.make(value)` **validates without normalizing**: it brands
+ * `"0x2::coin::Coin"` as given, unpadded. `StructTag.normalize(value)` decodes
+ * (pads every address in the tag) and brands, throwing a `SchemaError` on
+ * something that is not a struct tag. Every `Sui` read that takes a type also
+ * takes a plain string and normalizes it itself, so neither is needed there.
  */
-export const StructTag = structTagLike(
+const StructTagSchema = structTagLike(
   "StructTag",
   "A fully qualified Move struct tag, normalized",
   "Expected a fully qualified Move struct tag"
 ).pipe(Schema.brand("StructTag"))
-export type StructTag = typeof StructTag.Type
 
-/** A coin type: a struct tag used as the type argument of `0x2::coin::Coin`. */
-export const CoinType = structTagLike(
+/**
+ * A branded, normalized {@link StructTag} from any spelling: `"0x2::coin::Coin"`
+ * becomes `"0x000…002::coin::Coin"`. Throws a `SchemaError`
+ * (`Schema.isSchemaError`) on a string that is not a struct tag, because it is
+ * `Schema.decodeSync`; a value from outside goes through
+ * `Schema.decodeUnknownEffect(StructTag)`.
+ *
+ * @since 0.4.0
+ */
+const normalizeStructTagValue: (input: string) => typeof StructTagSchema.Type = Schema.decodeSync(
+  StructTagSchema
+)
+
+/**
+ * A fully qualified Move struct tag in normalized form: the schema, plus
+ * `StructTag.normalize` for any spelling.
+ */
+export const StructTag = Object.assign(StructTagSchema, { normalize: normalizeStructTagValue })
+export type StructTag = typeof StructTagSchema.Type
+
+/**
+ * A coin type: a struct tag used as the type argument of `0x2::coin::Coin`
+ * (`0x2::sui::SUI`, not `0x2::coin::Coin<0x2::sui::SUI>`).
+ *
+ * Same rules as {@link StructTag}: `CoinType.make` validates without
+ * normalizing (`CoinType.make("0x2::sui::SUI")` stays unpadded),
+ * `CoinType.normalize` pads and brands, and `CoinType.SUI` is SUI's coin type
+ * in normalized form. Every `Sui` read and `Executed.balanceChange` take a plain
+ * string too, and compare under the one Move type rule.
+ */
+const CoinTypeSchema = structTagLike(
   "CoinType",
   "A struct tag used as the type argument of 0x2::coin::Coin",
   "Expected a fully qualified Move coin type"
 ).pipe(Schema.brand("CoinType"))
-export type CoinType = typeof CoinType.Type
+
+/**
+ * A branded, normalized {@link CoinType} from any spelling. Throws a
+ * `SchemaError` on a string that is not a struct tag, because it is
+ * `Schema.decodeSync`.
+ *
+ * @since 0.4.0
+ *
+ * @example
+ * ```ts
+ * import { CoinType } from "@unconfirmed/sui-effect"
+ *
+ * const usdc = CoinType.normalize(`${USDC_PACKAGE}::usdc::USDC`)
+ * ```
+ */
+const normalizeCoinTypeValue: (input: string) => typeof CoinTypeSchema.Type = Schema.decodeSync(
+  CoinTypeSchema
+)
+
+/**
+ * A coin type in normalized form: the schema, plus `CoinType.normalize` for any
+ * spelling and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
+ */
+export const CoinType = Object.assign(CoinTypeSchema, {
+  normalize: normalizeCoinTypeValue,
+  /**
+   * SUI's coin type, `0x000…002::sui::SUI`, normalized and branded.
+   *
+   * @since 0.4.0
+   */
+  SUI: normalizeCoinTypeValue("0x2::sui::SUI")
+})
+export type CoinType = typeof CoinTypeSchema.Type
 
 /**
  * The `type` field of an object envelope. Almost always a struct tag, but gRPC

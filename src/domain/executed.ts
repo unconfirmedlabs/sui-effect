@@ -287,8 +287,12 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
     return refs
   }
 
-  /** The net balance change for one address and coin type, in MIST. Never fails. */
-  balanceChange(address: SuiAddress, coinType: CoinType): bigint {
+  /**
+   * The net balance change for one address and coin type, in the coin's base
+   * unit (MIST for SUI). `coinType` is any spelling — `"0x2::sui::SUI"`,
+   * `CoinType.SUI` — compared under the one Move type rule. Never fails.
+   */
+  balanceChange(address: SuiAddress, coinType: CoinType | string): bigint {
     let total = 0n
     for (const change of this.balanceChanges) {
       if (change.address === address && typeMatches(coinType, change.coinType)) {
