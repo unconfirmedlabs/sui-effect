@@ -18,6 +18,7 @@ import { DecodeError, decodePayload, ExecutionFailed, UnexpectedEffects } from "
 import {
   BalanceChange,
   ChangedObject,
+  type Coin,
   CoinType,
   Digest,
   Event,
@@ -83,12 +84,20 @@ export const objectRefOf = (ref: ChangedRef): ObjectRef | undefined =>
  * `tx.receivingRef(...)`, which takes the same three fields this returns.
  * Passing a shared object by `objectRef` produces bytes a validator rejects.
  *
+ * A {@link Coin} from `Sui.listCoins` / `Sui.streamCoins` is accepted too
+ * (since 0.4.0): it is an owned object with its id under `objectId`, which is
+ * exactly what a coin passed to `tx.objectRef` or `tx.setGasPayment` needs,
+ * and it always carries a version and a digest, so for a `Coin` the answer is
+ * never `undefined`.
+ *
  * `undefined` when the effects did not carry a version or a digest — a deleted
  * object has no output version, and nothing can be consumed without both.
  * Never fails.
  */
-export const sdkRefOf = (ref: ChangedRef | ObjectRef): SdkObjectRef | undefined =>
-  ref.version === undefined || ref.digest === undefined
+export const sdkRefOf = (ref: ChangedRef | ObjectRef | Coin): SdkObjectRef | undefined =>
+  "objectId" in ref
+    ? { objectId: ref.objectId, version: ref.version.toString(), digest: ref.digest }
+    : ref.version === undefined || ref.digest === undefined
     ? undefined
     : { objectId: ref.id, version: ref.version.toString(), digest: ref.digest }
 
