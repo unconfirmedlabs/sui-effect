@@ -104,7 +104,10 @@ conversion can be re-run against the same library.
    `EscrowContent`, `escrowType`, `receiptType`, `SettlementContent` — is a
    **function of the package id**, because a Move type name contains one:
    configuring a different package has to move the codecs with it. Keep that
-   shape.
+   shape. Rename freely: `scripts/check-package.ts` names none of these
+   exports. It reads the subpaths from `package.json`'s `exports` map, learns
+   what each one exports by importing the matching `src/` file, and requires
+   the packed `dist/` to export the same names.
 5. Keep the shape: reads through `Sui`, writes through `Tx`, contributions as
    recipe fragments, signers as parameters, every error a `Schema.TaggedError`
    with an `outcome`, and the Promise face derived from the service.
@@ -132,7 +135,10 @@ first, which is what a copied-out package has after `bun install`, and only
 falls back to the sui-effect repository two directories up when that repository
 is really there (it checks the `name` in its `package.json`). Whichever copy of
 `@unconfirmed/sui-effect` it finds has to be **built**, because the consumer imports its
-`exports` map; a published tarball always is.
+`exports` map; a published tarball always is. It hard-codes none of the
+template's names: every subpath in `exports` must export, from the packed
+`dist/`, every value its `src/` file exports — so it keeps working after you
+rename `Escrow`, and it catches a subpath you add but forget to build.
 
 To publish:
 

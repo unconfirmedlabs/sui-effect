@@ -20,7 +20,8 @@
     // Inside the sui-effect repository the template resolves `@unconfirmed/sui-effect` to
     // the library's own sources, so it needs no install of its own and there is
     // exactly one copy of `effect` in play. Delete this block when you copy the
-    // template out, and add `@unconfirmed/sui-effect` to `dependencies` instead.
+    // template out, and add `@unconfirmed/sui-effect` to `peerDependencies` and
+    // `devDependencies` (never `dependencies`) instead.
     "paths": {
       "@unconfirmed/sui-effect": ["../../src/index.ts"],
       "@unconfirmed/sui-effect/tx": ["../../src/tx.ts"],
