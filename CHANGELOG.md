@@ -424,7 +424,9 @@ package did not. Several signatures and one stored shape change; read
   inputConsumed }` evidence.
 - The sender lock (`Sui.withSenderLock`, and the Promise face's process-wide
   one) is keyed on the normalized address, so an upper-case `SuiAddress.make`
-  spelling of a sender no longer gets a second lock.
+  spelling of a sender no longer gets a second lock; `Tx.run` takes a
+  sender/gas-owner pair in that normalized order too, so two runs for one pair
+  spelled differently cannot take it in opposite orders and deadlock.
 - `SuiError.describe`, `toJson` and `.message` no longer overflow the stack for
   an extension error whose `message` getter calls `SuiError.describe(this)`, or
   for a cyclic `cause`; every helper documented "Never fails" now is, over a

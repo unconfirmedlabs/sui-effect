@@ -5,12 +5,17 @@
  * `call`/`apply`/`bind`, `"prototype" in` a cold call).
  */
 import { describe, expect, test } from "bun:test"
+import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
+import { normalizeSuiAddress } from "@mysten/sui/utils"
 import { Context, Deferred, Effect, Fiber, Layer, Option, Schema } from "effect"
 import { JournalError, SigningError, SubmissionUnknown, SuiError, TransportError } from "../src/domain/errors.ts"
 import { Digest, SuiAddress } from "../src/domain/schemas.ts"
+import { Journal } from "../src/services/Journal.ts"
+import { fromKeypair, type Signer } from "../src/services/Signer.ts"
 import { Sui } from "../src/services/Sui.ts"
 import { SuiCoreFake } from "../src/services/SuiCoreFake.ts"
 import { SuiExtension } from "../src/services/SuiExtension.ts"
+import { Tx } from "../src/services/Tx.ts"
 import { layerTest } from "../src/testing.ts"
 
 const CHAIN_ID = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
@@ -50,6 +55,39 @@ describe("sender locks are keyed on the normalized address", () => {
       Effect.provide(Effect.flatMap(Sui, overlaps), layerTest({ chainId: CHAIN_ID }), { local: true })
     )
     expect(entered).toBe(false)
+  })
+
+  test("Tx.run takes a sender/gas-owner pair in normalized order, whatever the spelling", async () => {
+    // Normalized, the sponsor (0xa0cc…) sorts before the sender (0xd64f…);
+    // spelled upper-case, "0xD…" sorts before "0xa…". Both locks are keyed on
+    // the normalized address, so two runs ordering the same pair by spelling
+    // could each hold one and wait for the other.
+    const real = fromKeypair(Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(3)))
+    const sender: Signer = { ...real, address: SuiAddress.make(`0x${real.address.slice(2).toUpperCase()}`) }
+    const sponsor = fromKeypair(Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(7)))
+    expect(sender.address < sponsor.address).toBe(true)
+    expect(normalizeSuiAddress(sender.address) > sponsor.address).toBe(true)
+    const taken: Array<string> = []
+    const spied = Effect.updateService(
+      Tx.run((tx) => {
+        tx.transferObjects([tx.splitCoins(tx.gas, [1])], sponsor.address)
+      }, { signer: sender, gasOwner: sponsor.address, sponsor }),
+      Sui,
+      (sui) => ({
+        ...sui,
+        withSenderLock: (address) => (effect) =>
+          Effect.andThen(
+            Effect.sync(() => taken.push(normalizeSuiAddress(address))),
+            sui.withSenderLock(address)(effect)
+          )
+      })
+    )
+    // How the run ends does not matter here (the fake holds no coins for
+    // either party); only the order in which the locks were asked for.
+    await Effect.runPromiseExit(
+      Effect.provide(spied, Layer.merge(Journal.layerMemory, layerTest({ chainId: CHAIN_ID })))
+    )
+    expect(taken).toEqual([sponsor.address, normalizeSuiAddress(sender.address)])
   })
 
   test("the Promise face's process-wide lock does too", async () => {

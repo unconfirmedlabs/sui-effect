@@ -2674,10 +2674,18 @@ export const run = Effect.fn("Tx.run")(function*(
     ? intended.gasOwner
     : undefined
   // An address-balance payment selects no coins, so the gas owner has nothing
-  // to lock: only its sender's lock serializes the run.
+  // to lock: only its sender's lock serializes the run. The pair is ordered by
+  // the **normalized** address, which is what the locks are keyed on: ordered
+  // by spelling, an upper-case `0xD…` sorts before `0xa…`, and two runs for
+  // one pair could take it in opposite orders and deadlock.
+  const byLockKey = (left: SuiAddress, right: SuiAddress): number => {
+    const l = normalizeSuiAddress(left)
+    const r = normalizeSuiAddress(right)
+    return l < r ? -1 : l > r ? 1 : 0
+  }
   const locked = payer === undefined || intended.addressBalance
     ? [sender]
-    : [sender, payer].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+    : [sender, payer].sort(byLockKey)
 
   // Before anything is built: a gas owner with no signer for it can never
   // produce bytes a validator accepts.
