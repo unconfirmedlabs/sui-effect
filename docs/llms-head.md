@@ -31,13 +31,13 @@ subpath by subpath; the examples and the extension template come last.
 | Import | What it exports |
 |---|---|
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
-| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `sponsored`, `gaslessStablecoinTransfer`, `submit`, `submitVia`, `reconcile`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors, `Verify`, `SubmitConfig`, `Journal`, `JournalEntry` |
+| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `submit`, `submitVia`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, …), `Verify`, `SubmitConfig` and `SubmitConfigOverrides`, `Journal`, `JournalEntry` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
-| `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)`, and `SuiExtension.leaf` |
+| `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)` (an `Effect<Option<A>>` member becomes `Promise<A \| undefined>`, `FaceValue`), and `SuiExtension.leaf` |
 | `@unconfirmed/sui-effect/script` | `Script` / `ScriptReadOnly` (layers that read `SUI_NETWORK`, `SUI_PRIVATE_KEY`, …), `Script.run`, `Script.report`, `Script.exitCode` |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest`, `SuiCoreFake`, `FakeOutcome` |
+| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig` |
 
-## Five recipes
+## Recipes
 
 Each one is a file in this repository that typechecks and runs against the fake
 (`test/recipes.test.ts`); the relative `src/` imports are shown as the package
@@ -51,13 +51,45 @@ Build and submit:
 
 <!-- recipe: examples/recipes/build-and-submit.ts -->
 
-The explicit lifecycle, for a sponsored transaction:
+The explicit lifecycle, for a sponsored transaction, and the coin-paid alternative:
 
 <!-- recipe: examples/recipes/sponsored.ts -->
+
+A stateless sponsor service, handed someone else's bytes:
+
+<!-- recipe: examples/recipes/sponsored-stateless.ts -->
+
+Re-sending a lost submission:
+
+<!-- recipe: examples/recipes/resubmit.ts -->
+
+A script with a durable journal:
+
+<!-- recipe: examples/recipes/durable-journal-script.ts -->
+
+Publish a package, then upgrade it:
+
+<!-- recipe: examples/recipes/publish-and-upgrade.ts -->
+
+Decode a transaction's events:
+
+<!-- recipe: examples/recipes/events.ts -->
+
+Map a Move abort to your own error:
+
+<!-- recipe: examples/recipes/move-abort.ts -->
+
+A resumable indexer:
+
+<!-- recipe: examples/recipes/indexer.ts -->
 
 An extension and its Promise face:
 
 <!-- recipe: examples/recipes/extension.ts -->
+
+Calling a Promise face from plain TypeScript:
+
+<!-- recipe: examples/recipes/promise-face.ts -->
 
 A test on the fake:
 
@@ -68,6 +100,9 @@ A test on the fake:
 - `SuiCore` is a 1:1 Effect wrap of the SDK's `ClientWithCoreApi`: one member per transport method, the SDK's `Include` generics, every call cancellable, reads retried on a retryable `TransportError`.
 - `Sui` is the opinionated tier over it: fixed include sets, BCS content decoded through a schema after the Move type is checked, `Option` where absence is normal, chunked batch reads, `Stream` pagination, one sender lock. Application and extension code reads through `Sui`.
 - **`Sui` members are positional** — `sui.getObject(id, { schema })`, `sui.getBalance(owner, coinType)`. **`SuiCore` members take the SDK's options object** — `core.getObject({ objectId, include })`. Writing `sui.getObject({ objectId })` is the SDK habit, and it does not typecheck.
+- **The SDK's `listX` is `Sui.streamX`**, a `Stream` that follows every page and ends once caught up; `tailX` never ends and polls: `listOwnedObjects` → `streamOwnedObjects`, `listCoins` → `streamCoins`, `listBalances` → `streamBalances`, `listDynamicFields` → `streamDynamicFields`, `listEvents` → `streamEvents` / `tailEvents`, `listTransactions` → `streamTransactions` / `tailTransactions`. The `…Pages` forms (`streamEventPages`, `tailEventPages`, …) carry each page's `endCursor` for a resumable reader; `{ after }` resumes from one.
+- **A transaction `function` filter must be fully qualified** (`package::module::function`) on `streamTransactions` and `tailTransactions`: the SDK cannot continue a `package` or `package::module` filter past its first page, so it is refused up front. For one page of a module filter, call `sui.core.listTransactions`.
+- **Ids:** `ObjectId.Strict` / `SuiAddress.Strict` (through `Schema.decodeUnknownEffect`) for what a person typed — exactly 64 hex digits; `.normalize` for a shorthand literal such as `"0x6"`; `.make` for the padded form only. Decoding refuses `""` and a bare `"0x"`.
 - `sui.core` is the `SuiCore` a `Sui` was built over, which is why every `Tx.*` function needs only `R = Sui`.
 - Reads go through `Sui`; writes go through `Tx`. Nothing calls `SuiCore.executeTransaction` directly.
 - `Signer` is a value, never a service: pass it as a parameter. `SubmitConfig` and `Journal` are `Context.Reference`s with working defaults.
@@ -85,7 +120,7 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 | `NetworkMismatch` | `not_applied` | 2 | The node is on another chain than the layer was built for |
 | `DecodeError` | `not_applied` | 4 | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
 | `SimulationFailed` | `not_applied` | 4 | Simulation reported an execution failure; no gas charged |
-| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing, building, preflight policy, the journal write before the first send |
+| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget); policy (`preflight`, and the gas ceiling as `rule: "maxGasBudget"`); the journal write before the first send |
 | `GraphQLUnavailable` / `ExtensionNotReady` | `not_applied` | 4 | No usable GraphQL endpoint; a synchronous Promise-face member called before its runtime existed |
 | `NotApplied` | `not_applied` | 4 | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
 | `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged |
@@ -93,25 +128,33 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 | `SubmissionUnknown` | `unknown` | 3 | Bytes may have been sent; the outcome is unknown. Carries the signed bytes |
 | anything else, with no `outcome` field | `unknown` | 1 | Unclassified; declare `outcome` on every extension error |
 
-`ConfigError` and `SchemaError` also exit 2; a defect exits 1, an interrupt with
-nothing outstanding 130.
+`ConfigError` (whose one line names the variable) and `SchemaError` also exit 2;
+a defect exits 1, an interrupt with nothing outstanding 130. An error that
+declares an integer `exitCode` from 1 to 255 exits with it. **Once a
+transaction of this run applied**, a failure that would exit 2, 4 or 130 exits
+5 instead, because a retry would send a second transaction; an unresolved entry
+still exits 3.
 
 Three rules:
 
 1. **Branch on `_tag` and `DecodeError.kind`, never on `issue` or `message`**, whose wording changes between releases.
 2. **`NotApplied` is rare on purpose.** It needs evidence checked twice; almost every stuck submission ends as `SubmissionUnknown`. Do not build a retry loop that waits for `NotApplied`.
-3. **`SubmissionUnknown` carries the signed bytes.** Answer it with `Tx.reconcile(error)` (or `Tx.reconcileAll()` at startup), never by rebuilding and sending again.
+3. **`SubmissionUnknown` carries the signed bytes.** Answer it with `Tx.reconcile(error)` to ask the chain, or `Tx.resubmit(error)` to send the identical bytes again (`Tx.reconcileAll({ resubmit: true })` at startup) — never by rebuilding and sending again.
 
 ## `SubmitConfig`
 
-`program.pipe(SubmitConfig.with({ … }))` spreads the defaults and overrides the
-fields given; `SubmitConfig.layer({ … })` is the same as a `Layer`.
+`program.pipe(SubmitConfig.with({ … }))` merges the fields given over the config
+**in force** where the program runs (not over the defaults), so nested `with`s
+compose; `SubmitConfig.layer({ … })` spreads them over the defaults, as a
+`Layer`. Durations take any `Duration.Input`: `executeTimeout: "10 seconds"`.
+The per-attempt read timeout is not here: it is `SuiCore`'s `requestTimeout`
+layer option (30 s; `SUI_RPC_TIMEOUT` for `layerConfig`).
 
 | Field | Default | What it decides |
 |---|---|---|
 | `expiration` | `"validDuring"` | The expiration `Tx.build` sets when the recipe set none: the current epoch and the next, plus the chain id (`"epoch"`, `"none"`) |
 | `validFor` | unset | An extra wall-clock bound; no Sui network accepts one yet |
-| `maxGasBudget` | 50 SUI | The ceiling above which `Tx.build` fails with `BuildError` |
+| `maxGasBudget` | 50 SUI | The ceiling above which `Tx.build` fails with `PolicyDenied { rule: "maxGasBudget" }` |
 | `preflight` | unset | `(simulation) => Effect<void, PolicyDenied>`, run before signing |
 | `lockSender` | `true` | Whether `Tx.run` holds the sender lock from build through submit |
 | `resubmit` | exponential from 250 ms, capped at 30 s, jittered | How `Tx.submit` re-sends the identical bytes |
@@ -120,19 +163,19 @@ fields given; `SubmitConfig.layer({ … })` is the same as a `Layer`.
 | `expiryMargin` | 30 s | Skew allowed on the wall-clock expiry rule |
 | `expiryEvidence` | `"epochThenMiss"` | Whether a closed expiry window may prove `NotApplied` (`"never"` behind a mixed-node load balancer) |
 | `reconcileRecheck` | 2 s | The pause between the two observations the expiry rule needs |
-| `awaitVisibility` | `true` | Wait for the execution to be readable before releasing the lock |
+| `awaitVisibility` | `true` | Wait for the execution to be readable before returning (and releasing the lock); it delays every return, `lockSender: false` included |
 | `visibilityTimeout` | 15 s | How long that wait may take; it never changes the outcome |
 | `nonce` | a random `u32` | The nonce on a default `ValidDuring` expiration |
 
-## Ten invariants
+## Invariants
 
 1. `Tx.build` always simulates before anything is signed, on every transport: when the SDK's resolver will not, it runs one explicit simulate.
 2. `Tx.build` bounds a transaction to the current epoch and the next and names the chain; bytes signed for testnet cannot land on mainnet.
 3. `Tx.submit` journals `Signed` before the first send and re-sends the **identical** bytes, never a rebuild, on a retryable failure or a timeout.
-4. Once bytes may have been sent no `TransportError` escapes; it becomes `SubmissionUnknown`. The one exception is a gRPC `INVALID_ARGUMENT` on the first send: the node refused, nothing ran, and the journal entry is settled as `NotApplied { evidence: "refused" }`.
+4. Once bytes may have been sent no `TransportError` escapes; it becomes `SubmissionUnknown`. The one exception is a gRPC `INVALID_ARGUMENT` on the first send: the node refused, nothing ran, and the journal entry is settled as `NotApplied { evidence: "refused" }`. A `Tx.resubmit` never takes a refusal that way: an earlier send of the same bytes may have landed.
 5. `JournalError` escapes only from the `Signed` write, before anything is sent.
-6. `NotApplied { inputConsumed }` is built only on a **different** transaction's effects reporting the exact pinned `inputVersion`; an input that merely moved on is not evidence.
-7. A sponsored `Tx.run` needs `sponsor` whenever the gas owner is not the sender; pass the gas owner as `opts.gasOwner` so its lock is taken too.
+6. `NotApplied { inputConsumed }` is built only on a **different** transaction's effects reporting the exact pinned `inputVersion`; an input that merely moved on is not evidence. Positive evidence vetoes expiry: a pinned object naming the transaction's own digest is never answered `NotApplied { expired }`, and neither is a miss on a gRPC node that has pruned into the validity window (JSON-RPC and GraphQL cannot report pruning: set `expiryEvidence: "never"` behind pruning nodes there).
+7. A sponsored `Tx.run` needs `sponsor` whenever the gas owner is not the sender — `opts.gasOwner`, or one the recipe set itself (`Tx.sponsored`), which `Tx.run` reads from the recipe before locking. The gas owner's lock is taken only when gas is paid with its coins; an address-balance payment (`Tx.sponsored`) locks the sender alone, so one sponsor pays for many senders at once.
 8. Every SDK call forwards the Effect's `AbortSignal`, so `Effect.timeout` and interruption cancel the request.
 9. One Move type rule everywhere: a bare expected tag matches every instantiation of the generic; a parameterized one is compared in full.
 10. A test that runs `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default journal is process-wide; `layerTest` is the production `Sui`, so fixtures use `localnet`.
