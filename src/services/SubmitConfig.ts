@@ -278,13 +278,7 @@ const layer = (overrides: SubmitConfigOverrides): Layer.Layer<never> =>
 const withOverrides =
   (overrides: SubmitConfigOverrides) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-    Effect.provideServiceEffect(
-      effect,
-      SubmitConfigRef,
-      Effect.gen(function*() {
-        return resolve(overrides, yield* SubmitConfigRef)
-      })
-    )
+    Effect.updateService(effect, SubmitConfigRef, (inForce) => resolve(overrides, inForce))
 
 /**
  * The lifecycle settings.
