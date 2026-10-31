@@ -7,8 +7,11 @@
  *
  * @since 0.1.0
  */
-import { Effect, Layer, Option } from "effect"
+import { Effect, Layer, Option, Schedule } from "effect"
+import { TestClock } from "effect/testing"
 import type { NetworkMismatch, TransportError } from "./domain/errors.ts"
+import { Journal } from "./services/Journal.ts"
+import { SubmitConfig } from "./services/SubmitConfig.ts"
 import { Sui } from "./services/Sui.ts"
 import { SuiGraphQL } from "./services/SuiGraphQL.ts"
 import type { SuiCore } from "./services/SuiCore.ts"
@@ -18,8 +21,35 @@ import { SuiCoreFake } from "./services/SuiCoreFake.ts"
 export * from "./services/SuiCoreFake.ts"
 
 /**
+ * The lifecycle settings every test layer puts in force: `SubmitConfig.defaults`
+ * with the re-send schedule a fake has no use for taken out: re-sends of
+ * identical bytes follow each other with no delay (still `resubmitAttempts` of
+ * them), so a test that drives a `SubmissionUnknown` takes milliseconds on the
+ * real clock — it took seconds on the production schedule — and needs no
+ * `TestClock.adjust` for the re-sends. Everything else — the execute timeout,
+ * the expiry recheck, the visibility timeout, the gas ceiling — is the
+ * production default.
+ *
+ * A test that is *about* one of these sets it with `SubmitConfig.with`.
+ *
+ * @since 0.4.0
+ */
+export const testSubmitConfig: Partial<typeof SubmitConfig.defaults> = {
+  resubmit: Schedule.forever
+}
+
+/**
  * The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test
  * can script outcomes and inspect what the fake received.
+ *
+ * **It also puts {@link testSubmitConfig} in force** (a `Context.Reference`, so
+ * it does not show in the layer's type): a resubmit path does not sleep
+ * through the production schedule on the real clock. A `SubmitConfig` the
+ * test provides *inside* — `SubmitConfig.with(...)` — wins over it.
+ *
+ * It does **not** provide a journal: the default one is process-wide, so a test
+ * that submits provides `Journal.layerMemory` itself, or runs through
+ * {@link SuiTest.provide}, which does.
  *
  * This is `Sui.layerNoDeps`, the production layer, so the chain-id rules are
  * the production rules: a script whose `network` is `mainnet` or `testnet` must
@@ -34,7 +64,10 @@ export * from "./services/SuiCoreFake.ts"
 export const layerTest = (
   script: FakeScript = {}
 ): Layer.Layer<Sui | SuiCore | SuiCoreFake, NetworkMismatch | TransportError> =>
-  Sui.layerNoDeps.pipe(Layer.provideMerge(SuiCoreFake.layer(script)))
+  Sui.layerNoDeps.pipe(
+    Layer.provideMerge(SuiCoreFake.layer(script)),
+    Layer.provideMerge(SubmitConfig.layer(testSubmitConfig))
+  )
 
 /**
  * An extension's own layer over {@link layerTest}, which is the whole wiring an
@@ -237,6 +270,57 @@ const calls = (
   )
 
 /**
+ * Holds `waitForTransaction` for transactions the fake executed — real
+ * milliseconds, or `"never"` (until the caller's signal fires); `undefined`
+ * makes them visible at once again. See `FakeScript.visibilityDelay`. Never
+ * fails.
+ *
+ * @since 0.4.0
+ */
+const setVisibilityDelay = (
+  delay: number | "never" | undefined
+): Effect.Effect<void, never, SuiCoreFake> =>
+  withFake((fake) => fake.setVisibilityDelay(delay))
+
+/**
+ * The whole wiring of one test, as one `.pipe` step: provides `layer` (a
+ * {@link layerTest} or {@link layerExtensionTest}) plus a **fresh**
+ * `Journal.layerMemory` and `TestClock.layer()`, built **locally** —
+ * `{ local: true }`, so nothing is shared with another test through Effect's
+ * global layer memo map, however the layer value was shared.
+ *
+ * The journal is why: the default one is process-wide, and a test that forgets
+ * its own reads every other test's submissions from `listUnresolved`. The
+ * `TestClock` means the program's own sleeps (`executeTimeout`,
+ * `visibilityTimeout`, `reconcileRecheck`, a `Schedule` of your own) wait for
+ * `TestClock.adjust` instead of the real clock; the chain's clock is still
+ * `SuiTest.setClock`. Run the result with `Effect.runPromise` in the test.
+ *
+ * Fails with: whatever the program and the layer fail with.
+ *
+ * @since 0.4.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { layerExtensionTest, SuiTest } from "@unconfirmed/sui-effect/testing"
+ *
+ * const run = <A, E>(program: Effect.Effect<A, E, Escrow | Sui | SuiCoreFake>) =>
+ *   program.pipe(SuiTest.provide(layerExtensionTest(Escrow.layerTest(), script)), Effect.runPromise)
+ * ```
+ */
+const provide =
+  <ROut, E>(layer: Layer.Layer<ROut, E>) =>
+  <A, E2, R>(
+    effect: Effect.Effect<A, E2, R>
+  ): Effect.Effect<A, E | E2, Exclude<R, ROut | TestClock.TestClock>> =>
+    Effect.provide(
+      effect,
+      Layer.mergeAll(layer, Layer.sync(Journal, Journal.makeMemoryUnsafe), TestClock.layer()),
+      { local: true }
+    )
+
+/**
  * The harness: everything an extension's tests need to drive the fake from
  * inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
  *
@@ -266,5 +350,7 @@ export const SuiTest = {
   scriptSimulate,
   scriptGetTransaction,
   scriptGetObject,
-  calls
+  setVisibilityDelay,
+  calls,
+  provide
 } as const

@@ -27,7 +27,7 @@ import {
 } from "@mysten/sui/utils"
 import { Context, Effect, Layer, Option, Result, Schema } from "effect"
 import { typeMatches } from "../domain/bcs.ts"
-import { ExecutionReason } from "../domain/schemas.ts"
+import { Digest, ExecutionReason } from "../domain/schemas.ts"
 import type { SuiCoreService } from "./SuiCore.ts"
 import { DefectMarker, makeFromClient, SuiCore } from "./SuiCore.ts"
 
@@ -40,12 +40,61 @@ export const ClockBcs = bcs.struct("Clock", {
 /** The Move type of the Clock object. */
 export const CLOCK_TYPE = "0x2::clock::Clock"
 
-/** A deterministic base58 32-byte digest, for fixtures. */
-export const fakeDigest = (seed: number): string => {
+/**
+ * A deterministic base58 32-byte digest, for fixtures, already branded as a
+ * {@link Digest} so it compares with `executed.digest` and fills any field
+ * typed `Digest` without a cast. Never fails.
+ */
+export const fakeDigest = (seed: number): Digest => {
   const bytes = new Uint8Array(32)
   bytes[0] = (seed % 255) + 1
   bytes[31] = 7
-  return toBase58(bytes)
+  return Digest.make(toBase58(bytes))
+}
+
+/**
+ * A gas coin for {@link FakeScript.coins}, in the SDK's `SuiClientTypes.Coin`
+ * shape, with the fields a fixture rarely cares about filled in: `coinType`
+ * defaults to SUI, `version` to 1 and `digest` to a {@link fakeDigest}. `owner`
+ * is an address; the coin is `AddressOwner`-owned by it. Never fails.
+ *
+ * @since 0.4.0
+ *
+ * @example
+ * ```ts
+ * import { fakeCoin, layerTest } from "@unconfirmed/sui-effect/testing"
+ *
+ * const layer = layerTest({
+ *   coins: [fakeCoin({ objectId: "0xc01", owner: signer.address, balance: 1_000_000_000n })]
+ * })
+ * ```
+ */
+export const fakeCoin = (options: {
+  readonly objectId: string
+  readonly owner: string
+  readonly balance: bigint
+  readonly coinType?: string
+  readonly version?: bigint
+  readonly digest?: string
+}): SuiClientTypes.Coin => ({
+  objectId: normalizeSuiAddress(options.objectId),
+  version: (options.version ?? 1n).toString(),
+  digest: options.digest ?? fakeDigest(Number((options.version ?? 1n) % 200n) + 40),
+  owner: addressOwner(options.owner),
+  type: `0x2::coin::Coin<${options.coinType ?? SUI_TYPE_ARG}>`,
+  balance: options.balance.toString()
+})
+
+/**
+ * An event in a scripted execution: the SDK's `SuiClientTypes.Event` with
+ * `json` **optional**, because the library's own {@link Event} treats it as
+ * the node's rendering and never reads it. Leave it out; give it only to test
+ * code that reads `event.json` off a listing.
+ *
+ * @since 0.4.0
+ */
+export type FakeEvent = Omit<SuiClientTypes.Event, "json"> & {
+  readonly json?: SuiClientTypes.Event["json"]
 }
 
 /** An object the fake serves. */
@@ -103,11 +152,22 @@ export interface FakeChange {
 
 /** What a scripted success returns. Everything is optional and defaulted. */
 export interface FakeExecution {
+  /**
+   * The transaction's digest. Leave it out for an `execute` outcome: the fake
+   * derives the digest from the bytes it was handed, as a node does, and an
+   * execute scripted with a **different** digest dies naming both. Give it for
+   * a `simulate` of an unbuilt transaction, for a transaction scripted by
+   * digest, or for a `getTransaction` answer.
+   */
   readonly digest?: string
   readonly created?: ReadonlyArray<FakeChange>
   readonly mutated?: ReadonlyArray<FakeChange>
   readonly deleted?: ReadonlyArray<FakeChange>
-  readonly events?: ReadonlyArray<SuiClientTypes.Event>
+  /**
+   * The events the execution emitted. `json` may be left out (see
+   * {@link FakeEvent}); `bcs` is what `Executed.eventsOf` decodes.
+   */
+  readonly events?: ReadonlyArray<FakeEvent>
   readonly balanceChanges?: ReadonlyArray<SuiClientTypes.BalanceChange>
   /**
    * The per-command results a simulation reports.
@@ -294,6 +354,15 @@ export interface FakeScript {
    * map.
    */
   readonly dynamicFields?: Readonly<Record<string, ReadonlyArray<SuiClientTypes.DynamicFieldEntry>>>
+  /**
+   * The value `getDynamicField` serves for an entry of {@link dynamicFields},
+   * keyed by that entry's **`fieldId`** (not by the parent, and not by the
+   * key). `type` is the value's Move type and `bcs` its BCS bytes — what
+   * `sui.getDynamicField(parent, name, { schema })` decodes. An entry with no
+   * value here is served with empty bytes and its own `valueType`, which
+   * decodes only as an empty layout. Dynamic **object** fields do not use it:
+   * their value is the object `childId` names in the object map.
+   */
   readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>
   /** How many items a list method returns per page. Defaults to 50. */
   readonly pageSize?: number
@@ -331,11 +400,19 @@ export interface FakeScript {
   readonly epoch?: bigint
   readonly simulate?: ReadonlyArray<FakeOutcome>
   /**
-   * What the resolve plugin's budget simulation does during
-   * `transaction.build({ client })`. Empty (the default) means the plugin sets
-   * the budget from `gasBudget` without simulating, which is what most tests
-   * want; scripting `failWith` here is how a test makes `Tx.build` fail with
-   * `SimulationFailed` the way a real node's resolver does.
+   * What the resolve plugin's budget simulation answers during
+   * `transaction.build({ client })` — which `Tx.build` always reaches, since
+   * it sets no budget up front.
+   *
+   * The resolver simulates whenever the transaction has no gas budget yet, and
+   * that call is **always recorded** as a `simulateTransaction` with
+   * `resolver: true`, scripted or not. It is answered by this script when it
+   * has entries, else by the ordered {@link simulate} script (so
+   * `simulate: [FakeOutcome.failWith(...)]` surfaces through `Tx.build` too),
+   * else not at all, and the budget comes from {@link gasBudget}. Script
+   * `failWith` here to make `Tx.build` fail with `SimulationFailed` without
+   * touching the `simulate` script a later `Tx.verify` or `preflight` reads;
+   * `timeoutThen` blocks the build until it is interrupted.
    */
   readonly buildSimulate?: ReadonlyArray<FakeOutcome>
   readonly execute?: ReadonlyArray<FakeOutcome>
@@ -356,6 +433,22 @@ export interface FakeScript {
    * `NotApplied { inputConsumed }` rule.
    */
   readonly transactions?: Readonly<Record<string, FakeOutcome>>
+  /**
+   * How long `waitForTransaction` takes to see a transaction this fake
+   * executed, in **real** milliseconds, or `"never"`: the wait does not settle
+   * until the caller's `AbortSignal` fires (a `SubmitConfig.visibilityTimeout`
+   * on a `TestClock`, or an interruption). Unset, a transaction is visible the
+   * moment it executes.
+   *
+   * This is how a test reaches the window between "the node answered the
+   * execute" and "the transaction is visible to reads" — the window `Tx.submit`
+   * spends in its visibility wait, where an interrupt or a timeout must not
+   * lose the `Executed` it already has. Change it mid-test with
+   * `SuiTest.setVisibilityDelay`.
+   *
+   * @since 0.4.0
+   */
+  readonly visibilityDelay?: number | "never"
 }
 
 /** One call the fake received, in order. */
@@ -393,6 +486,13 @@ export interface SuiCoreFakeState {
   /** Moves the epoch `getCurrentSystemState` reports. */
   readonly setEpoch: (epoch: bigint) => Effect.Effect<void>
   /**
+   * Replaces {@link FakeScript.visibilityDelay}; `undefined` makes executed
+   * transactions visible at once again.
+   *
+   * @since 0.4.0
+   */
+  readonly setVisibilityDelay: (delay: number | "never" | undefined) => Effect.Effect<void>
+  /**
    * Teaches the fake about one transaction **by digest**, the way
    * `FakeScript.transactions` does for a script written up front.
    */
@@ -421,6 +521,7 @@ interface Mutable {
   deleted: Set<string>
   clockTimestampMs: bigint
   epoch: bigint
+  visibilityDelay: number | "never" | undefined
   calls: Array<RecordedCall>
   aborted: number
   cursors: {
@@ -687,6 +788,19 @@ export class FakeUnimplemented extends Error {
   }
 }
 
+/**
+ * Thrown, and re-thrown as a defect, when a script asks the fake for something
+ * no node would do — an execute answered with a digest that is not the bytes'
+ * own. A broken fixture, not a failing test.
+ */
+class FakeScriptError extends Error {
+  readonly [DefectMarker] = true
+  constructor(message: string) {
+    super(`SuiCoreFake: ${message}`)
+    this.name = "FakeScriptError"
+  }
+}
+
 const unimplemented = (method: string): never => {
   throw new FakeUnimplemented(method)
 }
@@ -694,8 +808,8 @@ const unimplemented = (method: string): never => {
 /**
  * The in-memory `SuiCore`.
  *
- * Three things about it that a test has to know, because they are not visible
- * from the outside:
+ * What a test has to know about it, because none of it is visible from the
+ * outside:
  *
  * - **Its `client` implements `$extend`.** `SuiCoreFakeState.client` is a
  *   `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` gives a
@@ -704,7 +818,9 @@ const unimplemented = (method: string): never => {
  * - **`listOwnedObjects` filters like a node.** The `type` option goes through
  *   the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
  *   instantiation of a generic rather than only its own spelling.
- * - **`getDynamicField` matches on `name.type` *and* `name.bcs`.** An entry
+ * - **`getDynamicField` matches on `name.type` *and* `name.bcs`**, the type
+ *   under the same `typeMatches` rule, so a short and a padded spelling of one
+ *   key type are the same key. An entry
  *   scripted without `bcs` still matches any key of its type, which is what a
  *   test that only cares about the type wants; two entries of one type on one
  *   parent are told apart by their bytes, so a test can prove which key encoding
@@ -721,6 +837,14 @@ const unimplemented = (method: string): never => {
  *   needs when it follows a pinned object's `previousTransaction` to find out
  *   which version the consuming transaction took. `FakeChange.inputVersion` is
  *   how a test says which version that was.
+ * - **An execute's digest is the bytes' own.** The fake derives it with
+ *   `TransactionDataBuilder.getDigestFromBytes`, the way a node does, and an
+ *   execute outcome scripted with a different `digest` is a broken fixture: the
+ *   call dies saying so rather than handing `Tx.submit` another transaction.
+ * - **Visibility is instant unless scripted.** `FakeScript.visibilityDelay`
+ *   (or `SuiTest.setVisibilityDelay`) holds `waitForTransaction` for an executed
+ *   transaction, which is how a test reaches the window after the execute
+ *   answered and before `Tx.submit` returns.
  *
  * @example
  * ```ts
@@ -772,6 +896,7 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
       deleted: new Set(),
       clockTimestampMs: script.clockTimestampMs ?? 1_700_000_000_000n,
       epoch: script.epoch ?? DEFAULT_EPOCH,
+      visibilityDelay: script.visibilityDelay,
       calls: [],
       aborted: 0,
       cursors: { simulate: 0, execute: 0, getTransaction: 0, buildSimulate: 0, getObject: 0 },
@@ -1036,6 +1161,33 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     return signal instanceof AbortSignal ? signal : undefined
   }
 
+  /**
+   * The scripted wait before an executed transaction is visible: nothing,
+   * a real-time delay that the caller's signal cuts short, or a wait that only
+   * the signal ends.
+   */
+  const visibility = async (options: unknown): Promise<void> => {
+    const delay = state.visibilityDelay
+    if (delay === undefined || delay === 0) return
+    if (delay === "never") {
+      await pending<never>("waitForTransaction (visibilityDelay: \"never\")", options)
+      return
+    }
+    const signal = signalOf(options)
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, delay)
+      signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer)
+          state.aborted += 1
+          reject(abortError())
+        },
+        { once: true }
+      )
+    })
+  }
+
   const pending = async <A>(method: string, options: unknown): Promise<A> => {
     const signal = signalOf(options)
     if (signal === undefined) {
@@ -1054,9 +1206,27 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     method: "simulate" | "execute" | "getTransaction",
     digest: string,
     options: unknown,
-    executingPayment: ReadonlyArray<string> = []
+    executingPayment: ReadonlyArray<string> = [],
+    derivedFromBytes = false
   ): Promise<SettledTransaction> => {
     const outcome = next(method) ?? unimplemented(METHOD_NAMES[method])
+    if (
+      derivedFromBytes &&
+      (outcome._tag === "succeed" || outcome._tag === "failWith") &&
+      outcome.value.digest !== undefined &&
+      outcome.value.digest !== digest
+    ) {
+      // A network derives the digest from the bytes; no node answers an
+      // execute of these bytes with another transaction's digest. Serving the
+      // scripted one made a test of `Tx.submit` pass on an `Executed` for a
+      // transaction it never sent.
+      throw new FakeScriptError(
+        `${METHOD_NAMES[method]}: the script answers digest ${outcome.value.digest}, but` +
+          ` the bytes it was handed have digest ${digest}. A node derives the digest from` +
+          " the bytes: leave `digest` out of an execute outcome, or script the transaction" +
+          " you mean by digest with `FakeScript.transactions`."
+      )
+    }
     if (outcome._tag === "timeoutThen") {
       state.pendingDigests.set(digest, outcome.found)
       return pending<never>(method, options)
@@ -1327,13 +1497,17 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   }
 
   /** The digest of the bytes that were handed to us, as the network derives it. */
-  const digestOfBytes = (bytes: Uint8Array): string => {
+  const derivedDigestOf = (bytes: Uint8Array): string | undefined => {
     try {
       return TransactionDataBuilder.getDigestFromBytes(bytes)
     } catch {
-      return fakeDigest(state.calls.length + 1)
+      return undefined
     }
   }
+
+  /** The same, with a stand-in for bytes that are not a transaction (a unit-test fixture). */
+  const digestOfBytes = (bytes: Uint8Array): string =>
+    derivedDigestOf(bytes) ?? fakeDigest(state.calls.length + 1)
 
   /**
    * The scripted read failure for this `getObject` call, if a script asked for
@@ -1595,7 +1769,10 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       const parent = normalizeSuiAddress(options.parentId)
       const entry = (script.dynamicFields?.[parent] ?? []).find(
         (field) =>
-          field.name.type === options.name.type && sameBytes(field.name.bcs, options.name.bcs)
+          // The one Move type rule, so `0x2::object::ID` and its padded
+          // spelling name the same key type.
+          typeMatches(options.name.type, field.name.type) &&
+          sameBytes(field.name.bcs, options.name.bcs)
       )
       if (entry === undefined) {
         throw new ObjectError("notFound", "dynamic field not found", {
@@ -1682,7 +1859,8 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     executeTransaction: async (options: SuiClientTypes.ExecuteTransactionOptions) => {
       record("executeTransaction", options)
-      const digest = digestOfBytes(options.transaction)
+      const derived = derivedDigestOf(options.transaction)
+      const digest = derived ?? fakeDigest(state.calls.length + 1)
       assertSignatures(options.transaction, options.signatures ?? [])
       const known = state.knownTransactions.get(digest)
       if (known !== undefined) {
@@ -1693,7 +1871,13 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         // replay idempotency untestable.
         return asResult(known)
       }
-      const settled = await settle("execute", digest, options, paymentOfBytes(options.transaction))
+      const settled = await settle(
+        "execute",
+        digest,
+        options,
+        paymentOfBytes(options.transaction),
+        derived !== undefined
+      )
       state.knownTransactions.set(digest, settled)
       appendToLedger(digest)
       state.executedMeta.set(digest, metaOfBytes(options.transaction))
@@ -1716,7 +1900,10 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       // `Tx.submit` makes after a successful execute must not consume the
       // `getTransaction` script a reconcile test set up.
       const known = state.knownTransactions.get(digest)
-      if (known !== undefined) return asResult(known)
+      if (known !== undefined) {
+        await visibility(options)
+        return asResult(known)
+      }
       return asResult(await settle("getTransaction", digest, options))
     },
     simulateTransaction: async (options: SuiClientTypes.SimulateTransactionOptions) => {
@@ -1922,6 +2109,10 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     setEpoch: (epoch) =>
       Effect.sync(() => {
         state.epoch = epoch
+      }),
+    setVisibilityDelay: (delay) =>
+      Effect.sync(() => {
+        state.visibilityDelay = delay
       }),
     recordTransaction: (digest, outcome) =>
       Effect.sync(() => {
