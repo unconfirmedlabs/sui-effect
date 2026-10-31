@@ -9,6 +9,6 @@ export const pay = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
     tx.transferObjects([coin!], recipient)
   }, { signer }).pipe(
     Effect.map((executed) => executed.digest),
-    // A ceiling, not a budget: the build fails with `BuildError` above it.
+    // A ceiling, not a budget: above it the build fails with `PolicyDenied { rule: "maxGasBudget" }`.
     SubmitConfig.with({ maxGasBudget: Mist.make(1_000_000_000n) })
   )
