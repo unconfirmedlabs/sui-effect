@@ -25,8 +25,7 @@ import {
   Logger,
   Predicate,
   Result,
-  Schema,
-  SchemaIssue
+  Schema
 } from "effect"
 import * as Base64 from "effect/encoding/Base64"
 import type { NetworkMismatch, SuiError, TransportError } from "../domain/errors.ts"
@@ -137,7 +136,8 @@ export class Script extends Context.Service<Script, ScriptService>()("@unconfirm
    *
    * Reads `SUI_NETWORK` (required, no default; `mainnet` refused unless
    * `SUI_ALLOW_MAINNET=1`), `SUI_RPC_URL` (optional, defaulted per network) and
-   * `SUI_PRIVATE_KEY` (Bech32, through `Config.Redacted`).
+   * `SUI_PRIVATE_KEY` (a Bech32 `suiprivkey1…` or a 32-byte hex seed, through
+   * `Config.Redacted`; see `Signer.fromConfig`).
    *
    * Fails with: `ConfigError`, `NetworkMismatch`, `TransportError`.
    */
@@ -587,33 +587,6 @@ const oneLine = (text: string): string => text.replace(/\s*\n\s*/g, "; ").trim()
  * spells it: the segments joined with `_` (`["TIPJAR", "PACKAGE_ID"]` is
  * `TIPJAR_PACKAGE_ID`).
  */
-const envNameOf = (path: ReadonlyArray<PropertyKey>): string => path.map(String).join("_")
-
-const formatIssue = SchemaIssue.makeFormatterDefault()
-
-/**
- * A `ConfigError` as one line that names the variable: `missing SUI_NETWORK`
- * when it was not set at all, `TIPJAR_PACKAGE_ID: Expected …` when it was set
- * and did not fit. A source error (the mainnet gate, an unreadable provider)
- * is its message.
- */
-const describeConfigError = (error: Config.ConfigError): string => {
-  const cause = error.cause
-  if (!Schema.isSchemaError(cause)) return `ConfigError ${oneLine(cause.message)}`
-  const issue = cause.issue
-  if (issue._tag === "Pointer" && issue.path.length > 0) {
-    const name = envNameOf(issue.path)
-    const inner = issue.issue
-    // A variable that is not set reaches the schema as no input at all, which
-    // the schema reports as the wrong *type* with nothing to show for it.
-    if (inner._tag === "InvalidType" && !SchemaIssue.hasInput(inner)) {
-      return `ConfigError missing ${name}`
-    }
-    return `ConfigError ${name}: ${oneLine(formatIssue(inner))}`
-  }
-  return `ConfigError ${oneLine(formatIssue(issue))}`
-}
-
 /**
  * The lines for one failure: `SuiError.describe`, made one line, for every
  * tagged value — taxonomy or not — then the digest, and for a
@@ -621,16 +594,13 @@ const describeConfigError = (error: Config.ConfigError): string => {
  * print the same entry (whose `entry:` line carries them), and the reconcile
  * hint.
  *
- * `ConfigError` is rendered here (`ConfigError missing SUI_NETWORK`) rather
- * than by `describe`, which renders it the same way from 0.4.0 on.
+ * A `ConfigError` goes through `describe` like everything else, which names
+ * the variable (`ConfigError missing SUI_NETWORK`).
  */
 const describeFailure = (
   error: unknown,
   withEntry: ReadonlySet<string>
 ): ReadonlyArray<string> => {
-  if (isConfigError(error) && error instanceof Config.ConfigError) {
-    return [describeConfigError(error)]
-  }
   if (!hasTag(error)) return [oneLine(String(error))]
   const lines: Array<string> = [oneLine(SuiErrorHelpers.describe(error))]
   if (!SuiErrorHelpers.isTaxonomy(error)) return lines
