@@ -145,11 +145,18 @@ describe("PromiseFace: the type recurses where the runtime recurses", () => {
 // ---------------------------------------------------------------------------
 
 describe("a cold call is a real Promise", () => {
-  test("it is instanceof Promise, and expect(...).rejects sees it", async () => {
+  test("it is instanceof Promise, and awaiting it rejects with ExtensionNotReady", async () => {
+    // Since 0.4.0 (ext#1) the placeholder is a callable Proxy over the real
+    // Promise, so a cold recipe builder's result can be applied and throw
+    // `ExtensionNotReady`. `instanceof`, `then` and `await` are unchanged;
+    // `bun:test`'s `expect(...).rejects` checks for a native Promise, so a test
+    // of a *cold* call hands it `Promise.resolve(cold)`.
     const api = facedClient(false)
     const cold = (api as unknown as { readonly packageId: () => Promise<unknown> }).packageId()
     expect(cold).toBeInstanceOf(Promise)
-    await expect(cold).rejects.toBeInstanceOf(ExtensionNotReady)
+    await expect(Promise.resolve(cold)).rejects.toBeInstanceOf(ExtensionNotReady)
+    const error = await cold.then(() => undefined, (e: unknown) => e)
+    expect(error).toBeInstanceOf(ExtensionNotReady)
     await api.$dispose()
   })
 
