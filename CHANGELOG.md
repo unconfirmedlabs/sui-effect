@@ -371,6 +371,29 @@ package did not. Several signatures and one stored shape change; read
   summary is cut short at a prose line starting with `@`.
 - `examples/script-claim.ts`'s header put `UnexpectedEffects` on exit 4; it
   exits 5 (applied), as `Script.exitCode` and the README always said.
+- A failed `Signed` write on a re-send (`Tx.resubmit`, `reconcileAll({
+  resubmit })`, a second submit) no longer erases the run's earlier `Unknown`,
+  `Executed` or `Failed` record of those bytes, which made `Script.run` exit 4
+  instead of 3 or 5.
+- `Tx.reconcile` refuses a `getTransaction` answer for another digest (it was
+  returned and journalled under the foreign digest; it is now
+  `SubmissionUnknown`), and such an answer is never `NotApplied {
+  inputConsumed }` evidence.
+- The sender lock (`Sui.withSenderLock`, and the Promise face's process-wide
+  one) is keyed on the normalized address, so an upper-case `SuiAddress.make`
+  spelling of a sender no longer gets a second lock.
+- `SuiError.describe`, `toJson` and `.message` no longer overflow the stack for
+  an extension error whose `message` getter calls `SuiError.describe(this)`, or
+  for a cyclic `cause`; every helper documented "Never fails" now is, over a
+  null-prototype object, a throwing getter or `toString`, a revoked Proxy and a
+  taxonomy tag without its fields, and `isMoveAbort(e, { code: 1.5 })` is
+  `false` rather than a `RangeError`.
+- The Promise face: awaiting a cold face (`Promise.resolve(face)`, an `async`
+  function returning it) settles instead of hanging; `$ready()` and
+  `$reconcileAll()` after `$dispose()` on a `warm` registration no longer leak
+  a runtime; a cold member's `call`, `apply` and `bind` work as on a function
+  (a namespace member by those names still works); and `"prototype" in` a cold
+  call no longer throws.
 
 ### Migrating from 0.3.x
 
