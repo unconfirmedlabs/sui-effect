@@ -286,6 +286,7 @@ The full entries follow under "API".
 - `OutcomePhase` — Where in the lifecycle a failure was caught, which is the only thing that can classify an error the taxonomy does not own.
 - `Owner` — An object owner.
 - `PolicyDenied` — A preflight policy refused the transaction before it was signed.
+- `Published` — What `Executed.expectPublished` answers: the package id, the package's own changed ref, and the `UpgradeCap` that governs it.
 - `Recipe` — A synchronous transaction draft.
 - `SdkObjectRef` — The SDK's own object reference shape, as `Transaction#objectRef` takes it.
 - `Signature` — A serialized signature, as every SDK signer returns it: the base64 of the flag, signature and public key bytes.
@@ -645,6 +646,7 @@ The full entries follow under "API".
 - `DEFAULT_EPOCH` — The epoch the fake reports when a script does not set one.
 - `FakeBalance` — A balance the fake serves, optionally for one owner.
 - `FakeChange` — A created, mutated or deleted object in a scripted execution.
+- `FakeEvent` — An event in a scripted execution: the SDK's `SuiClientTypes.Event` with `json` **optional**, because the library's own `Event` treats it as the node's rendering and never reads it.
 - `FakeExecution` — What a scripted success returns.
 - `FakeObject` — An object the fake serves.
 - `FakeOutcome` — One scripted outcome of a call.
@@ -654,16 +656,18 @@ The full entries follow under "API".
 - `SuiCoreFake` — The in-memory `SuiCore`.
 - `SuiCoreFakeState` — What a test can do to the fake while it runs.
 - `SuiTest` — The harness: everything an extension's tests need to drive the fake from inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
-- `fakeDigest` — A deterministic base58 32-byte digest, for fixtures.
+- `fakeCoin` — A gas coin for `FakeScript.coins`, in the SDK's `SuiClientTypes.Coin` shape, with the fields a fixture rarely cares about filled in: `coinType` defaults to SUI, `version` to 1 and `digest` to a `fakeDigest`.
+- `fakeDigest` — A deterministic base58 32-byte digest, for fixtures, already branded as a `Digest` so it compares with `executed.digest` and fills any field typed `Digest` without a cast.
 - `layerExtensionTest` — An extension's own layer over `layerTest`, which is the whole wiring an extension test needs.
 - `layerTest` — The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test can script outcomes and inspect what the fake received.
+- `testSubmitConfig` — The lifecycle settings every test layer puts in force: `SubmitConfig.defaults` with the re-send schedule a fake has no use for taken out: re-sends of identical bytes follow each other with no delay (still `resubmitAttempts` of them), so a test that drives a `SubmissionUnknown` takes milliseconds on the real clock — it took seconds on the production schedule — and needs no `TestClock.adjust` for the re-sends.
 
 # API
 
 ## `@unconfirmed/sui-effect`
 
 
-91 exported symbols.
+92 exported symbols.
 
 ### `Balance` (const)
 
@@ -1206,21 +1210,114 @@ export declare class Executed extends Executed_base {
      * that type, or more than one.
      */
     expectCreated(type: string): Effect.Effect<ChangedRef, UnexpectedEffects>;
+    /**
+     * Every event this transaction emitted whose type matches the codec's Move
+     * type, decoded with that codec, in emission order.
+     *
+     * The codec is a `SuiSchema.bcs(layout, type)` (or anything piped from one):
+     * the type it was built with selects the events under the one Move type rule
+     * (`typeMatches` — a bare tag matches every instantiation of a generic event),
+     * and its layout decodes each one's `bcs`. Pass `eventType` to select by a
+     * different type than the codec records, or to give one to a codec built
+     * without a type.
+     *
+     * **After a package upgrade an event struct keeps the id of the package that
+     * first defined it**, even when a later version emits it, so a codec tagged
+     * with the latest package id selects nothing for a struct that existed in v1.
+     *
+     * No match is an empty array, not a failure; `expectEvent` is the
+     * "exactly one" form. An event with no BCS (a relay envelope that rendered
+     * events as JSON, read through `Executed.fromPartial`) fails to decode.
+     *
+     * Fails with: `DecodeError` — `kind: "bytes"` when a selected event's bytes do
+     * not parse, `kind: "type"` when neither the codec nor `eventType` names a
+     * Move type to select by.
+     *
+     * @since 0.4.0
+     *
+     * @example
+     * ```ts
+     * import { bcs } from "@mysten/sui/bcs"
+     * import { Effect } from "effect"
+     * import { SuiSchema } from "@unconfirmed/sui-effect"
+     * import type { Executed } from "@unconfirmed/sui-effect"
+     *
+     * const Posted = SuiSchema.bcs(bcs.struct("Posted", { index: bcs.u64() }), `${PKG}::board::Posted`)
+     *
+     * const indices = (executed: Executed) =>
+     *   Effect.map(executed.eventsOf(Posted), (events) => events.map((event) => event.index))
+     * ```
+     */
+    eventsOf<T>(codec: Schema.Codec<T, Uint8Array>, eventType?: string): Effect.Effect<ReadonlyArray<T>, DecodeError>;
+    /**
+     * The single event of the codec's type this transaction emitted, decoded.
+     *
+     * The "this call emits exactly one `Posted`" assertion, so a caller does not
+     * write `events.find(...)` plus a decode plus a `die` for the missing case.
+     * Selection and decoding are `eventsOf`'s.
+     *
+     * Fails with: `UnexpectedEffects` when the transaction emitted no event of
+     * that type, or more than one — its `found` holds the emitting package id of
+     * each matching event, so its length is the count; `DecodeError` when the one
+     * event does not decode, or when there is no Move type to select by.
+     *
+     * @since 0.4.0
+     */
+    expectEvent<T>(codec: Schema.Codec<T, Uint8Array>, eventType?: string): Effect.Effect<T, UnexpectedEffects | DecodeError>;
+    /**
+     * The package this transaction published — or the new version an upgrade
+     * created — and its `UpgradeCap`.
+     *
+     * A publish creates exactly one package (`packagesPublished()`) and one
+     * `0x2::package::UpgradeCap`; an upgrade creates the new package version
+     * and **mutates** the cap it was authorized with, so `upgradeCap` is the
+     * created cap when there is one and the mutated one otherwise. The cap is
+     * found through `objectTypes`, which every execute and `Tx.submit` reads.
+     *
+     * Remember that a publish's `UpgradeCap` must go somewhere: the recipe
+     * `transferObjects`es the `tx.publish(...)` result to the sender, or the
+     * transaction fails with an unused value.
+     *
+     * Fails with: `UnexpectedEffects` when the transaction published no package
+     * or more than one (`found` lists the package ids), or when no single
+     * `UpgradeCap` was created or mutated (`found` lists the caps it saw).
+     *
+     * @since 0.4.0
+     *
+     * @example
+     * ```ts
+     * import { Effect } from "effect"
+     * import { Tx } from "@unconfirmed/sui-effect/tx"
+     *
+     * const deploy = Effect.gen(function*() {
+     *   const executed = yield* Tx.run(publishRecipe, { signer })
+     *   const { packageId, upgradeCap } = yield* executed.expectPublished()
+     *   return { packageId, upgradeCapId: upgradeCap.id }
+     * })
+     * ```
+     */
+    expectPublished(): Effect.Effect<Published, UnexpectedEffects>;
 }
 ```
 
 A transaction the network executed, built from the fixed execute include set:
 effects, events, balance changes and object types.
 
-**`events` is `ReadonlyArray<Event>`, not `SuiClientTypes.Event[]`.** It is
-that type minus `json`: `packageId`, `module`, `sender`, `eventType` and
-`bcs`, with the branded ids this package uses. The SDK's `json` is dropped on
-purpose — it is the node's own rendering, it is absent on most transports,
-and the decode a caller wants is `SuiSchema.decode(codec, event.bcs)`, which
+**`events` is `ReadonlyArray<Event>`, not `SuiClientTypes.Event[]`.** It
+carries `packageId`, `module`, `sender`, `eventType` and `bcs`, with the
+branded ids this package uses, and an **optional** `json`: the node's own
+rendering, present only when the source carried one — a reduced envelope
+read through `Executed.fromPartial` may; a gRPC execute never does. Do
+not branch on it. The decode a caller wants is `Executed.eventsOf` /
+`Executed.expectEvent` (or `SuiSchema.decode(codec, event.bcs)`), which
 gives a typed value rather than a shape that changes with the node. Code
-typed against the SDK's `Event[]` therefore does not accept these; take
-`ReadonlyArray<Event>` from `@unconfirmed/sui-effect`, or map the fields you
-need.
+typed against the SDK's `Event[]` (whose `json` is required) therefore does
+not accept these; take `ReadonlyArray<Event>` from `@unconfirmed/sui-effect`,
+or map the fields you need.
+
+The data fields are `digest`, `effects`, `events`, `balanceChanges`,
+`objectTypes` (object id to Move type), `checkpoint` (`null` until the node
+says) and `timestampMs` (`null` likewise).
 
 ### `ExecutionFailed` (class)
 
@@ -1760,6 +1857,19 @@ export declare class PolicyDenied extends PolicyDenied_base {
 ```
 
 A preflight policy refused the transaction before it was signed.
+
+### `Published` (interface)
+
+```ts
+export interface Published {
+    readonly packageId: ObjectId;
+    readonly package: ChangedRef;
+    readonly upgradeCap: ChangedRef;
+}
+```
+
+What `Executed.expectPublished` answers: the package id, the package's
+own changed ref, and the `UpgradeCap` that governs it.
 
 ### `Recipe` (type)
 
@@ -5505,7 +5615,7 @@ Returns the exit code as well as passing it to `exit`, so a test can inject
 ## `@unconfirmed/sui-effect/testing`
 
 
-17 exported symbols.
+20 exported symbols.
 
 ### `CLOCK_TYPE` (const)
 
@@ -5585,15 +5695,39 @@ export interface FakeChange {
 
 A created, mutated or deleted object in a scripted execution.
 
+### `FakeEvent` (type)
+
+```ts
+export type FakeEvent = Omit<SuiClientTypes.Event, "json"> & {
+    readonly json?: SuiClientTypes.Event["json"];
+};
+```
+
+An event in a scripted execution: the SDK's `SuiClientTypes.Event` with
+`json` **optional**, because the library's own `Event` treats it as
+the node's rendering and never reads it. Leave it out; give it only to test
+code that reads `event.json` off a listing.
+
 ### `FakeExecution` (interface)
 
 ```ts
 export interface FakeExecution {
+    /**
+     * The transaction's digest. Leave it out for an `execute` outcome: the fake
+     * derives the digest from the bytes it was handed, as a node does, and an
+     * execute scripted with a **different** digest dies naming both. Give it for
+     * a `simulate` of an unbuilt transaction, for a transaction scripted by
+     * digest, or for a `getTransaction` answer.
+     */
     readonly digest?: string;
     readonly created?: ReadonlyArray<FakeChange>;
     readonly mutated?: ReadonlyArray<FakeChange>;
     readonly deleted?: ReadonlyArray<FakeChange>;
-    readonly events?: ReadonlyArray<SuiClientTypes.Event>;
+    /**
+     * The events the execution emitted. `json` may be left out (see
+     * `FakeEvent`); `bcs` is what `Executed.eventsOf` decodes.
+     */
+    readonly events?: ReadonlyArray<FakeEvent>;
     readonly balanceChanges?: ReadonlyArray<SuiClientTypes.BalanceChange>;
     /**
      * The per-command results a simulation reports.
@@ -5740,6 +5874,15 @@ export interface FakeScript {
      * map.
      */
     readonly dynamicFields?: Readonly<Record<string, ReadonlyArray<SuiClientTypes.DynamicFieldEntry>>>;
+    /**
+     * The value `getDynamicField` serves for an entry of `dynamicFields`,
+     * keyed by that entry's **`fieldId`** (not by the parent, and not by the
+     * key). `type` is the value's Move type and `bcs` its BCS bytes — what
+     * `sui.getDynamicField(parent, name, { schema })` decodes. An entry with no
+     * value here is served with empty bytes and its own `valueType`, which
+     * decodes only as an empty layout. Dynamic **object** fields do not use it:
+     * their value is the object `childId` names in the object map.
+     */
     readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>;
     /** How many items a list method returns per page. Defaults to 50. */
     readonly pageSize?: number;
@@ -5777,11 +5920,19 @@ export interface FakeScript {
     readonly epoch?: bigint;
     readonly simulate?: ReadonlyArray<FakeOutcome>;
     /**
-     * What the resolve plugin's budget simulation does during
-     * `transaction.build({ client })`. Empty (the default) means the plugin sets
-     * the budget from `gasBudget` without simulating, which is what most tests
-     * want; scripting `failWith` here is how a test makes `Tx.build` fail with
-     * `SimulationFailed` the way a real node's resolver does.
+     * What the resolve plugin's budget simulation answers during
+     * `transaction.build({ client })` — which `Tx.build` always reaches, since
+     * it sets no budget up front.
+     *
+     * The resolver simulates whenever the transaction has no gas budget yet, and
+     * that call is **always recorded** as a `simulateTransaction` with
+     * `resolver: true`, scripted or not. It is answered by this script when it
+     * has entries, else by the ordered `simulate` script (so
+     * `simulate: [FakeOutcome.failWith(...)]` surfaces through `Tx.build` too),
+     * else not at all, and the budget comes from `gasBudget`. Script
+     * `failWith` here to make `Tx.build` fail with `SimulationFailed` without
+     * touching the `simulate` script a later `Tx.verify` or `preflight` reads;
+     * `timeoutThen` blocks the build until it is interrupted.
      */
     readonly buildSimulate?: ReadonlyArray<FakeOutcome>;
     readonly execute?: ReadonlyArray<FakeOutcome>;
@@ -5802,6 +5953,22 @@ export interface FakeScript {
      * `NotApplied { inputConsumed }` rule.
      */
     readonly transactions?: Readonly<Record<string, FakeOutcome>>;
+    /**
+     * How long `waitForTransaction` takes to see a transaction this fake
+     * executed, in **real** milliseconds, or `"never"`: the wait does not settle
+     * until the caller's `AbortSignal` fires (a `SubmitConfig.visibilityTimeout`
+     * on a `TestClock`, or an interruption). Unset, a transaction is visible the
+     * moment it executes.
+     *
+     * This is how a test reaches the window between "the node answered the
+     * execute" and "the transaction is visible to reads" — the window `Tx.submit`
+     * spends in its visibility wait, where an interrupt or a timeout must not
+     * lose the `Executed` it already has. Change it mid-test with
+     * `SuiTest.setVisibilityDelay`.
+     *
+     * @since 0.4.0
+     */
+    readonly visibilityDelay?: number | "never";
 }
 ```
 
@@ -5844,8 +6011,8 @@ export declare class SuiCoreFake extends SuiCoreFake_base {
 
 The in-memory `SuiCore`.
 
-Three things about it that a test has to know, because they are not visible
-from the outside:
+What a test has to know about it, because none of it is visible from the
+outside:
 
 - **Its `client` implements `$extend`.** `SuiCoreFakeState.client` is a
   `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` gives a
@@ -5854,7 +6021,9 @@ from the outside:
 - **`listOwnedObjects` filters like a node.** The `type` option goes through
   the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
   instantiation of a generic rather than only its own spelling.
-- **`getDynamicField` matches on `name.type` *and* `name.bcs`.** An entry
+- **`getDynamicField` matches on `name.type` *and* `name.bcs`**, the type
+  under the same `typeMatches` rule, so a short and a padded spelling of one
+  key type are the same key. An entry
   scripted without `bcs` still matches any key of its type, which is what a
   test that only cares about the type wants; two entries of one type on one
   parent are told apart by their bytes, so a test can prove which key encoding
@@ -5871,6 +6040,14 @@ from the outside:
   needs when it follows a pinned object's `previousTransaction` to find out
   which version the consuming transaction took. `FakeChange.inputVersion` is
   how a test says which version that was.
+- **An execute's digest is the bytes' own.** The fake derives it with
+  `TransactionDataBuilder.getDigestFromBytes`, the way a node does, and an
+  execute outcome scripted with a different `digest` is a broken fixture: the
+  call dies saying so rather than handing `Tx.submit` another transaction.
+- **Visibility is instant unless scripted.** `FakeScript.visibilityDelay`
+  (or `SuiTest.setVisibilityDelay`) holds `waitForTransaction` for an executed
+  transaction, which is how a test reaches the window after the execute
+  answered and before `Tx.submit` returns.
 
 ### `SuiCoreFakeState` (interface)
 
@@ -5903,6 +6080,13 @@ export interface SuiCoreFakeState {
     /** Moves the epoch `getCurrentSystemState` reports. */
     readonly setEpoch: (epoch: bigint) => Effect.Effect<void>;
     /**
+     * Replaces `FakeScript.visibilityDelay`; `undefined` makes executed
+     * transactions visible at once again.
+     *
+     * @since 0.4.0
+     */
+    readonly setVisibilityDelay: (delay: number | "never" | undefined) => Effect.Effect<void>;
+    /**
      * Teaches the fake about one transaction **by digest**, the way
      * `FakeScript.transactions` does for a script written up front.
      */
@@ -5931,7 +6115,9 @@ declare const SuiTest: {
     readonly scriptSimulate: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
     readonly scriptGetTransaction: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
     readonly scriptGetObject: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
+    readonly setVisibilityDelay: (delay: number | "never" | undefined) => Effect.Effect<void, never, SuiCoreFake>;
     readonly calls: (method?: string) => Effect.Effect<ReadonlyArray<RecordedCall>, never, SuiCoreFake>;
+    readonly provide: <ROut, E>(layer: Layer.Layer<ROut, E>) => <A, E2, R>(effect: Effect.Effect<A, E2, R>) => Effect.Effect<A, E | E2, Exclude<R, ROut | TestClock.TestClock>>;
 }
 ```
 
@@ -5941,13 +6127,37 @@ inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
 Every member requires `SuiCoreFake`, which `layerTest` and
 `layerExtensionTest` provide.
 
+### `fakeCoin` (const)
+
+```ts
+declare const fakeCoin: (options: {
+    readonly objectId: string;
+    readonly owner: string;
+    readonly balance: bigint;
+    readonly coinType?: string;
+    readonly version?: bigint;
+    readonly digest?: string;
+}) => SuiClientTypes.Coin
+```
+
+A gas coin for `FakeScript.coins`, in the SDK's `SuiClientTypes.Coin`
+shape, with the fields a fixture rarely cares about filled in: `coinType`
+defaults to SUI, `version` to 1 and `digest` to a `fakeDigest`. `owner`
+is an address; the coin is `AddressOwner`-owned by it.
+
+**Never fails.**
+
 ### `fakeDigest` (const)
 
 ```ts
-declare const fakeDigest: (seed: number) => string
+declare const fakeDigest: (seed: number) => Digest
 ```
 
-A deterministic base58 32-byte digest, for fixtures.
+A deterministic base58 32-byte digest, for fixtures, already branded as a
+`Digest` so it compares with `executed.digest` and fills any field
+typed `Digest` without a cast.
+
+**Never fails.**
 
 ### `layerExtensionTest` (const)
 
@@ -5987,6 +6197,15 @@ declare const layerTest: (script?: FakeScript) => Layer.Layer<Sui | SuiCore | Su
 The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test
 can script outcomes and inspect what the fake received.
 
+**It also puts `testSubmitConfig` in force** (a `Context.Reference`, so
+it does not show in the layer's type): a resubmit path does not sleep
+through the production schedule on the real clock. A `SubmitConfig` the
+test provides *inside* — `SubmitConfig.with(...)` — wins over it.
+
+It does **not** provide a journal: the default one is process-wide, so a test
+that submits provides `Journal.layerMemory` itself, or runs through
+`SuiTest.provide`, which does.
+
 This is `Sui.layerNoDeps`, the production layer, so the chain-id rules are
 the production rules: a script whose `network` is `mainnet` or `testnet` must
 report that network's identifier, and any other network asserts nothing. A
@@ -5995,6 +6214,23 @@ test that wants the assertion on a custom network builds
 rather than having the fake compared against its own script.
 
 **Fails with: `NetworkMismatch`, `TransportError` — both only when the script asks for them.**
+
+### `testSubmitConfig` (const)
+
+```ts
+declare const testSubmitConfig: Partial<typeof SubmitConfig.defaults>
+```
+
+The lifecycle settings every test layer puts in force: `SubmitConfig.defaults`
+with the re-send schedule a fake has no use for taken out: re-sends of
+identical bytes follow each other with no delay (still `resubmitAttempts` of
+them), so a test that drives a `SubmissionUnknown` takes milliseconds on the
+real clock — it took seconds on the production schedule — and needs no
+`TestClock.adjust` for the re-sends. Everything else — the execute timeout,
+the expiry recheck, the visibility timeout, the gas ceiling — is the
+production default.
+
+A test that is *about* one of these sets it with `SubmitConfig.with`.
 
 # Examples
 
