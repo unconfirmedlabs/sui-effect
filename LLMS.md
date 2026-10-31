@@ -247,6 +247,7 @@ The full entries follow under "API".
 - `CommandResult` — The return values and mutated references of one command.
 - `DecodeError` — BCS content or a schema boundary did not decode.
 - `DecodeKind` — Which of the three things that can go wrong at a decode boundary went wrong.
+- `DescribeOptions` — What `describe` may be told.
 - `Digest` — A base58 transaction digest.
 - `DynamicField` — A dynamic field with its value.
 - `DynamicFieldEntry` — One entry of a dynamic-field listing.
@@ -268,6 +269,8 @@ The full entries follow under "API".
 - `KnownNetwork` — The four networks with a built-in default gRPC endpoint.
 - `ListOrder` — The ledger order a listing is read in.
 - `Mist` — An amount in MIST.
+- `MoveAbortInfo` — A Move abort, read off a `SimulationFailed` or an `ExecutionFailed` into the fields a caller matches on.
+- `MoveAbortMatch` — What `isMoveAbort` matches on.
 - `MoveLocation` — Where a Move abort happened.
 - `Network` — The network a client is pointed at.
 - `NetworkMismatch` — The chain identifier the node reported is not the one the layer was built for.
@@ -663,7 +666,7 @@ The full entries follow under "API".
 ## `@unconfirmed/sui-effect`
 
 
-91 exported symbols.
+94 exported symbols.
 
 ### `Balance` (const)
 
@@ -961,6 +964,21 @@ Which of the three things that can go wrong at a decode boundary went wrong.
 
 Branch on this, never on `DecodeError`'s `issue`: `issue` is a human
 sentence and its wording changes between releases.
+
+### `DescribeOptions` (interface)
+
+```ts
+export interface DescribeOptions {
+    /**
+     * `false` drops the leading tag, for a caller that prints it in a column of
+     * its own (`ExecutionFailed MoveAbort ...` becomes `MoveAbort ...`). Default
+     * `true`.
+     */
+    readonly tag?: boolean;
+}
+```
+
+What `describe` may be told.
 
 ### `Digest` (const)
 
@@ -1310,6 +1328,8 @@ declare const ExecutionReason: Schema
 //     };
 // } | {
 //     readonly $kind: "Unknown";
+//     readonly message?: string | undefined;
+//     readonly command?: number | undefined;
 // }
 ```
 
@@ -1318,6 +1338,10 @@ Why a transaction failed on chain or in simulation. Mirrors
 discriminant, with two differences: `abortCode` is decoded to `bigint`, and
 the shared `message` and `command` fields live on the error class that
 carries the reason rather than being repeated in every variant.
+
+The one exception is `Unknown`, which keeps `message` and `command`: it has
+no payload of its own, and the node's sentence is the only place the real
+kind (`InsufficientCoinBalance`, `FunctionNotFound`, ...) is written down.
 
 ### `ExecutionStatus` (const)
 
@@ -1455,6 +1479,56 @@ declare const Mist: Schema
 ```
 
 An amount in MIST. Encoded as the decimal string every SDK response uses.
+
+### `MoveAbortInfo` (interface)
+
+```ts
+export interface MoveAbortInfo {
+    readonly package?: string;
+    readonly module?: string;
+    readonly function?: string;
+    readonly code: bigint;
+    readonly abortCode: bigint;
+    readonly constant?: string;
+    readonly message?: string;
+    readonly line?: number;
+    readonly command?: number;
+}
+```
+
+A Move abort, read off a `SimulationFailed` or an `ExecutionFailed` into the
+fields a caller matches on.
+
+- `module`, `function`, `package`: where it aborted, when the node said.
+  **After an upgrade `package` is the id of the latest version** of the
+  package, not the one the type was first published under, so match on
+  `module` and `constant` (or `code`) rather than on `package`.
+- `code`: the code as the Move source wrote it — `N` in `abort N` and
+  `assert!(cond, N)`, and the declared `#[error(code = N)]` of a clever
+  error. For a clever error with no declared code it is the raw
+  `abortCode`, a packed integer: match on `constant` instead.
+- `abortCode`: always the raw code the VM reported.
+- `constant`, `message`, `line`: a clever error's constant name, its
+  rendered value, and the source line of the abort.
+- `command`: the index of the command that aborted.
+
+### `MoveAbortMatch` (interface)
+
+```ts
+export interface MoveAbortMatch {
+    readonly package?: string;
+    readonly module?: string;
+    readonly function?: string;
+    readonly constant?: string;
+    readonly code?: number | bigint;
+}
+```
+
+What `isMoveAbort` matches on. Every field given must match; none given
+matches every Move abort. `package` is compared as an address (padding and
+case do not matter) — but see `MoveAbortInfo`: after an upgrade the node
+names the **latest** package id, so prefer `module` plus `constant` or
+`code`.
 
 ### `MoveLocation` (const)
 
@@ -2040,6 +2114,7 @@ coins or from the sender's address balance.
 
 ```ts
 export declare class SimulationFailed extends SimulationFailed_base {
+  readonly message: string
   readonly reason: {
       readonly $kind: "MoveAbort";
       readonly MoveAbort: {
@@ -2112,12 +2187,18 @@ export declare class SimulationFailed extends SimulationFailed_base {
       };
   } | {
       readonly $kind: "Unknown";
+      readonly message?: string | undefined;
+      readonly command?: number | undefined;
   }
-  readonly message: string
+  readonly command: number | undefined
 }
 ```
 
 Simulation reported an execution failure. No gas was charged.
+
+`message` is the SDK's own sentence; `command` is the index of the command
+that failed, when the node named one — the same field `ExecutionFailed`
+carries, so the two describe one abort the same way.
 
 ### `SimulationLookupError` (type)
 
@@ -3612,6 +3693,8 @@ declare const JournalEntry: Schema
 //         };
 //     } | {
 //         readonly $kind: "Unknown";
+//         readonly message?: string | undefined;
+//         readonly command?: number | undefined;
 //     };
 //     readonly at: Utc;
 // }
@@ -4437,6 +4520,8 @@ declare const isUnresolved: (value: {
         };
     } | {
         readonly $kind: "Unknown";
+        readonly message?: string;
+        readonly command?: number;
     };
     readonly at: import("effect/DateTime").Utc;
 }) => value is {
