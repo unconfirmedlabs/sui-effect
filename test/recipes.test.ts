@@ -49,6 +49,9 @@ const coin = {
 const script: FakeScript = {
   objects: [counter],
   coins: [coin],
+  // Gas for the sponsored paths comes from an address balance, which
+  // `Tx.build` checks covers the budget before anything is signed.
+  balances: [{ coinType: "0x2::sui::SUI", balance: "1000000000", coinBalance: "0", addressBalance: "1000000000" }],
   execute: [FakeOutcome.succeed({ mutated: [{ ...counter, version: 4n }] })]
 }
 

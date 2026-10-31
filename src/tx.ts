@@ -39,10 +39,12 @@ export { Journal, type JournalService } from "./services/Journal.ts"
 /** The lifecycle as a serializable union, for what the journal holds. */
 export { isUnresolved, JournalEntry, UNRESOLVED_TAGS } from "./domain/journal-entry.ts"
 
-/** Build, sign, cosign, canonical recipe helpers, submit, reconcile, run. */
+/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, reconcile, run. */
 export {
+  attach,
   build,
   cosign,
+  fromBytes,
   gaslessStablecoinTransfer,
   type Built,
   Reconciled,

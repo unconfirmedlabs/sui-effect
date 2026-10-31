@@ -604,7 +604,10 @@ describe("8. extensions on one client share the sender lock", () => {
 describe("9. Tx.run completes a sponsorship or refuses it", () => {
   const sponsoredScript = {
     ...baseScript,
-    coins: [coinOf(COIN_ID, "2", sponsorOwner)]
+    coins: [coinOf(COIN_ID, "2", sponsorOwner)],
+    // `Tx.sponsored` pays from the sponsor's address balance, which `Tx.build`
+    // checks covers the budget before anything is signed.
+    balances: [{ coinType: "0x2::sui::SUI", balance: "1000000000", coinBalance: "0", addressBalance: "1000000000" }]
   }
 
   test("a gas owner with no sponsor is a SigningError before anything is built", async () => {
