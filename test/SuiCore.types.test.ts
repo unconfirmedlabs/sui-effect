@@ -9,6 +9,9 @@ import type {
 } from "../src/domain/schemas.ts"
 import {
   Built as BuiltSchema,
+  Coin,
+  CoinMetadata,
+  EventEntry,
   ObjectRef as ObjectRefSchema,
   SignedTransaction,
   Simulation as SimulationSchema
@@ -118,4 +121,10 @@ test("the named lifecycle interfaces are structurally their schema's Type", () =
   // Schema-derived helpers still accept the interface where the alias was used.
   const isBuilt: (input: unknown) => input is Built = Schema.is(BuiltSchema)
   expect(isBuilt(null)).toBe(false)
+})
+
+test("0.4.0's mirrored shapes accept what the SDK returns", () => {
+  expect(assignable<SuiClientTypes.Coin, typeof Coin.Encoded>()).toBe(true)
+  expect(assignable<SuiClientTypes.CoinMetadata, typeof CoinMetadata.Encoded>()).toBe(true)
+  expect(assignable<SuiClientTypes.EventEntry, typeof EventEntry.Encoded>()).toBe(true)
 })

@@ -122,6 +122,22 @@ export interface FakeExecution {
   readonly gasUsed?: SuiClientTypes.GasCostSummary
   readonly checkpoint?: string
   readonly timestampMs?: number
+  /**
+   * The sender `listTransactions`' `sender` filter matches, for a transaction
+   * scripted by digest (`FakeScript.transactions`). A transaction the fake
+   * executed takes its sender from its bytes, and this is ignored.
+   *
+   * @since 0.4.0
+   */
+  readonly sender?: string
+  /**
+   * The Move calls, as `package::module::function`, that `listTransactions`'
+   * `function` filter matches, for a transaction scripted by digest. A
+   * transaction the fake executed takes them from its bytes' commands.
+   *
+   * @since 0.4.0
+   */
+  readonly moveCalls?: ReadonlyArray<string>
 }
 
 /** One scripted outcome of a call. The last entry of a script repeats forever. */
@@ -268,10 +284,40 @@ export interface FakeScript {
    * @since 0.1.1
    */
   readonly coinMetadata?: Readonly<Record<string, SuiClientTypes.CoinMetadata>>
+  /**
+   * The dynamic fields of each parent, keyed by parent id.
+   *
+   * An entry of `$kind: "DynamicObject"` is a dynamic **object** field:
+   * `getDynamicObjectField` finds it by the key's own type and bytes (or by
+   * the `0x2::dynamic_object_field::Wrapper<…>` of that type, which is how a
+   * node lists it) and serves the object its `childId` names from the object
+   * map.
+   */
   readonly dynamicFields?: Readonly<Record<string, ReadonlyArray<SuiClientTypes.DynamicFieldEntry>>>
   readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>
   /** How many items a list method returns per page. Defaults to 50. */
   readonly pageSize?: number
+  /**
+   * How many ledger items one `listEvents` or `listTransactions` request
+   * **examines**, matching or not. Unset, a request scans as far as it needs.
+   *
+   * This is the gRPC server's scan bound: with a filter that matches rarely, a
+   * page can come back short — even empty — with `hasNextPage: true`, and
+   * continuing from `endCursor` still makes progress. Set it to prove a
+   * consumer paginates on `hasNextPage` rather than on the item count.
+   *
+   * @since 0.4.0
+   */
+  readonly scanLimit?: number
+  /**
+   * The SuiNS names the fake knows, name to target address.
+   * `resolveNameServiceAddress` answers `null` for a name the record does not
+   * hold, and `defaultNameServiceName` answers the **first** name that targets
+   * the address, or `null`. Unscripted, both die naming themselves.
+   *
+   * @since 0.4.0
+   */
+  readonly names?: Readonly<Record<string, string>>
   /**
    * The epoch `getCurrentSystemState` reports. Defaults to
    * {@link DEFAULT_EPOCH}.
@@ -395,6 +441,14 @@ interface Mutable {
   knownTransactions: Map<string, SettledTransaction>
   /** What the node says about a transaction asked for by digest. */
   byDigest: Map<string, FakeOutcome>
+  /**
+   * Every transaction the ledger holds, in ledger order: those scripted by
+   * digest first, then each recorded or executed one as it lands. This is what
+   * `listTransactions` and `listEvents` page through.
+   */
+  ledger: Array<string>
+  /** The sender and Move calls of each executed transaction, read off its bytes. */
+  executedMeta: Map<string, { readonly sender?: string; readonly moveCalls: ReadonlyArray<string> }>
 }
 
 /** What a settled call produced, kept so `getTransaction` can serve it again. */
@@ -730,7 +784,9 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
       },
       pendingDigests: new Map(),
       knownTransactions: new Map(),
-      byDigest: new Map(Object.entries(script.transactions ?? {}))
+      byDigest: new Map(Object.entries(script.transactions ?? {})),
+      ledger: Object.keys(script.transactions ?? {}),
+      executedMeta: new Map()
     })
   })
 
@@ -1304,6 +1360,180 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     }
   }
 
+  const appendToLedger = (digest: string): void => {
+    if (!state.ledger.includes(digest)) state.ledger.push(digest)
+  }
+
+  /** The sender and Move calls a set of bytes names, for the ledger filters. */
+  const metaOfBytes = (
+    bytes: Uint8Array
+  ): { readonly sender?: string; readonly moveCalls: ReadonlyArray<string> } => {
+    try {
+      const data = TransactionDataBuilder.fromBytes(bytes)
+      const moveCalls: Array<string> = []
+      for (const command of data.commands) {
+        if (command.$kind !== "MoveCall") continue
+        const call = command.MoveCall
+        moveCalls.push(`${call.package}::${call.module}::${call.function}`)
+      }
+      return {
+        ...(data.sender === null || data.sender === undefined ? {} : { sender: data.sender }),
+        moveCalls
+      }
+    } catch {
+      return { moveCalls: [] }
+    }
+  }
+
+  /**
+   * One transaction of the ledger as the node would list it, or `undefined`
+   * for a digest whose scripted outcome is not a transaction (a transport
+   * failure, a miss, a pending timeout).
+   */
+  interface LedgerTransaction {
+    readonly digest: string
+    readonly settled: SettledTransaction
+    readonly sender: string | undefined
+    readonly moveCalls: ReadonlyArray<string>
+  }
+
+  const ledgerTransactions = async (): Promise<ReadonlyArray<LedgerTransaction>> => {
+    const out: Array<LedgerTransaction> = []
+    for (const digest of state.ledger) {
+      const scripted = state.byDigest.get(digest)
+      if (scripted !== undefined) {
+        if (scripted._tag !== "succeed" && scripted._tag !== "failWith") continue
+        out.push({
+          digest,
+          settled: await applyOutcome(scripted, "getTransaction", digest),
+          sender: scripted.value.sender,
+          moveCalls: scripted.value.moveCalls ?? []
+        })
+        continue
+      }
+      const known = state.knownTransactions.get(digest)
+      if (known === undefined) continue
+      const meta = state.executedMeta.get(digest)
+      out.push({
+        digest,
+        settled: known,
+        sender: meta?.sender,
+        moveCalls: meta?.moveCalls ?? []
+      })
+    }
+    return out
+  }
+
+  /** Whether a `::`-path names the same package (and module, and member) as another. */
+  const pathMatches = (filter: string, path: string): boolean => {
+    const wanted = filter.split("::")
+    const actual = path.split("::")
+    if (wanted.length > actual.length) return false
+    return wanted.every((part, index) => {
+      const other = actual[index] as string
+      if (index > 0) return part === other
+      try {
+        return normalizeSuiAddress(part) === normalizeSuiAddress(other)
+      } catch {
+        return part === other
+      }
+    })
+  }
+
+  const sameAddress = (left: string, right: string | undefined): boolean =>
+    right !== undefined && normalizeSuiAddress(left) === normalizeSuiAddress(right)
+
+  const transactionMatches = (
+    filter: SuiClientTypes.TransactionFilter | undefined,
+    transaction: LedgerTransaction
+  ): boolean => {
+    if (filter === undefined) return true
+    if (filter.sender !== undefined) return sameAddress(filter.sender, transaction.sender)
+    if (filter.function !== undefined) {
+      const wanted = filter.function
+      return transaction.moveCalls.some((call) => pathMatches(wanted, call))
+    }
+    return true
+  }
+
+  const eventMatches = (
+    filter: SuiClientTypes.EventFilter | undefined,
+    event: SuiClientTypes.Event
+  ): boolean => {
+    if (filter === undefined) return true
+    if (filter.sender !== undefined) return sameAddress(filter.sender, event.sender)
+    if (filter.emitModule !== undefined) {
+      return pathMatches(filter.emitModule, `${event.packageId}::${event.module}`)
+    }
+    if (filter.eventType !== undefined) {
+      // `package::module` names every event type defined in that module; a
+      // longer path is a type, compared under the one Move type rule.
+      return filter.eventType.split("::").length === 2
+        ? pathMatches(filter.eventType, event.eventType)
+        : typeMatches(filter.eventType, event.eventType)
+    }
+    return true
+  }
+
+  /**
+   * One page of a ledger listing, the way the SDK's `listEvents` and
+   * `listTransactions` page: `after` reads ascending from strictly after a
+   * cursor, `before` descending from strictly before one, and neither reads
+   * from the start in `order`. A cursor is the item's ledger position. At most
+   * `scanLimit` items are examined per request, so a page may be short or empty
+   * with `hasNextPage: true`; its `endCursor` is then the last position
+   * examined, so continuing from it still makes progress.
+   */
+  const ledgerPage = <A>(
+    items: ReadonlyArray<A>,
+    matches: (item: A) => boolean,
+    options: {
+      readonly limit?: number
+      readonly after?: string | null
+      readonly before?: string | null
+      readonly order?: "ascending" | "descending"
+    }
+  ): {
+    items: ReadonlyArray<A>
+    hasNextPage: boolean
+    startCursor: string | null
+    endCursor: string | null
+  } => {
+    const descending = options.before !== undefined && options.before !== null
+      ? true
+      : options.after !== undefined && options.after !== null
+      ? false
+      : options.order === "descending"
+    const step = descending ? -1 : 1
+    let position = descending
+      ? (options.before === undefined || options.before === null
+        ? items.length - 1
+        : Number(options.before) - 1)
+      : (options.after === undefined || options.after === null ? 0 : Number(options.after) + 1)
+    const limit = options.limit ?? pageSize
+    const scanLimit = script.scanLimit ?? Number.POSITIVE_INFINITY
+    const found: Array<A> = []
+    let first: number | undefined
+    let last: number | undefined
+    let examined = 0
+    while (position >= 0 && position < items.length && found.length < limit && examined < scanLimit) {
+      const item = items[position] as A
+      examined += 1
+      last = position
+      if (matches(item)) {
+        if (first === undefined) first = position
+        found.push(item)
+      }
+      position += step
+    }
+    return {
+      items: found,
+      hasNextPage: position >= 0 && position < items.length,
+      startCursor: first === undefined ? null : String(first),
+      endCursor: last === undefined ? null : String(last)
+    }
+  }
+
   const core = {
     getObject: async (options: SuiClientTypes.GetObjectOptions) => {
       record("getObject", options)
@@ -1391,7 +1621,22 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     getDynamicObjectField: async (options: SuiClientTypes.GetDynamicObjectFieldOptions) => {
       record("getDynamicObjectField", options)
-      return unimplemented("getDynamicObjectField")
+      const parent = normalizeSuiAddress(options.parentId)
+      const wrapped = `0x2::dynamic_object_field::Wrapper<${options.name.type}>`
+      const entry = (script.dynamicFields?.[parent] ?? []).find(
+        (field) =>
+          field.$kind === "DynamicObject" &&
+          (typeMatches(options.name.type, field.name.type) ||
+            typeMatches(wrapped, field.name.type)) &&
+          sameBytes(field.name.bcs, options.name.bcs)
+      )
+      if (entry === undefined || entry.childId === undefined) {
+        throw new ObjectError("notFound", "dynamic object field not found", {
+          reason: "notFound",
+          objectId: parent
+        })
+      }
+      return { object: toSdkObject(lookup(entry.childId), options.include) }
     },
     getBalance: async (options: SuiClientTypes.GetBalanceOptions) => {
       record("getBalance", options)
@@ -1450,6 +1695,8 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       }
       const settled = await settle("execute", digest, options, paymentOfBytes(options.transaction))
       state.knownTransactions.set(digest, settled)
+      appendToLedger(digest)
+      state.executedMeta.set(digest, metaOfBytes(options.transaction))
       return asResult(settled)
     },
     signAndExecuteTransaction: async (
@@ -1486,11 +1733,44 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     listTransactions: async (options: SuiClientTypes.ListTransactionsOptions) => {
       record("listTransactions", options)
-      return unimplemented("listTransactions")
+      const transactions = await ledgerTransactions()
+      const result = ledgerPage(
+        transactions,
+        (transaction) => transactionMatches(options.filter, transaction),
+        options
+      )
+      return {
+        transactions: result.items.map((transaction) => asResult(transaction.settled)),
+        hasNextPage: result.hasNextPage,
+        startCursor: result.startCursor,
+        endCursor: result.endCursor
+      } as unknown as SuiClientTypes.ListTransactionsResponse
     },
     listEvents: async (options: SuiClientTypes.ListEventsOptions) => {
       record("listEvents", options)
-      return unimplemented("listEvents")
+      const entries: Array<SuiClientTypes.EventEntry> = []
+      for (const transaction of await ledgerTransactions()) {
+        const { checkpoint } = transaction.settled.transaction
+        // The fake's transactions always carry every include, events among them.
+        const events = (transaction.settled.transaction.events ?? []) as ReadonlyArray<
+          SuiClientTypes.Event
+        >
+        events.forEach((event, eventIndex) => {
+          entries.push({
+            ...event,
+            checkpoint: checkpoint ?? null,
+            transactionDigest: transaction.digest,
+            eventIndex
+          })
+        })
+      }
+      const result = ledgerPage(entries, (entry) => eventMatches(options.filter, entry), options)
+      return {
+        events: [...result.items],
+        hasNextPage: result.hasNextPage,
+        startCursor: result.startCursor,
+        endCursor: result.endCursor
+      }
     },
     getReferenceGasPrice: async (options?: SuiClientTypes.GetReferenceGasPriceOptions) => {
       record("getReferenceGasPrice", options)
@@ -1520,11 +1800,17 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       options: SuiClientTypes.ResolveNameServiceAddressOptions
     ) => {
       record("resolveNameServiceAddress", options)
-      return unimplemented("resolveNameServiceAddress")
+      if (script.names === undefined) return unimplemented("resolveNameServiceAddress")
+      const target = script.names[options.name]
+      return { address: target === undefined ? null : normalizeSuiAddress(target) }
     },
     defaultNameServiceName: async (options: SuiClientTypes.DefaultNameServiceNameOptions) => {
       record("defaultNameServiceName", options)
-      return unimplemented("defaultNameServiceName")
+      if (script.names === undefined) return unimplemented("defaultNameServiceName")
+      const named = Object.entries(script.names).find(([, target]) =>
+        sameAddress(options.address, target)
+      )
+      return { data: { name: named === undefined ? null : named[0] } }
     },
     mvr: {
       resolvePackage: async (options: SuiClientTypes.MvrResolvePackageOptions) => {
@@ -1640,6 +1926,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     recordTransaction: (digest, outcome) =>
       Effect.sync(() => {
         state.byDigest.set(digest, outcome)
+        appendToLedger(digest)
       }),
     setOutcomes: (method, outcomes) =>
       Effect.sync(() => {

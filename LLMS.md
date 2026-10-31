@@ -17,7 +17,7 @@ contract for building an extension package on top of it.
 ## `@unconfirmed/sui-effect`
 
 
-84 exported symbols.
+90 exported symbols.
 
 ### `Balance` (const)
 
@@ -207,6 +207,56 @@ declare const CleverError: Schema
 
 A decoded `#[error]` constant. Mirrors `SuiClientTypes.CleverError`.
 
+### `Coin` (const)
+
+```ts
+declare const Coin: Schema
+// decodes to:
+// {
+//     readonly objectId: ObjectId;
+//     readonly version: Version;
+//     readonly digest: string;
+//     readonly owner: {
+//         readonly $kind: "AddressOwner";
+//         readonly AddressOwner: SuiAddress;
+//     } | {
+//         readonly $kind: "ObjectOwner";
+//         readonly ObjectOwner: ObjectId;
+//     } | {
+//         readonly $kind: "Shared";
+//         readonly Shared: {
+//             readonly initialSharedVersion: Version;
+//         };
+//     } | {
+//         readonly $kind: "Immutable";
+//         readonly Immutable: true;
+//     } | {
+//         readonly $kind: "ConsensusAddressOwner";
+//         readonly ConsensusAddressOwner: {
+//             readonly startVersion: Version;
+//             readonly owner: SuiAddress;
+//         };
+//     } | {
+//         readonly $kind: "Unknown";
+//     };
+//     readonly type: StructTag;
+//     readonly balance: Mist;
+// }
+```
+
+A coin object. Mirrors `SuiClientTypes.Coin`: `type` is the full object type
+(`0x2::coin::Coin<T>`), `balance` the coin's value in its smallest unit.
+
+### `CoinMetadata` (const)
+
+```ts
+declare const CoinMetadata: Schema
+// decodes to: { readonly id: ObjectId | null; readonly decimals: number; readonly name: string; readonly symbol: string; readonly description: string; readonly iconUrl: string | null; }
+```
+
+The metadata of a coin type. Mirrors `SuiClientTypes.CoinMetadata`: `id` is
+the metadata object's id, `null` when the node does not report one.
+
 ### `CoinType` (const)
 
 ```ts
@@ -287,14 +337,14 @@ declare const DynamicField: Schema
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
 //     };
+//     readonly version: Version;
 //     readonly type: string;
-//     readonly fieldId: ObjectId;
 //     readonly name: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
 //     };
+//     readonly fieldId: ObjectId;
 //     readonly valueType: string;
-//     readonly version: Version;
 //     readonly childId?: ObjectId | undefined;
 // }
 ```
@@ -309,11 +359,11 @@ declare const DynamicFieldEntry: Schema
 // {
 //     readonly $kind: "DynamicField" | "DynamicObject";
 //     readonly type: string;
-//     readonly fieldId: ObjectId;
 //     readonly name: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
 //     };
+//     readonly fieldId: ObjectId;
 //     readonly valueType: string;
 //     readonly childId?: ObjectId | undefined;
 // }
@@ -346,6 +396,38 @@ something to build on — it is absent on most transports and its shape follows
 whatever the node feels like. It is kept only when the source carried it,
 which in practice means a relay or sponsor envelope decoded through
 `Executed.fromPartial`, where it may be the only form of the event there is.
+
+### `EventEntry` (const)
+
+```ts
+declare const EventEntry: Schema
+// decodes to:
+// {
+//     readonly sender: SuiAddress;
+//     readonly bcs: Uint8Array<ArrayBufferLike>;
+//     readonly packageId: ObjectId;
+//     readonly module: string;
+//     readonly eventType: string;
+//     readonly checkpoint: bigint | null;
+//     readonly transactionDigest: Digest;
+//     readonly eventIndex: number;
+//     readonly json?: unknown;
+// }
+```
+
+An event read from a listing, with its place in the ledger. Mirrors
+`SuiClientTypes.EventEntry`: an `Event` plus the checkpoint that
+contains the emitting transaction (`null` where the transport does not say),
+that transaction's digest, and the event's index in its list.
+
+### `EventFilter` (type)
+
+```ts
+export type EventFilter = SuiClientTypes.EventFilter;
+```
+
+A filter on events: exactly one of `sender`, `emitModule` or `eventType`.
+The SDK's `SuiClientTypes.EventFilter`, under its own name.
 
 ### `Executed` (class)
 
@@ -710,6 +792,14 @@ declare const KnownNetwork: Schema
 
 The four networks with a built-in default gRPC endpoint.
 
+### `ListOrder` (type)
+
+```ts
+export type ListOrder = "ascending" | "descending";
+```
+
+The ledger order a listing is read in. Mirrors the SDK's `order` option.
+
 ### `Mist` (const)
 
 ```ts
@@ -836,7 +926,7 @@ declare const ObjectEnvelope: Schema
 //     } | {
 //         readonly $kind: "Unknown";
 //     };
-//     readonly type: "package" | StructTag;
+//     readonly type: StructTag | "package";
 // }
 ```
 
@@ -887,7 +977,7 @@ declare const ObjectRef: Schema
 // decodes to:
 // {
 //     readonly id: ObjectId;
-//     readonly type: "package" | StructTag;
+//     readonly type: StructTag | "package";
 //     readonly version: Version;
 //     readonly digest: string;
 //     readonly owner: {
@@ -923,7 +1013,7 @@ type and owner so a caller can tell a shared object from an owned one.
 
 ```ts
 declare const ObjectType: Schema
-// decodes to: "package" | StructTag
+// decodes to: StructTag | "package"
 ```
 
 The `type` field of an object envelope. Almost always a struct tag, but gRPC
@@ -1989,33 +2079,88 @@ export interface SuiService {
             readonly expectedType?: string;
         }): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>;
     };
-    /**
-     * {@link getObjectsStrict} under its 0.1.0 name.
-     *
-     * `getObjectsOrFail` reads, out of context, as though failing were the point
-     * — `getObjects(ids).orFail()` — rather than as the strictness of the read.
-     * The two are the same function.
-     *
-     * @deprecated Use `getObjectsStrict`. This alias stays for 0.1.x.
-     */
-    readonly getObjectsOrFail: {
-        <S>(ids: ReadonlyArray<ObjectId>, opts: {
-            readonly schema: Schema.Codec<S, Uint8Array>;
-            readonly expectedType?: string;
-        }): Effect.Effect<ReadonlyArray<SuiObject<S>>, BatchItemError | TransportError>;
-        (ids: ReadonlyArray<ObjectId>, opts?: {
-            readonly schema?: undefined;
-            readonly expectedType?: string;
-        }): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>;
-    };
     /** The balance of one coin type for one owner. Fails with: `TransportError`. */
     readonly getBalance: (owner: SuiAddress, coinType?: CoinType) => Effect.Effect<Balance, TransportError>;
+    /**
+     * Every balance an owner holds, one per coin type, paginated.
+     *
+     * Fails with: `TransportError`.
+     *
+     * @since 0.4.0
+     */
+    readonly streamBalances: (owner: SuiAddress) => Stream.Stream<Balance, TransportError>;
+    /**
+     * Every coin object of one coin type an owner holds, paginated. `coinType`
+     * defaults to SUI, the way the SDK's `listCoins` does; it is the coin type,
+     * not the `0x2::coin::Coin<…>` object type.
+     *
+     * Fails with: `TransportError`.
+     *
+     * @since 0.4.0
+     */
+    readonly streamCoins: (owner: SuiAddress, coinType?: CoinType) => Stream.Stream<Coin, TransportError>;
+    /**
+     * The metadata of a coin type; `None` when the coin type has no metadata
+     * object, which is what the node answers for it.
+     *
+     * Fails with: `TransportError`.
+     *
+     * @since 0.4.0
+     */
+    readonly getCoinMetadataOption: (coinType: CoinType) => Effect.Effect<Option.Option<CoinMetadata>, TransportError>;
+    /**
+     * The address a SuiNS name points at; `None` when the name resolves to
+     * nothing.
+     *
+     * Fails with: `TransportError`.
+     *
+     * @since 0.4.0
+     */
+    readonly resolveNameServiceAddressOption: (name: string) => Effect.Effect<Option.Option<SuiAddress>, TransportError>;
+    /**
+     * The default SuiNS name of an address; `None` when it has none.
+     *
+     * From `@mysten/sui` 2.33.2 the node's "no name" is an answer
+     * (`{ data: { name: null } }`); before it, the gRPC transport threw
+     * `NOT_FOUND`. Both are `None` here, so the answer does not depend on the SDK
+     * version.
+     *
+     * Fails with: `TransportError`.
+     *
+     * @since 0.4.0
+     */
+    readonly defaultNameServiceNameOption: (address: SuiAddress) => Effect.Effect<Option.Option<string>, TransportError>;
     /**
      * Reads one dynamic field; absence is `None`.
      *
      * Fails with: `TransportError`.
      */
     readonly getDynamicFieldOption: (parent: ObjectId, name: DynamicFieldName) => Effect.Effect<Option.Option<DynamicField>, TransportError>;
+    /**
+     * Reads the object stored under a dynamic **object** field
+     * (`0x2::dynamic_object_field`), decoding its content with `opts.schema`
+     * when given; absence is `None`.
+     *
+     * `name` is the key as the Move code wrote it — its own type and BCS bytes —
+     * not the `dynamic_object_field::Wrapper<…>` the SDK wraps it in. The
+     * object's type tag is checked the way `getObject` checks it. Written as an
+     * overload set for the same reason `getObject` is; the implementation is
+     * `Effect.fn`.
+     *
+     * Fails with: `DecodeError`, `TransportError`.
+     *
+     * @since 0.4.0
+     */
+    readonly getDynamicObjectFieldOption: {
+        <S>(parent: ObjectId, name: DynamicFieldName, opts: {
+            readonly schema: Schema.Codec<S, Uint8Array>;
+            readonly expectedType?: string;
+        }): Effect.Effect<Option.Option<SuiObject<S>>, DecodeError | TransportError>;
+        (parent: ObjectId, name: DynamicFieldName, opts?: {
+            readonly schema?: undefined;
+            readonly expectedType?: string;
+        }): Effect.Effect<Option.Option<SuiObject<Uint8Array>>, DecodeError | TransportError>;
+    };
     /**
      * Reads an executed transaction. A historical transaction that failed on
      * chain fails here too, so there is one representation of an on-chain failure.
@@ -2049,12 +2194,14 @@ export interface SuiService {
      * composed with `Schema.decodeTo(DomainClass, …)`; no type tag is compared
      * either way.
      *
-     * `opts.sender` is the address the call is simulated as, defaulting to the
-     * zero address the way the SDK does; a recipe that sets its own sender wins.
+     * `input` is anything `simulate` takes: a recipe, a `Transaction`, or
+     * serialized bytes. `opts.sender` is the address the call is simulated as,
+     * defaulting to the zero address the way the SDK does; a recipe that sets its
+     * own sender wins, and bytes carry their own.
      *
      * Fails with: `SimulationFailed`, `BuildError`, `DecodeError`, `TransportError`.
      */
-    readonly view: <S, I>(recipe: Recipe, schema: Schema.Codec<S, Uint8Array> | BcsType<S, I>, opts?: {
+    readonly view: <S, I>(input: Recipe | Transaction | Uint8Array, schema: Schema.Codec<S, Uint8Array> | BcsType<S, I>, opts?: {
         readonly command?: number;
         readonly result?: number;
         readonly sender?: SuiAddress;
@@ -2078,6 +2225,44 @@ export interface SuiService {
      * Fails with: `TransportError`.
      */
     readonly streamDynamicFields: (parent: ObjectId) => Stream.Stream<DynamicFieldEntry, TransportError>;
+    /**
+     * Every event matching `filter` (all events when omitted), paginated in
+     * ledger order — oldest first, or newest first with
+     * `{ order: "descending" }`.
+     *
+     * `filter` is the SDK's `EventFilter`: exactly one of `sender`,
+     * `emitModule` (`package::module`) or `eventType` (a module, or a full type;
+     * a bare generic matches every instantiation on gRPC and GraphQL). Decode an
+     * event's payload with `SuiSchema.decode(codec, entry.bcs, { actualType:
+     * entry.eventType })`. The stream follows `hasNextPage`, not the item count,
+     * so a scan-limited server's empty pages do not end it early.
+     *
+     * Fails with: `TransportError`.
+     *
+     * @since 0.4.0
+     */
+    readonly streamEvents: (filter?: EventFilter, opts?: {
+        readonly order?: ListOrder;
+    }) => Stream.Stream<EventEntry, TransportError>;
+    /**
+     * Every transaction matching `filter` (all transactions when omitted),
+     * paginated in ledger order, oldest first unless `{ order: "descending" }`.
+     *
+     * `filter` is the SDK's `TransactionFilter`: exactly one of `sender` or
+     * `function` (`package`, `package::module` or `package::module::function`).
+     * Each transaction is read with the execute include set and decoded to an
+     * `Executed`. A transaction that applied and **failed** is an ordinary
+     * entry in a history, so it is a `Result` failure carrying the
+     * `ExecutionFailed` — not a failure of the stream, which `getTransaction`'s
+     * "a failure is a failure" rule would make it.
+     *
+     * Fails with: `TransportError`.
+     *
+     * @since 0.4.0
+     */
+    readonly streamTransactions: (filter?: TransactionFilter, opts?: {
+        readonly order?: ListOrder;
+    }) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
     /**
      * Serializes work for one sender, so two transactions from the same address
      * cannot pick the same gas coin. Adds no failures of its own.
@@ -2278,6 +2463,15 @@ discriminant, so our narrowing and `TransactionDataBuilder`'s agree.
 `maxTimestamp` is `null` unless `SubmitConfig.validFor` asks for one, because
 no Sui network accepts a timestamp expiration yet. Its `chain` is a replay
 guard, so bytes signed for testnet cannot land on mainnet.
+
+### `TransactionFilter` (type)
+
+```ts
+export type TransactionFilter = SuiClientTypes.TransactionFilter;
+```
+
+A filter on transactions: exactly one of `sender` or `function`. The SDK's
+`SuiClientTypes.TransactionFilter`, under its own name.
 
 ### `TransactionLookupError` (type)
 
@@ -4675,6 +4869,22 @@ export interface FakeExecution {
     readonly gasUsed?: SuiClientTypes.GasCostSummary;
     readonly checkpoint?: string;
     readonly timestampMs?: number;
+    /**
+     * The sender `listTransactions`' `sender` filter matches, for a transaction
+     * scripted by digest (`FakeScript.transactions`). A transaction the fake
+     * executed takes its sender from its bytes, and this is ignored.
+     *
+     * @since 0.4.0
+     */
+    readonly sender?: string;
+    /**
+     * The Move calls, as `package::module::function`, that `listTransactions`'
+     * `function` filter matches, for a transaction scripted by digest. A
+     * transaction the fake executed takes them from its bytes' commands.
+     *
+     * @since 0.4.0
+     */
+    readonly moveCalls?: ReadonlyArray<string>;
 }
 ```
 
@@ -4781,10 +4991,40 @@ export interface FakeScript {
      * @since 0.1.1
      */
     readonly coinMetadata?: Readonly<Record<string, SuiClientTypes.CoinMetadata>>;
+    /**
+     * The dynamic fields of each parent, keyed by parent id.
+     *
+     * An entry of `$kind: "DynamicObject"` is a dynamic **object** field:
+     * `getDynamicObjectField` finds it by the key's own type and bytes (or by
+     * the `0x2::dynamic_object_field::Wrapper<…>` of that type, which is how a
+     * node lists it) and serves the object its `childId` names from the object
+     * map.
+     */
     readonly dynamicFields?: Readonly<Record<string, ReadonlyArray<SuiClientTypes.DynamicFieldEntry>>>;
     readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>;
     /** How many items a list method returns per page. Defaults to 50. */
     readonly pageSize?: number;
+    /**
+     * How many ledger items one `listEvents` or `listTransactions` request
+     * **examines**, matching or not. Unset, a request scans as far as it needs.
+     *
+     * This is the gRPC server's scan bound: with a filter that matches rarely, a
+     * page can come back short — even empty — with `hasNextPage: true`, and
+     * continuing from `endCursor` still makes progress. Set it to prove a
+     * consumer paginates on `hasNextPage` rather than on the item count.
+     *
+     * @since 0.4.0
+     */
+    readonly scanLimit?: number;
+    /**
+     * The SuiNS names the fake knows, name to target address.
+     * `resolveNameServiceAddress` answers `null` for a name the record does not
+     * hold, and `defaultNameServiceName` answers the **first** name that targets
+     * the address, or `null`. Unscripted, both die naming themselves.
+     *
+     * @since 0.4.0
+     */
+    readonly names?: Readonly<Record<string, string>>;
     /**
      * The epoch `getCurrentSystemState` reports. Defaults to
      * {@link DEFAULT_EPOCH}.

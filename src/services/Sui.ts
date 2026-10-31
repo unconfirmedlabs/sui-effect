@@ -32,6 +32,7 @@ import { bcs as bcsCodec, decodeContent, typeMatches } from "../domain/bcs.ts"
 import {
   BuildError,
   DecodeError,
+  decodePayload,
   ExecutionFailed,
   NetworkMismatch,
   ObjectDeleted,
@@ -44,11 +45,14 @@ import {
 import { EXECUTE_INCLUDE, Executed, fromTransactionResult } from "../domain/executed.ts"
 import {
   Balance,
+  Coin,
+  CoinMetadata,
   CoinType,
   Digest,
   DynamicField,
   DynamicFieldEntry,
   DynamicFieldName,
+  EventEntry,
   executionReasonOf,
   KNOWN_CHAIN_IDS,
   makeSuiObject,
@@ -95,13 +99,72 @@ const decodeBalance = Schema.decodeUnknownEffect(Balance)
 const decodeDynamicField = Schema.decodeUnknownEffect(DynamicField)
 const decodeDynamicFieldEntry = Schema.decodeUnknownEffect(DynamicFieldEntry)
 const decodeSimulation = Schema.decodeUnknownEffect(Simulation)
+const decodeCoin = Schema.decodeUnknownEffect(Coin)
+const decodeCoinMetadata = Schema.decodeUnknownEffect(CoinMetadata)
+const decodeEventEntry = Schema.decodeUnknownEffect(EventEntry)
+const decodeAddress = Schema.decodeUnknownEffect(SuiAddress)
 
-const boundaryError = (method: string) => (issue: { readonly message: string }): TransportError =>
+/**
+ * The node answered and the answer did not match the shape this version reads.
+ *
+ * One representation for every such failure: a non-retryable `TransportError`
+ * whose `cause` is the structured `DecodeError { kind: "shape" }`, with every
+ * issue and its path — the same thing `getTransaction` and the streams produce
+ * when `Executed` or an object envelope does not decode. Never fails.
+ */
+const boundaryError = (method: string) => (error: Schema.SchemaError): TransportError =>
   new TransportError({
     method,
     retryable: false,
-    cause: `the node returned a response this version cannot read: ${issue.message}`
+    cause: new DecodeError({ kind: "shape", ...decodePayload(error) })
   })
+
+/** A `DecodeError` that escaped a read as the `cause` of a `TransportError`. Never fails. */
+const decodeAsTransport = (method: string) => (error: DecodeError): TransportError =>
+  new TransportError({ method, retryable: false, cause: error })
+
+/**
+ * One page of a paginated read: the decoded items, and the cursor to continue
+ * from, or `null` when there is nothing more to ask for.
+ */
+interface Page<A> {
+  readonly items: ReadonlyArray<A>
+  readonly next: string | null
+}
+
+/**
+ * The one pagination loop every `Sui.stream*` member is: ask for a page from a
+ * cursor, emit its items, and continue from the cursor the page names.
+ *
+ * Whether to continue is the page's `hasNextPage`, **never** its item count: a
+ * scan-limited gRPC server may return an empty page with `hasNextPage: true`,
+ * and stopping there would silently truncate the stream. A page that says there
+ * is more but names no cursor ends the stream, because asking again from the
+ * start would never end.
+ */
+const paginated = <A, E>(
+  span: string,
+  fetchPage: (cursor: string | null) => Effect.Effect<Page<A>, E>
+): Stream.Stream<A, E> =>
+  Stream.paginate(null as string | null, (cursor: string | null) =>
+    Effect.map(fetchPage(cursor), (page) =>
+      [
+        page.items,
+        page.next === null ? Option.none<string | null>() : Option.some<string | null>(page.next)
+      ] as const)).pipe(Stream.withSpan(span))
+
+/** The cursor to continue from, or `null` when the node says there is no more. */
+const nextCursor = (hasNextPage: boolean, cursor: string | null): string | null =>
+  hasNextPage ? cursor : null
+
+/**
+ * The sender locks: one reference-counted semaphore per address, released a
+ * minute after its last holder leaves.
+ */
+const makeSenderLocks = RcMap.make({
+  lookup: (_address: string) => Effect.succeed(Semaphore.makeUnsafe(1)),
+  idleTimeToLive: "1 minute"
+})
 
 /**
  * Decodes the SDK's simulation envelope into sui-effect's stable shape.
@@ -190,6 +253,21 @@ const gasPaymentMockedOf = (
   const id = effects?.gasObject?.objectId
   return id !== undefined && normalizeSuiAddress(id) === MOCKED_GAS_OBJECT_ID
 }
+
+/**
+ * A filter on events: exactly one of `sender`, `emitModule` or `eventType`.
+ * The SDK's `SuiClientTypes.EventFilter`, under its own name.
+ */
+export type EventFilter = SuiClientTypes.EventFilter
+
+/**
+ * A filter on transactions: exactly one of `sender` or `function`. The SDK's
+ * `SuiClientTypes.TransactionFilter`, under its own name.
+ */
+export type TransactionFilter = SuiClientTypes.TransactionFilter
+
+/** The ledger order a listing is read in. Mirrors the SDK's `order` option. */
+export type ListOrder = "ascending" | "descending"
 
 /** The opinionated tier over `SuiCore`. */
 export interface SuiService {
@@ -312,31 +390,74 @@ export interface SuiService {
     ): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>
   }
 
-  /**
-   * {@link getObjectsStrict} under its 0.1.0 name.
-   *
-   * `getObjectsOrFail` reads, out of context, as though failing were the point
-   * — `getObjects(ids).orFail()` — rather than as the strictness of the read.
-   * The two are the same function.
-   *
-   * @deprecated Use `getObjectsStrict`. This alias stays for 0.1.x.
-   */
-  readonly getObjectsOrFail: {
-    <S>(
-      ids: ReadonlyArray<ObjectId>,
-      opts: { readonly schema: Schema.Codec<S, Uint8Array>; readonly expectedType?: string }
-    ): Effect.Effect<ReadonlyArray<SuiObject<S>>, BatchItemError | TransportError>
-    (
-      ids: ReadonlyArray<ObjectId>,
-      opts?: { readonly schema?: undefined; readonly expectedType?: string }
-    ): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>
-  }
-
   /** The balance of one coin type for one owner. Fails with: `TransportError`. */
   readonly getBalance: (
     owner: SuiAddress,
     coinType?: CoinType
   ) => Effect.Effect<Balance, TransportError>
+
+  /**
+   * Every balance an owner holds, one per coin type, paginated.
+   *
+   * Fails with: `TransportError`.
+   *
+   * @since 0.4.0
+   */
+  readonly streamBalances: (owner: SuiAddress) => Stream.Stream<Balance, TransportError>
+
+  /**
+   * Every coin object of one coin type an owner holds, paginated. `coinType`
+   * defaults to SUI, the way the SDK's `listCoins` does; it is the coin type,
+   * not the `0x2::coin::Coin<…>` object type.
+   *
+   * Fails with: `TransportError`.
+   *
+   * @since 0.4.0
+   */
+  readonly streamCoins: (
+    owner: SuiAddress,
+    coinType?: CoinType
+  ) => Stream.Stream<Coin, TransportError>
+
+  /**
+   * The metadata of a coin type; `None` when the coin type has no metadata
+   * object, which is what the node answers for it.
+   *
+   * Fails with: `TransportError`.
+   *
+   * @since 0.4.0
+   */
+  readonly getCoinMetadataOption: (
+    coinType: CoinType
+  ) => Effect.Effect<Option.Option<CoinMetadata>, TransportError>
+
+  /**
+   * The address a SuiNS name points at; `None` when the name resolves to
+   * nothing.
+   *
+   * Fails with: `TransportError`.
+   *
+   * @since 0.4.0
+   */
+  readonly resolveNameServiceAddressOption: (
+    name: string
+  ) => Effect.Effect<Option.Option<SuiAddress>, TransportError>
+
+  /**
+   * The default SuiNS name of an address; `None` when it has none.
+   *
+   * From `@mysten/sui` 2.33.2 the node's "no name" is an answer
+   * (`{ data: { name: null } }`); before it, the gRPC transport threw
+   * `NOT_FOUND`. Both are `None` here, so the answer does not depend on the SDK
+   * version.
+   *
+   * Fails with: `TransportError`.
+   *
+   * @since 0.4.0
+   */
+  readonly defaultNameServiceNameOption: (
+    address: SuiAddress
+  ) => Effect.Effect<Option.Option<string>, TransportError>
 
   /**
    * Reads one dynamic field; absence is `None`.
@@ -347,6 +468,34 @@ export interface SuiService {
     parent: ObjectId,
     name: DynamicFieldName
   ) => Effect.Effect<Option.Option<DynamicField>, TransportError>
+
+  /**
+   * Reads the object stored under a dynamic **object** field
+   * (`0x2::dynamic_object_field`), decoding its content with `opts.schema`
+   * when given; absence is `None`.
+   *
+   * `name` is the key as the Move code wrote it — its own type and BCS bytes —
+   * not the `dynamic_object_field::Wrapper<…>` the SDK wraps it in. The
+   * object's type tag is checked the way `getObject` checks it. Written as an
+   * overload set for the same reason `getObject` is; the implementation is
+   * `Effect.fn`.
+   *
+   * Fails with: `DecodeError`, `TransportError`.
+   *
+   * @since 0.4.0
+   */
+  readonly getDynamicObjectFieldOption: {
+    <S>(
+      parent: ObjectId,
+      name: DynamicFieldName,
+      opts: { readonly schema: Schema.Codec<S, Uint8Array>; readonly expectedType?: string }
+    ): Effect.Effect<Option.Option<SuiObject<S>>, DecodeError | TransportError>
+    (
+      parent: ObjectId,
+      name: DynamicFieldName,
+      opts?: { readonly schema?: undefined; readonly expectedType?: string }
+    ): Effect.Effect<Option.Option<SuiObject<Uint8Array>>, DecodeError | TransportError>
+  }
 
   /**
    * Reads an executed transaction. A historical transaction that failed on
@@ -386,13 +535,15 @@ export interface SuiService {
    * composed with `Schema.decodeTo(DomainClass, …)`; no type tag is compared
    * either way.
    *
-   * `opts.sender` is the address the call is simulated as, defaulting to the
-   * zero address the way the SDK does; a recipe that sets its own sender wins.
+   * `input` is anything `simulate` takes: a recipe, a `Transaction`, or
+   * serialized bytes. `opts.sender` is the address the call is simulated as,
+   * defaulting to the zero address the way the SDK does; a recipe that sets its
+   * own sender wins, and bytes carry their own.
    *
    * Fails with: `SimulationFailed`, `BuildError`, `DecodeError`, `TransportError`.
    */
   readonly view: <S, I>(
-    recipe: Recipe,
+    input: Recipe | Transaction | Uint8Array,
     schema: Schema.Codec<S, Uint8Array> | BcsType<S, I>,
     opts?: {
       readonly command?: number
@@ -426,6 +577,48 @@ export interface SuiService {
   ) => Stream.Stream<DynamicFieldEntry, TransportError>
 
   /**
+   * Every event matching `filter` (all events when omitted), paginated in
+   * ledger order — oldest first, or newest first with
+   * `{ order: "descending" }`.
+   *
+   * `filter` is the SDK's `EventFilter`: exactly one of `sender`,
+   * `emitModule` (`package::module`) or `eventType` (a module, or a full type;
+   * a bare generic matches every instantiation on gRPC and GraphQL). Decode an
+   * event's payload with `SuiSchema.decode(codec, entry.bcs, { actualType:
+   * entry.eventType })`. The stream follows `hasNextPage`, not the item count,
+   * so a scan-limited server's empty pages do not end it early.
+   *
+   * Fails with: `TransportError`.
+   *
+   * @since 0.4.0
+   */
+  readonly streamEvents: (
+    filter?: EventFilter,
+    opts?: { readonly order?: ListOrder }
+  ) => Stream.Stream<EventEntry, TransportError>
+
+  /**
+   * Every transaction matching `filter` (all transactions when omitted),
+   * paginated in ledger order, oldest first unless `{ order: "descending" }`.
+   *
+   * `filter` is the SDK's `TransactionFilter`: exactly one of `sender` or
+   * `function` (`package`, `package::module` or `package::module::function`).
+   * Each transaction is read with the execute include set and decoded to an
+   * `Executed`. A transaction that applied and **failed** is an ordinary
+   * entry in a history, so it is a `Result` failure carrying the
+   * `ExecutionFailed` — not a failure of the stream, which `getTransaction`'s
+   * "a failure is a failure" rule would make it.
+   *
+   * Fails with: `TransportError`.
+   *
+   * @since 0.4.0
+   */
+  readonly streamTransactions: (
+    filter?: TransactionFilter,
+    opts?: { readonly order?: ListOrder }
+  ) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>
+
+  /**
    * Serializes work for one sender, so two transactions from the same address
    * cannot pick the same gas coin. Adds no failures of its own.
    */
@@ -433,9 +626,6 @@ export interface SuiService {
     address: SuiAddress
   ) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 }
-
-/** How long an unused sender lock is kept before it is released. */
-const SENDER_LOCK_TTL = "1 minute"
 
 const CHUNK = 50
 
@@ -674,7 +864,7 @@ const makeSui = (
     return yield* core.getDynamicField({ parentId: parent, name }).pipe(
       Effect.flatMap(({ dynamicField }) =>
         // `SuiClientTypes.DynamicField` declares `valueType`, but the SDK's
-        // `getDynamicField` (through at least 2.34) only sets `value.type`.
+        // `getDynamicField` (through at least 2.38) only sets `value.type`.
         decodeDynamicField({
           ...dynamicField,
           valueType: dynamicField.valueType ?? dynamicField.value?.type
@@ -697,10 +887,61 @@ const makeSui = (
   ): Effect.fn.Return<Executed, ExecutionFailed | TransactionNotFound | TransportError> {
     return yield* core.getTransaction({ digest, include: EXECUTE_INCLUDE }).pipe(
       Effect.flatMap(fromTransactionResult),
-      Effect.catchTag("DecodeError", (error) =>
+      Effect.catchTag("DecodeError", (error) => Effect.fail(decodeAsTransport("getTransaction")(error)))
+    )
+  })
+
+  const getDynamicObjectFieldOption = Effect.fn("Sui.getDynamicObjectFieldOption")(function*<S>(
+    parent: ObjectId,
+    name: DynamicFieldName,
+    opts?: ReadOptions<S>
+  ): Effect.fn.Return<Option.Option<SuiObject<S | Uint8Array>>, DecodeError | TransportError> {
+    return yield* core.getDynamicObjectField({ parentId: parent, name, include: OBJECT_INCLUDE }).pipe(
+      Effect.flatMap(({ object }) => Effect.map(decodeObject(object, opts), Option.some)),
+      Effect.catchTag(["ObjectNotFound", "ObjectDeleted"], () =>
+        Effect.succeed(Option.none<SuiObject<S | Uint8Array>>())),
+      // As `getDynamicFieldOption`: an object the node cannot serve is not an
+      // absence, and not something the caller can act on as an object error.
+      Effect.catchTag("ObjectUnavailable", (error) =>
         Effect.fail(
-          new TransportError({ method: "getTransaction", retryable: false, cause: error })
+          new TransportError({ method: "getDynamicObjectField", retryable: false, cause: error })
         ))
+    )
+  })
+
+  const getCoinMetadataOption = Effect.fn("Sui.getCoinMetadataOption")(function*(
+    coinType: CoinType
+  ): Effect.fn.Return<Option.Option<CoinMetadata>, TransportError> {
+    const { coinMetadata } = yield* core.getCoinMetadata({ coinType })
+    if (coinMetadata === null) return Option.none()
+    return Option.some(
+      yield* decodeCoinMetadata(coinMetadata).pipe(Effect.mapError(boundaryError("getCoinMetadata")))
+    )
+  })
+
+  const resolveNameServiceAddressOption = Effect.fn("Sui.resolveNameServiceAddressOption")(
+    function*(name: string): Effect.fn.Return<Option.Option<SuiAddress>, TransportError> {
+      const { address } = yield* core.resolveNameServiceAddress({ name })
+      if (address === null) return Option.none()
+      return Option.some(
+        yield* decodeAddress(address).pipe(
+          Effect.mapError(boundaryError("resolveNameServiceAddress"))
+        )
+      )
+    }
+  )
+
+  const defaultNameServiceNameOption = Effect.fn("Sui.defaultNameServiceNameOption")(function*(
+    address: SuiAddress
+  ): Effect.fn.Return<Option.Option<string>, TransportError> {
+    return yield* core.defaultNameServiceName({ address }).pipe(
+      Effect.map(({ data }) => Option.fromNullishOr(data.name)),
+      // `@mysten/sui` before 2.33.2 threw the node's `NOT_FOUND` for an address
+      // with no name instead of answering `null`.
+      Effect.catchIf(
+        (error: TransportError) => error.status === "NOT_FOUND",
+        () => Effect.succeed(Option.none<string>())
+      )
     )
   })
 
@@ -746,7 +987,7 @@ const makeSui = (
   })
 
   const view = Effect.fn("Sui.view")(function*<S, I>(
-    recipe: Recipe,
+    input: Recipe | Transaction | Uint8Array,
     schema: Schema.Codec<S, Uint8Array> | BcsType<S, I>,
     opts?: {
       readonly command?: number
@@ -761,7 +1002,7 @@ const makeSui = (
     const codec = isBcsType(schema)
       ? bcsCodec(schema as unknown as BcsType<S, S>)
       : schema
-    const simulation = yield* fromSimulationResult(yield* simulateRaw(recipe, false, opts?.sender))
+    const simulation = yield* fromSimulationResult(yield* simulateRaw(input, false, opts?.sender))
     const index = opts?.command ?? simulation.commandResults.length - 1
     const command = simulation.commandResults[index]
     if (command === undefined) {
@@ -782,7 +1023,7 @@ const makeSui = (
   })
 
   const streamOwnedObjects = (owner: SuiAddress, opts?: { readonly type?: StructTag }) =>
-    Stream.paginate(null as string | null, (cursor: string | null) =>
+    paginated("Sui.streamOwnedObjects", (cursor) =>
       core
         .listOwnedObjects({
           owner,
@@ -792,47 +1033,135 @@ const makeSui = (
         })
         .pipe(
           Effect.flatMap((response) =>
-            Effect.forEach(response.objects, (object) => decodeObject<Uint8Array>(object)).pipe(
-              Effect.map((objects) =>
-                [
-                  objects as ReadonlyArray<SuiObject<Uint8Array>>,
-                  response.hasNextPage && response.cursor !== null
-                    ? Option.some<string | null>(response.cursor)
-                    : Option.none<string | null>()
-                ] as const
-              )
+            Effect.map(
+              Effect.forEach(response.objects, (object) => decodeObject<Uint8Array>(object)),
+              (objects): Page<SuiObject<Uint8Array>> => ({
+                items: objects as ReadonlyArray<SuiObject<Uint8Array>>,
+                next: nextCursor(response.hasNextPage, response.cursor)
+              })
             )
           ),
           Effect.catchTag("DecodeError", (error) =>
-            Effect.fail(
-              new TransportError({ method: "listOwnedObjects", retryable: false, cause: error })
-            ))
-        )).pipe(Stream.withSpan("Sui.streamOwnedObjects"))
+            Effect.fail(decodeAsTransport("listOwnedObjects")(error)))
+        ))
 
   const streamDynamicFields = (parent: ObjectId) =>
-    Stream.paginate(null as string | null, (cursor: string | null) =>
+    paginated("Sui.streamDynamicFields", (cursor) =>
       core
-        .listDynamicFields({
-          parentId: parent,
+        .listDynamicFields({ parentId: parent, ...(cursor === null ? {} : { cursor }) })
+        .pipe(
+          Effect.flatMap((response) =>
+            Effect.map(
+              Effect.forEach(response.dynamicFields, (field) =>
+                decodeDynamicFieldEntry(field).pipe(
+                  Effect.mapError(boundaryError("listDynamicFields"))
+                )),
+              (fields): Page<DynamicFieldEntry> => ({
+                items: fields,
+                next: nextCursor(response.hasNextPage, response.cursor)
+              })
+            )
+          )
+        ))
+
+  const streamBalances = (owner: SuiAddress) =>
+    paginated("Sui.streamBalances", (cursor) =>
+      core.listBalances({ owner, ...(cursor === null ? {} : { cursor }) }).pipe(
+        Effect.flatMap((response) =>
+          Effect.map(
+            Effect.forEach(response.balances, (balance) =>
+              decodeBalance(balance).pipe(Effect.mapError(boundaryError("listBalances")))),
+            (balances): Page<Balance> => ({
+              items: balances,
+              next: nextCursor(response.hasNextPage, response.cursor)
+            })
+          )
+        )
+      ))
+
+  const streamCoins = (owner: SuiAddress, coinType?: CoinType) =>
+    paginated("Sui.streamCoins", (cursor) =>
+      core
+        .listCoins({
+          owner,
+          ...(coinType === undefined ? {} : { coinType }),
           ...(cursor === null ? {} : { cursor })
         })
         .pipe(
           Effect.flatMap((response) =>
-            Effect.forEach(response.dynamicFields, (field) =>
-              decodeDynamicFieldEntry(field).pipe(
-                Effect.mapError(boundaryError("listDynamicFields"))
-              )).pipe(
-                Effect.map((fields) =>
-                  [
-                    fields,
-                    response.hasNextPage && response.cursor !== null
-                      ? Option.some<string | null>(response.cursor)
-                      : Option.none<string | null>()
-                  ] as const
-                )
-              )
+            Effect.map(
+              Effect.forEach(response.objects, (coin) =>
+                decodeCoin(coin).pipe(Effect.mapError(boundaryError("listCoins")))),
+              (coins): Page<Coin> => ({
+                items: coins,
+                next: nextCursor(response.hasNextPage, response.cursor)
+              })
+            )
           )
-        )).pipe(Stream.withSpan("Sui.streamDynamicFields"))
+        ))
+
+  /**
+   * The SDK's ledger cursors: continue an ascending read with `after` and a
+   * descending one with `before`, both set to the last page's `endCursor`.
+   */
+  const ledgerCursor = (order: ListOrder | undefined, cursor: string | null) =>
+    cursor === null
+      ? (order === undefined ? {} : { order })
+      : order === "descending"
+      ? { before: cursor }
+      : { after: cursor }
+
+  const streamEvents = (filter?: EventFilter, opts?: { readonly order?: ListOrder }) =>
+    paginated("Sui.streamEvents", (cursor) =>
+      core
+        .listEvents({
+          ...(filter === undefined ? {} : { filter }),
+          ...ledgerCursor(opts?.order, cursor)
+        })
+        .pipe(
+          Effect.flatMap((response) =>
+            Effect.map(
+              Effect.forEach(response.events, (event) =>
+                decodeEventEntry(event).pipe(Effect.mapError(boundaryError("listEvents")))),
+              (events): Page<EventEntry> => ({
+                items: events,
+                next: nextCursor(response.hasNextPage, response.endCursor)
+              })
+            )
+          )
+        ))
+
+  const streamTransactions = (
+    filter?: TransactionFilter,
+    opts?: { readonly order?: ListOrder }
+  ) =>
+    paginated("Sui.streamTransactions", (cursor) =>
+      core
+        .listTransactions({
+          ...(filter === undefined ? {} : { filter }),
+          ...ledgerCursor(opts?.order, cursor),
+          include: EXECUTE_INCLUDE
+        })
+        .pipe(
+          Effect.flatMap((response) =>
+            Effect.map(
+              Effect.forEach(response.transactions, (transaction) =>
+                fromTransactionResult(transaction).pipe(
+                  Effect.map((executed): Result.Result<Executed, ExecutionFailed> =>
+                    Result.succeed(executed)
+                  ),
+                  Effect.catchTag("ExecutionFailed", (failed) =>
+                    Effect.succeed(Result.fail(failed) as Result.Result<Executed, ExecutionFailed>)),
+                  Effect.catchTag("DecodeError", (error) =>
+                    Effect.fail(decodeAsTransport("listTransactions")(error)))
+                )),
+              (transactions): Page<Result.Result<Executed, ExecutionFailed>> => ({
+                items: transactions,
+                next: nextCursor(response.hasNextPage, response.endCursor)
+              })
+            )
+          )
+        ))
 
   const withSenderLock = (address: SuiAddress) =>
     Effect.fn("Sui.withSenderLock")(function*<A, E, R>(
@@ -893,15 +1222,23 @@ const makeSui = (
     getObjectOption: getObjectOption as SuiService["getObjectOption"],
     getObjects: getObjects as SuiService["getObjects"],
     getObjectsStrict: getObjectsStrict as SuiService["getObjectsStrict"],
-    // The same function under its 0.1.0 name, so a 0.1.1 extension compiles.
-    getObjectsOrFail: getObjectsStrict as SuiService["getObjectsOrFail"],
     getBalance,
+    streamBalances,
+    streamCoins,
+    getCoinMetadataOption,
+    resolveNameServiceAddressOption,
+    defaultNameServiceNameOption,
     getDynamicFieldOption,
+    getDynamicObjectFieldOption: getDynamicObjectFieldOption as SuiService[
+      "getDynamicObjectFieldOption"
+    ],
     getTransaction,
     simulate,
     view,
     streamOwnedObjects,
     streamDynamicFields,
+    streamEvents,
+    streamTransactions,
     withSenderLock
   }
 }
@@ -988,10 +1325,7 @@ export class Sui extends Context.Service<Sui, SuiService>()("@unconfirmed/sui-ef
         if (expected !== undefined && expected !== chainIdentifier) {
           return yield* new NetworkMismatch({ expected, actual: chainIdentifier })
         }
-        const locks = yield* RcMap.make({
-          lookup: (_address: string) => Effect.succeed(Semaphore.makeUnsafe(1)),
-          idleTimeToLive: SENDER_LOCK_TTL
-        })
+        const locks = yield* makeSenderLocks
         return makeSui(core, chainIdentifier, locks)
       })
     )
@@ -1015,10 +1349,7 @@ export class Sui extends Context.Service<Sui, SuiService>()("@unconfirmed/sui-ef
       Sui,
       Effect.gen(function*() {
         const core = yield* SuiCore
-        const locks = yield* RcMap.make({
-          lookup: (_address: string) => Effect.succeed(Semaphore.makeUnsafe(1)),
-          idleTimeToLive: SENDER_LOCK_TTL
-        })
+        const locks = yield* makeSenderLocks
         return makeSui(core, chainId, locks)
       })
     )

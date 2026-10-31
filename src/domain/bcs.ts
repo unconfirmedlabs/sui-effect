@@ -9,20 +9,14 @@
  * @since 0.1.0
  */
 import type { BcsType } from "@mysten/bcs"
-import { normalizeStructTag, parseStructTag } from "@mysten/sui/utils"
+import { parseStructTag } from "@mysten/sui/utils"
 import { Effect, Schema, SchemaAST, SchemaIssue, SchemaTransformation } from "effect"
 import { DecodeError, decodePayload } from "./errors.ts"
-import type { ObjectId } from "./schemas.ts"
+import { normalizeStructTagSafe, type ObjectId } from "./schemas.ts"
 
 const SUI_TYPE_ANNOTATION = "sui-effect/suiType"
 
-const normalizeSafe = (value: string): string => {
-  try {
-    return normalizeStructTag(value)
-  } catch {
-    return value
-  }
-}
+const normalizeSafe = normalizeStructTagSafe
 
 /**
  * Turns a BCS layout into a `Schema.Codec<T, Uint8Array>` tagged with the Move

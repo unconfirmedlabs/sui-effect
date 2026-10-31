@@ -1117,12 +1117,12 @@ describe("generic Move types", () => {
   })
 })
 
-describe("getObjectsOrFail", () => {
+describe("getObjectsStrict", () => {
   test("returns the objects in the order of the ids", async () => {
     const objects = await run(
       Effect.gen(function*() {
         const sui = yield* Sui
-        return yield* sui.getObjectsOrFail(
+        return yield* sui.getObjectsStrict(
           [ObjectId.make(PADDED("e2")), ObjectId.make(PADDED("e1"))],
           { schema: Escrow }
         )
@@ -1136,7 +1136,7 @@ describe("getObjectsOrFail", () => {
       Effect.gen(function*() {
         const sui = yield* Sui
         return yield* sui
-          .getObjectsOrFail([ObjectId.make(PADDED("e1")), ObjectId.make(PADDED("404"))])
+          .getObjectsStrict([ObjectId.make(PADDED("e1")), ObjectId.make(PADDED("404"))])
           .pipe(Effect.flip)
       })
     )
@@ -1197,4 +1197,9 @@ describe("view and simulate senders", () => {
     const options = call?.options as { readonly transaction: { getData: () => { sender: string } } }
     expect(options.transaction.getData().sender).toBe(PADDED("b0b"))
   })
+})
+
+test("getObjectsOrFail is gone in 0.4.0: getObjectsStrict is the one name", async () => {
+  const sui = await run(Effect.service(Sui))
+  expect("getObjectsOrFail" in sui).toBe(false)
 })
