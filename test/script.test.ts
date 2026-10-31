@@ -596,11 +596,12 @@ describe("Script.run", () => {
     expect(lines).toContain("interrupted")
   })
 
-  test("a defect prints what the default journal still holds unresolved", async () => {
-    // A script killed between signing and the answer otherwise exits with no
-    // digest and no bytes, and nobody can account for the transaction. The
-    // default journal is process-wide, which is what makes it readable from
-    // outside the fiber that wrote to it.
+  test("a journal entry the run did not write is not this run's to report", async () => {
+    // Before 0.4.0 this printed whatever the process-wide default journal held,
+    // which in a shared durable journal includes other processes' in-flight
+    // submissions (wallet#12). A run now reports the entries `Tx` wrote during
+    // it, wherever the journal was provided; test/f3-script.test.ts drives the
+    // real path, a submission interrupted mid-flight.
     const digest = Digest.make(fakeDigest(31))
     await Effect.runPromise(
       Effect.flatMap(Journal, (journal) =>
@@ -617,8 +618,7 @@ describe("Script.run", () => {
     expect(result.code).toBe(1)
     const printed = result.lines.join("\n")
     expect(printed).toContain("killed mid-submit")
-    expect(printed).toContain(`unresolved ${digest} (Signed)`)
-    expect(printed).toContain("bytes: ")
+    expect(printed).not.toContain(`unresolved ${digest} (Signed)`)
 
     // Clean up after ourselves: the default journal outlives this test.
     await Effect.runPromise(

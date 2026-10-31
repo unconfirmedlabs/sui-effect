@@ -25,14 +25,17 @@ import {
   Logger,
   Predicate,
   Result,
-  Schema
+  Schema,
+  SchemaIssue
 } from "effect"
 import * as Base64 from "effect/encoding/Base64"
 import type { NetworkMismatch, SuiError, TransportError } from "../domain/errors.ts"
 import { digestOf, SuiError as SuiErrorHelpers } from "../domain/errors.ts"
-import { JournalEntry } from "../domain/journal-entry.ts"
+import { isUnresolved, JournalEntry } from "../domain/journal-entry.ts"
 import type { JournalService } from "./Journal.ts"
 import { Journal } from "./Journal.ts"
+import type { RunRecordService } from "./RunRecord.ts"
+import { makeRunRecord, RunRecord } from "./RunRecord.ts"
 import type { Signer } from "./Signer.ts"
 import { fromConfig } from "./Signer.ts"
 import type { SuiService } from "./Sui.ts"
@@ -76,15 +79,37 @@ const configError = (message: string): Config.ConfigError =>
  */
 export const readNetwork: Effect.Effect<string, Config.ConfigError> = Effect.gen(function*() {
   const network = yield* Config.NonEmptyString("SUI_NETWORK")
-  if (network !== "mainnet") return network
-  const gate = yield* Config.String(MAINNET_GATE).pipe(Config.withDefault(""))
-  if (gate === "1" || gate === "true") return network
-  return yield* Effect.fail(
-    configError(
-      `SUI_NETWORK is mainnet: set ${MAINNET_GATE}=1 to let this script touch mainnet.`
-    )
-  )
+  return yield* gateNetwork(network, "SUI_NETWORK is mainnet")
 })
+
+/**
+ * The mainnet gate on a network that is already known: `mainnet` passes only
+ * with `SUI_ALLOW_MAINNET=1`, everything else passes.
+ *
+ * Fails with: `ConfigError`.
+ */
+const gateNetwork = (
+  network: string,
+  what: string
+): Effect.Effect<string, Config.ConfigError> =>
+  Effect.gen(function*() {
+    if (network !== "mainnet") return network
+    const gate = yield* Config.String(MAINNET_GATE).pipe(Config.withDefault(""))
+    if (gate === "1" || gate === "true") return network
+    return yield* Effect.fail(
+      configError(`${what}: set ${MAINNET_GATE}=1 to let this script touch mainnet.`)
+    )
+  })
+
+/**
+ * The network of the `SuiCore` a `NoDeps` layer was handed, through the same
+ * mainnet gate. The client already knows its network; reading `SUI_NETWORK`
+ * again could only disagree with it, or fail over a fake that never set it.
+ */
+const networkOfCore = Effect.flatMap(
+  SuiCore,
+  (core) => gateNetwork(core.network, "the client is on mainnet")
+)
 
 /** The read-only script service, which has no `signer` in its type. */
 export class ScriptReadOnly
@@ -143,13 +168,17 @@ export class Script extends Context.Service<Script, ScriptService>()("@unconfirm
    * Like {@link layer}, but over a `Sui` and `SuiCore` the caller already has,
    * which is how a test runs a script against the fake.
    *
+   * The network is the one that `SuiCore` reports, not `SUI_NETWORK`: the
+   * client already knows where it points, so only `SUI_PRIVATE_KEY` is read.
+   * A `mainnet` client still needs `SUI_ALLOW_MAINNET=1`.
+   *
    * Fails with: `ConfigError`.
    */
   static readonly layerNoDeps: Layer.Layer<Script, Config.ConfigError, Sui | SuiCore> = Layer
     .effect(
       Script,
       Effect.gen(function*() {
-        const network = yield* readNetwork
+        const network = yield* networkOfCore
         const signer = yield* fromConfig()
         const sui = yield* Sui
         const core = yield* SuiCore
@@ -161,6 +190,10 @@ export class Script extends Context.Service<Script, ScriptService>()("@unconfirm
    * A script with a signer the caller built, for a credential that does not
    * come from `SUI_PRIVATE_KEY` (a KMS, a wallet, a test key).
    *
+   * Reads nothing from the environment except the mainnet gate: the network is
+   * the one the provided `SuiCore` reports, and `SUI_ALLOW_MAINNET=1` is
+   * required only when that is `mainnet`.
+   *
    * Fails with: `ConfigError`.
    */
   static readonly layerWithSigner = (
@@ -169,7 +202,7 @@ export class Script extends Context.Service<Script, ScriptService>()("@unconfirm
     Layer.effect(
       Script,
       Effect.gen(function*() {
-        const network = yield* readNetwork
+        const network = yield* networkOfCore
         const sui = yield* Sui
         const core = yield* SuiCore
         return { sui, core, signer, network }
@@ -202,7 +235,8 @@ export class Script extends Context.Service<Script, ScriptService>()("@unconfirm
 
   /**
    * {@link layerReadOnly} over a `Sui` and `SuiCore` the caller already has,
-   * which is how a test exercises the read-only preset against the fake.
+   * which is how a test exercises the read-only preset against the fake. The
+   * network is the one that `SuiCore` reports, as in {@link layerNoDeps}.
    *
    * Fails with: `ConfigError`.
    */
@@ -213,7 +247,7 @@ export class Script extends Context.Service<Script, ScriptService>()("@unconfirm
   > = Layer.effect(
     ScriptReadOnly,
     Effect.gen(function*() {
-      const network = yield* readNetwork
+      const network = yield* networkOfCore
       const sui = yield* Sui
       const core = yield* SuiCore
       return { sui, core, network }
@@ -251,6 +285,11 @@ export interface ReportOptions {
    * default and find nothing, which is precisely wrong for the program that
    * provided a durable one. Left out, the default reference is read, which is
    * right for a program that never provided a journal at all.
+   *
+   * Every unresolved entry in it is reported, including entries another
+   * process wrote to a shared store. `Script.run` does better: it records the
+   * entries its own program wrote, wherever the journal was provided, and
+   * reports only those.
    */
   readonly journal?: JournalService
 }
@@ -284,25 +323,39 @@ export const report = async <A, E>(
 ): Promise<number> => {
   const write = safeWriter(options?.stderr)
   if (Exit.isSuccess(exit)) return exitCode(exit)
-  if (Cause.hasDies(exit.cause)) {
-    write(Cause.pretty(exit.cause))
-  } else {
-    const failure = Cause.findErrorOption(exit.cause)
-    if (failure._tag === "Some") {
-      for (const line of describeFailure(failure.value)) write(line)
-    } else if (Cause.hasInterrupts(exit.cause)) {
-      write("interrupted")
-    } else {
-      write(Cause.pretty(exit.cause))
-    }
-  }
+  const printed = writeFailure(exit, write)
   // On **every** non-zero exit, not only a defect or an interrupt: a typed
   // failure escaping after a submission — an outer timeout, a preflight that
   // ran too late, an extension error raised past `Tx.submit` — leaves the
   // same record on the wire, and the operator needs the same bytes.
   const unresolved = await readUnresolved(options?.journal)
-  for (const line of unresolvedLines(unresolved)) write(line)
+  for (const line of unresolvedLines(unresolved, printed)) write(line)
   return exitCode(exit, { unresolved: unresolved.length })
+}
+
+/**
+ * Writes the diagnostic lines of a failed `Exit` and answers the digests whose
+ * bytes were already printed, so the unresolved section does not print them a
+ * second time.
+ */
+const writeFailure = <A, E>(
+  exit: Exit.Failure<A, E>,
+  write: (line: string) => void
+): ReadonlySet<string> => {
+  const printed = new Set<string>()
+  if (Cause.hasDies(exit.cause)) {
+    write(Cause.pretty(exit.cause))
+    return printed
+  }
+  const failure = Cause.findErrorOption(exit.cause)
+  if (failure._tag === "Some") {
+    for (const line of describeFailure(failure.value, printed)) write(line)
+  } else if (Cause.hasInterrupts(exit.cause)) {
+    write("interrupted")
+  } else {
+    write(Cause.pretty(exit.cause))
+  }
+  return printed
 }
 
 /**
@@ -344,6 +397,14 @@ const hasTag = (error: unknown): error is { readonly _tag: string } =>
 const hasOutcomeField = (error: unknown): error is { readonly outcome: string } =>
   Predicate.hasProperty(error, "outcome") && typeof error.outcome === "string"
 
+/**
+ * A declared exit code: an integer from 1 to 255. Zero is not one — a failure
+ * that exits 0 would tell a wrapper it succeeded.
+ */
+const hasExitCodeField = (error: unknown): error is { readonly exitCode: number } =>
+  Predicate.hasProperty(error, "exitCode") && typeof error.exitCode === "number" &&
+  Number.isInteger(error.exitCode) && error.exitCode >= 1 && error.exitCode <= 255
+
 /** What {@link exitCode} needs to know beyond the `Exit` itself. */
 export interface ExitCodeOptions {
   /**
@@ -356,10 +417,25 @@ export interface ExitCodeOptions {
    * entry the exit is 3, "reconcile before doing anything else"; with none it
    * is the ordinary 4 for a timeout and 130 for an interrupt.
    *
-   * `Script.run` fills it in from the journal the script ran with. Left out, it
-   * is zero, and a timeout is 4 as before.
+   * `Script.run` fills it in from the entries the script itself wrote. Left
+   * out, it is zero, and a timeout is 4 as before.
    */
   readonly unresolved?: number
+  /**
+   * How many transactions this run submitted that the network answered as
+   * applied (`Executed` or `Failed` in the journal).
+   *
+   * A failure *after* a transaction applied — a timeout around the visibility
+   * wait, a read that failed afterwards, an interrupt — must not tell a
+   * wrapper "nothing happened, safe to retry", because the retry sends a
+   * second transaction. So when this is above zero, a failure that would exit
+   * 2, 4 or 130 exits **5** instead. An unresolved entry still wins (3).
+   *
+   * `Script.run` fills it in. Left out, it is zero.
+   *
+   * @since 0.4.0
+   */
+  readonly applied?: number
 }
 
 /**
@@ -373,11 +449,19 @@ export interface ExitCodeOptions {
  * is a submission outstanding, in which case it is 3, because a wrapper that
  * sees 130 has no reason to go looking for one.
  *
- * An extension error that declares an `outcome` is honoured, so a downstream
- * SDK's own failures land on the same axis. `SchemaError` — what Effect's own
- * `Config.schema` and `Schema.decodeUnknownEffect` fail with — is exit 2 with
- * `ConfigError`, because in a script it can only mean the input a person gave
- * did not fit the schema, and no retry fixes that.
+ * **A declared `exitCode` wins.** An error carrying an integer `exitCode`
+ * field from 1 to 255 exits with it — which is how a script's own `BadInput`
+ * says 2 ("fix the input, retrying will not help") instead of the 4 its
+ * `outcome: "not_applied"` would give. Below that, an extension error that
+ * declares an `outcome` is honoured, so a downstream SDK's own failures land
+ * on the same axis. `SchemaError` — what Effect's own `Config.schema` and
+ * `Schema.decodeUnknownEffect` fail with — is exit 2 with `ConfigError`,
+ * because in a script it can only mean the input a person gave did not fit the
+ * schema, and no retry fixes that.
+ *
+ * **Once this run applied a transaction** ({@link ExitCodeOptions.applied}),
+ * any failure that would exit 2, 4 or 130 — a declared `exitCode` included —
+ * exits 5: none of those may be read as "nothing happened" any more.
  *
  * An error with a tag this library has never heard of and no `outcome` is
  * *unclassified* and exits 1, the code that also means defect. It deliberately
@@ -392,8 +476,16 @@ export const exitCode = <A, E>(
   options?: ExitCodeOptions
 ): number => {
   if (Exit.isSuccess(exit)) return EXIT.success
-  const cause = exit.cause
   const unresolved = options?.unresolved ?? 0
+  const applied = options?.applied ?? 0
+  const code = rawExitCode(exit.cause, unresolved)
+  if (unresolved > 0 || applied === 0) return code
+  return code === EXIT.configuration || code === EXIT.notApplied || code === EXIT.interrupted
+    ? EXIT.applied
+    : code
+}
+
+const rawExitCode = <E>(cause: Cause.Cause<E>, unresolved: number): number => {
   if (Cause.hasInterrupts(cause) && !Cause.hasFails(cause) && !Cause.hasDies(cause)) {
     return unresolved > 0 ? EXIT.unknown : EXIT.interrupted
   }
@@ -416,6 +508,9 @@ export const exitCode = <A, E>(
  */
 const codeOfError = (error: unknown, unresolved: number): number => {
   if (isConfigError(error)) return EXIT.configuration
+  // A declared exit code is the most specific thing an error can say about
+  // itself: the author chose the number.
+  if (hasExitCodeField(error)) return error.exitCode
   // **A declared `outcome` wins before anything else, tag or no tag.** That is
   // the order this function has always had, and it is load-bearing: a wrapper
   // that puts `outcome` on an error is saying what it knows about the chain,
@@ -461,11 +556,14 @@ export interface ScriptRunOptions {
    * The layer to run the script over. Defaults to {@link Script.layer}, which
    * reads the environment; a test passes `Script.layerNoDeps` over
    * `layerTest(script)` and never touches the network.
+   *
+   * It may fail with **anything**: a layer that also opens a durable journal
+   * (`Layer.merge(Script.layer, journalLayer)`) fails with `JournalError` or a
+   * `PlatformError`, and that failure is mapped to an exit code like any other
+   * — never `Layer.orDie` it, which turns a failed journal open into exit 1.
+   * It may also provide more than the three services, a `Journal` above all.
    */
-  readonly layer?: Layer.Layer<
-    Script | Sui | SuiCore,
-    Config.ConfigError | NetworkMismatch | TransportError
-  >
+  readonly layer?: Layer.Layer<Script | Sui | SuiCore, unknown>
   /** How the process ends. Defaults to `process.exit`. */
   readonly exit?: (code: number) => void
   /** Where diagnostics go, one line at a time. Defaults to `process.stderr`. */
@@ -482,14 +580,52 @@ export interface SignalSource {
   readonly off?: (signal: string, handler: () => void) => unknown
 }
 
-const describeFailure = (error: unknown): ReadonlyArray<string> => {
-  if (!hasTag(error)) return [String(error)]
+/** Many lines made one: one failure, one line on stderr. */
+const oneLine = (text: string): string => text.replace(/\s*\n\s*/g, "; ").trim()
+
+/**
+ * The environment variable a config path names, as `ConfigProvider.fromEnv`
+ * spells it: the segments joined with `_` (`["TIPJAR", "PACKAGE_ID"]` is
+ * `TIPJAR_PACKAGE_ID`).
+ */
+const envNameOf = (path: ReadonlyArray<PropertyKey>): string => path.map(String).join("_")
+
+const formatIssue = SchemaIssue.makeFormatterDefault()
+
+/**
+ * A `ConfigError` as one line that names the variable: `missing SUI_NETWORK`
+ * when it was not set at all, `TIPJAR_PACKAGE_ID: Expected …` when it was set
+ * and did not fit. A source error (the mainnet gate, an unreadable provider)
+ * is its message.
+ */
+const describeConfigError = (error: Config.ConfigError): string => {
+  const cause = error.cause
+  if (!Schema.isSchemaError(cause)) return `ConfigError ${oneLine(cause.message)}`
+  const issue = cause.issue
+  if (issue._tag === "Pointer" && issue.path.length > 0) {
+    const name = envNameOf(issue.path)
+    const inner = issue.issue
+    // A variable that is not set reaches the schema as no input at all, which
+    // the schema reports as the wrong *type* with nothing to show for it.
+    if (inner._tag === "InvalidType" && !SchemaIssue.hasInput(inner)) {
+      return `ConfigError missing ${name}`
+    }
+    return `ConfigError ${name}: ${oneLine(formatIssue(inner))}`
+  }
+  return `ConfigError ${oneLine(formatIssue(issue))}`
+}
+
+const describeFailure = (error: unknown, printed: Set<string>): ReadonlyArray<string> => {
+  if (isConfigError(error) && error instanceof Config.ConfigError) {
+    return [describeConfigError(error)]
+  }
+  if (!hasTag(error)) return [oneLine(String(error))]
   const lines: Array<string> = []
   if (!SuiErrorHelpers.isTaxonomy(error)) {
     const message = "message" in error && typeof error.message === "string"
       ? ` ${error.message}`
       : ""
-    return [`${error._tag}${message}`]
+    return [oneLine(`${error._tag}${message}`)]
   }
   {
     const tagged: SuiError = error
@@ -499,6 +635,7 @@ const describeFailure = (error: unknown): ReadonlyArray<string> => {
     if (tagged._tag === "SubmissionUnknown") {
       if (tagged.signed !== undefined) {
         lines.push(`bytes: ${Base64.encode(tagged.signed.bytes)}`)
+        printed.add(tagged.digest)
       }
       lines.push(
         "the outcome is unknown: reconcile this digest before sending anything else from this sender"
@@ -529,22 +666,26 @@ const encodeJournalEntry = Schema.encodeUnknownResult(JournalEntry)
 /**
  * The lines describing what this process left on the wire, if anything.
  *
- * Three lines per entry: the digest and tag for a human, the raw base64 bytes
- * for someone about to resubmit by hand, and the **whole entry encoded through
- * the `JournalEntry` schema** — which is the same JSON a durable journal
+ * Up to three lines per entry: the digest and tag for a human, the raw base64
+ * bytes for someone about to resubmit by hand — unless the failure line above
+ * already printed them for that digest — and the **whole entry encoded through
+ * the `JournalEntry` schema**, which is the same JSON a durable journal
  * stores, bytes base64 and timestamps included. That last line is what lets a
  * wrapper pipe stderr into a file and hand it back to a recovery process
  * verbatim, instead of scraping two lines and losing `attempts`, `lastError`
  * and the expiration the bytes carry.
  */
-const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<string> => {
+const unresolvedLines = (
+  entries: ReadonlyArray<JournalEntry>,
+  printed: ReadonlySet<string>
+): ReadonlyArray<string> => {
   if (entries.length === 0) return []
   const lines = [
     `${entries.length} submission(s) left unresolved; reconcile them before sending anything else:`
   ]
   for (const entry of entries) {
     lines.push(`unresolved ${entry.digest} (${entry._tag})`)
-    if (entry._tag === "Signed" || entry._tag === "Unknown") {
+    if ((entry._tag === "Signed" || entry._tag === "Unknown") && !printed.has(entry.digest)) {
       lines.push(`bytes: ${Base64.encode(entry.signed.bytes)}`)
     }
     const encoded = encodeJournalEntry(entry)
@@ -554,19 +695,7 @@ const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<st
 }
 
 /**
- * Reads the journal **the script actually ran with** for entries that never got
- * an answer.
- *
- * A script interrupted mid-submit has a `Signed` entry and nothing else: no
- * digest in an error, no bytes on stderr, and an exit code that says only that
- * someone pressed Ctrl-C. Printing the entry is the difference between a
- * transaction an operator can reconcile and one nobody can account for.
- *
- * The journal is captured inside the script's own runtime rather than read off
- * the bare reference afterwards: a script that provided a durable `Journal` —
- * which is exactly the script with something to lose — would otherwise have its
- * unresolved entries looked for in the process-wide in-memory default, find
- * none, and print nothing.
+ * Reads a journal for entries that never got an answer, for {@link report}.
  *
  * This is the one `Effect.runPromise` outside `run` and the extension facade:
  * `report` is `run`'s own tail, exported for a program that owns its process,
@@ -594,12 +723,17 @@ const readUnresolved = async (
  * prints the base64 of the signed bytes and a line saying to reconcile, because
  * those bytes are the durable record a script has.
  *
- * On **every** non-zero exit it also prints whatever the journal the script ran
- * with still holds unresolved, which is the only record of bytes that may be on
- * the wire when a script is killed — or fails — between signing and the answer.
- * That count is also what decides a timeout (3 rather than 4) and an interrupt
- * (3 rather than 130): an `Effect.timeout` around a submission interrupts it
- * from the outside and never reaches `Tx.submit`'s own mapping.
+ * **What the run wrote, wherever its journal lives.** Every journal entry
+ * `Tx` writes during the run is also recorded by the run itself, so it does
+ * not matter where the program provided its journal — in `options.layer`, or
+ * inside the program with `Effect.provide(journalLayer)` — and entries other
+ * processes wrote to a shared durable journal are not this run's business.
+ * On **every** non-zero exit the run prints the submissions *it* left
+ * unresolved, which is the only record of bytes that may be on the wire when a
+ * script is killed — or fails — between signing and the answer. Those entries
+ * decide a timeout (3 rather than 4) and an interrupt (3 rather than 130), and
+ * a submission of this run that the network answered as applied turns a
+ * would-be 2, 4 or 130 into 5 (see {@link ExitCodeOptions.applied}).
  *
  * **A second SIGINT does nothing.** The handler interrupts the root fiber once;
  * pressing Ctrl-C again while finalizers run is ignored, because the whole
@@ -611,8 +745,9 @@ const readUnresolved = async (
  * Returns the exit code as well as passing it to `exit`, so a test can inject
  * `exit` and assert on the number without ending the test process.
  *
- * Never fails: every failure of the program becomes an exit code, and a
- * `stderr` writer that throws loses its line, not the exit.
+ * Never fails: every failure of the program — and of `options.layer`, whatever
+ * its error type — becomes an exit code, and a `stderr` writer that throws
+ * loses its line, not the exit.
  */
 export const run = async <A, E>(
   effect: Effect.Effect<A, E, Script | Sui | SuiCore>,
@@ -625,18 +760,14 @@ export const run = async <A, E>(
   const signals = options?.signals ?? process
   const names = options?.signalNames ?? ["SIGINT", "SIGTERM"]
 
-  // The journal the script ran with, captured from inside its own context so an
-  // interrupt can report what it left on the wire even when the script provided
-  // a durable journal of its own.
-  let journal: JournalService | undefined
+  // What this run writes to whatever journal it uses, recorded by `Tx` itself.
+  const record = makeRunRecord()
   const fiber = Effect.runFork(
-    Effect.flatMap(Journal, (found) => {
-      journal = found
-      return effect
-    }).pipe(
+    effect.pipe(
       Effect.provide(
         Layer.merge(options?.layer ?? Script.layer, Logger.layer([stderrLogger(write)]))
-      )
+      ),
+      Effect.provideService(RunRecord, record)
     )
   )
   const handlers = names.map((name) => {
@@ -650,7 +781,32 @@ export const run = async <A, E>(
   const exit = await Effect.runPromise(Fiber.await(fiber))
   for (const [name, handler] of handlers) signals.off?.(name, handler)
 
-  const code = await report(exit, journal === undefined ? { stderr: write } : { stderr: write, journal })
+  const code = reportRun(exit, write, record)
   stop(code)
   return code
+}
+
+/** `run`'s tail: the failure lines, this run's unresolved entries, the code. */
+const reportRun = <A, E>(
+  exit: Exit.Exit<A, E>,
+  write: (line: string) => void,
+  record: RunRecordService
+): number => {
+  if (Exit.isSuccess(exit)) return EXIT.success
+  const printed = writeFailure(exit, write)
+  const entries = record.entries()
+  const unresolved = entries.filter(isUnresolved)
+  const signedHere = record.signedHere()
+  const applied = entries.filter((entry) =>
+    (entry._tag === "Executed" || entry._tag === "Failed") && signedHere.has(entry.digest)
+  )
+  for (const line of unresolvedLines(unresolved, printed)) write(line)
+  if (unresolved.length === 0 && applied.length > 0) {
+    write(
+      `${applied.length} submission(s) of this run applied on chain: ` +
+        applied.map((entry) => `${entry.digest} (${entry._tag})`).join(", ") +
+        "; do not send them again"
+    )
+  }
+  return exitCode(exit, { unresolved: unresolved.length, applied: applied.length })
 }
