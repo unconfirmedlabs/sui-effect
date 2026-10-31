@@ -31,13 +31,13 @@ subpath by subpath; the examples and the extension template come last.
 | Import | What it exports |
 |---|---|
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
-| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `sponsored`, `gaslessStablecoinTransfer`, `submit`, `submitVia`, `reconcile`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors, `Verify`, `SubmitConfig`, `Journal`, `JournalEntry` |
+| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `submit`, `submitVia`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, …), `Verify`, `SubmitConfig` and `SubmitConfigOverrides`, `Journal`, `JournalEntry` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
-| `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)`, and `SuiExtension.leaf` |
+| `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)` (an `Effect<Option<A>>` member becomes `Promise<A \| undefined>`, `FaceValue`), and `SuiExtension.leaf` |
 | `@unconfirmed/sui-effect/script` | `Script` / `ScriptReadOnly` (layers that read `SUI_NETWORK`, `SUI_PRIVATE_KEY`, …), `Script.run`, `Script.report`, `Script.exitCode` |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest`, `SuiCoreFake`, `FakeOutcome` |
+| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig` |
 
-## Five recipes
+## Recipes
 
 Each one is a file in this repository that typechecks and runs against the fake
 (`test/recipes.test.ts`); the relative `src/` imports are shown as the package
@@ -77,12 +77,12 @@ export const pay = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
     tx.transferObjects([coin!], recipient)
   }, { signer }).pipe(
     Effect.map((executed) => executed.digest),
-    // A ceiling, not a budget: the build fails with `BuildError` above it.
+    // A ceiling, not a budget: above it the build fails with `PolicyDenied { rule: "maxGasBudget" }`.
     SubmitConfig.with({ maxGasBudget: Mist.make(1_000_000_000n) })
   )
 ```
 
-The explicit lifecycle, for a sponsored transaction:
+The explicit lifecycle, for a sponsored transaction, and the coin-paid alternative:
 
 ```ts
 // The explicit lifecycle, for two parties: the sender signs, the sponsor pays.
@@ -92,10 +92,12 @@ import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
 
 const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
 
+// `Tx.sponsored` sets sender, gas owner and an empty gas payment: gas comes from the sponsor's
+// SUI ADDRESS balance, which must cover the budget or `Tx.build` fails with `BuildError` before
+// anything is signed. Fund it from a coin with `coin::into_balance` + `balance::send_funds<SUI>`.
 export const sponsoredIncrement = (sender: Signer, sponsor: Signer, counter: ObjectId) =>
   Effect.gen(function*() {
     const parties = { sender: sender.address, gasOwner: sponsor.address }
-    // `Tx.sponsored` sets sender, gas owner and an empty gas payment (address balance).
     const recipe = Tx.sponsored(parties)((tx) => {
       tx.moveCall({ target: `${PKG}::counter::increment`, arguments: [tx.object(counter)] })
     })
@@ -103,6 +105,214 @@ export const sponsoredIncrement = (sender: Signer, sponsor: Signer, counter: Obj
     const signed = yield* Tx.cosign(yield* Tx.sign(built, sender), sponsor)
     return yield* Tx.submit(signed)
   })
+
+// The coin-paid alternative, both signers in one process: no `Tx.sponsored`, just a gas owner.
+// Gas is the sponsor's coins, so `Tx.run` also takes the sponsor's lock (only when coins pay).
+export const coinPaidIncrement = (sender: Signer, sponsor: Signer, counter: ObjectId) =>
+  Tx.run((tx) => {
+    tx.moveCall({ target: `${PKG}::counter::increment`, arguments: [tx.object(counter)] })
+  }, { signer: sender, sponsor, gasOwner: sponsor.address })
+```
+
+A stateless sponsor service, handed someone else's bytes:
+
+```ts
+// A stateless sponsor service: handed the sender's bytes and signature, it checks, co-signs and
+// submits. The sender built `Tx.build(Tx.sponsored(parties)(recipe), parties)` and sent
+// `built.bytes` with the signature `Tx.sign(built, sender)` made.
+import { Effect } from "effect"
+import { PolicyDenied, Sui } from "@unconfirmed/sui-effect"
+import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+export const sponsorBytes = (sponsor: Signer) => (bytes: Uint8Array, senderSignature: string) =>
+  Effect.gen(function*() {
+    // Sender, gas owner, expiration and chain are read out of the bytes, never taken on trust.
+    const built = yield* Tx.fromBytes(bytes)
+    if (built.gasOwner !== sponsor.address) {
+      return yield* new PolicyDenied({ rule: "sponsor.gasOwner", message: `not paid by ${sponsor.address}` })
+    }
+    // `fromBytes` simulates nothing: simulate bytes you did not build before paying for them.
+    yield* Effect.flatMap(Sui, (sui) => sui.simulate(built.bytes))
+    // Verified against the bytes; the signer must be their sender or gas owner.
+    const withSender = yield* Tx.attach(built, senderSignature)
+    return yield* Tx.submit(yield* Tx.cosign(withSender, sponsor))
+  })
+```
+
+Re-sending a lost submission:
+
+```ts
+// Re-sending a lost submission: the identical signed bytes, never a rebuild. One digest executes
+// at most once, so a re-send can only land the transaction already signed, or find it landed.
+import { Effect } from "effect"
+import type { SuiAddress } from "@unconfirmed/sui-effect"
+import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+export const payOrResend = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
+  Tx.run((tx) => {
+    tx.transferObjects([tx.splitCoins(tx.gas, [amount])], recipient)
+  }, { signer }).pipe(
+    // `SubmissionUnknown` carries the bytes; `Tx.resubmit` sends them again and settles them.
+    Effect.catchTag("SubmissionUnknown", (unknown) => Tx.resubmit(unknown))
+  )
+
+// At startup, over a durable journal: reconcile every unresolved entry, and re-send the bytes of
+// those still unknown. A settled entry is never sent again.
+export const startup = Tx.reconcileAll({ resubmit: true })
+```
+
+A script with a durable journal:
+
+```ts
+// A script whose submissions survive a crash: a durable journal, and a sweep of whatever the
+// last run left unresolved before anything new is sent.
+import { Effect, Layer } from "effect"
+import type { KeyValueStore } from "effect/persistence"
+import type { SuiAddress } from "@unconfirmed/sui-effect"
+import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
+import { Script } from "@unconfirmed/sui-effect/script"
+import { Tx } from "@unconfirmed/sui-effect/tx"
+
+// In production `KeyValueStore.layerFileSystem("./journal")` over a platform's `FileSystem` and
+// `Path` (`BunServices.layer`); in a test `KeyValueStore.layerMemory`.
+export const durableJournal = <E>(store: Layer.Layer<KeyValueStore.KeyValueStore, E>) =>
+  layerKeyValueStore({ onUnresolved: "ignore" }).pipe(Layer.provide(store))
+
+export const payOnce = (recipient: SuiAddress, amount: bigint) =>
+  Effect.gen(function*() {
+    yield* Tx.reconcileAll({ resubmit: true })
+    const { signer } = yield* Script
+    const executed = yield* Tx.run((tx) => {
+      tx.transferObjects([tx.splitCoins(tx.gas, [amount])], recipient)
+    }, { signer })
+    return executed.digest
+  })
+
+// Given in `options.layer`, or provided inside the program with `Effect.provide(durableJournal(store))`:
+// `Script.run` finds the journal either way and reports only this run's entries on a failure.
+export const main = <E>(store: Layer.Layer<KeyValueStore.KeyValueStore, E>, recipient: SuiAddress) =>
+  Script.run(payOnce(recipient, 1_000n), { layer: Layer.merge(Script.layer, durableJournal(store)) })
+```
+
+Publish a package, then upgrade it:
+
+```ts
+// Publish a package, then upgrade it. `expectPublished()` answers `{ packageId, package, upgradeCap }`
+// for both: a publish creates the cap, an upgrade mutates it.
+import { Effect } from "effect"
+import type { ObjectId } from "@unconfirmed/sui-effect"
+import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+// What `sui move build --dump-bytecode-as-base64` prints.
+export interface Compiled {
+  readonly modules: ReadonlyArray<string>
+  readonly dependencies: ReadonlyArray<string>
+  readonly digest: ReadonlyArray<number>
+}
+
+export const publish = (signer: Signer, compiled: Compiled) =>
+  Tx.run((tx) => {
+    const upgradeCap = tx.publish({ modules: [...compiled.modules], dependencies: [...compiled.dependencies] })
+    // The cap must go somewhere, or the transaction fails with an unused value.
+    tx.transferObjects([upgradeCap], signer.address)
+  }, { signer }).pipe(Effect.flatMap((executed) => executed.expectPublished()))
+
+// authorize_upgrade → upgrade → commit_upgrade, in one transaction. Policy 0 is `compatible`.
+export const upgrade = (signer: Signer, current: ObjectId, upgradeCap: ObjectId, compiled: Compiled) =>
+  Tx.run((tx) => {
+    const ticket = tx.moveCall({
+      target: "0x2::package::authorize_upgrade",
+      arguments: [tx.object(upgradeCap), tx.pure.u8(0), tx.pure.vector("u8", [...compiled.digest])]
+    })
+    const receipt = tx.upgrade({
+      modules: [...compiled.modules],
+      dependencies: [...compiled.dependencies],
+      package: current,
+      ticket
+    })
+    tx.moveCall({ target: "0x2::package::commit_upgrade", arguments: [tx.object(upgradeCap), receipt] })
+  }, { signer }).pipe(Effect.flatMap((executed) => executed.expectPublished()))
+```
+
+Decode a transaction's events:
+
+```ts
+// Decode a transaction's events with the codec you read objects with.
+//
+// Upgrades: an event struct (like an object type) keeps the id of the package that FIRST
+// defined it, even when v2 code emits it, so a codec or filter for a v1 type names the original
+// id. A struct added in v2 lives under the v2 id. A Move abort's `package` is the LATEST id.
+import { bcs } from "@mysten/sui/bcs"
+import { Effect } from "effect"
+import { type Executed, SuiSchema } from "@unconfirmed/sui-effect"
+
+const ORIGINAL = "0x00000000000000000000000000000000000000000000000000000000000000b1"
+
+export const Posted = SuiSchema.bcs(
+  bcs.struct("Posted", { board: bcs.Address, index: bcs.u64() }),
+  `${ORIGINAL}::board::Posted`
+)
+
+// Every `Posted` the transaction emitted, decoded, in emission order; none is `[]`.
+export const postedIndices = (executed: Executed) =>
+  Effect.map(executed.eventsOf(Posted), (events) => events.map((event) => BigInt(event.index)))
+
+// Exactly one, or `UnexpectedEffects`; a second argument selects by another type than the codec's.
+export const thePost = (executed: Executed) => executed.expectEvent(Posted)
+```
+
+Map a Move abort to your own error:
+
+```ts
+// Mapping a Move abort to your own error. Match on `module` and `constant` (or `code`), not on
+// `package`: after an upgrade the abort's location names the LATEST package id.
+import { Effect, Schema } from "effect"
+import { type ObjectId, SuiError } from "@unconfirmed/sui-effect"
+import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+const PKG = "0x00000000000000000000000000000000000000000000000000000000000000e5"
+
+export class AlreadyClaimed extends Schema.TaggedError<AlreadyClaimed>()("AlreadyClaimed", {
+  escrow: Schema.String,
+  // A simulated abort charged nothing; an executed one did. Declare which, for `Script.exitCode`.
+  outcome: Schema.Literals(["applied", "not_applied"])
+}) {}
+
+export const claim = (signer: Signer, escrow: ObjectId) =>
+  Tx.run((tx) => {
+    tx.moveCall({ target: `${PKG}::escrow::claim`, arguments: [tx.object(escrow)] })
+  }, { signer }).pipe(
+    Effect.catchIf(
+      (error) => SuiError.isMoveAbort(error, { module: "escrow", constant: "EAlreadyClaimed" }),
+      (error) => new AlreadyClaimed({ escrow, outcome: error._tag === "ExecutionFailed" ? "applied" : "not_applied" })
+    )
+  )
+```
+
+A resumable indexer:
+
+```ts
+// A resumable indexer: commit each page's items together with its `endCursor`, and start
+// again from the last committed cursor. The tail never ends; it polls once caught up.
+//
+// Pruning: a node keeps a bounded history. A cursor it has pruned past fails the tail with a
+// non-retryable `TransportError` (gRPC `OUT_OF_RANGE`): resume from a node that still holds it.
+// A filtered tail keeps its cursor near the head while nothing matches (it emits an empty page
+// to say so), so commit empty pages too, or an idle indexer falls behind the pruning line.
+import { Effect, Stream } from "effect"
+import { type EventEntry, Sui } from "@unconfirmed/sui-effect"
+
+const POSTED = "0x00000000000000000000000000000000000000000000000000000000000000b1::board::Posted"
+
+export const indexPosts = <E>(
+  after: string | null,
+  commit: (items: ReadonlyArray<EventEntry>, cursor: string | null) => Effect.Effect<void, E>
+) =>
+  Stream.unwrap(Effect.map(Sui, (sui) =>
+    sui.tailEventPages({ eventType: POSTED }, { after }).pipe(
+      // One transaction in your store: the rows and the cursor, or neither.
+      Stream.mapEffect((page) => commit(page.items, page.endCursor))
+    )))
 ```
 
 An extension and its Promise face:
@@ -123,6 +333,45 @@ export class Versions extends Context.Service<Versions, {
 
 // `new SuiGrpcClient({ … }).$extend(versions)`, then `await client.versions.of(id)`.
 export const versions = SuiExtension.fromService(Versions, { name: "versions", layer: Versions.layer })
+```
+
+Calling a Promise face from plain TypeScript:
+
+```ts
+// A Promise face from plain TypeScript: a `Signer` value, a branded id decoded from user input,
+// and one readable line on rejection. `SuiError.describe` takes any value, so no cast.
+import type { ClientWithCoreApi } from "@mysten/sui/client"
+import type { Keypair } from "@mysten/sui/cryptography"
+import { Context, Effect, Layer, Schema } from "effect"
+import { type Digest, ObjectId, Sui, SuiError } from "@unconfirmed/sui-effect"
+import { SuiExtension } from "@unconfirmed/sui-effect/extension"
+import { type RunError, Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
+
+export class Counters extends Context.Service<Counters, {
+  readonly increment: (signer: Signer, counter: ObjectId) => Effect.Effect<Digest, RunError>
+}>()("example/Counters") {
+  static readonly layer = Layer.effect(Counters, Effect.map(Sui, (sui) => ({
+    increment: (signer: Signer, counter: ObjectId) =>
+      Tx.run((tx) => {
+        tx.moveCall({ target: `${PKG}::counter::increment`, arguments: [tx.object(counter)] })
+      }, { signer }).pipe(Effect.map((executed) => executed.digest), Effect.provideService(Sui, sui))
+  })))
+}
+
+export const counters = SuiExtension.fromService(Counters, { name: "counters", layer: Counters.layer })
+
+export const incrementCommand = (client: ClientWithCoreApi, keypair: Keypair) => {
+  const face = client.$extend(counters).counters
+  const signer = Signer.fromKeypair(keypair)
+  // `ObjectId.Strict` for what a person typed: exactly 64 hex digits, never padded.
+  return (input: string): Promise<string> =>
+    Schema.decodeUnknownPromise(ObjectId.Strict)(input)
+      .then((counter) => face.increment(signer, counter))
+      .then((digest) => `incremented in ${digest}`)
+      .catch((error) => SuiError.describe(error))
+}
 ```
 
 A test on the fake:
@@ -157,6 +406,9 @@ test("a counter the fake serves decodes, and a missing one is None", async () =>
 - `SuiCore` is a 1:1 Effect wrap of the SDK's `ClientWithCoreApi`: one member per transport method, the SDK's `Include` generics, every call cancellable, reads retried on a retryable `TransportError`.
 - `Sui` is the opinionated tier over it: fixed include sets, BCS content decoded through a schema after the Move type is checked, `Option` where absence is normal, chunked batch reads, `Stream` pagination, one sender lock. Application and extension code reads through `Sui`.
 - **`Sui` members are positional** — `sui.getObject(id, { schema })`, `sui.getBalance(owner, coinType)`. **`SuiCore` members take the SDK's options object** — `core.getObject({ objectId, include })`. Writing `sui.getObject({ objectId })` is the SDK habit, and it does not typecheck.
+- **The SDK's `listX` is `Sui.streamX`**, a `Stream` that follows every page and ends once caught up; `tailX` never ends and polls: `listOwnedObjects` → `streamOwnedObjects`, `listCoins` → `streamCoins`, `listBalances` → `streamBalances`, `listDynamicFields` → `streamDynamicFields`, `listEvents` → `streamEvents` / `tailEvents`, `listTransactions` → `streamTransactions` / `tailTransactions`. The `…Pages` forms (`streamEventPages`, `tailEventPages`, …) carry each page's `endCursor` for a resumable reader; `{ after }` resumes from one.
+- **A transaction `function` filter must be fully qualified** (`package::module::function`) on `streamTransactions` and `tailTransactions`: the SDK cannot continue a `package` or `package::module` filter past its first page, so it is refused up front. For one page of a module filter, call `sui.core.listTransactions`.
+- **Ids:** `ObjectId.Strict` / `SuiAddress.Strict` (through `Schema.decodeUnknownEffect`) for what a person typed — exactly 64 hex digits; `.normalize` for a shorthand literal such as `"0x6"`; `.make` for the padded form only. Decoding refuses `""` and a bare `"0x"`.
 - `sui.core` is the `SuiCore` a `Sui` was built over, which is why every `Tx.*` function needs only `R = Sui`.
 - Reads go through `Sui`; writes go through `Tx`. Nothing calls `SuiCore.executeTransaction` directly.
 - `Signer` is a value, never a service: pass it as a parameter. `SubmitConfig` and `Journal` are `Context.Reference`s with working defaults.
@@ -174,7 +426,7 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 | `NetworkMismatch` | `not_applied` | 2 | The node is on another chain than the layer was built for |
 | `DecodeError` | `not_applied` | 4 | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
 | `SimulationFailed` | `not_applied` | 4 | Simulation reported an execution failure; no gas charged |
-| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing, building, preflight policy, the journal write before the first send |
+| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget); policy (`preflight`, and the gas ceiling as `rule: "maxGasBudget"`); the journal write before the first send |
 | `GraphQLUnavailable` / `ExtensionNotReady` | `not_applied` | 4 | No usable GraphQL endpoint; a synchronous Promise-face member called before its runtime existed |
 | `NotApplied` | `not_applied` | 4 | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
 | `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged |
@@ -182,25 +434,33 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 | `SubmissionUnknown` | `unknown` | 3 | Bytes may have been sent; the outcome is unknown. Carries the signed bytes |
 | anything else, with no `outcome` field | `unknown` | 1 | Unclassified; declare `outcome` on every extension error |
 
-`ConfigError` and `SchemaError` also exit 2; a defect exits 1, an interrupt with
-nothing outstanding 130.
+`ConfigError` (whose one line names the variable) and `SchemaError` also exit 2;
+a defect exits 1, an interrupt with nothing outstanding 130. An error that
+declares an integer `exitCode` from 1 to 255 exits with it. **Once a
+transaction of this run applied**, a failure that would exit 2, 4 or 130 exits
+5 instead, because a retry would send a second transaction; an unresolved entry
+still exits 3.
 
 Three rules:
 
 1. **Branch on `_tag` and `DecodeError.kind`, never on `issue` or `message`**, whose wording changes between releases.
 2. **`NotApplied` is rare on purpose.** It needs evidence checked twice; almost every stuck submission ends as `SubmissionUnknown`. Do not build a retry loop that waits for `NotApplied`.
-3. **`SubmissionUnknown` carries the signed bytes.** Answer it with `Tx.reconcile(error)` (or `Tx.reconcileAll()` at startup), never by rebuilding and sending again.
+3. **`SubmissionUnknown` carries the signed bytes.** Answer it with `Tx.reconcile(error)` to ask the chain, or `Tx.resubmit(error)` to send the identical bytes again (`Tx.reconcileAll({ resubmit: true })` at startup) — never by rebuilding and sending again.
 
 ## `SubmitConfig`
 
-`program.pipe(SubmitConfig.with({ … }))` spreads the defaults and overrides the
-fields given; `SubmitConfig.layer({ … })` is the same as a `Layer`.
+`program.pipe(SubmitConfig.with({ … }))` merges the fields given over the config
+**in force** where the program runs (not over the defaults), so nested `with`s
+compose; `SubmitConfig.layer({ … })` spreads them over the defaults, as a
+`Layer`. Durations take any `Duration.Input`: `executeTimeout: "10 seconds"`.
+The per-attempt read timeout is not here: it is `SuiCore`'s `requestTimeout`
+layer option (30 s; `SUI_RPC_TIMEOUT` for `layerConfig`).
 
 | Field | Default | What it decides |
 |---|---|---|
 | `expiration` | `"validDuring"` | The expiration `Tx.build` sets when the recipe set none: the current epoch and the next, plus the chain id (`"epoch"`, `"none"`) |
 | `validFor` | unset | An extra wall-clock bound; no Sui network accepts one yet |
-| `maxGasBudget` | 50 SUI | The ceiling above which `Tx.build` fails with `BuildError` |
+| `maxGasBudget` | 50 SUI | The ceiling above which `Tx.build` fails with `PolicyDenied { rule: "maxGasBudget" }` |
 | `preflight` | unset | `(simulation) => Effect<void, PolicyDenied>`, run before signing |
 | `lockSender` | `true` | Whether `Tx.run` holds the sender lock from build through submit |
 | `resubmit` | exponential from 250 ms, capped at 30 s, jittered | How `Tx.submit` re-sends the identical bytes |
@@ -209,19 +469,19 @@ fields given; `SubmitConfig.layer({ … })` is the same as a `Layer`.
 | `expiryMargin` | 30 s | Skew allowed on the wall-clock expiry rule |
 | `expiryEvidence` | `"epochThenMiss"` | Whether a closed expiry window may prove `NotApplied` (`"never"` behind a mixed-node load balancer) |
 | `reconcileRecheck` | 2 s | The pause between the two observations the expiry rule needs |
-| `awaitVisibility` | `true` | Wait for the execution to be readable before releasing the lock |
+| `awaitVisibility` | `true` | Wait for the execution to be readable before returning (and releasing the lock); it delays every return, `lockSender: false` included |
 | `visibilityTimeout` | 15 s | How long that wait may take; it never changes the outcome |
 | `nonce` | a random `u32` | The nonce on a default `ValidDuring` expiration |
 
-## Ten invariants
+## Invariants
 
 1. `Tx.build` always simulates before anything is signed, on every transport: when the SDK's resolver will not, it runs one explicit simulate.
 2. `Tx.build` bounds a transaction to the current epoch and the next and names the chain; bytes signed for testnet cannot land on mainnet.
 3. `Tx.submit` journals `Signed` before the first send and re-sends the **identical** bytes, never a rebuild, on a retryable failure or a timeout.
-4. Once bytes may have been sent no `TransportError` escapes; it becomes `SubmissionUnknown`. The one exception is a gRPC `INVALID_ARGUMENT` on the first send: the node refused, nothing ran, and the journal entry is settled as `NotApplied { evidence: "refused" }`.
+4. Once bytes may have been sent no `TransportError` escapes; it becomes `SubmissionUnknown`. The one exception is a gRPC `INVALID_ARGUMENT` on the first send: the node refused, nothing ran, and the journal entry is settled as `NotApplied { evidence: "refused" }`. A `Tx.resubmit` never takes a refusal that way: an earlier send of the same bytes may have landed.
 5. `JournalError` escapes only from the `Signed` write, before anything is sent.
-6. `NotApplied { inputConsumed }` is built only on a **different** transaction's effects reporting the exact pinned `inputVersion`; an input that merely moved on is not evidence.
-7. A sponsored `Tx.run` needs `sponsor` whenever the gas owner is not the sender; pass the gas owner as `opts.gasOwner` so its lock is taken too.
+6. `NotApplied { inputConsumed }` is built only on a **different** transaction's effects reporting the exact pinned `inputVersion`; an input that merely moved on is not evidence. Positive evidence vetoes expiry: a pinned object naming the transaction's own digest is never answered `NotApplied { expired }`, and neither is a miss on a gRPC node that has pruned into the validity window (JSON-RPC and GraphQL cannot report pruning: set `expiryEvidence: "never"` behind pruning nodes there).
+7. A sponsored `Tx.run` needs `sponsor` whenever the gas owner is not the sender — `opts.gasOwner`, or one the recipe set itself (`Tx.sponsored`), which `Tx.run` reads from the recipe before locking. The gas owner's lock is taken only when gas is paid with its coins; an address-balance payment (`Tx.sponsored`) locks the sender alone, so one sponsor pays for many senders at once.
 8. Every SDK call forwards the Effect's `AbortSignal`, so `Effect.timeout` and interruption cancel the request.
 9. One Move type rule everywhere: a bare expected tag matches every instantiation of the generic; a parameterized one is compared in full.
 10. A test that runs `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default journal is process-wide; `layerTest` is the production `Sui`, so fixtures use `localnet`.
@@ -253,6 +513,7 @@ The full entries follow under "API".
 - `DynamicField` — A dynamic field with its value.
 - `DynamicFieldEntry` — One entry of a dynamic-field listing.
 - `DynamicFieldName` — The BCS-encoded name of a dynamic field.
+- `EXECUTE_INCLUDE` — The `include` set every execute, simulate and transaction read asks for, and the one `Executed.fromTransactionResult` is typed over: a `SuiCore` read made with `{ include: EXECUTE_INCLUDE }` is a result that method accepts.
 - `Event` — An emitted Move event.
 - `EventEntry` — An event read from a listing, with its place in the ledger.
 - `EventFilter` — A filter on events: exactly one of `sender`, `emitModule` or `eventType`.
@@ -349,7 +610,7 @@ The full entries follow under "API".
 - `RunError` — Everything `run` can fail with, as one name: `SubmitError` plus what building, preflighting and signing can produce.
 - `Signature` — re-exported from `@unconfirmed/sui-effect`.
 - `SignatureScheme`
-- `Signed` — Signed bytes: everything `executeTransaction` needs, plus what `reconcile` needs.
+- `Signed` — The schema of `Signed`.
 - `Signer` — A credential: who it signs as, how, and the two things it can sign.
 - `SubmitConfig` — The lifecycle settings.
 - `SubmitConfigOverrides` — What `SubmitConfig.with` and `SubmitConfig.layer` accept: any subset of `SubmitConfigService`, with every duration given as a `Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of milliseconds — and converted on the way in.
@@ -379,6 +640,7 @@ The full entries follow under "API".
 - `reconcileAll` — Settles every unresolved entry in the journal: the explicit startup call a long-lived application makes after building a durable `Journal`.
 - `recorded` — What the journal recorded for one digest, if anything.
 - `remote` — Builds a signer around something that signs elsewhere: a KMS, a wallet, a hardware device, another process.
+- `resubmit` — Re-sends signed bytes whose outcome is unknown — the **identical** bytes, never a rebuild — and settles them the way `submit` does.
 - `run` — Build, preflight, sign and submit, with the sender lock held throughout.
 - `sign` — Signs built bytes.
 - `sponsored` — Turns a recipe into a sponsored one: the sender owns the transaction, the gas owner pays, and gas comes from the sponsor's address balance rather than from coin objects, so the two parties never have to agree on a gas coin and can sign in either order.
@@ -396,240 +658,7 @@ The full entries follow under "API".
 
 ### `@unconfirmed/sui-effect/extension`
 
-- `ExtensionFace` — What every registration carries besides the service's own members, under `# @unconfirmed/sui-effect for agents
-
-This file is generated by `bun run llms` from `docs/llms-head.md`, the emitted
-type declarations and the JSDoc in `src/`, plus every example in the
-repository. Do not edit it by hand; a test fails when it is stale.
-
-## Start here
-
-@unconfirmed/sui-effect is an opinionated Effect v4 layer over `@mysten/sui`.
-Two client tiers (`SuiCore` mirrors the SDK, `Sui` makes the decisions), a
-closed error union on every function, the transaction lifecycle as functions
-with typed outcomes, and an in-memory fake so every test runs with no network.
-
-```bash
-bun add @unconfirmed/sui-effect
-bun add -d effect@4.1.1 @mysten/sui@2.38.0
-```
-
-`effect` (`>=4.1.1 <4.2`), `@mysten/sui` (`^2.28`) and `@mysten/bcs` are peer
-dependencies: **one copy of each per process**, or `Context.Service` identities
-and `instanceof` checks stop matching. A library built on this package puts all
-of them in its own `peerDependencies` and `devDependencies`, never in
-`dependencies`.
-
-`AGENTS.md` has the invariants, `README.md` the tour, `docs/extensions.md` the
-contract for an extension package. The API reference follows this section,
-subpath by subpath; the examples and the extension template come last.
-
-## Subpaths
-
-| Import | What it exports |
-|---|---|
-| `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
-| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `sponsored`, `gaslessStablecoinTransfer`, `submit`, `submitVia`, `reconcile`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors, `Verify`, `SubmitConfig`, `Journal`, `JournalEntry` |
-| `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
-| `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)`, and `SuiExtension.leaf` |
-| `@unconfirmed/sui-effect/script` | `Script` / `ScriptReadOnly` (layers that read `SUI_NETWORK`, `SUI_PRIVATE_KEY`, …), `Script.run`, `Script.report`, `Script.exitCode` |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest`, `SuiCoreFake`, `FakeOutcome` |
-
-## Five recipes
-
-Each one is a file in this repository that typechecks and runs against the fake
-(`test/recipes.test.ts`); the relative `src/` imports are shown as the package
-subpaths they are.
-
-Read an object:
-
-```ts
-// Read one object, decoded. Absence is `None`; a wrong Move type is `DecodeError`.
-import { bcs } from "@mysten/sui/bcs"
-import { Effect, Option } from "effect"
-import { type ObjectId, Sui, SuiSchema } from "@unconfirmed/sui-effect"
-
-const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
-const Counter = SuiSchema.bcs(bcs.struct("Counter", { id: bcs.Address, value: bcs.u64() }), `${PKG}::counter::Counter`)
-
-export const readCounter = (id: ObjectId) =>
-  Effect.gen(function*() {
-    const sui = yield* Sui
-    // Positional: `sui.getObject(id, { schema })`, not the SDK's `{ objectId }`.
-    const counter = yield* sui.getObjectOption(id, { schema: Counter })
-    return Option.map(counter, (object) => BigInt(object.content.value))
-  })
-```
-
-Build and submit:
-
-```ts
-// Build, simulate, sign, journal, submit, reconcile: one call, one sender lock.
-import { Effect } from "effect"
-import { Mist, type SuiAddress } from "@unconfirmed/sui-effect"
-import { type Signer, SubmitConfig, Tx } from "@unconfirmed/sui-effect/tx"
-
-export const pay = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
-  Tx.run((tx) => {
-    const [coin] = tx.splitCoins(tx.gas, [amount])
-    tx.transferObjects([coin!], recipient)
-  }, { signer }).pipe(
-    Effect.map((executed) => executed.digest),
-    // A ceiling, not a budget: the build fails with `BuildError` above it.
-    SubmitConfig.with({ maxGasBudget: Mist.make(1_000_000_000n) })
-  )
-```
-
-The explicit lifecycle, for a sponsored transaction:
-
-```ts
-// The explicit lifecycle, for two parties: the sender signs, the sponsor pays.
-import { Effect } from "effect"
-import type { ObjectId } from "@unconfirmed/sui-effect"
-import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
-
-const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
-
-export const sponsoredIncrement = (sender: Signer, sponsor: Signer, counter: ObjectId) =>
-  Effect.gen(function*() {
-    const parties = { sender: sender.address, gasOwner: sponsor.address }
-    // `Tx.sponsored` sets sender, gas owner and an empty gas payment (address balance).
-    const recipe = Tx.sponsored(parties)((tx) => {
-      tx.moveCall({ target: `${PKG}::counter::increment`, arguments: [tx.object(counter)] })
-    })
-    const built = yield* Tx.build(recipe, parties)
-    const signed = yield* Tx.cosign(yield* Tx.sign(built, sender), sponsor)
-    return yield* Tx.submit(signed)
-  })
-```
-
-An extension and its Promise face:
-
-```ts
-// An extension: a service on `Sui`, and its Promise face derived for `$extend`.
-import { Context, Effect, Layer } from "effect"
-import { type GetObjectError, type ObjectId, Sui } from "@unconfirmed/sui-effect"
-import { SuiExtension } from "@unconfirmed/sui-effect/extension"
-
-export class Versions extends Context.Service<Versions, {
-  readonly of: (id: ObjectId) => Effect.Effect<bigint, GetObjectError>
-}>()("example/Versions") {
-  static readonly layer = Layer.effect(Versions, Effect.map(Sui, (sui) => ({
-    of: (id: ObjectId) => Effect.map(sui.getObject(id), (object) => object.version)
-  })))
-}
-
-// `new SuiGrpcClient({ … }).$extend(versions)`, then `await client.versions.of(id)`.
-export const versions = SuiExtension.fromService(Versions, { name: "versions", layer: Versions.layer })
-```
-
-A test on the fake:
-
-```ts
-// A test on the in-memory fake: the real `Sui` over a scripted `SuiCore`, no network.
-import { expect, test } from "bun:test"
-import { bcs } from "@mysten/sui/bcs"
-import { Effect, Option } from "effect"
-import { ObjectId, Sui, SuiSchema } from "@unconfirmed/sui-effect"
-import { layerTest, SuiTest } from "@unconfirmed/sui-effect/testing"
-
-const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
-const CounterBcs = bcs.struct("Counter", { id: bcs.Address, value: bcs.u64() })
-const Counter = SuiSchema.bcs(CounterBcs, `${PKG}::counter::Counter`)
-
-test("a counter the fake serves decodes, and a missing one is None", async () => {
-  const id = ObjectId.normalize("0xc0")
-  const content = CounterBcs.serialize({ id, value: 7n }).toBytes()
-  const [found, missing] = await Effect.gen(function*() {
-    yield* SuiTest.putObject({ objectId: id, type: `${PKG}::counter::Counter`, version: 1n, content })
-    const sui = yield* Sui
-    return yield* Effect.all([sui.getObject(id, { schema: Counter }), sui.getObjectOption(ObjectId.normalize("0xc1"))])
-  }).pipe(Effect.provide(layerTest()), Effect.runPromise)
-  expect(found.content.value).toBe("7")
-  expect(Option.isNone(missing)).toBe(true)
-})
-```
-
-## The two tiers
-
-- `SuiCore` is a 1:1 Effect wrap of the SDK's `ClientWithCoreApi`: one member per transport method, the SDK's `Include` generics, every call cancellable, reads retried on a retryable `TransportError`.
-- `Sui` is the opinionated tier over it: fixed include sets, BCS content decoded through a schema after the Move type is checked, `Option` where absence is normal, chunked batch reads, `Stream` pagination, one sender lock. Application and extension code reads through `Sui`.
-- **`Sui` members are positional** — `sui.getObject(id, { schema })`, `sui.getBalance(owner, coinType)`. **`SuiCore` members take the SDK's options object** — `core.getObject({ objectId, include })`. Writing `sui.getObject({ objectId })` is the SDK habit, and it does not typecheck.
-- `sui.core` is the `SuiCore` a `Sui` was built over, which is why every `Tx.*` function needs only `R = Sui`.
-- Reads go through `Sui`; writes go through `Tx`. Nothing calls `SuiCore.executeTransaction` directly.
-- `Signer` is a value, never a service: pass it as a parameter. `SubmitConfig` and `Journal` are `Context.Reference`s with working defaults.
-
-## Errors
-
-Every failure is one flat `Schema.TaggedError`. `SuiError.outcome(e)` puts it on
-the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
-
-| Tag | Outcome | Exit | Means |
-|---|---|---|---|
-| `TransportError` | `not_applied` | 4 | The request did not reach a usable answer; `retryable` says whether a read may try again |
-| `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | `not_applied` | 4 | The three `ObjectError.reason` values |
-| `TransactionNotFound` | `not_applied` | 4 | No transaction with that digest is known |
-| `NetworkMismatch` | `not_applied` | 2 | The node is on another chain than the layer was built for |
-| `DecodeError` | `not_applied` | 4 | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
-| `SimulationFailed` | `not_applied` | 4 | Simulation reported an execution failure; no gas charged |
-| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing, building, preflight policy, the journal write before the first send |
-| `GraphQLUnavailable` / `ExtensionNotReady` | `not_applied` | 4 | No usable GraphQL endpoint; a synchronous Promise-face member called before its runtime existed |
-| `NotApplied` | `not_applied` | 4 | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
-| `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged |
-| `UnexpectedEffects` | `applied` | 5 | It ran; the effects lack what the caller expected (`expectCreated`) |
-| `SubmissionUnknown` | `unknown` | 3 | Bytes may have been sent; the outcome is unknown. Carries the signed bytes |
-| anything else, with no `outcome` field | `unknown` | 1 | Unclassified; declare `outcome` on every extension error |
-
-`ConfigError` and `SchemaError` also exit 2; a defect exits 1, an interrupt with
-nothing outstanding 130.
-
-Three rules:
-
-1. **Branch on `_tag` and `DecodeError.kind`, never on `issue` or `message`**, whose wording changes between releases.
-2. **`NotApplied` is rare on purpose.** It needs evidence checked twice; almost every stuck submission ends as `SubmissionUnknown`. Do not build a retry loop that waits for `NotApplied`.
-3. **`SubmissionUnknown` carries the signed bytes.** Answer it with `Tx.reconcile(error)` (or `Tx.reconcileAll()` at startup), never by rebuilding and sending again.
-
-## `SubmitConfig`
-
-`program.pipe(SubmitConfig.with({ … }))` spreads the defaults and overrides the
-fields given; `SubmitConfig.layer({ … })` is the same as a `Layer`.
-
-| Field | Default | What it decides |
-|---|---|---|
-| `expiration` | `"validDuring"` | The expiration `Tx.build` sets when the recipe set none: the current epoch and the next, plus the chain id (`"epoch"`, `"none"`) |
-| `validFor` | unset | An extra wall-clock bound; no Sui network accepts one yet |
-| `maxGasBudget` | 50 SUI | The ceiling above which `Tx.build` fails with `BuildError` |
-| `preflight` | unset | `(simulation) => Effect<void, PolicyDenied>`, run before signing |
-| `lockSender` | `true` | Whether `Tx.run` holds the sender lock from build through submit |
-| `resubmit` | exponential from 250 ms, capped at 30 s, jittered | How `Tx.submit` re-sends the identical bytes |
-| `resubmitAttempts` | `5` | Sends in total, the first included |
-| `executeTimeout` | 60 s | One `executeTransaction`; a timeout is retryable |
-| `expiryMargin` | 30 s | Skew allowed on the wall-clock expiry rule |
-| `expiryEvidence` | `"epochThenMiss"` | Whether a closed expiry window may prove `NotApplied` (`"never"` behind a mixed-node load balancer) |
-| `reconcileRecheck` | 2 s | The pause between the two observations the expiry rule needs |
-| `awaitVisibility` | `true` | Wait for the execution to be readable before releasing the lock |
-| `visibilityTimeout` | 15 s | How long that wait may take; it never changes the outcome |
-| `nonce` | a random `u32` | The nonce on a default `ValidDuring` expiration |
-
-## Ten invariants
-
-1. `Tx.build` always simulates before anything is signed, on every transport: when the SDK's resolver will not, it runs one explicit simulate.
-2. `Tx.build` bounds a transaction to the current epoch and the next and names the chain; bytes signed for testnet cannot land on mainnet.
-3. `Tx.submit` journals `Signed` before the first send and re-sends the **identical** bytes, never a rebuild, on a retryable failure or a timeout.
-4. Once bytes may have been sent no `TransportError` escapes; it becomes `SubmissionUnknown`. The one exception is a gRPC `INVALID_ARGUMENT` on the first send: the node refused, nothing ran, and the journal entry is settled as `NotApplied { evidence: "refused" }`.
-5. `JournalError` escapes only from the `Signed` write, before anything is sent.
-6. `NotApplied { inputConsumed }` is built only on a **different** transaction's effects reporting the exact pinned `inputVersion`; an input that merely moved on is not evidence.
-7. A sponsored `Tx.run` needs `sponsor` whenever the gas owner is not the sender; pass the gas owner as `opts.gasOwner` so its lock is taken too.
-8. Every SDK call forwards the Effect's `AbortSignal`, so `Effect.timeout` and interruption cancel the request.
-9. One Move type rule everywhere: a bare expected tag matches every instantiation of the generic; a parameterized one is compared in full.
-10. A test that runs `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default journal is process-wide; `layerTest` is the production `Sui`, so fixtures use `localnet`.
-
-## Index
-
-Every exported name, by subpath, with the first sentence of its documentation.
-The full entries follow under "API".
-
--prefixed names so an extension is free to call a member `ready` or `dispose` itself.
+- `ExtensionFace` — What every registration carries besides the service's own members, under `$`-prefixed names so an extension is free to call a member `ready` or `dispose` itself.
 - `FaceValue` — What an `Effect` member's success becomes at the Promise boundary: an `Option<A>` is `A | undefined`, everything else is itself.
 - `Leaf` — `T`, marked as a leaf of the Promise face: it is handed to a Promise consumer exactly as the Effect service holds it.
 - `PromiseFace` — The Promise face of a service interface.
@@ -680,7 +709,7 @@ The full entries follow under "API".
 ## `@unconfirmed/sui-effect`
 
 
-101 exported symbols.
+102 exported symbols.
 
 ### `Balance` (const)
 
@@ -712,8 +741,8 @@ What can go wrong decoding one object of a batch read.
 
 ```ts
 export declare class BuildError extends BuildError_base {
-  readonly message: string
-  readonly cause: unknown
+  readonly message: string;
+  readonly cause: unknown;
 }
 ```
 
@@ -725,8 +754,8 @@ The transaction could not be built into bytes.
 declare const Built: Schema
 // decodes to:
 // {
-//     readonly digest: Digest;
 //     readonly bytes: Uint8Array<ArrayBufferLike>;
+//     readonly digest: Digest;
 //     readonly sender: SuiAddress;
 //     readonly gasOwner?: SuiAddress | undefined;
 //     readonly expiration?: {
@@ -833,7 +862,7 @@ declare const ChangedObject: Schema
 //     } | {
 //         readonly $kind: "Unknown";
 //     } | null;
-//     readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+//     readonly idOperation: "Unknown" | "None" | "Created" | "Deleted";
 // }
 ```
 
@@ -949,6 +978,12 @@ The return values and mutated references of one command. Mirrors `SuiClientTypes
 
 ```ts
 export declare class DecodeError extends DecodeError_base {
+    readonly kind: DecodeKind;
+    readonly issue: string;
+    readonly objectId?: ObjectId | undefined;
+    readonly expectedType?: string | undefined;
+    readonly actualType?: string | undefined;
+    readonly issues?: readonly { readonly path: readonly (string | number)[]; readonly message: string; }[] | undefined;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -966,7 +1001,7 @@ compiles and still answers the question conservatively.
 
 ```ts
 declare const DecodeKind: Schema
-// decodes to: "bytes" | "type" | "shape"
+// decodes to: "type" | "bytes" | "shape"
 ```
 
 Which of the three things that can go wrong at a decode boundary went wrong.
@@ -1033,6 +1068,7 @@ outside. There is no `normalize`, because there is nothing to normalize.
 declare const DynamicField: Schema
 // decodes to:
 // {
+//     readonly type: string;
 //     readonly digest: string;
 //     readonly $kind: "DynamicField" | "DynamicObject";
 //     readonly value: {
@@ -1040,7 +1076,6 @@ declare const DynamicField: Schema
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
 //     };
 //     readonly version: Version;
-//     readonly type: string;
 //     readonly name: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
@@ -1059,8 +1094,8 @@ A dynamic field with its value. Mirrors `SuiClientTypes.DynamicField`.
 declare const DynamicFieldEntry: Schema
 // decodes to:
 // {
-//     readonly $kind: "DynamicField" | "DynamicObject";
 //     readonly type: string;
+//     readonly $kind: "DynamicField" | "DynamicObject";
 //     readonly name: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
@@ -1081,6 +1116,21 @@ declare const DynamicFieldName: Schema
 ```
 
 The BCS-encoded name of a dynamic field. Mirrors `SuiClientTypes.DynamicFieldName`.
+
+### `EXECUTE_INCLUDE` (const)
+
+```ts
+declare const EXECUTE_INCLUDE: {
+    readonly effects: true;
+    readonly events: true;
+    readonly balanceChanges: true;
+    readonly objectTypes: true;
+}
+```
+
+The `include` set every execute, simulate and transaction read asks for, and
+the one `Executed.fromTransactionResult` is typed over: a `SuiCore` read made
+with `{ include: EXECUTE_INCLUDE }` is a result that method accepts.
 
 ### `Event` (const)
 
@@ -1135,17 +1185,13 @@ The SDK's `SuiClientTypes.EventFilter`, under its own name.
 
 ```ts
 export declare class Executed extends Executed_base {
-    /**
-     * The type of a changed object, from the `objectTypes` join. A published
-     * package reports the literal `package` rather than a struct tag, so the
-     * decode goes through `ObjectType`.
-     */
-    /**
-     * Everything the effects actually say about one changed object. Nothing is
-     * invented: a field the node did not report stays `undefined`, so a caller
-     * that needs a full builder reference can tell the difference between
-     * "version 0" and "the node did not say".
-     */
+    readonly digest: Digest;
+    readonly effects: TransactionEffects;
+    readonly events: ReadonlyArray<Event>;
+    readonly balanceChanges: ReadonlyArray<BalanceChange>;
+    readonly objectTypes: { readonly [x: string]: string; };
+    readonly checkpoint: bigint | null;
+    readonly timestampMs: number | null;
     /**
      * Objects this transaction created, optionally filtered by Move type through
      * `typeMatches`: a bare tag matches every instantiation of the generic, a
@@ -1186,16 +1232,6 @@ export declare class Executed extends Executed_base {
      * Never fails.
      */
     wrapped(): ReadonlyArray<ChangedRef>;
-    /**
-     * Whether this change wrote an object, treating `Unknown` as "the envelope
-     * did not say".
-     *
-     * A node always reports the output state; a reduced envelope from a relay or
-     * a sponsor often reports nothing but the id and the id operation, and
-     * `Executed.fromPartial` leaves what it was not told as `Unknown`
-     * rather than inventing `ObjectWrite`. Reading `Unknown` as "not an object
-     * write" would make `created()` silently empty for exactly those envelopes.
-     */
     /**
      * Packages this transaction published (`PackageWrite` plus `Created`), as
      * full refs like every other accessor. A package's `type` is the literal
@@ -1379,6 +1415,10 @@ says) and `timestampMs` (`null` likewise).
 
 ```ts
 export declare class ExecutionFailed extends ExecutionFailed_base {
+    readonly digest: Digest;
+    readonly effects: TransactionEffects;
+    readonly reason: ExecutionReason;
+    readonly command?: number | undefined;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -1494,6 +1534,8 @@ representation of an on-chain failure.
 
 ```ts
 export declare class ExtensionNotReady extends ExtensionNotReady_base {
+    readonly extension: string;
+    readonly member: string;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -1533,6 +1575,8 @@ What can go wrong reading one object with a schema.
 
 ```ts
 export declare class GraphQLUnavailable extends GraphQLUnavailable_base {
+    readonly method: string;
+    readonly reason: string;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -1570,6 +1614,7 @@ the documented retry idiom to send again on no evidence at all.
 
 ```ts
 export declare class JournalError extends JournalError_base {
+    readonly cause: unknown;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -1737,6 +1782,8 @@ The network a client is pointed at. Mirrors `SuiClientTypes.Network`.
 
 ```ts
 export declare class NetworkMismatch extends NetworkMismatch_base {
+    readonly expected: string;
+    readonly actual: string;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -1759,6 +1806,8 @@ rather than bytes the validator will reject later.
 
 ```ts
 export declare class NotApplied extends NotApplied_base {
+    readonly digest: Digest;
+    readonly evidence: NotAppliedEvidence;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -1795,6 +1844,8 @@ cannot drift.
 
 ```ts
 export declare class ObjectDeleted extends ObjectDeleted_base {
+    readonly objectId: ObjectId;
+    readonly version?: Version | undefined;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -1834,7 +1885,7 @@ declare const ObjectEnvelope: Schema
 //     } | {
 //         readonly $kind: "Unknown";
 //     };
-//     readonly type: StructTag | "package";
+//     readonly type: "package" | StructTag;
 // }
 ```
 
@@ -1864,6 +1915,8 @@ The failures of an object lookup.
 
 ```ts
 export declare class ObjectNotFound extends ObjectNotFound_base {
+    readonly objectId: ObjectId;
+    readonly version?: Version | undefined;
     /**
      * The one actionable line `SuiError.describe` produces for this error.
      *
@@ -1887,7 +1940,7 @@ declare const ObjectRef: Schema
 // decodes to:
 // {
 //     readonly id: ObjectId;
-//     readonly type: StructTag | "package";
+//     readonly type: "package" | StructTag;
 //     readonly version: Version;
 //     readonly digest: string;
 //     readonly owner: {
@@ -1923,7 +1976,7 @@ type and owner so a caller can tell a shared object from an owned one.
 
 ```ts
 declare const ObjectType: Schema
-// decodes to: StructTag | "package"
+// decodes to: "package" | StructTag
 ```
 
 The `type` field of an object envelope. Almost always a struct tag, but gRPC
@@ -1935,6 +1988,8 @@ readable object like any other.
 
 ```ts
 export declare class ObjectUnavailable extends ObjectUnavailable_base {
+    readonly objectId: ObjectId;
+    readonly version?: Version | undefined;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -2004,8 +2059,8 @@ An object owner. Mirrors `SuiClientTypes.ObjectOwner` exactly, including its
 
 ```ts
 export declare class PolicyDenied extends PolicyDenied_base {
-  readonly rule: string
-  readonly message: string
+  readonly rule: string;
+  readonly message: string;
 }
 ```
 
@@ -2093,8 +2148,8 @@ where a digest or an address is expected.
 declare const SignedTransaction: Schema
 // decodes to:
 // {
-//     readonly digest: Digest;
 //     readonly bytes: Uint8Array<ArrayBufferLike>;
+//     readonly digest: Digest;
 //     readonly sender: SuiAddress;
 //     readonly signatures: readonly Signature[];
 //     readonly gasOwner?: SuiAddress | undefined;
@@ -2146,6 +2201,7 @@ The expiration the transaction was built with rides along, because it is what
 
 ```ts
 export declare class SigningError extends SigningError_base {
+    readonly cause: unknown;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -2226,7 +2282,7 @@ declare const Simulation: Schema
 //             } | {
 //                 readonly $kind: "Unknown";
 //             } | null;
-//             readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+//             readonly idOperation: "Unknown" | "None" | "Created" | "Deleted";
 //         } | null;
 //         readonly eventsDigest: string | null;
 //         readonly dependencies: readonly string[];
@@ -2285,7 +2341,7 @@ declare const Simulation: Schema
 //             } | {
 //                 readonly $kind: "Unknown";
 //             } | null;
-//             readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+//             readonly idOperation: "Unknown" | "None" | "Created" | "Deleted";
 //         }[];
 //         readonly unchangedConsensusObjects: readonly {
 //             readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
@@ -2336,83 +2392,9 @@ coins or from the sender's address balance.
 
 ```ts
 export declare class SimulationFailed extends SimulationFailed_base {
-  readonly message: string
-  readonly reason: {
-      readonly $kind: "MoveAbort";
-      readonly MoveAbort: {
-          readonly abortCode: bigint;
-          readonly location?: {
-              readonly function?: number | undefined;
-              readonly module?: string | undefined;
-              readonly package?: string | undefined;
-              readonly functionName?: string | undefined;
-              readonly instruction?: number | undefined;
-          } | undefined;
-          readonly cleverError?: {
-              readonly errorCode?: number | undefined;
-              readonly lineNumber?: number | undefined;
-              readonly constantName?: string | undefined;
-              readonly constantType?: string | undefined;
-              readonly value?: string | undefined;
-          } | undefined;
-      };
-  } | {
-      readonly $kind: "SizeError";
-      readonly SizeError: {
-          readonly name: string;
-          readonly size: number;
-          readonly maxSize: number;
-      };
-  } | {
-      readonly $kind: "CommandArgumentError";
-      readonly CommandArgumentError: {
-          readonly argument: number;
-          readonly name: string;
-      };
-  } | {
-      readonly $kind: "TypeArgumentError";
-      readonly TypeArgumentError: {
-          readonly typeArgument: number;
-          readonly name: string;
-      };
-  } | {
-      readonly $kind: "PackageUpgradeError";
-      readonly PackageUpgradeError: {
-          readonly name: string;
-          readonly digest?: string | undefined;
-          readonly packageId?: string | undefined;
-      };
-  } | {
-      readonly $kind: "IndexError";
-      readonly IndexError: {
-          readonly index?: number | undefined;
-          readonly subresult?: number | undefined;
-      };
-  } | {
-      readonly $kind: "CoinDenyListError";
-      readonly CoinDenyListError: {
-          readonly coinType: string;
-          readonly name: string;
-          readonly address?: string | undefined;
-      };
-  } | {
-      readonly $kind: "CongestedObjects";
-      readonly CongestedObjects: {
-          readonly name: string;
-          readonly objects: readonly string[];
-      };
-  } | {
-      readonly $kind: "ObjectIdError";
-      readonly ObjectIdError: {
-          readonly objectId: string;
-          readonly name?: string | undefined;
-      };
-  } | {
-      readonly $kind: "Unknown";
-      readonly message?: string | undefined;
-      readonly command?: number | undefined;
-  }
-  readonly command: number | undefined
+  readonly message: string;
+  readonly reason: ExecutionReason;
+  readonly command?: number | undefined;
 }
 ```
 
@@ -2444,6 +2426,9 @@ A fully qualified Move struct tag in normalized form: the schema, plus
 
 ```ts
 export declare class SubmissionUnknown extends SubmissionUnknown_base {
+    readonly digest: Digest;
+    readonly cause: unknown;
+    readonly signed?: SignedTransaction;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -2714,13 +2699,39 @@ export interface SuiCoreService {
 The mechanical tier: one member per `SuiClientTypes.TransportMethods` key,
 plus the four concrete conveniences `CoreClient` adds and the `use` hatch.
 
-### `SuiError` (type)
+### `SuiError` (type + const)
 
 ```ts
 export type SuiError = TransportError | ObjectNotFound | ObjectDeleted | ObjectUnavailable | TransactionNotFound | NetworkMismatch | DecodeError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError | UnexpectedEffects | GraphQLUnavailable | ExtensionNotReady;
 ```
 
 Every failure sui-effect can produce.
+
+```ts
+declare const SuiError: {
+    readonly isRetryable: (error: unknown) => boolean;
+    readonly isTaxonomy: (error: unknown) => error is SuiError;
+    readonly outcome: (error: unknown, options?: {
+        readonly phase?: OutcomePhase;
+    }) => Outcome;
+    readonly describe: (error: unknown, options?: DescribeOptions) => string;
+    readonly toJson: (error: unknown) => Record<string, unknown>;
+    readonly digestOf: (error: unknown) => Digest | undefined;
+    readonly moveAbort: (error: unknown) => Option.Option<MoveAbortInfo>;
+    readonly isMoveAbort: (error: unknown, match?: MoveAbortMatch) => error is SimulationFailed | ExecutionFailed;
+}
+```
+
+The helpers every repo hand-rolls: is this worth retrying, did the
+transaction land, is it even one of ours, what does an operator need to read,
+what goes in a log, which transaction is it about, and which Move abort was
+it. Every one takes `unknown`.
+
+For *branching* on a failure, the taxonomy is a flat tagged union, so
+`Effect.catchTags({ ObjectNotFound: ..., TransportError: ... })` in the error
+channel and `Match.tagsExhaustive` over a `SuiError` value both work and are
+the two documented consumer idioms; these helpers are for the questions that
+are the same whatever the tag is.
 
 ### `SuiGraphQL` (class)
 
@@ -2907,7 +2918,7 @@ from an object, which is every `getObject(id, { schema })` read.
 #### `decode` (const)
 
 ```ts
-declare const decodeContent: <T>(schema: Schema.Codec<T, Uint8Array>, content: Uint8Array, context?: {
+declare const decode: <T>(schema: Schema.Codec<T, Uint8Array>, content: Uint8Array, context?: {
     readonly objectId?: ObjectId;
     readonly expectedType?: string;
     readonly actualType?: string;
@@ -2968,6 +2979,7 @@ need bytes back.
 
 ```ts
 export declare function name<T>(codec: Schema.Codec<T, Uint8Array>, key: T): DynamicFieldName;
+export declare function name<T extends Input, Input>(layout: BcsType<T, Input>, type: string, key: Input): DynamicFieldName;
 ```
 
 The key of a dynamic field, built from **one** description of it: the Move
@@ -2993,7 +3005,7 @@ the calling code, not runtime conditions.
 #### `matchesType` (const)
 
 ```ts
-declare const typeMatches: (expected: string, actual: string) => boolean
+declare const matchesType: (expected: string, actual: string) => boolean
 ```
 
 Whether an object's type tag satisfies an expected type.
@@ -3521,7 +3533,7 @@ declare const TransactionEffects: Schema
 //         } | {
 //             readonly $kind: "Unknown";
 //         } | null;
-//         readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+//         readonly idOperation: "Unknown" | "None" | "Created" | "Deleted";
 //     } | null;
 //     readonly eventsDigest: string | null;
 //     readonly dependencies: readonly string[];
@@ -3580,7 +3592,7 @@ declare const TransactionEffects: Schema
 //         } | {
 //             readonly $kind: "Unknown";
 //         } | null;
-//         readonly idOperation: "None" | "Unknown" | "Created" | "Deleted";
+//         readonly idOperation: "Unknown" | "None" | "Created" | "Deleted";
 //     }[];
 //     readonly unchangedConsensusObjects: readonly {
 //         readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
@@ -3662,6 +3674,7 @@ The failures of a transaction lookup.
 
 ```ts
 export declare class TransactionNotFound extends TransactionNotFound_base {
+    readonly digest: Digest;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -3673,6 +3686,10 @@ No transaction with this digest is known to the node.
 
 ```ts
 export declare class TransportError extends TransportError_base {
+    readonly cause: unknown;
+    readonly method: string;
+    readonly retryable: boolean;
+    readonly status?: string | undefined;
     /**
      * Builds a `TransportError` out of whatever a call threw, classifying the
      * status and the retryability the way `SuiCore` does for the SDK's own
@@ -3736,6 +3753,9 @@ Mirrors `SuiClientTypes.UnchangedConsensusObject`.
 
 ```ts
 export declare class UnexpectedEffects extends UnexpectedEffects_base {
+    readonly digest: Digest;
+    readonly expected: string;
+    readonly found: readonly ObjectId[];
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
@@ -3890,7 +3910,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-47 exported symbols.
+48 exported symbols.
 
 ### `Built` (const)
 
@@ -3965,8 +3985,8 @@ declare const JournalEntry: Schema
 //     readonly _tag: "Unknown";
 //     readonly digest: Digest;
 //     readonly signed: {
-//         readonly digest: Digest;
 //         readonly bytes: Uint8Array<ArrayBufferLike>;
+//         readonly digest: Digest;
 //         readonly sender: SuiAddress;
 //         readonly signatures: readonly Signature[];
 //         readonly gasOwner?: SuiAddress | undefined;
@@ -4015,8 +4035,8 @@ declare const JournalEntry: Schema
 //     readonly _tag: "Signed";
 //     readonly digest: Digest;
 //     readonly signed: {
-//         readonly digest: Digest;
 //         readonly bytes: Uint8Array<ArrayBufferLike>;
+//         readonly digest: Digest;
 //         readonly sender: SuiAddress;
 //         readonly signatures: readonly Signature[];
 //         readonly gasOwner?: SuiAddress | undefined;
@@ -4055,8 +4075,8 @@ declare const JournalEntry: Schema
 //     };
 //     readonly signedAt: Utc;
 // } | {
-//     readonly _tag: "Executed";
 //     readonly digest: Digest;
+//     readonly _tag: "Executed";
 //     readonly at: Utc;
 //     readonly checkpoint?: bigint | undefined;
 // } | {
@@ -4196,17 +4216,17 @@ What `Tx.reconcile` can be asked about.
 declare const Reconciled: Schema
 // decodes to:
 // {
-//     readonly _tag: "NotApplied";
-//     readonly error: NotApplied;
-// } | {
-//     readonly _tag: "Executed";
-//     readonly executed: Executed;
-// } | {
 //     readonly _tag: "ExecutionFailed";
 //     readonly error: ExecutionFailed;
 // } | {
+//     readonly _tag: "NotApplied";
+//     readonly error: NotApplied;
+// } | {
 //     readonly _tag: "SubmissionUnknown";
 //     readonly error: SubmissionUnknown;
+// } | {
+//     readonly _tag: "Executed";
+//     readonly executed: Executed;
 // }
 ```
 
@@ -4257,20 +4277,55 @@ Re-exported from `@unconfirmed/sui-effect`.
 type SignatureScheme = 'ED25519' | 'Secp256k1' | 'Secp256r1' | 'MultiSig' | 'ZkLogin' | 'Passkey' | 'MLDSA65';
 ```
 
-### `Signed` (interface)
+### `Signed` (const)
 
 ```ts
-export interface Signed extends SignedTransaction {
-}
+declare const Signed: Schema
+// decodes to:
+// {
+//     readonly bytes: Uint8Array<ArrayBufferLike>;
+//     readonly digest: Digest;
+//     readonly sender: SuiAddress;
+//     readonly signatures: readonly Signature[];
+//     readonly gasOwner?: SuiAddress | undefined;
+//     readonly expiration?: {
+//         readonly $kind: "None";
+//         readonly None: true;
+//     } | {
+//         readonly $kind: "Epoch";
+//         readonly Epoch: bigint;
+//     } | {
+//         readonly $kind: "ValidDuring";
+//         readonly ValidDuring: {
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | {
+//         readonly $kind: "Validity";
+//         readonly Validity: {
+//             readonly allowedProposers: {
+//                 readonly epoch: bigint;
+//                 readonly proposers: readonly number[];
+//             } | null;
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | undefined;
+//     readonly chain?: string | undefined;
+// }
 ```
 
-Signed bytes: everything `executeTransaction` needs, plus what `reconcile`
-needs.
+The schema of `Signed`.
 
-An interface rather than a type alias so the name survives into `.d.ts`,
-editor hover and `LLMS.md`; structurally it is `SignedTransaction`.
-
-### `Signer` (interface)
+### `Signer` (interface + const)
 
 ```ts
 export interface Signer {
@@ -4298,6 +4353,20 @@ A credential: who it signs as, how, and the two things it can sign.
 Both members fail with `SigningError` and nothing else: a signer that has to
 reach a KMS or a wallet wraps its own transport failure in the `cause`, so a
 caller's error union does not grow a branch per credential kind.
+
+```ts
+declare const Signer: {
+    readonly fromSdkSigner: (keypair: SdkSigner) => Signer;
+    readonly fromKeypair: (keypair: Keypair) => Signer;
+    readonly fromConfig: (name?: string) => Effect.Effect<Signer, Config.ConfigError>;
+    readonly ephemeral: Effect.Effect<Signer, never, never>;
+    readonly remote: (signer: RemoteSigner) => Signer;
+}
+```
+
+The constructors, namespaced the way the spec spells them:
+`Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.fromConfig`,
+`Signer.ephemeral`, `Signer.remote`. The type `Signer` is the interface above.
 
 ### `SubmitConfig` (const)
 
@@ -4375,7 +4444,8 @@ export interface SubmitConfigService {
     /**
      * The largest gas budget `Tx.build` will accept. The budget itself is chosen
      * by the node's simulation during build; this is the ceiling above which
-     * building fails with `BuildError` rather than signing an expensive mistake.
+     * building fails with `PolicyDenied { rule: "maxGasBudget" }` rather than
+     * signing an expensive mistake.
      */
     readonly maxGasBudget: Mist;
     /**
@@ -5355,6 +5425,41 @@ instead of pretending.
 
 **Never fails.**
 
+### `resubmit` (const)
+
+```ts
+declare const resubmit: (input: SubmissionUnknown | Signed) => Effect.Effect<Executed, SubmitError, Sui>
+```
+
+Re-sends signed bytes whose outcome is unknown — the **identical** bytes,
+never a rebuild — and settles them the way `submit` does.
+
+Safe by construction: the bytes have one digest, and Sui executes a digest at
+most once, so a re-send can only land the transaction that was already
+signed, or tell you it already landed. This is the way out of a
+`SubmissionUnknown` that `reconcile` cannot settle yet — a submission with no
+owned inputs whose evidence can only be the expiry window, a node that lost
+the request — without waiting for that window to close.
+
+What it does **not** do is send bytes that cannot help:
+
+- a digest the journal already holds as **settled** is not sent again:
+  `Executed` or `Failed` is read back with `reconcile`, and `NotApplied`
+  fails with that `NotApplied`;
+- bytes built for another chain than this `Sui`'s are not sent; the
+  reconcile names both chains;
+- bytes whose validity window has observably closed are not sent; they are
+  reconciled, which is where the expiry rule decides.
+
+Unlike a first `Tx.submit`, a refusal (`INVALID_ARGUMENT`) on the re-send is
+**not** taken as "nothing executed": an earlier send of the same bytes may
+have landed, so the refusal reconciles like any other ambiguous answer.
+
+Given a `SubmissionUnknown` that carries no bytes (one that came from
+reconciling a bare digest), there is nothing to send and this is `reconcile`.
+
+**Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError` (reading the journal, or the `Signed` write before the send), `TransportError` (in the union for `SubmitError`'s sake; a re-send never fails with one).**
+
 ### `run` (const)
 
 ```ts
@@ -5617,7 +5722,7 @@ The durable journal as a layer.
 ### `makeKeyValueStore` (const)
 
 ```ts
-declare const make: (store: KeyValueStore.KeyValueStore, options?: {
+declare const makeKeyValueStore: (store: KeyValueStore.KeyValueStore, options?: {
     readonly prefix?: string;
 }) => JournalService
 ```
@@ -5797,7 +5902,7 @@ typed and named, not silent — but the cure is `warm` or `$ready()`, not a
 retry. An extension that is registered lazily should expose such a value
 through an `Effect` member instead.
 
-### `SuiExtension` (const)
+### `SuiExtension` (const + namespace)
 
 ```ts
 declare const SuiExtension: {
@@ -5809,6 +5914,13 @@ declare const SuiExtension: {
 The namespace the spec spells: `SuiExtension.fromService(...)`, plus the
 leaf marker a service uses to say "this member is a value, not a namespace"
 (`SuiExtension.leaf(value)`, typed `SuiExtension.Leaf<T>`).
+
+```ts
+export declare namespace SuiExtension {
+    /** `Leaf` under the namespace the spec spells. */
+    type Leaf<T> = T & LeafBrand;
+}
+```
 
 ### `SuiExtensionOptions` (interface)
 
@@ -5931,7 +6043,10 @@ passes to `client.$extend(...)`.
 id and the extension's own layer is built on the first call and shared by
 every call after it. The `Sui` and `SuiCore` underneath are shared with every
 other registration on that client that names the same chain id — one
-transport, one chain identity and one sender-lock map. A rejection carries
+transport and one chain identity — and the sender lock is **process-wide**:
+every registration, on every client, takes the same lock per address, so a
+warm and a lazy registration (or two clients) cannot race one gas coin. A
+rejection carries
 the original tagged error instance, so a Promise consumer can still switch on
 `_tag`.
 
@@ -5971,13 +6086,23 @@ Two lifetimes worth knowing:
   copies of whatever the layer holds (a cache, a connection). Register once
   per client and keep the extended client.
 
-**A cold call is a real `Promise`.** The placeholder a member call returns
-before the runtime exists is a `Promise` subclass that also implements
-`Symbol.asyncIterator`, so `instanceof Promise` holds and `bun:test`'s
-`expect(...).rejects` recognises it. Its rejection is **pre-handled** (a
-no-op `catch` is attached at creation), so a cold call nobody awaits —
+**A cold call is a callable Promise.** The placeholder a member call returns
+before the runtime exists is a `Proxy` over a function whose prototype is a
+`Promise` subclass that also implements `Symbol.asyncIterator`:
+`instanceof Promise` holds, `await` and `then` work, iteration works, and
+applying it — a cold recipe builder's result used as `recipe(tx)` — throws
+`ExtensionNotReady` naming the member. `typeof` is `"function"`, so
+`bun:test`'s `expect(...).rejects`, which wants a native Promise, takes
+`Promise.resolve(cold)`. Its rejection is **pre-handled** (a no-op `catch`
+is attached at creation), so a cold call nobody awaits —
 `client.ext.doThing()` as a statement — cannot abort the process with an
 unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
+
+**A cold value placeholder refuses value-only use.** A plain value member
+read before the runtime exists throws `ExtensionNotReady` on the names only
+a value has (`.length`, `.startsWith`, `toString`, `valueOf`, `toJSON`, …),
+on spread and on string conversion, and prints as
+`<ExtensionNotReady ext.member>`.
 
 A warm registration builds the
 **whole layer** synchronously inside `register`, so **any** failure of that
@@ -6045,7 +6170,8 @@ export declare class Script extends Script_base {
      *
      * Reads `SUI_NETWORK` (required, no default; `mainnet` refused unless
      * `SUI_ALLOW_MAINNET=1`), `SUI_RPC_URL` (optional, defaulted per network) and
-     * `SUI_PRIVATE_KEY` (Bech32, through `Config.Redacted`).
+     * `SUI_PRIVATE_KEY` (a Bech32 `suiprivkey1…` or a 32-byte hex seed, through
+     * `Config.Redacted`; see `Signer.fromConfig`).
      *
      * Fails with: `ConfigError`, `NetworkMismatch`, `TransportError`.
      */
@@ -6102,8 +6228,8 @@ The script preset: the two tiers and the signer.
 
 ```ts
 export declare class ScriptReadOnly extends ScriptReadOnly_base {
-  readonly Service: ScriptReadOnlyService
-  readonly key: "@unconfirmed/sui-effect/ScriptReadOnly"
+  readonly Service: ScriptReadOnlyService;
+  readonly key: "@unconfirmed/sui-effect/ScriptReadOnly";
 }
 ```
 
@@ -6469,7 +6595,7 @@ export interface FakeObject {
 
 An object the fake serves.
 
-### `FakeOutcome` (type)
+### `FakeOutcome` (type + const)
 
 ```ts
 export type FakeOutcome = {
@@ -6492,6 +6618,41 @@ export type FakeOutcome = {
 ```
 
 One scripted outcome of a call. The last entry of a script repeats forever.
+
+```ts
+declare const FakeOutcome: {
+    /** The call succeeds with these effects. */
+    succeed: (value?: FakeExecution) => FakeOutcome;
+    /**
+     * The call resolves with an on-chain failure (`FailedTransaction`).
+     *
+     * `reason` may be the SDK's `SuiClientTypes.ExecutionError` — the wire shape,
+     * with a top-level `message` and an `abortCode` **string** — or sui-effect's
+     * decoded `ExecutionReason`, whose `abortCode` is a `bigint` and which
+     * carries no `message`. The second is encoded into the first here; a value
+     * that is neither throws immediately, naming the two shapes, rather than
+     * failing a decode several calls later.
+     */
+    failWith: (reason: SuiClientTypes.ExecutionError | ExecutionReason, value?: FakeExecution) => FakeOutcome;
+    /**
+     * The call rejects with a gRPC status, as `RpcError` would. `message` is the
+     * node's text, for a test about what a refusal *says* — a validator's
+     * "already locked by a different transaction" is a `FAILED_PRECONDITION`
+     * whose message names the conflicting digest.
+     */
+    transportError: (status: string, message?: string) => FakeOutcome;
+    /** The call rejects the way a missing transaction does. */
+    notFound: () => FakeOutcome;
+    /**
+     * The call never settles until the caller's `AbortSignal` fires, then rejects
+     * with a `DEADLINE_EXCEEDED`. `found` says whether a later `getTransaction`
+     * for the same digest should find the transaction.
+     */
+    timeoutThen: (found: boolean) => FakeOutcome;
+}
+```
+
+Builders for `FakeOutcome`.
 
 ### `FakeScript` (interface)
 
