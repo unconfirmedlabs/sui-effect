@@ -2760,9 +2760,12 @@ the page to read before the conversion rather than after it.
   `SuiExtension.leaf`.** `Uint8Array`, `Date`, `Promise`, arrays and BCS codecs
   are leaves already; everything else with a prototype of its own is passed
   through by the runtime and must say so in the type.
-- **A cold call is a real `Promise`** that is also an `AsyncIterable`, and its
-  rejection is pre-handled, so `expect(...).rejects` works and an un-awaited
-  cold call cannot abort the test run.
+- **A cold call is a callable `Proxy` over a `Promise`** that is also an
+  `AsyncIterable`: `instanceof Promise`, `await` and `for await` work, but
+  `typeof` is `"function"`, so in `bun:test` write
+  `expect(Promise.resolve(cold)).rejects` (a bare `expect(cold).rejects` does
+  not see a Promise). Its rejection is pre-handled, so an un-awaited cold call
+  cannot abort the test run.
 - **`outcome` survives `SuiError.toJson`** even as a class field; keep declaring
   it as one.
 - **`warm` throws *any* layer failure synchronously out of `$extend`**, not only

@@ -286,8 +286,10 @@ const withOverrides =
  * Because this is a `Context.Reference` and not a service, it never appears in
  * an `R`: a one-shot script gets the defaults with no wiring, and an
  * application overrides what it cares about with
- * {@link SubmitConfig.with} (one effect) or {@link SubmitConfig.layer} (a whole
- * application), both of which spread {@link SubmitConfig.defaults} for you.
+ * {@link SubmitConfig.with} (one effect), which merges over the config **in
+ * force** so an outer override survives an inner one, or
+ * {@link SubmitConfig.layer} (a whole application), which spreads
+ * {@link SubmitConfig.defaults} for you.
  *
  * @example
  * ```ts

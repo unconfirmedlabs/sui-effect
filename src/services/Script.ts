@@ -324,6 +324,12 @@ export interface ReportOptions {
  * get the lines on stderr and the number back, and call `process.exitCode = …`
  * yourself rather than `process.exit`, so buffered output still flushes.
  *
+ * It is not quite `run`'s tail. It counts **every** unresolved entry in the
+ * journal it is given — in a shared durable store, another process's too —
+ * and any one of them turns a would-be 2, 4 or 130 into 3. It has no count of
+ * what applied, so it never turns a failure into 5 for an applied
+ * transaction: that rule needs the run record only `Script.run` keeps.
+ *
  * Never fails.
  *
  * @example
@@ -709,8 +715,8 @@ const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<st
  * Reads a journal for entries that never got an answer, for {@link report}.
  *
  * This is the one `Effect.runPromise` outside `run` and the extension facade:
- * `report` is `run`'s own tail, exported for a program that owns its process,
- * so it sits at the same process edge.
+ * `report` is `run`'s tail for a program that owns its process, so it sits at
+ * the same process edge.
  */
 const readUnresolved = async (
   journal: JournalService | undefined

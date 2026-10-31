@@ -126,10 +126,12 @@ but `sui.core.getObject({ objectId, include })`. The SDK habit,
 `after`/`before`, come as pages (`streamEventPages`, `streamTransactionPages`:
 `{ items, endCursor }`, so an indexer commits its cursor with its rows), and
 have never-ending `tail…` forms that poll, retry from the last cursor, and keep
-a filtered cursor ahead of a pruning node. A transaction `function` filter must
-be fully qualified (`pkg::module::function`); the SDK cannot page past the
-first page of a `pkg` or `pkg::module` filter, so the streams refuse those up
-front, and one page of one is `sui.core.listTransactions`.
+a filtered cursor ahead of a pruning node (sound only against one sticky node:
+behind a load-balanced endpoint that move can skip matches). A transaction
+`function` filter must be fully qualified (`pkg::module::function`); the SDK
+cannot page past the first page of a `pkg` or `pkg::module` filter, so the
+streams refuse those up front, and one page of one is
+`sui.core.listTransactions`.
 
 **Ids from a user go through `.Strict`.** `Schema.decodeUnknownEffect(SuiAddress)`
 pads (`"2"` is `0x…02`), which is right for a node and wrong for a recipient a
@@ -283,8 +285,10 @@ recipe is applied before any lock is chosen, so a gas owner it sets itself
 **Two ways to sponsor.** `Tx.sponsored({ sender, gasOwner })` leaves the gas
 payment empty: the sponsor's **SUI address balance** pays, no coin is selected,
 and so `Tx.run` takes only the sender's lock — one sponsor serves many senders
-concurrently. That balance has to cover the budget, and faucets pay coins, so a
-sponsor deposits first (`coin::into_balance` then `balance::send_funds<SUI>` to
+concurrently. That balance has to cover the budget. The devnet and testnet
+faucet (`requestSuiFromFaucetV3`) pays into the address balance; the localnet
+faucet (V2) and most other funding pay coins, so a sponsor funded that way
+deposits first (`coin::into_balance` then `balance::send_funds<SUI>` to
 itself); `Tx.build` checks before signing and fails with `BuildError` when it
 falls short. Without `Tx.sponsored`, `Tx.run(recipe, { signer, gasOwner,
 sponsor })` pays from the sponsor's **coins**, and then the sponsor's lock is
@@ -390,9 +394,15 @@ before sending anything new: `yield* Tx.reconcileAll({ resubmit: true })` first
 in the program. `examples/recipes/durable-journal-script.ts` (quoted in
 `LLMS.md`) is that script, tested.
 
-A store written by 0.3 reads unchanged (its old `index` key is ignored and left
-in place). The other direction does not hold for one kind of entry: a 0.3
-reader cannot decode `NotApplied { evidence: "refused" }`, which 0.4 writes.
+A store written by 0.3 reads with no migration: its old `index` key is ignored,
+left in place and no longer maintained. **Rolling back is not safe as is.** 0.3
+lists unresolved entries only through that index, so a `Signed` or `Unknown`
+entry 0.4 wrote is invisible to a 0.3 `listUnresolved`, `Tx.reconcileAll` and
+`onUnresolved: "fail"` (only `Tx.recorded(digest)` finds it), and a 0.3 reader
+cannot decode `NotApplied { evidence: "refused" }`, which 0.4 writes. Before
+rolling back, or while 0.3 and 0.4 processes share a store, drain it with
+`Tx.reconcileAll()` on 0.4 (or settle the entries by hand) and delete the
+`"refused"` entries.
 
 ## Extensions
 
@@ -571,7 +581,9 @@ their own — the diagnostic lines and the unresolved entries, with the exit cod
 as the answer — for a CLI that owns its own argv parsing and process. Assign it
 to `process.exitCode` rather than calling `process.exit`. It lists **every**
 unresolved entry of the journal it is given, another process's included in a
-shared store; `Script.run` lists only the entries its own program wrote.
+shared store, and any one of them turns a would-be 2, 4 or 130 into 3; it has
+no count of what applied, so the "applied → 5" rule is `Script.run`'s alone.
+`Script.run` lists, and counts, only the entries its own program wrote.
 `Script.layerNoDeps`, `layerWithSigner` and `layerReadOnlyNoDeps` take the
 network from the `SuiCore` underneath, not from `SUI_NETWORK`, so they build
 over `layerTest` with no environment.
@@ -579,10 +591,10 @@ over `layerTest` with no environment.
 A timeout or an interrupt asks the journal: with an unresolved submission in it
 the exit is 3, not 4 or 130, because an `Effect.timeout` wrapped around a
 submission interrupts it from the outside and the bytes may be on the wire. Each
-unresolved entry is printed three ways: the digest and tag, the raw base64
-bytes, and the whole entry encoded through the `JournalEntry` schema — the same
-JSON a durable journal stores — so a wrapper can hand stderr to a recovery
-process verbatim.
+unresolved entry is printed as two lines: `unresolved <digest> (<tag>)`, and
+`entry: <JSON>`, the whole entry encoded through the `JournalEntry` schema — the
+same JSON a durable journal stores, bytes base64 included — so a wrapper can
+hand stderr to a recovery process verbatim.
 
 ## Relay and sponsor envelopes
 

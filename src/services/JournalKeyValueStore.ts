@@ -106,10 +106,17 @@ const readAll = (kv: KeyValueStore.KeyValueStore) =>
  * makes startup recovery slower without bound; {@link pruneSettled} is how a
  * long-lived service keeps it short.
  *
- * A store written by 0.3 or earlier also holds an `index` key. It is dead data
- * here: never read, never rewritten, never an error. It is left alone so that
- * a rollback to 0.3 still finds its index; remove it by hand once nothing
- * older reads the store.
+ * A store written by 0.3 or earlier also holds an `index` key, and reading
+ * such a store needs no migration: the key is dead data here — never read,
+ * never rewritten, never an error — left in place and no longer maintained.
+ * **Rolling back to 0.3 is therefore not safe as is.** 0.3 lists unresolved
+ * entries only through that index, so a `Signed` or `Unknown` entry this
+ * journal wrote is invisible to a 0.3 `listUnresolved`, `Tx.reconcileAll` and
+ * `onUnresolved: "fail"` (only `Tx.recorded(digest)` finds it), and a 0.3
+ * reader cannot decode a `NotApplied { evidence: "refused" }` entry at all.
+ * Before rolling back, or while 0.3 and 0.4 processes share a store, drain it
+ * with `Tx.reconcileAll()` on 0.4 (or settle the entries by hand) and delete
+ * the `"refused"` entries.
  *
  * Every member fails with `JournalError` and nothing else.
  */

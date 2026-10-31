@@ -520,11 +520,11 @@ interface Bridge {
 /**
  * The placeholder a **cold** member call returns.
  *
- * It is a real `Promise` subclass — `instanceof Promise` holds, and `bun:test`'s
- * `expect(...).rejects` recognises it — that also implements
- * `Symbol.asyncIterator`, because until the runtime exists nothing knows
- * whether the member was an `Effect` (a Promise) or a `Stream` (an
- * `AsyncIterable`). `Symbol.species` is `Promise`, so `.then`, `.catch` and
+ * It is a real `Promise` subclass — `instanceof Promise` holds — that also
+ * implements `Symbol.asyncIterator`, because until the runtime exists nothing
+ * knows whether the member was an `Effect` (a Promise) or a `Stream` (an
+ * `AsyncIterable`). The caller gets it wrapped in a callable `Proxy` (below),
+ * whose `typeof` is `"function"`. `Symbol.species` is `Promise`, so `.then`, `.catch` and
  * `.finally` produce plain Promises rather than more of these.
  */
 class ColdCall<A> extends Promise<A> {

@@ -4454,8 +4454,10 @@ The lifecycle settings.
 Because this is a `Context.Reference` and not a service, it never appears in
 an `R`: a one-shot script gets the defaults with no wiring, and an
 application overrides what it cares about with
-`SubmitConfig.with` (one effect) or `SubmitConfig.layer` (a whole
-application), both of which spread `SubmitConfig.defaults` for you.
+`SubmitConfig.with` (one effect), which merges over the config **in
+force** so an outer override survives an inner one, or
+`SubmitConfig.layer` (a whole application), which spreads
+`SubmitConfig.defaults` for you.
 
 ### `SubmitConfigOverrides` (type)
 
@@ -5815,10 +5817,17 @@ terminal ones included (`keys` is O(n) in the prefix, and each entry is one
 makes startup recovery slower without bound; `pruneSettled` is how a
 long-lived service keeps it short.
 
-A store written by 0.3 or earlier also holds an `index` key. It is dead data
-here: never read, never rewritten, never an error. It is left alone so that
-a rollback to 0.3 still finds its index; remove it by hand once nothing
-older reads the store.
+A store written by 0.3 or earlier also holds an `index` key, and reading
+such a store needs no migration: the key is dead data here — never read,
+never rewritten, never an error — left in place and no longer maintained.
+**Rolling back to 0.3 is therefore not safe as is.** 0.3 lists unresolved
+entries only through that index, so a `Signed` or `Unknown` entry this
+journal wrote is invisible to a 0.3 `listUnresolved`, `Tx.reconcileAll` and
+`onUnresolved: "fail"` (only `Tx.recorded(digest)` finds it), and a 0.3
+reader cannot decode a `NotApplied { evidence: "refused" }` entry at all.
+Before rolling back, or while 0.3 and 0.4 processes share a store, drain it
+with `Tx.reconcileAll()` on 0.4 (or settle the entries by hand) and delete
+the `"refused"` entries.
 
 Every member fails with `JournalError` and nothing else.
 
@@ -6447,6 +6456,12 @@ twenty subcommands has all of that already and still wants the two things
 plus the code itself. That is this: hand it the `Exit` of whatever you ran,
 get the lines on stderr and the number back, and call `process.exitCode = …`
 yourself rather than `process.exit`, so buffered output still flushes.
+
+It is not quite `run`'s tail. It counts **every** unresolved entry in the
+journal it is given — in a shared durable store, another process's too —
+and any one of them turns a would-be 2, 4 or 130 into 3. It has no count of
+what applied, so it never turns a failure into 5 for an applied
+transaction: that rule needs the run record only `Script.run` keeps.
 
 **Never fails.**
 
