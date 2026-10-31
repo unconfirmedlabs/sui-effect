@@ -310,7 +310,7 @@ and why. Everything here is additive except where noted.
    `actualType` context field) and in the fake's owned-object filter, which was
    stricter than a node. DESIGN §11.
 2. **`SuiSchema.bcs(codec, expectedType?)` and `Sui.view` over a bare codec.** A
-   Move return value has no struct tag, so `view(recipe, bcs.Address())` now
+   Move return value has no struct tag, so `view(recipe, bcs.Address)` now
    takes a `BcsType` directly and the expected type is optional. `view` and
    `simulate` gained `opts.sender` (`setSenderIfNotSet`, so a recipe's own sender
    wins; the SDK's zero-address default otherwise).

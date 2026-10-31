@@ -37,6 +37,7 @@
     "LICENSE",
     "LLMS.md",
     "AGENTS.md",
+    "DESIGN.md",
     "docs/extensions.md",
     "examples/extension-template",
     "!examples/extension-template/dist"
