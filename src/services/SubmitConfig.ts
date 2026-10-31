@@ -171,6 +171,50 @@ export const defaults: SubmitConfigService = {
   nonce: Random.nextIntBetween(0, U32_MAX)
 }
 
+/** The fields of {@link SubmitConfigService} that hold a `Duration`. */
+type DurationField = "validFor" | "executeTimeout" | "expiryMargin" | "reconcileRecheck" | "visibilityTimeout"
+
+/**
+ * What {@link SubmitConfig.with} and {@link SubmitConfig.layer} accept: any
+ * subset of {@link SubmitConfigService}, with every duration given as a
+ * `Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of
+ * milliseconds — and converted on the way in. The value in force (what
+ * `yield* SubmitConfig` answers) always holds `Duration`s.
+ *
+ * @since 0.4.0
+ */
+export type SubmitConfigOverrides = {
+  readonly [K in keyof SubmitConfigService]?: K extends DurationField ? Duration.Input
+    : SubmitConfigService[K]
+}
+
+const DURATION_FIELDS: ReadonlyArray<DurationField> = [
+  "validFor",
+  "executeTimeout",
+  "expiryMargin",
+  "reconcileRecheck",
+  "visibilityTimeout"
+]
+
+/**
+ * `base` ({@link defaults} unless given) with `overrides` applied, every
+ * duration converted.
+ *
+ * An input that is not a valid `Duration.Input` — reachable only past the type
+ * checker — throws, which is a defect at the edge that set it.
+ */
+const resolve = (
+  overrides: SubmitConfigOverrides,
+  base: SubmitConfigService = defaults
+): SubmitConfigService => {
+  const merged: Record<string, unknown> = { ...base, ...overrides }
+  for (const field of DURATION_FIELDS) {
+    const value = overrides[field]
+    if (value !== undefined) merged[field] = Duration.fromInputUnsafe(value)
+  }
+  return merged as unknown as SubmitConfigService
+}
+
 /** The reference itself; {@link SubmitConfig} is it with the constructors attached. */
 const SubmitConfigRef = Context.Reference<SubmitConfigService>(
   "@unconfirmed/sui-effect/SubmitConfig",
@@ -184,7 +228,8 @@ const SubmitConfigRef = Context.Reference<SubmitConfigService>(
  * The spread is the point: a `Context.Reference` holds one whole value, so
  * providing it by hand means writing `{ ...SubmitConfig.defaults, ... }` at
  * every site and casting every branded literal back to its field's type. This
- * does both. The `Journal.layerMemory` precedent is the same idea.
+ * does both, and takes every duration as a `Duration.Input` (`"3 seconds"`).
+ * The `Journal.layerMemory` precedent is the same idea.
  *
  * Never fails, requires nothing.
  *
@@ -195,16 +240,24 @@ const SubmitConfigRef = Context.Reference<SubmitConfigService>(
  * import { Layer } from "effect"
  * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
  *
- * const app = Layer.mergeAll(SubmitConfig.layer({ resubmitAttempts: 1 }))
+ * const app = Layer.mergeAll(
+ *   SubmitConfig.layer({ resubmitAttempts: 1, executeTimeout: "10 seconds" })
+ * )
  * ```
  */
-const layer = (overrides: Partial<SubmitConfigService>): Layer.Layer<never> =>
-  Layer.succeed(SubmitConfigRef, { ...defaults, ...overrides })
+const layer = (overrides: SubmitConfigOverrides): Layer.Layer<never> =>
+  Layer.sync(SubmitConfigRef, () => resolve(overrides))
 
 /**
- * {@link defaults} with `overrides` applied, provided to one effect — the
- * `.pipe`-able form of {@link layer}, for overriding the lifecycle for a single
- * submission rather than for a whole application.
+ * The config **in force** with `overrides` applied, provided to one effect —
+ * the `.pipe`-able form of {@link layer}, for overriding the lifecycle for a
+ * single submission rather than for a whole application.
+ *
+ * It merges over whatever is in force where the effect runs, not over
+ * {@link defaults}, the way `Gate.with` does: a `SubmitConfig.layer` (or the
+ * fast config `layerTest` installs) stays in force for every field the
+ * overrides leave out, and two nested `with`s compose. Before 0.4.0 it reset
+ * to the defaults.
  *
  * Never fails, requires nothing.
  *
@@ -222,9 +275,15 @@ const layer = (overrides: Partial<SubmitConfigService>): Layer.Layer<never> =>
  * ```
  */
 const withOverrides =
-  (overrides: Partial<SubmitConfigService>) =>
+  (overrides: SubmitConfigOverrides) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-    Effect.provideService(effect, SubmitConfigRef, { ...defaults, ...overrides })
+    Effect.provideServiceEffect(
+      effect,
+      SubmitConfigRef,
+      Effect.gen(function*() {
+        return resolve(overrides, yield* SubmitConfigRef)
+      })
+    )
 
 /**
  * The lifecycle settings.
@@ -255,8 +314,9 @@ export const SubmitConfig = Object.assign(SubmitConfigRef, {
    */
   layer,
   /**
-   * `defaults` with `overrides` applied, provided to one effect: the
-   * `.pipe`-able form of `layer`. Never fails, requires nothing.
+   * The config in force with `overrides` applied, provided to one effect:
+   * the `.pipe`-able form of `layer`, merging over what is in force rather
+   * than over `defaults`. Never fails, requires nothing.
    */
   with: withOverrides
 })

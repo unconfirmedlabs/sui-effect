@@ -148,11 +148,12 @@ To publish:
 `src/extension.ts` and `src/Platform.ts` both register `warm` and both thread
 an `options.chainId` through. That is deliberate and it is the rule:
 
-- **Every registration on one client gets the same chain id.** The base `Sui`,
-  its transport and its **sender-lock map** are shared per client per effective
-  chain id. Two registrations that disagree — or one `warm` on a pinned id and
-  one lazy with none — get two of everything, and two `Tx.run`s for one address
-  stop serializing.
+- **Every registration on one client gets the same chain id.** The base `Sui`
+  and its transport are shared per client per effective chain id. Two
+  registrations that disagree — or one `warm` on a pinned id and one lazy with
+  none — build two of them and read the chain id twice. (The **sender lock** is
+  process-wide, keyed by address, so two `Tx.run`s for one address serialize
+  across registrations and clients either way.)
 - **`warm` needs a chain id it can take.** It builds the runtime inside
   `register`, synchronously, so it never asks the node. `mainnet` and `testnet`
   are in the built-in table; `devnet`, `localnet` and any custom network are

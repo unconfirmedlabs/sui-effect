@@ -1033,7 +1033,9 @@ export const escrow = (options: EscrowRegistrationOptions) =>
   SuiExtension.fromService(Escrow, {
     name: "escrow",
     layer: Escrow.layer(options),
-    warm: options.chainId === undefined ? {} : { chainId: options.chainId }
+    warm: options.chainId === undefined ? {} : { chainId: options.chainId },
+    ...(options.submit === undefined ? {} : { submit: options.submit }),
+    ...(options.journal === undefined ? {} : { journal: options.journal })
   })
 ```
 

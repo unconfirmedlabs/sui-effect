@@ -503,10 +503,10 @@ describe("the Promise face: registering on a client", () => {
   })
 
   test("two registrations naming one chain id both work off one client", async () => {
-    // The rule from `docs/extensions.md`: the base `Sui`, its transport and its
-    // sender-lock map are shared per client **per chain id**. Registering the
-    // escrow extension and the platform that composes it with the same id is
-    // what keeps two `Tx.run`s for one address serialized.
+    // The rule from `docs/extensions.md`: the base `Sui` and its transport are
+    // shared per client **per chain id**. Registering the escrow extension and
+    // the platform that composes it with the same id is what gives them one
+    // `Sui` (the sender lock is process-wide either way).
     const client = fakeClientOf("devnet", LOCAL_CHAIN)
     const extended = client
       .$extend(escrowRegistration({ ...options, chainId: LOCAL_CHAIN }))

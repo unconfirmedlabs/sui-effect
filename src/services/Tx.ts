@@ -57,6 +57,7 @@ import { readSchedule } from "./SuiCore.ts"
 import { Journal } from "./Journal.ts"
 import { verifyTransactionSignature } from "./Verify.ts"
 import type { Signer } from "./Signer.ts"
+import { forgetEntry, recordEntry } from "./RunRecord.ts"
 import type { SubmitConfigService } from "./SubmitConfig.ts"
 import { SubmitConfig } from "./SubmitConfig.ts"
 import type { Recipe } from "./Sui.ts"
@@ -1236,15 +1237,26 @@ export const attach = Effect.fn("Tx.attach")(function*(
 const journalSigned = Effect.fnUntraced(function*(signed: Signed) {
   const journal = yield* Journal
   const now = yield* DateTime.now
-  yield* journal.put(
-    JournalEntry.cases.Signed.make({ _tag: "Signed", digest: signed.digest, signed, signedAt: now })
-  )
+  const entry = JournalEntry.cases.Signed.make({
+    _tag: "Signed",
+    digest: signed.digest,
+    signed,
+    signedAt: now
+  })
+  // Recorded for `Script.run` *before* the write, and withdrawn only when the
+  // write fails: an interrupt in between leaves it recorded, which reports a
+  // submission that may be outstanding rather than hiding one that is.
+  yield* recordEntry(entry)
+  yield* journal.put(entry).pipe(Effect.tapError(() => forgetEntry(signed.digest)))
 })
 
 const journalOutcome = Effect.fnUntraced(function*(
   entry: JournalEntry
 ): Effect.fn.Return<void, JournalError> {
   const journal = yield* Journal
+  // The answer stands whether or not the write below succeeds, so the run
+  // record learns it first.
+  yield* recordEntry(entry)
   yield* journal.put(entry)
 })
 

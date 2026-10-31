@@ -50,8 +50,8 @@ export interface PlatformRegistrationOptions extends PlatformOptions {
   /**
    * The chain identifier the node must be on. Required on `devnet`, `localnet`
    * and any custom network, and **the same id every other registration on this
-   * client is given**: the base `Sui` and its sender-lock map are shared per
-   * client per chain id.
+   * client is given**: the base `Sui` and its transport are shared per client
+   * per chain id. The sender lock is process-wide either way.
    */
   readonly chainId?: string
 }
@@ -119,8 +119,8 @@ export class Platform extends Context.Service<Platform, PlatformService>()(
  * `options.chainId` is threaded through rather than left to the built-in table,
  * so this works on `devnet` and `localnet` too — and so it matches what
  * `escrow(...)` in `extension.ts` is given. Two registrations on one client
- * that name the same chain id share one `Sui`, one transport and one
- * sender-lock map; two that disagree share nothing.
+ * that name the same chain id share one `Sui` and one transport; two that
+ * disagree build two. Every face in the process shares one sender lock.
  *
  * ```ts
  * const client = new SuiGrpcClient({ network: "testnet", baseUrl }).$extend(platform(options))

@@ -5,6 +5,7 @@
  */
 export {
   type ExtensionFace,
+  type FaceValue,
   fromService,
   type Leaf,
   leaf,
