@@ -9,7 +9,7 @@
  *
  * @since 0.1.0
  */
-import type { Keypair, Signer as SdkSigner } from "@mysten/sui/cryptography"
+import type { Keypair, Signer as SdkSigner, SignatureScheme } from "@mysten/sui/cryptography"
 import { decodeSuiPrivateKey, SUI_PRIVATE_KEY_PREFIX } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
@@ -19,15 +19,16 @@ import { Config, ConfigProvider, Effect, Redacted, Schema } from "effect"
 import { SigningError } from "../domain/errors.ts"
 import { Signature, SuiAddress } from "../domain/schemas.ts"
 
-/** The signature schemes a {@link Signer} built by this module can carry. */
-export type SignatureScheme =
-  | "ED25519"
-  | "Secp256k1"
-  | "Secp256r1"
-  | "MLDSA65"
-  | "MultiSig"
-  | "ZkLogin"
-  | "Passkey"
+/**
+ * The signature schemes a {@link Signer} can carry: the SDK's own
+ * `SignatureScheme` from `@mysten/sui/cryptography`, re-exported rather than
+ * copied, so a scheme the SDK adds is a scheme a `Signer` can name.
+ *
+ * It is exactly as wide as the installed SDK: `"MLDSA65"` is a member from
+ * `@mysten/sui` 2.36 on and absent before, where the SDK can neither produce
+ * nor verify such a signature.
+ */
+export type { SignatureScheme }
 
 /**
  * A credential: who it signs as, how, and the two things it can sign.
