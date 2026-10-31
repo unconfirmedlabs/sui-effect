@@ -310,6 +310,12 @@ package did not. Several signatures and one stored shape change; read
 - `Signer.fromConfig` wipes the `Config.Redacted` it read
   (`Redacted.wipeUnsafe`) as soon as the key is decoded, on success and
   failure alike, so a stray reference to it can no longer be unwrapped.
+- Property tests with Effect's own `Arbitrary` (`test/properties.test.ts`):
+  `SuiError.toJson` round-trips through `SuiErrorSchema` with its tag, outcome
+  and a message, and `Script.exitCode` is total (1–255, never 0) over generated
+  causes. Derivation cannot satisfy the branded id checks, so it covers the ten
+  unbranded taxonomy tags; `JournalEntry` cannot be derived and keeps its
+  example tests.
 
 ### Fixed
 
