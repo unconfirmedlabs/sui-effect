@@ -309,14 +309,13 @@ const abortableClient = (client: ClientWithCoreApi, signal: AbortSignal): Client
 }
 
 /**
- * Whether the SDK will have to resolve this transaction, which is the same
- * question as "will building simulate".
+ * Whether the SDK will have to resolve this transaction at all.
  *
  * It mirrors the SDK's own `needsTransactionResolution`, which is not exported:
  * the resolve plugin returns early — no gas-budget simulation, no plugin call
  * at all — when every input is resolved and the gas price, budget and payment
- * are already set. `Tx.build` promises a simulation before any bytes are
- * signed, so when this says `false` it runs one itself.
+ * are already set. Resolving is necessary for the SDK to simulate, not
+ * sufficient: {@link sdkSimulates} is the question `Tx.build` asks.
  *
  * Bytes this version cannot read answer `false`, which costs one simulate and
  * keeps the guarantee. Never fails.
@@ -337,6 +336,35 @@ const willResolve = (tx: Transaction): boolean => {
     if (payment === null || payment === undefined) return true
     if (payment.length === 0 && data.expiration == null) return true
     return false
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether building this transaction against this client simulates it with
+ * checks enabled — the question "building always simulates" depends on.
+ *
+ * The SDK has two resolvers, and they answer differently:
+ *
+ * - the **gRPC** plugin (`GrpcCoreClient.resolveTransactionPlugin`) simulates,
+ *   checks enabled, every time it runs;
+ * - the **core** resolver every other transport uses
+ *   (`coreClientResolveTransactionPlugin`) simulates only inside
+ *   `setGasBudget`, which returns at once when the budget is already set. A
+ *   recipe that calls `tx.setGasBudget(...)` and leaves its coins and object
+ *   inputs to the resolver is resolved without ever being shown to execute.
+ *
+ * So: `false` when nothing resolves; `true` on a gRPC client; otherwise
+ * whether the budget is still unset. Must be asked **before** the build, which
+ * sets the budget. Bytes this version cannot read answer `false`, which costs
+ * one simulate and keeps the guarantee. Never fails.
+ */
+const sdkSimulates = (tx: Transaction, client: ClientWithCoreApi): boolean => {
+  if (!willResolve(tx)) return false
+  if (isSuiGrpcClient(client)) return true
+  try {
+    return !tx.getData().gasData.budget
   } catch {
     return false
   }
@@ -471,15 +499,19 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
 /**
  * Builds a transaction into signable bytes.
  *
- * **Building always simulates.** On gRPC the SDK's resolve plugin simulates
- * with checks enabled to choose the gas budget, and an execution failure there
- * arrives as `SimulationFailed`. That costs nothing extra — but the resolver
- * returns early for a transaction that was **already fully resolved** (every
- * input resolved, gas price, budget and payment set), and then nothing
- * simulates at all. `Tx.build` detects that case and runs one explicit
- * `simulateTransaction` with checks enabled, so simulate-before-submit holds
- * for every transaction: it costs nothing extra when the SDK had to resolve,
- * and one call otherwise.
+ * **Building always simulates, on every transport.** When the SDK's resolver
+ * simulates with checks enabled, an execution failure there arrives as
+ * `SimulationFailed` and nothing extra is spent. It does not always: the gRPC
+ * plugin simulates whenever it runs, but the core resolver every other
+ * transport uses (JSON-RPC, GraphQL, a custom client) simulates only to choose
+ * a gas budget it was not given, and neither runs at all for a transaction
+ * that was **already fully resolved** (every input resolved, gas price,
+ * budget and payment set). `Tx.build` decides which case it is in against the
+ * client that resolves, before the build, and runs one explicit
+ * `simulateTransaction` with checks enabled whenever the SDK will not — so a
+ * recipe that presets `tx.setGasBudget(...)` on a non-gRPC transport is still
+ * shown to execute, and a Move abort is `SimulationFailed` with no gas charged
+ * rather than `ExecutionFailed` after a send.
  *
  * An interrupted build cancels the request it started: the SDK is handed a
  * client whose Core calls carry the Effect's `AbortSignal`.
@@ -532,10 +564,15 @@ export const build = Effect.fn("Tx.build")(function*(
     }
   }
 
-  const resolving = willResolve(tx)
   const unresolved = unresolvedObjectIdsOf(tx)
-  const bytes = yield* sui.core
-    .use((client, signal) => tx.build({ client: abortableClient(client, signal) }))
+  const { bytes, simulated } = yield* sui.core
+    .use(async (client, signal) => {
+      // Asked of the client that will resolve, and before the build: building
+      // sets the budget the core resolver's answer depends on.
+      const simulated = sdkSimulates(tx, client)
+      const bytes = await tx.build({ client: abortableClient(client, signal) })
+      return { bytes, simulated }
+    })
     .pipe(
       Effect.catchTag(
         ["ObjectNotFound", "ObjectDeleted", "ObjectUnavailable", "TransactionNotFound"],
@@ -561,10 +598,11 @@ export const build = Effect.fn("Tx.build")(function*(
         ))
     )
 
-  if (!resolving) {
-    // The SDK resolved nothing, so it simulated nothing. One explicit simulate
-    // with checks enabled keeps the promise `Tx.run` is built on: nothing is
-    // signed that was not first shown to execute.
+  if (!simulated) {
+    // The SDK simulated nothing: it resolved nothing, or it ran the core
+    // resolver with a preset budget. One explicit simulate with checks enabled
+    // keeps the promise `Tx.run` is built on: nothing is signed that was not
+    // first shown to execute.
     yield* sui.simulate(bytes)
   }
 

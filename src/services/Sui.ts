@@ -163,9 +163,33 @@ export const fromSimulationResult = Effect.fn("Sui.fromSimulationResult")(functi
     events: transaction.events,
     balanceChanges: transaction.balanceChanges,
     objectTypes: transaction.objectTypes,
-    commandResults: result.commandResults
+    commandResults: result.commandResults,
+    gasPaymentMocked: gasPaymentMockedOf(result, transaction.effects)
   }).pipe(Effect.mapError(boundaryError("simulateTransaction")))
 })
+
+/**
+ * The SDK reports a mocked gas payment as `effects.gasObject` naming this id;
+ * `@mysten/sui` exports it as `MOCKED_GAS_OBJECT_ID` from 2.38, and the peer
+ * range admits older versions that do not.
+ */
+const MOCKED_GAS_OBJECT_ID = normalizeSuiAddress("0x" + "f".repeat(64))
+
+/**
+ * `gasPaymentMocked` as the SDK reported it (2.38 and later) and, on an SDK
+ * that predates the field, derived the way the SDK derives it: from the gas
+ * object the effects name. Read structurally so the declaration compiles
+ * against every SDK version the peer range admits. Never fails.
+ */
+const gasPaymentMockedOf = (
+  result: object,
+  effects: { readonly gasObject?: { readonly objectId?: string } | null } | null | undefined
+): boolean => {
+  const reported = (result as { readonly gasPaymentMocked?: unknown }).gasPaymentMocked
+  if (typeof reported === "boolean") return reported
+  const id = effects?.gasObject?.objectId
+  return id !== undefined && normalizeSuiAddress(id) === MOCKED_GAS_OBJECT_ID
+}
 
 /** The opinionated tier over `SuiCore`. */
 export interface SuiService {

@@ -958,6 +958,12 @@ export type CommandResult = typeof CommandResult.Type
 /**
  * The result of a successful simulation, with the fixed include set `Sui` asks
  * for: effects, events, balance changes, object types and command results.
+ *
+ * `gasPaymentMocked` mirrors the SDK field of the same name: `true` when the
+ * simulated transaction had no gas payment, so the node ran it on a mocked gas
+ * coin — gas costs and logic are exercised, but anything drawn from `tx.gas`
+ * was funded by the mock, not the sender. `false` when gas was paid with real
+ * coins or from the sender's address balance.
  */
 export const Simulation = Schema.Struct({
   digest: Digest,
@@ -965,7 +971,8 @@ export const Simulation = Schema.Struct({
   events: Schema.Array(Event),
   balanceChanges: Schema.Array(BalanceChange),
   objectTypes: Schema.Record(Schema.String, Schema.String),
-  commandResults: Schema.Array(CommandResult)
+  commandResults: Schema.Array(CommandResult),
+  gasPaymentMocked: Schema.Boolean
 }).annotate({
   identifier: "Simulation",
   description: "The result of a successful simulation"

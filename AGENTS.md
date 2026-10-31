@@ -5,7 +5,7 @@ the work plan. Where this file and the spec disagree, fix this file.
 
 ## Ground rules
 
-- **Effect v4, stable `4.0.x` (peer `>=4.0.3 <4.1`, developed against `4.0.3`).**
+- **Effect v4, stable `4.1.x` (peer `>=4.1.1 <4.2`, developed against `4.1.1`).**
   No release candidate is supported: rc.113 renamed `Config.nonEmptyString`,
   `Config.string` and `Config.redacted` to `Config.NonEmptyString`,
   `Config.String` and `Config.Redacted`, and rc.118 moved `effect/unstable/*` to
@@ -119,9 +119,11 @@ stands.
 
 `Tx.build` bounds a transaction to the current epoch and the next and names the
 chain, records `sui.chainId` on `Built`/`Signed`, always simulates before
-anything is signed (the SDK's resolver does it whenever there is anything to
-resolve — a client with a base resolver and a preset gas budget resolves without
-simulating, and `willResolve` sees that and runs one explicitly), and cancels
+anything is signed (the gRPC resolver simulates whenever it runs; the core
+resolver every other transport uses simulates only to choose a budget it was
+not given; `sdkSimulates` asks which case applies against the resolving client,
+before the build, and `Tx.build` runs one explicit simulate whenever the SDK
+will not), and cancels
 its in-flight request when interrupted, on **every** transport: the gRPC
 resolver's simulate is reached by rebuilding the SDK's own
 `GrpcCoreClient.resolveTransactionPlugin` over a client that carries the
@@ -234,7 +236,8 @@ submission whose signatures do not cover the addresses the bytes name — by cou
 validator refuses it (an `RpcError` carrying `INVALID_ARGUMENT`, so `Tx.submit`
 fails fast instead of reconciling into a scripted success), and a
 version history is served through `tryGetPastObject`, which is what
-`SuiCore.getObjectAtVersion` reads. The resolver's budget simulate is recorded
+`SuiCore.getObjectAtVersion` reads. The resolver mirrors the SDK's core
+resolver: its budget simulate runs only when the budget is unset, is recorded
 as a `simulateTransaction` call (`resolver: true`) and answered by
 `FakeScript.buildSimulate` when there is one and by the ordered `simulate`
 script otherwise, so "building always simulates" is observable on the harness.

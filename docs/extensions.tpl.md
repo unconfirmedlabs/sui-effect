@@ -1129,7 +1129,11 @@ and on the fake that simulate is the **resolver's**: it is recorded (so
 `simulate` script. So `simulate: [FakeOutcome.failWith(...)]` makes `Tx.build`
 and `Tx.run` fail with `SimulationFailed` the way a node would, and
 `buildSimulate` is the slot to use when a test needs the build's simulate and
-an explicit `sui.simulate` to answer differently.
+an explicit `sui.simulate` to answer differently. The fake's resolver mirrors
+the SDK's core resolver, which simulates only to choose a budget: a recipe that
+calls `tx.setGasBudget(...)` gets no resolver simulate, and the build's simulate
+is `Tx.build`'s own explicit one — recorded without `resolver: true` and
+answered by the ordered `simulate` script.
 
 **`layerTest` asserts the built-in chain id for `mainnet` and `testnet`.**
 It is `Sui.layerNoDeps`, the production layer, so a script that says

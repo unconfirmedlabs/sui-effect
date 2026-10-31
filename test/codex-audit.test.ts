@@ -446,7 +446,8 @@ describe("7. the durable journal writes terminal entries before de-indexing", ()
           store.delete(key)
         }),
       clear: Effect.sync(() => store.clear()),
-      size: Effect.sync(() => store.size)
+      size: Effect.sync(() => store.size),
+      keys: Effect.sync(() => Array.from(store.keys()))
     })
     const journal = makeKeyValueJournal(kv)
     const digest = Schema.decodeUnknownSync(JournalEntry.cases.Signed.fields.digest)(OTHER_DIGEST)
@@ -501,7 +502,8 @@ describe("7. the durable journal writes terminal entries before de-indexing", ()
           store.delete(key)
         }),
       clear: Effect.sync(() => store.clear()),
-      size: Effect.sync(() => store.size)
+      size: Effect.sync(() => store.size),
+      keys: Effect.sync(() => Array.from(store.keys()))
     })
     const first = makeKeyValueJournal(kv, { prefix: "shared:" })
     const second = makeKeyValueJournal(kv, { prefix: "shared:" })
@@ -876,6 +878,93 @@ describe("14. building always simulates", () => {
     expect(simulates).toHaveLength(1)
     expect((simulates[0]!.options as { resolver?: boolean }).resolver).toBe(true)
   })
+
+  /**
+   * An unresolved object input **and** a preset budget: the shape the SDK's
+   * core resolver (every non-gRPC transport) resolves without simulating,
+   * because it simulates only inside `setGasBudget`, which returns at once
+   * when the budget is set. The fake's resolver mirrors that.
+   */
+  const presetBudget = (tx: Transaction) => {
+    claim(tx)
+    tx.setGasBudget(50_000_000)
+  }
+
+  test("a preset budget on a non-gRPC resolver still gets exactly one simulate, Tx.build's own", async () => {
+    const simulates = await run(
+      Effect.gen(function*() {
+        yield* Tx.build(presetBudget, { sender: SuiAddress.make(SENDER) })
+        return yield* SuiTest.calls("simulateTransaction")
+      }),
+      { ...baseScript, simulate: [FakeOutcome.succeed()] }
+    )
+    expect(simulates).toHaveLength(1)
+    expect((simulates[0]!.options as { resolver?: boolean }).resolver).toBeUndefined()
+    // The explicit simulate is of the built bytes, not of an unresolved recipe.
+    expect((simulates[0]!.options as { transaction?: unknown }).transaction).toBeInstanceOf(Uint8Array)
+  })
+
+  test("a preset budget on a non-gRPC resolver surfaces an abort as SimulationFailed", async () => {
+    const error = await run(
+      Tx.build(presetBudget, { sender: SuiAddress.make(SENDER) }).pipe(Effect.flip),
+      {
+        ...baseScript,
+        simulate: [
+          FakeOutcome.failWith({
+            $kind: "MoveAbort",
+            message: "would abort",
+            MoveAbort: { abortCode: "3" }
+          } as unknown as SuiClientTypes.ExecutionError)
+        ]
+      }
+    )
+    expect(error._tag).toBe("SimulationFailed")
+  })
+})
+
+describe("14b. Simulation.gasPaymentMocked", () => {
+  test("a recipe with no gas payment is simulated on a mocked gas coin", async () => {
+    const simulation = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* sui.simulate(claim, { sender: SuiAddress.make(SENDER) })
+      }),
+      { ...baseScript, simulate: [FakeOutcome.succeed()] }
+    )
+    expect(simulation.gasPaymentMocked).toBe(true)
+  })
+
+  test("Tx.build's resolved bytes carry a payment, so their simulate is not mocked", async () => {
+    const simulation = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        const built = yield* Tx.build(claim, { sender: SuiAddress.make(SENDER) })
+        return yield* sui.simulate(built.bytes)
+      }),
+      // The first answers the resolver's budget simulate, the second ours.
+      { ...baseScript, simulate: [FakeOutcome.succeed(), FakeOutcome.succeed()] }
+    )
+    expect(simulation.gasPaymentMocked).toBe(false)
+  })
+
+  test("Tx.build's own explicit simulate of fully resolved bytes reports false", async () => {
+    const mocked = await run(
+      Effect.gen(function*() {
+        const sui = yield* Sui
+        const built = yield* Tx.build((tx) => {
+          claim(tx)
+          tx.setGasBudget(50_000_000)
+        }, { sender: SuiAddress.make(SENDER) })
+        const simulates = yield* SuiTest.calls("simulateTransaction")
+        // The one simulate the build made is its own, of these exact bytes.
+        expect(simulates).toHaveLength(1)
+        expect((simulates[0]!.options as { transaction?: unknown }).transaction).toEqual(built.bytes)
+        return (yield* sui.simulate(built.bytes)).gasPaymentMocked
+      }),
+      { ...baseScript, simulate: [FakeOutcome.succeed(), FakeOutcome.succeed()] }
+    )
+    expect(mocked).toBe(false)
+  })
 })
 
 describe("15. the fake's transaction and gas invariants", () => {
@@ -1049,7 +1138,8 @@ describe("17. malformed persisted u64s are typed decode failures", () => {
           store.delete(key)
         }),
       clear: Effect.sync(() => store.clear()),
-      size: Effect.sync(() => store.size)
+      size: Effect.sync(() => store.size),
+      keys: Effect.sync(() => Array.from(store.keys()))
     })
     const journal = makeKeyValueJournal(kv)
     const digest = Schema.decodeUnknownSync(JournalEntry.cases.Signed.fields.digest)(OTHER_DIGEST)

@@ -14,14 +14,16 @@ Effect so tests can drive them.
 
 ```bash
 bun add @unconfirmed/sui-effect
-bun add -d effect@4.0.3 @mysten/sui@2.30.0
+bun add -d effect@4.1.1 @mysten/sui@2.38.0
 ```
 
 `effect` and `@mysten/sui` are peer dependencies: one copy of each per process,
 or `Context.Service` identities and `instanceof` checks stop matching. The
-`effect` peer is `>=4.0.3 <4.1`: the stable 4.0.x line, which is the long-term
-support line. Release candidates are not supported; 0.2.x of this package is the
-line for `4.0.0-rc.112`.
+`effect` peer is `>=4.1.1 <4.2`: the stable 4.1.x line. 4.1.1 is the floor
+because 4.1 made `KeyValueStore.keys` part of every store, which the durable
+journal relies on; 0.3.x of this package is the line for 4.0.x. Release
+candidates are not supported; 0.2.x of this package is the line for
+`4.0.0-rc.112`.
 
 A **library** built on sui-effect puts all three in its own
 `peerDependencies` **and** `devDependencies`, never in `dependencies`; see
@@ -431,8 +433,9 @@ was built over as `sui.core`, which is why every `Tx.*` function needs only
 `run`, `reconcileAll` — each with a closed error union
 and `R = Sui`. `Tx.run` holds the sender lock from build through submit, builds
 (which always simulates before anything is signed — the SDK's resolver does it
-when there is anything to resolve, and `Tx.build` runs one explicitly when
-there is not, so a transaction that would abort never gets signed),
+when it has a budget to choose, and `Tx.build` runs one explicitly whenever it
+will not, on every transport, so a transaction that would abort never gets
+signed),
 signs, journals the signed bytes before the first execute, re-sends the
 identical bytes — never a rebuild — on a retryable transport failure or a
 timeout, waits for the execution to be visible to reads before it releases the
@@ -796,19 +799,19 @@ ordered `simulate` script otherwise.
 
 | Package | Range | Tested against |
 |---|---|---|
-| `effect` | `>=4.0.3 <4.1` | `4.0.3`, in CI; `4.0.3` is the pinned devDependency |
-| `@mysten/sui` | `^2.28` (the first version whose BCS and gRPC round-trip `ValidDuring` and `Validity` expirations) | `2.29.0` and `2.30.0`, both in CI; `2.30.0` is the pinned devDependency |
-| `@mysten/bcs` | `^2.1.1` | `2.1.1` |
+| `effect` | `>=4.1.1 <4.2` | `4.1.1`, in CI; `4.1.1` is the pinned devDependency |
+| `@mysten/sui` | `^2.28` (the first version whose BCS and gRPC round-trip `ValidDuring` and `Validity` expirations) | `2.30.0` and `2.38.0`, both in CI; `2.38.0` is the pinned devDependency |
+| `@mysten/bcs` | `^2.1.3` | `2.1.3` |
 | TypeScript | `5.9.x` to build | `5.9.3` |
 | Bun | `1.4.x` | `1.4.2` |
 
 The SDK row is a matrix, not a hope: CI builds, typechecks and runs the suite
-against `@mysten/sui` 2.29.0 and 2.30.0, which are the versions consumers pin
-today. The `effect` row is a matrix of one today (`4.0.3`): the range admits the 4.0.x
+against `@mysten/sui` 2.30.0 and 2.38.0: the oldest version consumers pin and
+the current one. The `effect` row is a matrix of one today (`4.1.1`): the range admits the 4.1.x
 patch releases, and a release is added to the CI matrix once it exists and the
 suite has run against it. Release candidates are out of range on purpose: the
 module paths (`effect/unstable/*` became `effect/*` in rc.118) and the `Config`
-and `Schema` constructors this package calls differ between rc.112 and 4.0.x.
+and `Schema` constructors this package calls differ between rc.112 and 4.x.
 
 **Consumers on TypeScript 7 (`tsgo`) are supported.** The shipped `.d.ts` needs
 nothing from the old compiler. The `prepare` script here

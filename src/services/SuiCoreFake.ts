@@ -479,6 +479,33 @@ const toCommandResult = (
   mutatedReferences: result.mutatedReferences ?? []
 })
 
+/**
+ * What a node reports as `gasPaymentMocked` for the transaction it was asked
+ * to simulate: `true` when the transaction carries no gas payment at all (an
+ * unbuilt recipe), or an empty one with no expiration — nothing could pay, so
+ * the node mocks a gas coin. An empty payment **with** an expiration is the
+ * address-balance form (`Tx.sponsored`, `gaslessStablecoinTransfer`), and a
+ * non-empty one is real coins: both `false`. Bytes the SDK cannot read answer
+ * `false`. Never throws.
+ */
+const gasPaymentMockedOf = (transaction: Uint8Array | { getData(): unknown }): boolean => {
+  try {
+    const data = (transaction instanceof Uint8Array
+      ? TransactionDataBuilder.fromBytes(transaction)
+      : transaction.getData()) as {
+        readonly gasData: { readonly payment?: ReadonlyArray<unknown> | null }
+        readonly expiration?: unknown
+      }
+    const payment = data.gasData.payment
+    if (payment === null || payment === undefined) return true
+    if (payment.length > 0) return false
+    return data.expiration === null || data.expiration === undefined ||
+      (data.expiration as { readonly $kind?: string }).$kind === "None"
+  } catch {
+    return false
+  }
+}
+
 const commandResultsOf = (
   execution: FakeExecution
 ): ReadonlyArray<SuiClientTypes.CommandResult> =>
@@ -1066,29 +1093,38 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     // surfaces through `Tx.build` as the `SimulationFailed` a node would give.
     // With neither, the resolver sets the budget from `script.gasBudget` and
     // the recorded call is the only trace.
-    record("simulateTransaction", {
-      transaction: undefined,
-      checks: "enabled",
-      resolver: true,
-      signal: lastSignal
-    })
-    const budgetOutcome = state.scripts.buildSimulate.length > 0
-      ? next("buildSimulate")
-      : state.scripts.simulate.length > 0
-      ? next("simulate")
-      : undefined
-    if (budgetOutcome !== undefined) {
-      if (budgetOutcome._tag === "timeoutThen") {
-        // Never settles until the build is interrupted, which is exactly what a
-        // resolver's in-flight simulate does.
-        if (lastSignal === undefined) {
-          return unimplemented(
-            "buildSimulate timeoutThen (no AbortSignal reached the resolver; build through Tx.build)"
-          )
+    //
+    // It mirrors the SDK's **core** resolver, which every non-gRPC transport
+    // uses: that resolver simulates only inside `setGasBudget`, which returns
+    // at once when the budget is already set. So a preset budget means no
+    // resolver simulate here either, and `Tx.build`'s own explicit simulate is
+    // what the harness records — which is how a test sees that "building
+    // always simulates" holds on a transport whose resolver does not.
+    if (!options.onlyTransactionKind && !transactionData.gasData.budget) {
+      record("simulateTransaction", {
+        transaction: undefined,
+        checks: "enabled",
+        resolver: true,
+        signal: lastSignal
+      })
+      const budgetOutcome = state.scripts.buildSimulate.length > 0
+        ? next("buildSimulate")
+        : state.scripts.simulate.length > 0
+        ? next("simulate")
+        : undefined
+      if (budgetOutcome !== undefined) {
+        if (budgetOutcome._tag === "timeoutThen") {
+          // Never settles until the build is interrupted, which is exactly what
+          // a resolver's in-flight simulate does.
+          if (lastSignal === undefined) {
+            return unimplemented(
+              "buildSimulate timeoutThen (no AbortSignal reached the resolver; build through Tx.build)"
+            )
+          }
+          await waitForAbort(lastSignal)
         }
-        await waitForAbort(lastSignal)
+        await applyOutcome(budgetOutcome, "simulate", fakeDigest(state.calls.length + 200))
       }
-      await applyOutcome(budgetOutcome, "simulate", fakeDigest(state.calls.length + 200))
     }
     if (!options.onlyTransactionKind) {
       if (!transactionData.gasData.price) {
@@ -1442,7 +1478,11 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         ? digestOfBytes(options.transaction)
         : fakeDigest(state.calls.length + 100)
       const result = await settle("simulate", digest, options)
-      return { ...asResult(result), commandResults: result.commandResults }
+      return {
+        ...asResult(result),
+        commandResults: result.commandResults,
+        gasPaymentMocked: gasPaymentMockedOf(options.transaction)
+      }
     },
     listTransactions: async (options: SuiClientTypes.ListTransactionsOptions) => {
       record("listTransactions", options)

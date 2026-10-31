@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import type { PublicKey, SignatureScheme } from "@mysten/sui/cryptography"
+import type { Keypair, PublicKey, SignatureScheme } from "@mysten/sui/cryptography"
 import { decodeSuiPrivateKey, Signer as SdkSigner } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
@@ -63,6 +63,24 @@ describe("Signer.fromConfig", () => {
       expect(signer.address).toBe(SuiAddress.make(keypair.toSuiAddress()))
     })
   }
+
+  // ML-DSA-65 shipped in @mysten/sui 2.36; the peer range still admits 2.28 and
+  // the SDK matrix runs 2.30, so the keypair class is imported on demand here
+  // exactly as `Signer.fromConfig` does.
+  test("decodes a Bech32 MLDSA65 key", async () => {
+    const specifier = "@mysten/sui/keypairs/mldsa65"
+    const mod: { MLDSA65Keypair: { generate: () => Keypair } } | undefined = await import(specifier)
+      .catch(() => undefined)
+    if (mod === undefined) return
+    const keypair = mod.MLDSA65Keypair.generate()
+    const secret = keypair.getSecretKey()
+    expect(decodeSuiPrivateKey(secret).scheme).toBe("MLDSA65")
+    const signer = await run(
+      Effect.provide(Signer.fromConfig(), withEnv({ SUI_PRIVATE_KEY: secret }))
+    )
+    expect(signer.scheme).toBe("MLDSA65")
+    expect(signer.address).toBe(SuiAddress.make(keypair.toSuiAddress()))
+  })
 
   test("reads the name it is given", async () => {
     const keypair = new Ed25519Keypair()
