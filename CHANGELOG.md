@@ -54,6 +54,49 @@ package did not. Several signatures and one stored shape change; read
   runs only when the recipe left the budget unset. A test that presets a
   budget now sees `Tx.build`'s explicit simulate (no `resolver: true`) instead
   of a resolver one; call-count assertions on `simulateTransaction` may move.
+- **`Tx.build` reports the `maxGasBudget` ceiling as `PolicyDenied { rule:
+  "maxGasBudget" }`** with a readable message (it was a `BuildError` whose cause
+  was a bare bigint). `Tx.build`'s union gains `PolicyDenied`.
+- **`Tx.build` refuses an address-balance gas payment the payer cannot cover.**
+  With an empty gas payment (`Tx.sponsored`), one `getBalance` read checks the
+  payer's SUI address balance against the budget and fails with `BuildError`
+  before anything is signed (it used to sign bytes the validator then refused
+  with "Insufficient address balance"). Fake-based tests of sponsored builds
+  must script a balance with an `addressBalance`.
+- **Resolver refusals are `BuildError`**, with the node's message: gRPC
+  `INVALID_ARGUMENT` and `FAILED_PRECONDITION` (an input owned by another
+  address, a function that does not exist, gas selection with no coin) and the
+  SDK resolver's own errors ("Insufficient balance"), where they used to be a
+  `TransportError { method: "use" }`. A remaining `TransportError` from
+  `Tx.build` is named `"Tx.build"`.
+- **`SubmitConfig.with` merges over the config in force**; it used to spread
+  over the defaults, so an inner `with` silently reset an outer one.
+  `SubmitConfig.layer` still spreads over the defaults.
+- **The Promise face maps `Effect<Option<A>>` to `Promise<A | undefined>`**
+  (`FaceValue`, exported from `/extension`). `Stream` items are not unwrapped.
+- **A cold face call is a callable `Proxy` over its Promise.** `typeof` is
+  `"function"`; `instanceof Promise`, `await` and iteration are unchanged; a cold
+  recipe builder's result throws `ExtensionNotReady` (naming the member) when
+  applied. In `bun:test` write `expect(Promise.resolve(cold)).rejects`.
+- **`SuiAddress` / `ObjectId` decoding refuses `""`, a bare `"0x"` and non-hex**,
+  which used to decode to the zero address.
+- **SDK caller-argument errors are defects**, not `TransportError`: a malformed
+  filter, an unpaginable function filter, `after` with `before`. The stream and
+  tail transaction readers refuse a `pkg` or `pkg::module` function filter up
+  front (the SDK cannot page past its first page).
+- **`SuiError.describe` text changed** (matchers on it break; branch on `_tag`):
+  an `Unknown` reason prints the node's sentence (`SimulationFailed
+  InsufficientCoinBalance in command 0`); a clever abort prints
+  `CONST "value" (line N) code E` without the packed abort code, identically for
+  `SimulationFailed` and `ExecutionFailed`; `BuildError`, `SigningError` and
+  `JournalError` append their cause's line; `DecodeError` kind `"type"` reads
+  `object X is T1, expected T2`; a `ConfigError` reads `missing NAME`. Always one
+  line, never bytes.
+- **Testing**: `fakeDigest` returns a `Digest`; `layerTest` re-sends with no
+  delay (`testSubmitConfig`); an execute outcome scripted with a digest other
+  than the bytes' own stops the test with a defect; the fake's `getDynamicField`
+  compares key types under `typeMatches`; `FakeExecution.events[].json` is
+  optional.
 
 ### Added
 
@@ -98,8 +141,70 @@ package did not. Several signatures and one stored shape change; read
   `getDynamicObjectField`, `resolveNameServiceAddress` and
   `defaultNameServiceName`, with `FakeScript.scanLimit`, `FakeScript.names`,
   `FakeExecution.sender` and `FakeExecution.moveCalls`.
+- **`Tx.resubmit(signed | SubmissionUnknown)`** re-sends identical bytes
+  (refused when the journal says `NotApplied`; reconciles instead when it says
+  `Executed`/`Failed`, when the bytes name another chain, or when their window
+  has closed), and **`Tx.reconcileAll({ resubmit: true })`** does it for every
+  entry still unknown. Both are on `/tx`.
+- **`Tx.fromBytes(bytes)`** (a `Built` from someone else's bytes: chain filled
+  in, other-chain expirations refused) and **`Tx.attach(builtOrSigned,
+  signature)`** (verified; the signer must be the sender or the gas owner; a
+  duplicate is a no-op) — the stateless sponsor is `fromBytes → attach → cosign
+  → submit`. `Built.gasOwner` is read from the bytes (present only when it is
+  not the sender) and `SignedTransaction` gains `gasOwner`.
+- `Tx.gaslessStablecoinTransfer({ requireZeroGas: true })` fails the build
+  unless the resolved gas price and budget are 0. `sdkRefOf` accepts a `Coin`.
+- **`SuiError.digestOf`, `SuiError.moveAbort` (`Option<MoveAbortInfo>`),
+  `SuiError.isMoveAbort(e, { package?, module?, function?, constant?, code? })`**
+  and `describe(e, { tag: false })`; types `DescribeOptions`, `MoveAbortInfo`,
+  `MoveAbortMatch`. `describe`, `outcome`, `toJson` and `isRetryable` accept
+  `unknown`, so a Promise `catch` needs no cast. `ExecutionReason`'s `Unknown`
+  carries `message` and `command`; `SimulationFailed` gains `command`;
+  `DecodeError` gains `actualType`.
+- **`Executed.eventsOf(codec, eventType?)`, `Executed.expectEvent(codec,
+  eventType?)`** (`UnexpectedEffects | DecodeError`) and
+  **`Executed.expectPublished()`** → `{ packageId, package, upgradeCap }` (type
+  `Published`). `EXECUTE_INCLUDE`, which `Executed.fromTransactionResult` is
+  typed over, is exported.
+- **Resumable and tailing ledger streams**: `after`/`before` on `streamEvents`
+  and `streamTransactions` (`ListOptions`); `streamEventPages` /
+  `streamTransactionPages` yielding `ListPage { items, endCursor }`; and
+  `tailEvents` / `tailTransactions` / `tailEventPages` / `tailTransactionPages`,
+  which never end, poll (1 s by default), retry a retryable error from the last
+  cursor, and advance a filtered cursor to the unfiltered head so a pruning node
+  does not strand it (`TailOptions`). A full `eventType` filter is normalized.
+- **A per-attempt read `requestTimeout`** (30 s by default, `"Infinity"` off,
+  `SUI_RPC_TIMEOUT` under `layerConfig`) ending in a retryable
+  `DEADLINE_EXCEEDED`, and a `readRetry` schedule option; each read retry is
+  logged at debug. `SuiCoreReadOptions` on `layerFromClient`/`makeFromClient`;
+  `SuiGrpcLayerOptions` extends it. Not applied to execute,
+  `signAndExecuteTransaction`, `waitForTransaction` or `use`.
+- **`SuiCore.getServiceInfo`** (`ServiceInfo`, with `lowestAvailableCheckpoint`);
+  `UNIMPLEMENTED` on non-gRPC transports.
+- **`SuiAddress.Strict` / `ObjectId.Strict`** for user input (exactly 64 hex
+  digits, same brand); `CoinType.normalize`, `StructTag.normalize` and
+  `CoinType.SUI`. The type arguments of `getBalance`, `streamCoins`,
+  `getCoinMetadataOption`, `streamOwnedObjects({ type })` and
+  `Executed.balanceChange` accept plain strings.
+- `Sui.getDynamicFieldOption(parent, name, { schema, expectedType? })` →
+  `Option<DecodedDynamicField<S>>`, and `SuiSchema.name(codec, key)` /
+  `SuiSchema.name(layout, type, key)` to build a dynamic-field key from one
+  description.
+- **Promise-face options for Promise consumers**: `SuiExtensionOptions.submit`
+  (`SubmitConfigOverrides`) and `journal` (`JournalService`), and
+  `face.$reconcileAll()` (a reserved name). `SubmitConfig` overrides accept
+  `Duration.Input` (`SubmitConfigOverrides`, exported from `/tx`).
+- **`Script`**: a declared integer `exitCode` (1–255) on an error is honoured
+  (after `ConfigError`, before `outcome`); `ScriptRunOptions.layer` accepts any
+  error type.
+- **Testing**: `fakeCoin`, `FakeEvent` (`json` optional),
+  `FakeScript.visibilityDelay` (ms or `"never"`) and `SuiTest.setVisibilityDelay`,
+  `SuiTest.provide(layer)` (a fresh `Journal.layerMemory` and `TestClock`,
+  `{ local: true }`), `testSubmitConfig`,
+  `FakeOutcome.transportError(status, message?)` and
+  `FakeScript.ledger { lowestAvailableCheckpoint?, firstCheckpoints? }`.
 - **`LLMS.md` opens with a "start here" section** (`docs/llms-head.md`): the
-  subpath map, five recipes that are tested files, the two tiers and the
+  subpath map, thirteen recipes that are tested files, the two tiers and the
   positional-versus-options rule, the error table with outcomes and exit codes,
   `SubmitConfig`'s defaults, ten invariants and an index of every export by
   subpath. The extension template's test suite and manifest are now named by
@@ -119,9 +224,38 @@ package did not. Several signatures and one stored shape change; read
 - A store written by 0.3 reads unchanged; its `index` key is ignored and left
   in place, so rolling back is safe (see the `"refused"` caveat above), and it
   can be deleted by hand.
-- `Tx.run` documents that the gas owner's lock comes from `opts.gasOwner`
-  only: a gas owner only the recipe sets is not known when the locks are
-  chosen, so pass it as `gasOwner` too.
+- **`Tx.run` takes the gas owner's lock only when gas is paid with coins.**
+  An empty payment (address-balance gas, `Tx.sponsored`) selects no coin, so
+  one sponsor serves many senders concurrently (twenty concurrent sponsored
+  runs went from ~50 s to ~1 s). The recipe is applied before the locks are
+  chosen, so a gas owner it sets is known without `opts.gasOwner`, and a
+  missing sponsor is a `SigningError` before the build.
+- `Tx.reconcile` journals its terminal answer for a digest the journal holds
+  unresolved.
+- Every Promise-face registration shares **one process-wide sender lock per
+  address**, which fixes gas equivocation between a warm and a lazy
+  registration, or two clients.
+- `Script.run` finds the journal wherever the program provided it and reports
+  only this run's entries. A failure after this run's transaction applied exits
+  5, never 2, 4 or 130 (`ExitCodeOptions.applied`), and prints "N submission(s)
+  of this run applied on chain: … do not send them again". Diagnostics are one
+  line per failure through `SuiError.describe` (a `ConfigError` names the
+  variable), with the bytes printed once. `Script.layerNoDeps`,
+  `layerWithSigner` and `layerReadOnlyNoDeps` read the network from `SuiCore`,
+  not `SUI_NETWORK`.
+- A cold face value placeholder throws `ExtensionNotReady` on value-only names
+  (`.length`, `.startsWith`, `toString`, `valueOf`, `toJSON`, …) and on spread,
+  and renders as `<ExtensionNotReady ext.member>`.
+- A SuiNS lookup answered `UNIMPLEMENTED` (localnet) is `None`. A package
+  object's `content` is an empty `Uint8Array`.
+- The `awaitVisible` warning is one line, with no stack.
+- `DESIGN.md` ships in the package, because the shipped `AGENTS.md` and
+  `README.md` cite it; `docs/PLAN.md` and the house skill are named as
+  repository-only.
+- The extension template's `scripts/check-package.ts` names none of the
+  template's exports: it reads every subpath of `package.json`'s `exports`,
+  learns each one's names from its `src/` file and requires the packed `dist/`
+  to export them, so the documented rename no longer breaks it.
 - Internal journal and entry helpers no longer open spans, so `Tx.executedEntry`
   and friends are gone from traces.
 - The extension template's peer on `@unconfirmed/sui-effect` is
@@ -135,6 +269,34 @@ package did not. Several signatures and one stored shape change; read
 
 ### Fixed
 
+- **`Tx.reconcile` no longer answers `NotApplied { expired }` for a transaction
+  that applied.** A pinned object naming the transaction's own digest now vetoes
+  expiry, and on gRPC a node that has pruned into the validity window
+  (`GetServiceInfo.lowestAvailableCheckpoint` against
+  `GetEpoch(minEpoch).firstCheckpoint`) cannot prove a miss; both answer
+  `SubmissionUnknown`. JSON-RPC and GraphQL cannot report their history, so the
+  old rule stands there; behind a pruning node use `expiryEvidence: "never"`.
+- A first-send validator lock conflict ("already locked by a different
+  transaction", "rejected as invalid by more than 1/3 of validators") is
+  reconciled up to three more times, `reconcileRecheck` apart, before
+  answering. A `SubmissionUnknown` from a send names the send's own error
+  ("…; the last send failed with …").
+- An execute answer is journalled before an interrupt can land
+  (`uninterruptibleMask`); an interrupt during the visibility wait is logged as
+  executed.
+- An execute or relay answer for **another** digest is reconciled instead of
+  returned, and a `submitVia` reply without effects, or reporting failure, asks
+  the chain (it was a hollow or false `Executed`).
+- `LLMS.md` carried its head twice — `String.replace` expanded the "$\`" in
+  the `ExtensionFace` summary into everything before the index marker — and now
+  prints both halves of a name that is a type and a value (`SuiError`'s
+  helpers, `FakeOutcome`'s constructors, `Signer`'s, the `Signed` schema), every
+  overload of a function, a schema class's fields by schema name (`Executed`,
+  every error with a `get message()`), no private member or its orphaned JSDoc,
+  and a renamed export under its exported name (`SuiSchema.decode`,
+  `SuiSchema.matchesType`, `makeKeyValueStore`).
+- The docs no longer say `bcs.Address()` (it is a value), "passing `gasOwner`
+  costs nothing", or that a cold call works with `expect(cold).rejects`.
 - A `Signed` entry for a refused submission no longer stays unresolved until
   its epoch window closes.
 - Coin-reservation refs in `gasData.payment` (address-balance gas) are no
@@ -166,6 +328,36 @@ package did not. Several signatures and one stored shape change; read
 6. Pass the `AbortSignal` through in `SuiGraphQL.query` callbacks.
 7. Durable journals need no migration. Once 0.4 has written a `"refused"` entry,
    a 0.3 process cannot read that entry back.
+8. Catch the gas ceiling as `PolicyDenied` (`rule: "maxGasBudget"`), not
+   `BuildError`; add `PolicyDenied` wherever you handle `Tx.build`'s union.
+9. A `catchTag("TransportError", …)` around `Tx.build` that meant "the node
+   refused my inputs" now sees `BuildError`; keep the `TransportError` branch
+   for real transport failures (`method: "Tx.build"`).
+10. A sponsored build with `Tx.sponsored` needs the sponsor's SUI **address
+    balance** to cover the budget (deposit with `coin::into_balance` +
+    `balance::send_funds<SUI>`), or sponsor with coins: `Tx.run(recipe, {
+    signer, gasOwner, sponsor })` without `Tx.sponsored`. On the fake, script a
+    balance with an `addressBalance`. Passing `gasOwner` only to get its lock is
+    no longer needed.
+11. A nested `SubmitConfig.with` now keeps the outer overrides; if you relied on
+    it resetting to the defaults, pass those fields explicitly.
+12. Promise-face consumers of an `Effect<Option<A>>` member get `A | undefined`:
+    replace `Option.isSome(x)` / `x.value` with an `undefined` check. A test of a
+    cold call writes `expect(Promise.resolve(cold)).rejects`, and code that
+    checked `typeof cold === "object"` sees `"function"`.
+13. An address or id decoded from `""`, `"0x"` or non-hex is now a decode
+    failure; decode a value a human typed with `SuiAddress.Strict` /
+    `ObjectId.Strict`.
+14. A `catchTag("TransportError", …)` that handled a malformed filter or a
+    `pkg`/`pkg::module` function filter on `streamTransactions` now sees a
+    defect: fix the filter (fully qualified `pkg::module::function`, or
+    `sui.core.listTransactions` for one page).
+15. Replace assertions on `SuiError.describe` text with `_tag` / field checks;
+    the wording of aborts, `Unknown` reasons and causes changed.
+16. Tests: `fakeDigest` is a `Digest` (drop casts); an execute outcome scripted
+    with a digest other than the bytes' own is now a defect — remove the
+    `digest` override; `layerTest` re-sends without delay, so a test that
+    counted on the production schedule sets `SubmitConfig.with({ resubmit })`.
 
 ## 0.3.0
 
