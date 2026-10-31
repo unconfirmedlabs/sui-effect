@@ -323,39 +323,38 @@ export const report = async <A, E>(
 ): Promise<number> => {
   const write = safeWriter(options?.stderr)
   if (Exit.isSuccess(exit)) return exitCode(exit)
-  const printed = writeFailure(exit, write)
   // On **every** non-zero exit, not only a defect or an interrupt: a typed
   // failure escaping after a submission — an outer timeout, a preflight that
   // ran too late, an extension error raised past `Tx.submit` — leaves the
   // same record on the wire, and the operator needs the same bytes.
   const unresolved = await readUnresolved(options?.journal)
-  for (const line of unresolvedLines(unresolved, printed)) write(line)
+  writeFailure(exit, write, new Set(unresolved.map((entry) => entry.digest)))
+  for (const line of unresolvedLines(unresolved)) write(line)
   return exitCode(exit, { unresolved: unresolved.length })
 }
 
 /**
- * Writes the diagnostic lines of a failed `Exit` and answers the digests whose
- * bytes were already printed, so the unresolved section does not print them a
- * second time.
+ * Writes the diagnostic lines of a failed `Exit`. `withEntry` is the digests
+ * the unresolved section will print an `entry:` line for, which carries the
+ * bytes, so the failure lines do not print them as well.
  */
 const writeFailure = <A, E>(
   exit: Exit.Failure<A, E>,
-  write: (line: string) => void
-): ReadonlySet<string> => {
-  const printed = new Set<string>()
+  write: (line: string) => void,
+  withEntry: ReadonlySet<string>
+): void => {
   if (Cause.hasDies(exit.cause)) {
     write(Cause.pretty(exit.cause))
-    return printed
+    return
   }
   const failure = Cause.findErrorOption(exit.cause)
   if (failure._tag === "Some") {
-    for (const line of describeFailure(failure.value, printed)) write(line)
+    for (const line of describeFailure(failure.value, withEntry)) write(line)
   } else if (Cause.hasInterrupts(exit.cause)) {
     write("interrupted")
   } else {
     write(Cause.pretty(exit.cause))
   }
-  return printed
 }
 
 /**
@@ -615,32 +614,36 @@ const describeConfigError = (error: Config.ConfigError): string => {
   return `ConfigError ${oneLine(formatIssue(issue))}`
 }
 
-const describeFailure = (error: unknown, printed: Set<string>): ReadonlyArray<string> => {
+/**
+ * The lines for one failure: `SuiError.describe`, made one line, for every
+ * tagged value — taxonomy or not — then the digest, and for a
+ * `SubmissionUnknown` its bytes **unless** the unresolved section below will
+ * print the same entry (whose `entry:` line carries them), and the reconcile
+ * hint.
+ *
+ * `ConfigError` is rendered here (`ConfigError missing SUI_NETWORK`) rather
+ * than by `describe`, which renders it the same way from 0.4.0 on.
+ */
+const describeFailure = (
+  error: unknown,
+  withEntry: ReadonlySet<string>
+): ReadonlyArray<string> => {
   if (isConfigError(error) && error instanceof Config.ConfigError) {
     return [describeConfigError(error)]
   }
   if (!hasTag(error)) return [oneLine(String(error))]
-  const lines: Array<string> = []
-  if (!SuiErrorHelpers.isTaxonomy(error)) {
-    const message = "message" in error && typeof error.message === "string"
-      ? ` ${error.message}`
-      : ""
-    return [oneLine(`${error._tag}${message}`)]
-  }
-  {
-    const tagged: SuiError = error
-    lines.push(SuiErrorHelpers.describe(tagged))
-    const digest = digestOf(tagged)
-    if (digest !== undefined) lines.push(`digest: ${digest}`)
-    if (tagged._tag === "SubmissionUnknown") {
-      if (tagged.signed !== undefined) {
-        lines.push(`bytes: ${Base64.encode(tagged.signed.bytes)}`)
-        printed.add(tagged.digest)
-      }
-      lines.push(
-        "the outcome is unknown: reconcile this digest before sending anything else from this sender"
-      )
+  const lines: Array<string> = [oneLine(SuiErrorHelpers.describe(error))]
+  if (!SuiErrorHelpers.isTaxonomy(error)) return lines
+  const tagged: SuiError = error
+  const digest = digestOf(tagged)
+  if (digest !== undefined) lines.push(`digest: ${digest}`)
+  if (tagged._tag === "SubmissionUnknown") {
+    if (tagged.signed !== undefined && !withEntry.has(tagged.digest)) {
+      lines.push(`bytes: ${Base64.encode(tagged.signed.bytes)}`)
     }
+    lines.push(
+      "the outcome is unknown: reconcile this digest before sending anything else from this sender"
+    )
   }
   return lines
 }
@@ -666,28 +669,22 @@ const encodeJournalEntry = Schema.encodeUnknownResult(JournalEntry)
 /**
  * The lines describing what this process left on the wire, if anything.
  *
- * Up to three lines per entry: the digest and tag for a human, the raw base64
- * bytes for someone about to resubmit by hand — unless the failure line above
- * already printed them for that digest — and the **whole entry encoded through
- * the `JournalEntry` schema**, which is the same JSON a durable journal
- * stores, bytes base64 and timestamps included. That last line is what lets a
+ * Two lines per entry: the digest and tag for a human, and the **whole entry
+ * encoded through the `JournalEntry` schema**, which is the same JSON a
+ * durable journal stores, bytes base64 and timestamps included — the one
+ * place the bytes are printed (0.4.0 dropped the separate `bytes:` line, which
+ * printed them a second time). That last line is what lets a
  * wrapper pipe stderr into a file and hand it back to a recovery process
  * verbatim, instead of scraping two lines and losing `attempts`, `lastError`
  * and the expiration the bytes carry.
  */
-const unresolvedLines = (
-  entries: ReadonlyArray<JournalEntry>,
-  printed: ReadonlySet<string>
-): ReadonlyArray<string> => {
+const unresolvedLines = (entries: ReadonlyArray<JournalEntry>): ReadonlyArray<string> => {
   if (entries.length === 0) return []
   const lines = [
     `${entries.length} submission(s) left unresolved; reconcile them before sending anything else:`
   ]
   for (const entry of entries) {
     lines.push(`unresolved ${entry.digest} (${entry._tag})`)
-    if ((entry._tag === "Signed" || entry._tag === "Unknown") && !printed.has(entry.digest)) {
-      lines.push(`bytes: ${Base64.encode(entry.signed.bytes)}`)
-    }
     const encoded = encodeJournalEntry(entry)
     if (Result.isSuccess(encoded)) lines.push(`entry: ${JSON.stringify(encoded.success)}`)
   }
@@ -793,14 +790,14 @@ const reportRun = <A, E>(
   record: RunRecordService
 ): number => {
   if (Exit.isSuccess(exit)) return EXIT.success
-  const printed = writeFailure(exit, write)
   const entries = record.entries()
   const unresolved = entries.filter(isUnresolved)
+  writeFailure(exit, write, new Set(unresolved.map((entry) => entry.digest)))
   const signedHere = record.signedHere()
   const applied = entries.filter((entry) =>
     (entry._tag === "Executed" || entry._tag === "Failed") && signedHere.has(entry.digest)
   )
-  for (const line of unresolvedLines(unresolved, printed)) write(line)
+  for (const line of unresolvedLines(unresolved)) write(line)
   if (unresolved.length === 0 && applied.length > 0) {
     write(
       `${applied.length} submission(s) of this run applied on chain: ` +

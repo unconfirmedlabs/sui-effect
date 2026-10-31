@@ -124,7 +124,6 @@ describe("wallet#1: Script.run finds the journal the program used", () => {
     const result = await run(program, scriptLayer([FakeOutcome.timeoutThen(true)]))
     expect(result.code).toBe(1)
     expect(result.printed).toMatch(/unresolved \S+ \(Signed\)/)
-    expect(result.printed).toContain("bytes: ")
     expect(result.printed).toContain("entry: ")
   })
 })
@@ -292,15 +291,15 @@ describe("wallet#11, ext#19: diagnostics are one line per failure", () => {
     expect(result.lines[0]).toContain("SUI_ALLOW_MAINNET=1")
   })
 
-  test("a SubmissionUnknown's bytes are printed once, and the entry once", async () => {
+  test("a SubmissionUnknown's bytes are printed once, in its entry", async () => {
     const program = Effect.gen(function*() {
       const error = yield* Tx.run(transfer, { signer }).pipe(fastTimeout, Effect.flip)
       return yield* (error._tag === "SubmissionUnknown" ? Effect.fail(error) : Effect.die(error))
     }).pipe(Effect.provide(Journal.layerMemory))
     const result = await run(program, scriptLayer([FakeOutcome.timeoutThen(false)]))
     expect(result.code).toBe(3)
-    const bytesLines = result.lines.filter((line) => line.startsWith("bytes: "))
-    expect(bytesLines).toHaveLength(1)
+    // The bytes once: in the `entry:` line, not in a `bytes:` line as well.
+    expect(result.lines.filter((line) => line.startsWith("bytes: "))).toHaveLength(0)
     expect(result.lines.filter((line) => line.startsWith("entry: "))).toHaveLength(1)
     // The type is used, so the import is not dead weight.
     expect(SubmissionUnknown).toBeDefined()
