@@ -342,6 +342,7 @@ The full entries follow under "API".
 - `Signed` — Signed bytes: everything `executeTransaction` needs, plus what `reconcile` needs.
 - `Signer` — A credential: who it signs as, how, and the two things it can sign.
 - `SubmitConfig` — The lifecycle settings.
+- `SubmitConfigOverrides` — What `SubmitConfig.with` and `SubmitConfig.layer` accept: any subset of `SubmitConfigService`, with every duration given as a `Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of milliseconds — and converted on the way in.
 - `SubmitConfigService` — Every decision `Tx.build`, `Tx.submit` and `Tx.reconcile` read from context.
 - `SubmitError` — Everything `submit` can fail with, as one name.
 - `SubmitViaError` — Everything `submitVia` can fail with, before the sender's own errors.
@@ -617,6 +618,7 @@ Every exported name, by subpath, with the first sentence of its documentation.
 The full entries follow under "API".
 
 -prefixed names so an extension is free to call a member `ready` or `dispose` itself.
+- `FaceValue` — What an `Effect` member's success becomes at the Promise boundary: an `Option<A>` is `A | undefined`, everything else is itself.
 - `Leaf` — `T`, marked as a leaf of the Promise face: it is handed to a Promise consumer exactly as the Effect service holds it.
 - `PromiseFace` — The Promise face of a service interface.
 - `SuiExtension` — The namespace the spec spells: `SuiExtension.fromService(...)`, plus the leaf marker a service uses to say "this member is a value, not a namespace" (`SuiExtension.leaf(value)`, typed `SuiExtension.Leaf<T>`).
@@ -3370,7 +3372,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-44 exported symbols.
+45 exported symbols.
 
 ### `Built` (const)
 
@@ -3786,12 +3788,13 @@ declare const SubmitConfig: Context.Reference<SubmitConfigService> & {
      * application or a test that sets its lifecycle policy once at the edge.
      * Never fails, requires nothing.
      */
-    layer: (overrides: Partial<SubmitConfigService>) => Layer.Layer<never>;
+    layer: (overrides: SubmitConfigOverrides) => Layer.Layer<never>;
     /**
-     * `defaults` with `overrides` applied, provided to one effect: the
-     * `.pipe`-able form of `layer`. Never fails, requires nothing.
+     * The config in force with `overrides` applied, provided to one effect:
+     * the `.pipe`-able form of `layer`, merging over what is in force rather
+     * than over `defaults`. Never fails, requires nothing.
      */
-    with: (overrides: Partial<SubmitConfigService>) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+    with: (overrides: SubmitConfigOverrides) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
 }
 ```
 
@@ -3802,6 +3805,20 @@ an `R`: a one-shot script gets the defaults with no wiring, and an
 application overrides what it cares about with
 `SubmitConfig.with` (one effect) or `SubmitConfig.layer` (a whole
 application), both of which spread `SubmitConfig.defaults` for you.
+
+### `SubmitConfigOverrides` (type)
+
+```ts
+export type SubmitConfigOverrides = {
+    readonly [K in keyof SubmitConfigService]?: K extends DurationField ? Duration.Input : SubmitConfigService[K];
+};
+```
+
+What `SubmitConfig.with` and `SubmitConfig.layer` accept: any
+subset of `SubmitConfigService`, with every duration given as a
+`Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of
+milliseconds — and converted on the way in. The value in force (what
+`yield* SubmitConfig` answers) always holds `Duration`s.
 
 ### `SubmitConfigService` (interface)
 
@@ -4970,7 +4987,7 @@ same `prefix`. The dead `index` key a 0.3 journal kept is not touched.
 ## `@unconfirmed/sui-effect/extension`
 
 
-7 exported symbols.
+8 exported symbols.
 
 ### `ExtensionFace` (interface)
 
@@ -4990,12 +5007,39 @@ export interface ExtensionFace {
      * the next call builds a fresh one.
      */
     readonly $dispose: () => Promise<void>;
+    /**
+     * `Tx.reconcileAll()` over this registration's runtime: settles every entry
+     * the journal in force (the one `SuiExtensionOptions.journal` gave, or
+     * the in-memory default) still holds unresolved, and answers what each one
+     * turned out to be. The startup call for a Promise consumer with a durable
+     * journal.
+     *
+     * Rejects with `JournalError` when the journal cannot be read, and with
+     * whatever the layer fails with when the runtime cannot be built.
+     *
+     * @since 0.4.0
+     */
+    readonly $reconcileAll: () => Promise<ReadonlyArray<Reconciled>>;
 }
 ```
 
 What every registration carries besides the service's own members, under
 `$`-prefixed names so an extension is free to call a member `ready` or
 `dispose` itself.
+
+### `FaceValue` (type)
+
+```ts
+export type FaceValue<A> = A extends Option.Option<infer B> ? B | undefined : A;
+```
+
+What an `Effect` member's success becomes at the Promise boundary: an
+`Option<A>` is `A | undefined`, everything else is itself.
+
+A Promise consumer has no `Option` and should not need one: a member that
+answers `Option.none()` where absence is normal resolves to `undefined`, and
+`Option.some(a)` resolves to `a`. Distributive, so `Option<A> | B` is
+`A | undefined | B`. Stream items are not unwrapped.
 
 ### `Leaf` (type)
 
@@ -5013,7 +5057,7 @@ Declare the member as `Leaf<MyClass>` and build it with `leaf`. A
 
 ```ts
 export type PromiseFace<S> = {
-    readonly [K in keyof S]: S[K] extends Stream.Stream<infer A, infer _E, infer _R> ? AsyncIterable<A> : S[K] extends Effect.Effect<infer A, infer _E2, infer _R2> ? () => Promise<A> : S[K] extends (...args: infer Args) => Stream.Stream<infer A, infer _E3, infer _R3> ? (...args: Args) => AsyncIterable<A> : S[K] extends (...args: infer Args) => Effect.Effect<infer A, infer _E4, infer _R4> ? (...args: Args) => Promise<A> : S[K] extends FaceLeaf ? S[K] : S[K] extends (...args: ReadonlyArray<never>) => unknown ? S[K] : S[K] extends object ? PromiseFace<S[K]> : S[K];
+    readonly [K in keyof S]: S[K] extends Stream.Stream<infer A, infer _E, infer _R> ? AsyncIterable<A> : S[K] extends Effect.Effect<infer A, infer _E2, infer _R2> ? () => Promise<FaceValue<A>> : S[K] extends (...args: infer Args) => Stream.Stream<infer A, infer _E3, infer _R3> ? (...args: Args) => AsyncIterable<A> : S[K] extends (...args: infer Args) => Effect.Effect<infer A, infer _E4, infer _R4> ? (...args: Args) => Promise<FaceValue<A>> : S[K] extends FaceLeaf ? S[K] : S[K] extends (...args: ReadonlyArray<never>) => unknown ? S[K] : S[K] extends object ? PromiseFace<S[K]> : S[K];
 };
 ```
 
@@ -5024,6 +5068,10 @@ function returning an `Effect` keeps its arguments and returns a Promise, a
 `Stream` member becomes an `AsyncIterable`, a nested object of members is
 mapped the same way (platform SDKs namespace their surface as
 `client.miso.protocol.*`), and anything else passes through untouched.
+
+**An `Option` result is `A | undefined`** (`FaceValue`): `Effect<Option<A>>`
+is `Promise<A | undefined>`, in the type and at runtime, so one service can
+return `Option` to its Effect callers and `undefined` to its Promise ones.
 
 **A synchronous member stays synchronous**: a recipe builder
 `(p: Params) => Recipe` is still `(p: Params) => Recipe` here, and a plain
@@ -5154,6 +5202,25 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
     readonly warm?: {
         readonly chainId?: string;
     };
+    /**
+     * Lifecycle overrides for every member call on this registration, the
+     * `SubmitConfig.layer` of a Promise consumer: `maxGasBudget`, `resubmit`,
+     * `executeTimeout: "10 seconds"` and the rest. Provided under the
+     * extension's layer and to every call.
+     *
+     * @since 0.4.0
+     */
+    readonly submit?: SubmitConfigOverrides;
+    /**
+     * The journal every member call on this registration records submissions
+     * in, instead of the process-wide in-memory default — a durable one from
+     * `@unconfirmed/sui-effect/journal` (`makeKeyValueStore(store)`) for a
+     * consumer that must survive a restart. `$reconcileAll()` settles what it
+     * holds.
+     *
+     * @since 0.4.0
+     */
+    readonly journal?: JournalService;
 }
 ```
 
@@ -5265,6 +5332,11 @@ export interface ReportOptions {
      * default and find nothing, which is precisely wrong for the program that
      * provided a durable one. Left out, the default reference is read, which is
      * right for a program that never provided a journal at all.
+     *
+     * Every unresolved entry in it is reported, including entries another
+     * process wrote to a shared store. `Script.run` does better: it records the
+     * entries its own program wrote, wherever the journal was provided, and
+     * reports only those.
      */
     readonly journal?: JournalService;
 }
@@ -5291,12 +5363,20 @@ export declare class Script extends Script_base {
      * Like `layer`, but over a `Sui` and `SuiCore` the caller already has,
      * which is how a test runs a script against the fake.
      *
+     * The network is the one that `SuiCore` reports, not `SUI_NETWORK`: the
+     * client already knows where it points, so only `SUI_PRIVATE_KEY` is read.
+     * A `mainnet` client still needs `SUI_ALLOW_MAINNET=1`.
+     *
      * Fails with: `ConfigError`.
      */
     static readonly layerNoDeps: Layer.Layer<Script, Config.ConfigError, Sui | SuiCore>;
     /**
      * A script with a signer the caller built, for a credential that does not
      * come from `SUI_PRIVATE_KEY` (a KMS, a wallet, a test key).
+     *
+     * Reads nothing from the environment except the mainnet gate: the network is
+     * the one the provided `SuiCore` reports, and `SUI_ALLOW_MAINNET=1` is
+     * required only when that is `mainnet`.
      *
      * Fails with: `ConfigError`.
      */
@@ -5310,7 +5390,8 @@ export declare class Script extends Script_base {
     static readonly layerReadOnly: Layer.Layer<ScriptReadOnly | Sui | SuiCore, Config.ConfigError | NetworkMismatch | TransportError>;
     /**
      * `layerReadOnly` over a `Sui` and `SuiCore` the caller already has,
-     * which is how a test exercises the read-only preset against the fake.
+     * which is how a test exercises the read-only preset against the fake. The
+     * network is the one that `SuiCore` reports, as in `layerNoDeps`.
      *
      * Fails with: `ConfigError`.
      */
@@ -5357,8 +5438,14 @@ export interface ScriptRunOptions {
      * The layer to run the script over. Defaults to `Script.layer`, which
      * reads the environment; a test passes `Script.layerNoDeps` over
      * `layerTest(script)` and never touches the network.
+     *
+     * It may fail with **anything**: a layer that also opens a durable journal
+     * (`Layer.merge(Script.layer, journalLayer)`) fails with `JournalError` or a
+     * `PlatformError`, and that failure is mapped to an exit code like any other
+     * — never `Layer.orDie` it, which turns a failed journal open into exit 1.
+     * It may also provide more than the three services, a `Journal` above all.
      */
-    readonly layer?: Layer.Layer<Script | Sui | SuiCore, Config.ConfigError | NetworkMismatch | TransportError>;
+    readonly layer?: Layer.Layer<Script | Sui | SuiCore, unknown>;
     /** How the process ends. Defaults to `process.exit`. */
     readonly exit?: (code: number) => void;
     /** Where diagnostics go, one line at a time. Defaults to `process.stderr`. */
@@ -5416,11 +5503,19 @@ an interrupt is 130 the way a shell expects — unless the journal says there
 is a submission outstanding, in which case it is 3, because a wrapper that
 sees 130 has no reason to go looking for one.
 
-An extension error that declares an `outcome` is honoured, so a downstream
-SDK's own failures land on the same axis. `SchemaError` — what Effect's own
-`Config.schema` and `Schema.decodeUnknownEffect` fail with — is exit 2 with
-`ConfigError`, because in a script it can only mean the input a person gave
-did not fit the schema, and no retry fixes that.
+**A declared `exitCode` wins.** An error carrying an integer `exitCode`
+field from 1 to 255 exits with it — which is how a script's own `BadInput`
+says 2 ("fix the input, retrying will not help") instead of the 4 its
+`outcome: "not_applied"` would give. Below that, an extension error that
+declares an `outcome` is honoured, so a downstream SDK's own failures land
+on the same axis. `SchemaError` — what Effect's own `Config.schema` and
+`Schema.decodeUnknownEffect` fail with — is exit 2 with `ConfigError`,
+because in a script it can only mean the input a person gave did not fit the
+schema, and no retry fixes that.
+
+**Once this run applied a transaction** (`ExitCodeOptions.applied`),
+any failure that would exit 2, 4 or 130 — a declared `exitCode` included —
+exits 5: none of those may be read as "nothing happened" any more.
 
 An error with a tag this library has never heard of and no `outcome` is
 *unclassified* and exits 1, the code that also means defect. It deliberately
@@ -5483,12 +5578,17 @@ calls cannot land in the script's output. A `SubmissionUnknown` additionally
 prints the base64 of the signed bytes and a line saying to reconcile, because
 those bytes are the durable record a script has.
 
-On **every** non-zero exit it also prints whatever the journal the script ran
-with still holds unresolved, which is the only record of bytes that may be on
-the wire when a script is killed — or fails — between signing and the answer.
-That count is also what decides a timeout (3 rather than 4) and an interrupt
-(3 rather than 130): an `Effect.timeout` around a submission interrupts it
-from the outside and never reaches `Tx.submit`'s own mapping.
+**What the run wrote, wherever its journal lives.** Every journal entry
+`Tx` writes during the run is also recorded by the run itself, so it does
+not matter where the program provided its journal — in `options.layer`, or
+inside the program with `Effect.provide(journalLayer)` — and entries other
+processes wrote to a shared durable journal are not this run's business.
+On **every** non-zero exit the run prints the submissions *it* left
+unresolved, which is the only record of bytes that may be on the wire when a
+script is killed — or fails — between signing and the answer. Those entries
+decide a timeout (3 rather than 4) and an interrupt (3 rather than 130), and
+a submission of this run that the network answered as applied turns a
+would-be 2, 4 or 130 into 5 (see `ExitCodeOptions.applied`).
 
 **A second SIGINT does nothing.** The handler interrupts the root fiber once;
 pressing Ctrl-C again while finalizers run is ignored, because the whole
@@ -5500,7 +5600,7 @@ handle.
 Returns the exit code as well as passing it to `exit`, so a test can inject
 `exit` and assert on the number without ending the test process.
 
-**Never fails: every failure of the program becomes an exit code, and a `stderr` writer that throws loses its line, not the exit.**
+**Never fails: every failure of the program — and of `options.layer`, whatever its error type — becomes an exit code, and a `stderr` writer that throws loses its line, not the exit.**
 
 ## `@unconfirmed/sui-effect/testing`
 
@@ -7375,6 +7475,7 @@ export const settlementApi = (options: {
  *
  * There is no second implementation to keep in step, which is the whole point.
  */
+import type { SuiExtensionOptions } from "@unconfirmed/sui-effect/extension"
 import { SuiExtension } from "@unconfirmed/sui-effect/extension"
 import type { EscrowOptions } from "./Escrow.ts"
 import { Escrow } from "./Escrow.ts"
@@ -7390,12 +7491,17 @@ export interface EscrowRegistrationOptions extends EscrowOptions {
    * is no built-in entry for those; `register` throws without it. On `mainnet`
    * and `testnet` the built-in table answers and this is optional.
    *
-   * Give the same id to **every** registration on one client. The base `Sui`,
-   * its transport and its sender-lock map are shared per client **per chain
-   * id**, so two registrations that disagree get two of everything and two
-   * `Tx.run`s for one address stop serializing.
+   * Give the same id to **every** registration on one client. The base `Sui`
+   * and its transport are shared per client **per chain id**, so two
+   * registrations that disagree build two of them. (The sender lock is
+   * process-wide whatever the id, so two `Tx.run`s for one address serialize
+   * either way.)
    */
   readonly chainId?: string
+  /** Lifecycle overrides for every call (`SubmitConfig` fields, durations as `"10 seconds"`). */
+  readonly submit?: SuiExtensionOptions<Escrow, never>["submit"]
+  /** The journal every call records submissions in; durable for a restartable consumer. */
+  readonly journal?: SuiExtensionOptions<Escrow, never>["journal"]
 }
 
 /**
@@ -7416,7 +7522,8 @@ export interface EscrowRegistrationOptions extends EscrowOptions {
  *
  * The runtime is built inside `register`, over `SuiCore.layerFromClient(client)`,
  * a `Sui` pinned to `options.chainId` and `Escrow.layer`, so the extension and
- * the consumer share one transport, one chain identity and one sender-lock map.
+ * the consumer share one transport and one chain identity, and every face in the
+ * process shares one sender lock.
  *
  * Throws out of `register` when the network has no built-in chain identifier
  * and `options.chainId` was not given.
@@ -7425,6 +7532,8 @@ export const escrow = (options: EscrowRegistrationOptions) =>
   SuiExtension.fromService(Escrow, {
     name: "escrow",
     layer: Escrow.layer(options),
-    warm: options.chainId === undefined ? {} : { chainId: options.chainId }
+    warm: options.chainId === undefined ? {} : { chainId: options.chainId },
+    ...(options.submit === undefined ? {} : { submit: options.submit }),
+    ...(options.journal === undefined ? {} : { journal: options.journal })
   })
 ```
