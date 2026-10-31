@@ -44,14 +44,17 @@ export interface JournalService {
  */
 export const makeMemoryUnsafe = (): JournalService => {
   const entries = new Map<string, JournalEntry>()
+  // `put` and `get` carry no span of their own: a `Map` access is not a
+  // boundary, and `Tx.submit` makes several per transaction. The durable
+  // journal's, which reach a store, are `Journal.put` / `Journal.get` spans.
   return {
-    put: Effect.fn("Journal.put")(function*(entry: JournalEntry) {
+    put: Effect.fnUntraced(function*(entry: JournalEntry) {
       yield* Effect.sync(() => {
         entries.delete(entry.digest)
         entries.set(entry.digest, entry)
       })
     }),
-    get: Effect.fn("Journal.get")(function*(digest: Digest) {
+    get: Effect.fnUntraced(function*(digest: Digest) {
       return yield* Effect.sync(() => Option.fromNullishOr(entries.get(digest)))
     }),
     listUnresolved: Effect.sync(() => [...entries.values()].filter(isUnresolved)).pipe(

@@ -209,6 +209,30 @@ package did not. Several signatures and one stored shape change; read
   `SubmitConfig`'s defaults, ten invariants and an index of every export by
   subpath. The extension template's test suite and manifest are now named by
   path rather than reprinted.
+- **Metrics**, through Effect's `Metric` into the registry in context, with
+  names and attribute keys that are a public contract (README, "Metrics and
+  tracing"): `sui_effect_tx_execute_attempts_total`,
+  `sui_effect_tx_submit_total{result}`, `sui_effect_tx_lock_conflicts_total`,
+  `sui_effect_tx_reconcile_total{result, evidence}`,
+  `sui_effect_tx_visibility_wait{result}`,
+  `sui_effect_tx_build_duration{simulated_by}`,
+  `sui_effect_tx_build_gas_budget`,
+  `sui_effect_core_read_retries_total{method, status}`,
+  `sui_effect_core_request_timeouts_total{method}` and
+  `sui_effect_sender_lock_wait`. Every attribute value is from a closed set;
+  none is a digest, an address, an object id or a coin type.
+- **Span attributes**: `sui.outcome`, `sui.refused`, `sui.lock_conflict` and
+  `sui.not_applied.evidence` on the submit and reconcile spans;
+  `sui.simulated_by`, `sui.gas_budget` and `sui.max_epoch` on `Tx.build`;
+  `sui.object_count` and `sui.chunk_count` on `Sui.getObjects` and
+  `sui.decode_failures` on each `Sui.getObjectsPage`; `sui.page_count` and
+  `sui.caught_up` on a tail's span.
+- `SuiCoreService.readPolicy(method)`: the effective read retry `Schedule`
+  (the layer's `readRetry`, or the default), for a read made outside the
+  members. Optional on the interface, so a `Layer.mock(SuiCore, ...)` need not
+  supply it.
+- `FakeScript.readOptions` (`SuiCoreReadOptions`) builds the fake's `SuiCore`
+  with a custom `readRetry` / `requestTimeout`.
 
 ### Changed
 
@@ -266,6 +290,18 @@ package did not. Several signatures and one stored shape change; read
 - `test/live.devnet.test.ts` (behind `SUI_LIVE=1`) funds through
   `requestSuiFromFaucetV3`, which pays into the address balance, so it also
   exercises address-balance gas.
+- `Tx.build` retries its resolver on `SuiCore`'s **effective** read policy
+  (`core.readPolicy("use")`), so `SuiCoreReadOptions.readRetry` now governs it
+  and each retry is logged at debug and counted; before, it ran a private copy
+  of the default schedule that ignored `readRetry` and logged nothing.
+- Per-item and nested helpers no longer open spans of their own, so a batch
+  read or a stream is no longer one span per object: `Sui.decodeObject`,
+  `Sui.simulateRaw`, `Sui.fromSimulationResult`,
+  `Executed.fromTransactionResult`, the in-memory journal's `Journal.put` /
+  `Journal.get`, and `Tx.inputStateOf`, `Tx.consumedVersionOf`,
+  `Tx.currentEpoch` and `Tx.expiryClosed` are gone from traces (the durable
+  journal's `Journal.put` / `Journal.get`, `Tx.recover`, `Tx.inputEvidence`,
+  `Tx.historyOf` and `Sui.getObjectsPage` remain).
 
 ### Fixed
 

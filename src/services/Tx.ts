@@ -22,7 +22,7 @@ import { fromBase58, normalizeSuiAddress } from "@mysten/sui/utils"
 
 /** The shape `Transaction#setExpiration` accepts, which the SDK does not export. */
 type SdkExpiration = NonNullable<Parameters<Transaction["setExpiration"]>[0]>
-import { DateTime, Duration, Effect, Option, Result, Schema } from "effect"
+import { Clock, DateTime, Duration, Effect, Option, Result, Schema } from "effect"
 import {
   BuildError,
   ExecutionFailed,
@@ -36,6 +36,7 @@ import {
   TransportError
 } from "../domain/errors.ts"
 import { EXECUTE_INCLUDE, Executed, fromTransactionResult } from "../domain/executed.ts"
+import * as Metrics from "../domain/metrics.ts"
 import { isUnresolved, JournalEntry } from "../domain/journal-entry.ts"
 import {
   Built,
@@ -45,6 +46,7 @@ import {
   maxEpochOf,
   maxTimestampMsOf,
   Nonce,
+  type NotAppliedEvidence,
   ObjectId,
   Signature,
   SignedTransaction,
@@ -53,8 +55,8 @@ import {
   U32_MAX,
   Version
 } from "../domain/schemas.ts"
-import { readSchedule } from "./SuiCore.ts"
 import { Journal } from "./Journal.ts"
+import { defaultReadPolicy } from "./SuiCore.ts"
 import { verifyTransactionSignature } from "./Verify.ts"
 import type { Signer } from "./Signer.ts"
 import { forgetEntry, recordEntry } from "./RunRecord.ts"
@@ -195,12 +197,6 @@ const decodeObjectId = Schema.decodeUnknownOption(ObjectId)
 const decodeNonce = Schema.decodeUnknownEffect(Nonce)
 const decodeAddress = Schema.decodeUnknownOption(SuiAddress)
 const decodeSignature = Schema.decodeUnknownOption(Signature)
-
-/**
- * How many times `Tx.build` runs the SDK's resolver before a retryable
- * `TransportError` stands: the same five attempts `SuiCore` gives a read.
- */
-const BUILD_ATTEMPTS = 5
 
 const buildError = (message: string) => (cause: unknown): BuildError =>
   new BuildError({ message, cause })
@@ -732,6 +728,7 @@ export const build = Effect.fn("Tx.build")(function*(
     "sui.sender": opts.sender,
     ...(opts.gasOwner === undefined ? {} : { "sui.gas_owner": opts.gasOwner })
   })
+  const started = yield* Clock.currentTimeMillis
   const sui = yield* Sui
   const config = yield* SubmitConfig
   const tx = yield* toTransaction(input)
@@ -765,14 +762,12 @@ export const build = Effect.fn("Tx.build")(function*(
     .pipe(
       // The resolver's own reads (system state, coins, the budget simulate) go
       // straight to the SDK, under none of `SuiCore`'s read retries. Nothing
-      // has been signed, so a transient failure is retried on the read policy.
+      // has been signed, so a transient failure is retried on the **same**
+      // policy `SuiCore` reads run under — `SuiCoreReadOptions.readRetry` when
+      // the layer was given one — logged and counted under method `use`.
       // `simulated` is asked afresh each attempt: an attempt that set the
       // budget before failing leaves one the next attempt must simulate itself.
-      Effect.retry({
-        schedule: readSchedule,
-        times: BUILD_ATTEMPTS - 1,
-        while: (error) => error._tag === "TransportError" && error.retryable
-      }),
+      Effect.retry(sui.core.readPolicy?.("use") ?? defaultReadPolicy("use")),
       Effect.catchTag(
         ["ObjectNotFound", "ObjectDeleted", "ObjectUnavailable", "TransactionNotFound"],
         (error) =>
@@ -790,6 +785,8 @@ export const build = Effect.fn("Tx.build")(function*(
       Effect.catchTag("TransportError", (error) => Effect.fail(resolverError(error, unresolved)))
     )
 
+  const simulatedBy = simulated ? "sdk" : "explicit"
+  yield* Effect.annotateCurrentSpan({ "sui.simulated_by": simulatedBy })
   if (!simulated) {
     // The SDK simulated nothing: it resolved nothing, or it ran the core
     // resolver with a preset budget. One explicit simulate with checks enabled
@@ -800,6 +797,7 @@ export const build = Effect.fn("Tx.build")(function*(
 
   const data = dataOfBytes(bytes)
   const budget = Option.getOrUndefined(Option.map(data, gasBudgetOf))
+  if (budget !== undefined) yield* Effect.annotateCurrentSpan({ "sui.gas_budget": Number(budget) })
   if (budget !== undefined && budget > config.maxGasBudget) {
     // A configured limit refusing the transaction before it is signed is what
     // `PolicyDenied` means; a `BuildError` whose cause was a bare `2988000n`
@@ -842,6 +840,13 @@ export const build = Effect.fn("Tx.build")(function*(
     )
   )
   const expiration = Option.getOrUndefined(Option.map(data, expirationOf))
+  const maxEpoch = maxEpochOf(expiration)
+  if (maxEpoch !== undefined) yield* Effect.annotateCurrentSpan({ "sui.max_epoch": Number(maxEpoch) })
+  const finished = yield* Clock.currentTimeMillis
+  yield* Metrics.recordDuration(Metrics.buildDuration, Duration.millis(finished - started), {
+    simulated_by: simulatedBy
+  })
+  if (budget !== undefined) yield* Metrics.observe(Metrics.buildGasBudget, Number(budget))
   return {
     digest,
     bytes,
@@ -1367,10 +1372,10 @@ const awaitVisible = (
     .pipe(
       Effect.timeoutOption(config.visibilityTimeout),
       Effect.flatMap((visible) =>
-        visible._tag === "Some" ? Effect.void : Effect.logWarning(
+        visible._tag === "Some" ? Effect.succeed("visible") : Effect.logWarning(
           "the transaction executed but did not become visible to reads within" +
             ` SubmitConfig.visibilityTimeout (${Duration.format(config.visibilityTimeout)}); the outcome stands`
-        )
+        ).pipe(Effect.as("timeout"))
       ),
       // One line, not a cause with a stack: a `TransportError` or a
       // `TransactionNotFound` here is the failure this is allowed to swallow,
@@ -1380,8 +1385,10 @@ const awaitVisible = (
         Effect.logWarning(
           "the transaction executed but waiting for it to become visible failed; the outcome" +
             ` stands: ${SuiError.describe(error)}`
-        )
+        ).pipe(Effect.as("failed"))
       ),
+      Effect.timed,
+      Effect.flatMap(([duration, result]) => Metrics.recordDuration(Metrics.visibilityWait, duration, { result })),
       // An interrupt here is the caller's to make, and it wins — but the
       // journal already says `Executed`, and a person reading the log should
       // not have to guess that.
@@ -1480,6 +1487,7 @@ const send = Effect.fnUntraced(function*(
     // a trace of a stuck submission is read for, and the execute spans are
     // one per attempt anyway.
     return Effect.annotateCurrentSpan({ "sui.attempt": attempts }).pipe(
+      Effect.andThen(Metrics.increment(Metrics.executeAttempts)),
       Effect.andThen(sui.core.executeTransaction({
         transaction: signed.bytes,
         signatures: [...signed.signatures],
@@ -1557,19 +1565,39 @@ const send = Effect.fnUntraced(function*(
   // may have landed — a refusal says nothing about the earlier send: that is
   // the ambiguous case, and it reconciles.
   if (!resent && attempts === 1 && refusedOutright(failure)) {
+    yield* Effect.annotateCurrentSpan({ "sui.refused": true })
     yield* journalRefused(signed)
     return yield* failure
   }
   // Bytes may have reached the network: the only honest next step is to ask.
   // Another transaction's lock on a pinned input is a race whose winner is
   // usually readable a moment later, so that case asks a few more times.
+  const conflicted = lockConflict(failure)
+  if (conflicted) {
+    yield* Effect.annotateCurrentSpan({ "sui.lock_conflict": true })
+    yield* Metrics.increment(Metrics.lockConflicts)
+  }
   return yield* reconcileSigned(
     signed,
     failure,
     attempts,
-    lockConflict(failure) ? LOCK_CONFLICT_RECHECKS : 0
+    conflicted ? LOCK_CONFLICT_RECHECKS : 0
   )
-})
+}, (effect) =>
+  // How the submit ended, on the enclosing `Tx.submit` / `Tx.resubmit` span
+  // and in `sui_effect_tx_submit_total`. Interrupts and defects are neither.
+  effect.pipe(
+    Effect.tap(() => submitEnded("Executed")),
+    Effect.tapError((error) => submitEnded(error._tag))
+  ))
+
+/** Annotates and counts one submit's result. Never fails. */
+const submitEnded = (tag: SubmitError["_tag"] | "Executed"): Effect.Effect<void> => {
+  const result = Metrics.resultOf(tag)
+  return Effect.annotateCurrentSpan({ "sui.outcome": result }).pipe(
+    Effect.andThen(Metrics.increment(Metrics.submitResults, { result }))
+  )
+}
 
 /**
  * An execute answer for a digest other than the one submitted is not an
@@ -1866,7 +1894,7 @@ type InputState =
  *
  * Fails with: `TransportError`.
  */
-const inputStateOf = Effect.fn("Tx.inputStateOf")(function*(
+const inputStateOf = Effect.fnUntraced(function*(
   sui: Sui["Service"],
   objectId: string
 ): Effect.fn.Return<InputState, TransportError> {
@@ -1922,7 +1950,7 @@ type InputEvidence =
  *
  * Fails with: `TransportError`.
  */
-const consumedVersionOf = Effect.fn("Tx.consumedVersionOf")(function*(
+const consumedVersionOf = Effect.fnUntraced(function*(
   sui: Sui["Service"],
   by: string,
   objectId: string
@@ -2025,7 +2053,7 @@ const inputEvidence = Effect.fn("Tx.inputEvidence")(function*(
 })
 
 /** The epoch the node currently reports. Fails with: `TransportError`. */
-const currentEpoch = Effect.fn("Tx.currentEpoch")(function*(
+const currentEpoch = Effect.fnUntraced(function*(
   sui: Sui["Service"]
 ): Effect.fn.Return<bigint, TransportError> {
   const { systemState } = yield* sui.core.getCurrentSystemState()
@@ -2042,7 +2070,7 @@ const currentEpoch = Effect.fn("Tx.currentEpoch")(function*(
  *
  * Fails with: `TransportError`.
  */
-const expiryClosed = Effect.fn("Tx.expiryClosed")(function*(
+const expiryClosed = Effect.fnUntraced(function*(
   sui: Sui["Service"],
   config: SubmitConfigService,
   signed: Signed
@@ -2321,7 +2349,24 @@ const reconcileUnjournaled = Effect.fnUntraced(function*(
         })
       ))
   )
-})
+}, (effect) =>
+  // Every reconcile answer, on the enclosing span and in
+  // `sui_effect_tx_reconcile_total`: the one `Tx.submit` runs, `Tx.reconcile`,
+  // `Tx.resubmit` and `Tx.reconcileAll` all come through here.
+  effect.pipe(
+    Effect.tap(() => reconciled("Executed")),
+    Effect.tapError((error) => reconciled(error._tag, error._tag === "NotApplied" ? error.evidence : undefined))
+  ))
+
+/** Annotates and counts one reconcile answer. Never fails. */
+const reconciled = (
+  tag: "Executed" | "ExecutionFailed" | "NotApplied" | "SubmissionUnknown",
+  evidence?: NotAppliedEvidence
+): Effect.Effect<void> =>
+  Effect.annotateCurrentSpan({
+    "sui.outcome": Metrics.resultOf(tag),
+    ...(evidence === undefined ? {} : { "sui.not_applied.evidence": evidence })
+  }).pipe(Effect.andThen(Metrics.increment(Metrics.reconcileResults, Metrics.reconcileAttributes(tag, evidence))))
 
 /** The body of {@link reconcile}, before its read failures become unknown. */
 const recover = Effect.fn("Tx.recover")(function*(

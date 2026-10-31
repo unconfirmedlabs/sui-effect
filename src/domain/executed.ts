@@ -607,7 +607,7 @@ const decodeExecuted = (input: unknown) => decodeExecutedAst(input, { errors: "a
  * and `DecodeError` when the response does not carry the include set that was
  * asked for.
  */
-export const fromTransactionResult = Effect.fn("Executed.fromTransactionResult")(
+export const fromTransactionResult = Effect.fnUntraced(
   function*(
     result: SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
   ): Effect.fn.Return<Executed, ExecutionFailed | DecodeError> {

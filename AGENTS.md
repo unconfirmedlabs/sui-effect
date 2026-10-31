@@ -67,8 +67,23 @@ Where this file and the spec disagree, fix this file.
   The only exceptions are `Sui.getObject`, `getObjectOption`, `getObjects`,
   `getObjectsStrict` and `getDynamicObjectFieldOption`, whose declared types
   are overload sets `Effect.fn` cannot express; their implementations are still
-  `Effect.fn`. Internal helpers that are not a tracing boundary (the journal
-  entry builders in `Tx.ts`) open no span.
+  `Effect.fn`. Internal helpers that are not a tracing boundary are
+  `Effect.fnUntraced` and open no span: the journal entry builders in `Tx.ts`,
+  anything that runs once per item (`Sui`'s object decode,
+  `Executed.fromTransactionResult`, the in-memory journal's `put`/`get`), the
+  nested `simulateRaw`/`fromSimulationResult`, and the reconcile helpers that
+  wrap one `SuiCore` call that already has a span (`inputStateOf`,
+  `consumedVersionOf`, `currentEpoch`, `expiryClosed`). What such a helper
+  learns goes on the enclosing span (`Sui.getObjectsPage` carries
+  `sui.decode_failures`). Public members and real boundaries (`Tx.recover`,
+  `Tx.inputEvidence`, `Tx.historyOf`, `Sui.getObjectsPage`) keep theirs.
+- **Metric names and their attribute keys are a public contract** (README,
+  "Metrics"). They live in `src/domain/metrics.ts`, every one prefixed
+  `sui_effect_`, and **every attribute value comes from a closed set** (a
+  result, an evidence kind, a `SuiCore` method name, a transport status, who
+  simulated) — never a digest, an address, an object id or a coin type. A new
+  metric is added there, documented in the README table, and tested under a
+  fresh `Metric.MetricRegistry`.
 - Every SDK call forwards the Effect's `AbortSignal` into the SDK's `signal`
   option, so `Effect.timeout` and interruption cancel the request.
 - Tests run on `bun test` with `effect/testing` (`TestClock`, `TestSchema`).
@@ -96,7 +111,7 @@ Where this file and the spec disagree, fix this file.
 
 | Tier | What it is | When to use it |
 |---|---|---|
-| `SuiCore` | A 1:1 Effect wrap of `ClientWithCoreApi`. One member per `SuiClientTypes.TransportMethods` key plus `getObject`, `getDynamicObjectField`, `waitForTransaction`, `signAndExecuteTransaction`, `getServiceInfo` (gRPC's `ServiceInfo`, with `lowestAvailableCheckpoint`; `UNIMPLEMENTED` on other transports) and `use`. `Include` generics preserved. Every read has a per-attempt `requestTimeout` (30 s by default, `"Infinity"` off, `SUI_RPC_TIMEOUT` under `layerConfig`) that ends in a retryable `DEADLINE_EXCEEDED`, and a `readRetry` schedule option. An SDK caller-argument error (a malformed filter, an unpaginable function filter, `after` with `before`) is a defect, not a `TransportError`. | Reaching a field or method `Sui` does not expose, and inside extension implementations. |
+| `SuiCore` | A 1:1 Effect wrap of `ClientWithCoreApi`. One member per `SuiClientTypes.TransportMethods` key plus `getObject`, `getDynamicObjectField`, `waitForTransaction`, `signAndExecuteTransaction`, `getServiceInfo` (gRPC's `ServiceInfo`, with `lowestAvailableCheckpoint`; `UNIMPLEMENTED` on other transports) and `use`, plus `readPolicy(method)`, the effective read retry `Schedule` for a read made outside the members (optional on the interface so a `Layer.mock` need not supply it). `Include` generics preserved. Every read has a per-attempt `requestTimeout` (30 s by default, `"Infinity"` off, `SUI_RPC_TIMEOUT` under `layerConfig`) that ends in a retryable `DEADLINE_EXCEEDED`, and a `readRetry` schedule option. An SDK caller-argument error (a malformed filter, an unpaginable function filter, `after` with `before`) is a defect, not a `TransportError`. | Reaching a field or method `Sui` does not expose, and inside extension implementations. |
 | `Sui` | The opinionated tier over `SuiCore`: fixed include sets, decoded BCS content, `Option` where absence is normal (`getObjectOption`, `getDynamicFieldOption`, `getDynamicObjectFieldOption`, `getCoinMetadataOption`, `resolveNameServiceAddressOption`, `defaultNameServiceNameOption`), chunked and integrity-checked batch reads (`getObjects` per-item `Result`, `getObjectsStrict` first-error-wins; `getObjectsOrFail` was removed in 0.4.0), `Stream` pagination (`streamOwnedObjects`, `streamDynamicFields`, `streamCoins`, `streamBalances`, `streamEvents`, `streamTransactions` — the last yields `Result<Executed, ExecutionFailed>` per entry, and both ledger streams follow `hasNextPage`, not the page's item count, and take `after`/`before`; `streamEventPages`/`streamTransactionPages` yield `ListPage { items, endCursor }` so a consumer commits a cursor with its items; `tailEvents`/`tailTransactions` and their `…Pages` never end, poll (1 s), retry retryable errors from the last cursor, and advance a filtered cursor to the unfiltered head so a pruning node does not strand it), `getDynamicFieldOption(parent, name, { schema })` decoding the value, `simulate`/`view` over a `Recipe`, `Transaction` or bytes, one sender lock. A transaction stream's `function` filter must be fully qualified (`pkg::module::function`); a `pkg` or `pkg::module` filter is refused up front, and one page of it is `sui.core.listTransactions`. | Almost all application and extension code. |
 
 **`Sui` members are positional; `SuiCore` members take the SDK's options
@@ -232,7 +247,8 @@ Chain identity is compared before any recovery query, and
 `SubmissionUnknown`.
 
 `SuiCore` retries retryable `TransportError`s on reads only (and `Tx.build`
-retries its resolver call on the same schedule, above)
+retries its resolver call on the **same policy**, `core.readPolicy("use")`, so
+a layer's `readRetry` governs it and its retries are logged and counted too)
 (`Schedule.min([exponential("250 millis"), spaced("10 seconds")])` jittered, five
 attempts). Retryable means gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`,
 `RESOURCE_EXHAUSTED`, `INTERNAL` or `UNKNOWN`, HTTP 5xx or 429, or a timeout;
@@ -344,7 +360,10 @@ pruning guard; unscripted, the client has none, like a JSON-RPC transport. A
 read the fake never answers (a `timeoutThen` on a read) ends in `SuiCore`'s
 30 s per-attempt `requestTimeout` — a retryable `DEADLINE_EXCEEDED`, then the
 read retries — once a test advances `TestClock` past it; a test that means
-"hangs until interrupted" interrupts sooner. A scripted
+"hangs until interrupted" interrupts sooner. `FakeScript.readOptions`
+(`SuiCoreReadOptions`: `requestTimeout`, `readRetry`) builds the fake's
+`SuiCore` the way a layer's options would, so a custom read policy — and
+`Tx.build`'s resolver retry under it — is testable on the fake. A scripted
 `commandResults` entry may give either array; the missing one defaults to `[]`
 rather than failing a `Simulation` decode.
 

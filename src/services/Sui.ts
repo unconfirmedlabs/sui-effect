@@ -15,6 +15,7 @@ import { Transaction } from "@mysten/sui/transactions"
 import { normalizeSuiAddress, SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
 import {
   Array,
+  Clock,
   Config,
   Context,
   DateTime,
@@ -44,6 +45,7 @@ import {
   TransportError
 } from "../domain/errors.ts"
 import { EXECUTE_INCLUDE, Executed, fromTransactionResult } from "../domain/executed.ts"
+import * as Metrics from "../domain/metrics.ts"
 import {
   Balance,
   Coin,
@@ -227,21 +229,21 @@ const tailOf = <A>(
   fetchPage: (cursor: string | null) => Effect.Effect<RawPage<A>, TransportError>,
   head: Effect.Effect<string | null, TransportError> | undefined
 ): Stream.Stream<ListPage<A>, TransportError> => {
+  // `while` is checked before the schedule steps, so the tap logs exactly the
+  // retryable failures it is about to retry.
+  const spaced: Schedule.Schedule<number, TransportError> = Schedule.spaced(poll)
+  const retrying = spaced.pipe(
+    Schedule.tap(({ input }) => Effect.logWarning(`${span}: ${input.message}; retrying from the last cursor`))
+  )
   const persistently = <X>(effect: Effect.Effect<X, TransportError>) =>
-    effect.pipe(
-      Effect.tapError((error) =>
-        error.retryable
-          ? Effect.logWarning(`${span}: ${error.message}; retrying from the last cursor`)
-          : Effect.void
-      ),
-      Effect.retry({ schedule: Schedule.spaced(poll), while: (error) => error.retryable })
-    )
+    Effect.retry(effect, { schedule: retrying, while: (error) => error.retryable })
   interface State {
     readonly cursor: string | null
     readonly waited: boolean
+    readonly pages: number
   }
   return Stream.paginate<State, ListPage<A>, TransportError>(
-    { cursor: start, waited: false },
+    { cursor: start, waited: false, pages: 0 },
     (state) =>
       Effect.gen(function*() {
         if (state.waited) yield* Effect.sleep(poll)
@@ -253,7 +255,11 @@ const tailOf = <A>(
         const emitted: ReadonlyArray<ListPage<A>> = page.items.length > 0 || endCursor !== state.cursor
           ? [{ items: page.items, endCursor, hasNextPage: more }]
           : []
-        return [emitted, Option.some({ cursor: endCursor, waited: !more })] as const
+        const pages = state.pages + emitted.length
+        // On the tail's own span: how far it has read, and whether it is at
+        // the head — a tail that never catches up is falling behind the chain.
+        yield* Effect.annotateCurrentSpan({ "sui.page_count": pages, "sui.caught_up": !more })
+        return [emitted, Option.some({ cursor: endCursor, waited: !more, pages })] as const
       })
   ).pipe(Stream.withSpan(span))
 }
@@ -314,7 +320,7 @@ const makeSenderLocks = RcMap.make({
  * `src/internal.ts` so the two live wire shapes and the disagreement case can
  * be tested directly.
  */
-export const fromSimulationResult = Effect.fn("Sui.fromSimulationResult")(function*(
+export const fromSimulationResult = Effect.fnUntraced(function*(
   result: SuiClientTypes.SimulateTransactionResult<typeof SIMULATE_INCLUDE>
 ): Effect.fn.Return<Simulation, SimulationFailed | TransportError> {
   if (result.$kind === "FailedTransaction") {
@@ -990,7 +996,7 @@ const makeSui = (
   const envelopeOf = (object: SuiClientTypes.Object<typeof OBJECT_INCLUDE>) =>
     decodeEnvelope(object).pipe(Effect.mapError(boundaryError("getObject")))
 
-  const decodeObject = Effect.fn("Sui.decodeObject")(function*<S>(
+  const decodeObject = Effect.fnUntraced(function*<S>(
     object: SuiClientTypes.Object<typeof OBJECT_INCLUDE>,
     opts?: ReadOptions<S>
   ): Effect.fn.Return<SuiObject<S | Uint8Array>, DecodeError | TransportError> {
@@ -1084,6 +1090,9 @@ const makeSui = (
         })
       }
       const entries: Array<Entry> = []
+      // `decodeObject` has no span of its own (it runs once per object), so a
+      // page that decoded badly says how badly on its own span.
+      let decodeFailures = 0
       for (let index = 0; index < page.length; index += 1) {
         const id = page[index] as ObjectId
         const item = response.objects[index]
@@ -1108,11 +1117,16 @@ const makeSui = (
         const decoded = yield* Effect.result(decodeObject(item, opts))
         if (Result.isFailure(decoded)) {
           if (decoded.failure._tag === "TransportError") return yield* decoded.failure
+          decodeFailures += 1
           entries.push([keyOf(id), Result.fail(decoded.failure)])
           continue
         }
         entries.push([keyOf(id), Result.succeed(decoded.success)])
       }
+      yield* Effect.annotateCurrentSpan({
+        "sui.object_count": page.length,
+        "sui.decode_failures": decodeFailures
+      })
       return entries
     })
 
@@ -1121,8 +1135,10 @@ const makeSui = (
     // integrity failure or a `TransportError` out of `decodeObject` still fails
     // the whole read and no partial array escapes. Bounded, not unbounded,
     // because the other side of this is a rate-limited node.
+    const chunks = Array.chunksOf(unique, CHUNK)
+    yield* Effect.annotateCurrentSpan({ "sui.object_count": unique.length, "sui.chunk_count": chunks.length })
     const pages = yield* Effect.forEach(
-      Array.chunksOf(unique, CHUNK),
+      chunks,
       fetchPage,
       { concurrency: CHUNK_CONCURRENCY }
     )
@@ -1301,7 +1317,7 @@ const makeSui = (
     })
   }
 
-  const simulateRaw = Effect.fn("Sui.simulateRaw")(function*(
+  const simulateRaw = Effect.fnUntraced(function*(
     input: Recipe | Transaction | Uint8Array,
     checksEnabled: boolean,
     sender?: SuiAddress
@@ -1587,10 +1603,18 @@ const makeSui = (
       // that sponsors thousands of addresses therefore holds entries for the
       // senders it is actually working for, not for every sender it has ever
       // seen.
+      //
+      // The time spent queued for the permit is `sui_effect_sender_lock_wait`,
+      // measured from asking for the semaphore to holding the permit; the
+      // sender is deliberately not an attribute.
+      const asked = yield* Clock.currentTimeMillis
+      const held = Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => Metrics.recordDuration(Metrics.senderLockWait, Duration.millis(now - asked)))
+      )
       return yield* Effect.scoped(
         Effect.flatMap(
           RcMap.get(locks, address),
-          (semaphore) => Semaphore.withPermits(semaphore, 1)(effect)
+          (semaphore) => Semaphore.withPermit(semaphore, Effect.andThen(held, effect))
         )
       )
     })

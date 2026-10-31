@@ -25,6 +25,7 @@ import {
 } from "../domain/errors.ts"
 
 import { classifyTransportCause } from "../domain/errors.ts"
+import * as Metrics from "../domain/metrics.ts"
 import { Digest, executionReasonOf, ExecutionReason, KnownNetwork, ObjectId } from "../domain/schemas.ts"
 
 export { RETRYABLE_GRPC_STATUSES } from "../domain/errors.ts"
@@ -387,10 +388,23 @@ const readPolicy = (
           "sui.method": method,
           "sui.attempt": attempt,
           "sui.error": input instanceof Error ? input.message : String(input)
-        })
+        }),
+        Effect.andThen(Metrics.increment(Metrics.readRetries, { method, status: statusOf(input) }))
       )
     )
   )
+
+/** The `status` attribute of a retried failure: its transport status, or `none`. */
+const statusOf = (input: unknown): string =>
+  Predicate.hasProperty(input, "status") && typeof input.status === "string" ? input.status : "none"
+
+/**
+ * The default read policy for `method`: what `SuiCoreService.readPolicy`
+ * answers on a layer built without `readRetry`, and what to use when a
+ * hand-built mock has no `readPolicy`. Internal.
+ */
+export const defaultReadPolicy = (method: string): Schedule.Schedule<unknown, unknown> =>
+  readPolicy(method, undefined)
 
 /**
  * How the read tier behaves: the per-attempt request timeout and the retry
@@ -681,6 +695,24 @@ export interface SuiCoreService {
   readonly use: <A>(
     run: (client: ClientWithCoreApi, signal: AbortSignal) => Promise<A>
   ) => Effect.Effect<A, SuiCoreError>
+
+  /**
+   * The retry schedule this client's reads run under, for a read made outside
+   * its members — `Tx.build` retries the SDK resolver's own reads on it. It is
+   * `SuiCoreReadOptions.readRetry` when the layer was given one and the
+   * default otherwise (jittered exponential from 250 ms, capped at 10 s, five
+   * attempts in all); in both cases it only continues while the failure is a
+   * retryable `TransportError`, and every retry is logged at debug level and
+   * counted in `sui_effect_core_read_retries_total` under `method`.
+   *
+   * Use it as `Effect.retry(effect, core.readPolicy("myRead"))`. Optional
+   * only so a hand-built `Layer.mock(SuiCore, ...)` need not supply it; every
+   * layer this package builds has it, and `Tx.build` falls back to the
+   * default policy when it is absent.
+   *
+   * @since 0.4.0
+   */
+  readonly readPolicy?: (method: string) => Schedule.Schedule<unknown, unknown>
 }
 
 /**
@@ -971,13 +1003,15 @@ export const makeFromClient = (
       ? Effect.timeoutOrElse(effect, {
         duration: requestTimeout,
         orElse: () =>
-          Effect.fail(
-            new TransportError({
-              method,
-              retryable: true,
-              status: "DEADLINE_EXCEEDED",
-              cause: `no answer within ${Duration.format(requestTimeout)} (requestTimeout)`
-            })
+          Metrics.increment(Metrics.requestTimeouts, { method }).pipe(
+            Effect.andThen(Effect.fail(
+              new TransportError({
+                method,
+                retryable: true,
+                status: "DEADLINE_EXCEEDED",
+                cause: `no answer within ${Duration.format(requestTimeout)} (requestTimeout)`
+              })
+            ))
           )
       })
       : effect
@@ -1326,6 +1360,7 @@ export const makeFromClient = (
         try: (signal) => run(client, signal),
         catch: (cause) => mapSdkError("use", cause)
       })
-    })
+    }),
+    readPolicy: (method) => readPolicy(method, readRetry)
   }
 }

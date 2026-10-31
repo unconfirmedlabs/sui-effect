@@ -473,6 +473,29 @@ layer option (30 s; `SUI_RPC_TIMEOUT` for `layerConfig`).
 | `visibilityTimeout` | 15 s | How long that wait may take; it never changes the outcome |
 | `nonce` | a random `u32` | The nonce on a default `ValidDuring` expiration |
 
+## Metrics
+
+The library records Effect `Metric`s into the `Metric.MetricRegistry` in
+context. **The names and attribute keys are a public contract**; every
+attribute value is from a closed set, never a digest, address, object id or
+coin type. README "Metrics and tracing" has the full table.
+
+| Metric | Attributes |
+|---|---|
+| `sui_effect_tx_execute_attempts_total` | — |
+| `sui_effect_tx_submit_total` | `result`: `executed`, `execution_failed`, `not_applied`, `submission_unknown`, `refused`, `journal_error` |
+| `sui_effect_tx_lock_conflicts_total` | — |
+| `sui_effect_tx_reconcile_total` | `result`; `evidence` (`expired`, `inputConsumed`, `refused`) on `not_applied` |
+| `sui_effect_tx_visibility_wait` (timer, ms) | `result`: `visible`, `timeout`, `failed` |
+| `sui_effect_tx_build_duration` (timer, ms) | `simulated_by`: `sdk`, `explicit` |
+| `sui_effect_tx_build_gas_budget` (histogram, MIST) | — |
+| `sui_effect_core_read_retries_total` | `method`, `status` (or `none`) |
+| `sui_effect_core_request_timeouts_total` | `method` |
+| `sui_effect_sender_lock_wait` (timer, ms) | — |
+
+A test provides `Metric.MetricRegistry` with a fresh `Map`; the default is
+process-wide.
+
 ## Invariants
 
 1. `Tx.build` always simulates before anything is signed, on every transport: when the SDK's resolver will not, it runs one explicit simulate.
@@ -2693,6 +2716,23 @@ export interface SuiCoreService {
      * `SimulationFailed`.
      */
     readonly use: <A>(run: (client: ClientWithCoreApi, signal: AbortSignal) => Promise<A>) => Effect.Effect<A, SuiCoreError>;
+    /**
+     * The retry schedule this client's reads run under, for a read made outside
+     * its members — `Tx.build` retries the SDK resolver's own reads on it. It is
+     * `SuiCoreReadOptions.readRetry` when the layer was given one and the
+     * default otherwise (jittered exponential from 250 ms, capped at 10 s, five
+     * attempts in all); in both cases it only continues while the failure is a
+     * retryable `TransportError`, and every retry is logged at debug level and
+     * counted in `sui_effect_core_read_retries_total` under `method`.
+     *
+     * Use it as `Effect.retry(effect, core.readPolicy("myRead"))`. Optional
+     * only so a hand-built `Layer.mock(SuiCore, ...)` need not supply it; every
+     * layer this package builds has it, and `Tx.build` falls back to the
+     * default policy when it is absent.
+     *
+     * @since 0.4.0
+     */
+    readonly readPolicy?: (method: string) => Schedule.Schedule<unknown, unknown>;
 }
 ```
 
@@ -6830,6 +6870,15 @@ export interface FakeScript {
         readonly lowestAvailableCheckpoint?: bigint;
         readonly firstCheckpoints?: Readonly<Record<string, bigint>>;
     };
+    /**
+     * The read options the fake's `SuiCore` is built with — what
+     * `SuiCore.layerGrpc(..., { readRetry, requestTimeout })` would be given —
+     * so a test can prove a read, or `Tx.build`'s resolver retry, runs under a
+     * custom `readRetry`. Unscripted, the defaults.
+     *
+     * @since 0.4.0
+     */
+    readonly readOptions?: SuiCoreReadOptions;
 }
 ```
 

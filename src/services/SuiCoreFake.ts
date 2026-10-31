@@ -28,7 +28,7 @@ import {
 import { Context, Effect, Layer, Option, Result, Schema } from "effect"
 import { typeMatches } from "../domain/bcs.ts"
 import { Digest, ExecutionReason } from "../domain/schemas.ts"
-import type { SuiCoreService } from "./SuiCore.ts"
+import type { SuiCoreReadOptions, SuiCoreService } from "./SuiCore.ts"
 import { DefectMarker, makeFromClient, SuiCore } from "./SuiCore.ts"
 
 /** The BCS layout of `0x2::clock::Clock`. */
@@ -473,6 +473,15 @@ export interface FakeScript {
     readonly lowestAvailableCheckpoint?: bigint
     readonly firstCheckpoints?: Readonly<Record<string, bigint>>
   }
+  /**
+   * The read options the fake's `SuiCore` is built with — what
+   * `SuiCore.layerGrpc(..., { readRetry, requestTimeout })` would be given —
+   * so a test can prove a read, or `Tx.build`'s resolver retry, runs under a
+   * custom `readRetry`. Unscripted, the defaults.
+   *
+   * @since 0.4.0
+   */
+  readonly readOptions?: SuiCoreReadOptions
 }
 
 /** One call the fake received, in order. */
@@ -2129,7 +2138,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   } as unknown as ClientWithCoreApi
 
   return {
-    core: makeFromClient(client),
+    core: makeFromClient(client, script.readOptions),
     client,
     calls: Effect.sync(() => [...state.calls]),
     aborted: Effect.sync(() => state.aborted),

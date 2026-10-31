@@ -81,6 +81,7 @@ with no handling lines anywhere.
 | [Errors](#errors) | `@unconfirmed/sui-effect` | One flat tagged error per failure, `SuiError.outcome` and the exit codes |
 | [Scripts](#scripts) | `@unconfirmed/sui-effect/script` | `Script.run`: config from the environment, signals, stderr diagnostics, exit codes |
 | [Extensions](#extensions) | `@unconfirmed/sui-effect/extension` | A downstream SDK as an Effect service with a derived Promise face |
+| [Metrics and tracing](#metrics-and-tracing) | — | The span attributes and the `sui_effect_*` metrics, whose names are a public contract |
 | [Testing](#testing) | `@unconfirmed/sui-effect/testing` | The real `Sui` over an in-memory fake; no network |
 
 [Side by side](#side-by-side), at the end, is one read and one write against the
@@ -651,6 +652,40 @@ should know four things:
 `docs/extensions.md` sections 17 and 18 have the runtime module, the HMR
 dispose, the vitest double and the `KeyValueStore.makeStringOnly` adapter over
 Durable Object storage.
+
+## Metrics and tracing
+
+Every public member opens a span named after itself (`SuiCore.getObject`,
+`Tx.submit`); per-item helpers open none and annotate the enclosing span
+instead. A submission's spans carry `sui.digest`, `sui.attempt`, `sui.outcome`
+and, when they apply, `sui.refused`, `sui.lock_conflict` and
+`sui.not_applied.evidence`; `Tx.build`'s carry `sui.simulated_by`,
+`sui.gas_budget` and `sui.max_epoch`; `Sui.getObjects` carries
+`sui.object_count` and `sui.chunk_count`, and each `Sui.getObjectsPage`
+`sui.decode_failures`; a tail carries `sui.page_count` and `sui.caught_up`.
+
+The library also records **metrics**, through Effect's `Metric` into the
+`Metric.MetricRegistry` in context (install any exporter; read them with
+`Metric.snapshot`). **The names and attribute keys below are a public
+contract.** Every attribute value comes from a small closed set: no metric is
+ever keyed by a digest, an address, an object id or a coin type.
+
+| Metric | Kind | Attributes | Counts |
+|---|---|---|---|
+| `sui_effect_tx_execute_attempts_total` | counter | — | `executeTransaction` attempts by `Tx.submit`/`Tx.resubmit`, resends included |
+| `sui_effect_tx_submit_total` | counter | `result`: `executed`, `execution_failed`, `not_applied`, `submission_unknown`, `refused`, `journal_error` | How each `Tx.submit`/`Tx.resubmit` ended |
+| `sui_effect_tx_lock_conflicts_total` | counter | — | Sends that ended in a validator lock conflict on a pinned input |
+| `sui_effect_tx_reconcile_total` | counter | `result` (as above, less `refused`/`journal_error`); `evidence` (`expired`, `inputConsumed`, `refused`) for `not_applied` | Every reconcile answer: inside `Tx.submit`, `Tx.reconcile`, `Tx.resubmit`, `Tx.reconcileAll` |
+| `sui_effect_tx_visibility_wait` | timer (ms) | `result`: `visible`, `timeout`, `failed` | `Tx.submit`'s wait for an executed transaction to become readable |
+| `sui_effect_tx_build_duration` | timer (ms) | `simulated_by`: `sdk`, `explicit` | Each successful `Tx.build` |
+| `sui_effect_tx_build_gas_budget` | histogram (MIST) | — | The gas budget of each successful `Tx.build` |
+| `sui_effect_core_read_retries_total` | counter | `method` (the `SuiCore` method; `use` for `Tx.build`'s resolver), `status` (the transport status, or `none`) | Retries of retryable read failures |
+| `sui_effect_core_request_timeouts_total` | counter | `method` | Read attempts abandoned at `requestTimeout` |
+| `sui_effect_sender_lock_wait` | timer (ms) | — | Time queued for a sender's lock in `Sui.withSenderLock` |
+
+Timers are Effect `Metric.timer` histograms, which add `time_unit:
+"milliseconds"`. In a test, provide `Metric.MetricRegistry` with a fresh `Map`
+so counts do not leak between tests; the default registry is process-wide.
 
 ## Testing
 
