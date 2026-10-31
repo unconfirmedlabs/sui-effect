@@ -1611,9 +1611,15 @@ const makeSui = (
       const held = Clock.currentTimeMillis.pipe(
         Effect.flatMap((now) => Metrics.recordDuration(Metrics.senderLockWait, Duration.millis(now - asked)))
       )
+      //
+      // The key is the normalized spelling, not the raw string: `SuiAddress
+      // .make` validates without decoding, so an upper-case `0xAAAA…` is a
+      // valid brand of the same sender, and keying on the raw string would
+      // give that sender two semaphores — the gas-coin equivocation this lock
+      // exists to stop.
       return yield* Effect.scoped(
         Effect.flatMap(
-          RcMap.get(locks, address),
+          RcMap.get(locks, normalizeSuiAddress(address)),
           (semaphore) => Semaphore.withPermit(semaphore, Effect.andThen(held, effect))
         )
       )

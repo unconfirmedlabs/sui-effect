@@ -15,6 +15,7 @@
  * @since 0.1.0
  */
 import type { ClientWithCoreApi, SuiClientRegistration } from "@mysten/sui/client"
+import { normalizeSuiAddress } from "@mysten/sui/utils"
 import type { Context } from "effect"
 import { Effect, Layer, ManagedRuntime, Option, Semaphore, Stream } from "effect"
 import type { TransportError } from "../domain/errors.ts"
@@ -345,6 +346,8 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
  * address across unrelated clients costs throughput, never correctness.
  *
  * Reference counted: an entry lives while someone holds or waits for it.
+ * Keyed on the normalized spelling, so the upper- and lower-case spellings of
+ * one address (both valid `SuiAddress` brands) share one semaphore.
  */
 const FACE_LOCKS = new Map<string, { readonly semaphore: Semaphore.Semaphore; holders: number }>()
 
@@ -353,12 +356,13 @@ const faceSenderLock = (address: SuiAddress) =>
     effect: Effect.Effect<A, E, R>
   ): Effect.fn.Return<A, E, R> {
     yield* Effect.annotateCurrentSpan({ "sui.sender": address })
+    const key = normalizeSuiAddress(address)
     return yield* Effect.acquireUseRelease(
       Effect.sync(() => {
-        let entry = FACE_LOCKS.get(address)
+        let entry = FACE_LOCKS.get(key)
         if (entry === undefined) {
           entry = { semaphore: Semaphore.makeUnsafe(1), holders: 0 }
-          FACE_LOCKS.set(address, entry)
+          FACE_LOCKS.set(key, entry)
         }
         entry.holders += 1
         return entry
@@ -367,7 +371,7 @@ const faceSenderLock = (address: SuiAddress) =>
       (entry) =>
         Effect.sync(() => {
           entry.holders -= 1
-          if (entry.holders === 0 && FACE_LOCKS.get(address) === entry) FACE_LOCKS.delete(address)
+          if (entry.holders === 0 && FACE_LOCKS.get(key) === entry) FACE_LOCKS.delete(key)
         })
     )
   })

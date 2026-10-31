@@ -328,9 +328,10 @@ describe("2.10 coverage that was missing", () => {
     expect(second.created(RECEIPT_TYPE)).toHaveLength(1)
   })
 
-  test("withSenderLock is keyed by the SuiAddress, which is always the padded spelling", async () => {
-    // The key is the raw string; what makes that correct is the brand: a
-    // shorthand spelling only becomes a `SuiAddress` through `normalize`.
+  test("withSenderLock is keyed by the normalized address", async () => {
+    // A shorthand spelling only becomes a `SuiAddress` through `normalize`;
+    // the lock also normalizes its key, so a non-canonical brand (an
+    // upper-case `make`) shares the lock too (release-0-4-0-review.test.ts).
     const short = SuiAddress.normalize("0x2")
     const padded = SuiAddress.make(PADDED("2"))
     expect(short).toBe(padded)
