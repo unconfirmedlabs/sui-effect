@@ -23,8 +23,12 @@ export interface RunRecordService {
   /** Notes an entry the run is about to write. Never fails. */
   readonly record: (entry: JournalEntry) => void
   /**
-   * Forgets a `Signed` entry whose write failed, so a submission that was
-   * never sent is not reported as outstanding. Never fails.
+   * Withdraws a `Signed` entry whose write failed, so a submission that was
+   * never sent is not reported as outstanding: the record for that digest goes
+   * back to exactly what it was before that `Signed` — the earlier latest
+   * entry and `signedHere` membership, or nothing when there was none. A
+   * digest the run already holds as `Unknown`, `Executed` or `Failed` (a
+   * re-send of the same bytes) keeps that entry. Never fails.
    */
   readonly forget: (digest: string) => void
   /** The latest entry per digest, in the order the digests first appeared. */
@@ -37,14 +41,24 @@ export interface RunRecordService {
 export const makeRunRecord = (): RunRecordService => {
   const latest = new Map<string, JournalEntry>()
   const signed = new Set<string>()
+  // What each digest's record was just before its latest `Signed`, so a failed
+  // write can put it back rather than erase an earlier, still-true entry.
+  const beforeSigned = new Map<string, { readonly entry: JournalEntry | undefined; readonly signed: boolean }>()
   return {
     record: (entry) => {
+      if (entry._tag === "Signed") {
+        beforeSigned.set(entry.digest, { entry: latest.get(entry.digest), signed: signed.has(entry.digest) })
+        signed.add(entry.digest)
+      }
       latest.set(entry.digest, entry)
-      if (entry._tag === "Signed") signed.add(entry.digest)
     },
     forget: (digest) => {
-      latest.delete(digest)
-      signed.delete(digest)
+      const before = beforeSigned.get(digest)
+      beforeSigned.delete(digest)
+      if (before?.entry === undefined) latest.delete(digest)
+      else latest.set(digest, before.entry)
+      if (before?.signed === true) signed.add(digest)
+      else signed.delete(digest)
     },
     entries: () => [...latest.values()],
     signedHere: () => signed

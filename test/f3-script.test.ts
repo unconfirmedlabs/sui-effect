@@ -14,7 +14,8 @@ import { Config, ConfigProvider, DateTime, Effect, Layer, Schedule, Schema } fro
 import { JournalError, ObjectNotFound, SubmissionUnknown } from "../src/domain/errors.ts"
 import { JournalEntry } from "../src/domain/journal-entry.ts"
 import { Digest, ObjectId, Signature, SuiAddress } from "../src/domain/schemas.ts"
-import { Journal } from "../src/services/Journal.ts"
+import { Journal, type JournalService } from "../src/services/Journal.ts"
+import { makeRunRecord } from "../src/services/RunRecord.ts"
 import { exitCode, readNetwork, Script, ScriptReadOnly } from "../src/services/Script.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
 import { SubmitConfig } from "../src/services/SubmitConfig.ts"
@@ -315,5 +316,87 @@ describe("wallet#11, ext#19: diagnostics are one line per failure", () => {
     expect(result.lines.filter((line) => line.startsWith("entry: "))).toHaveLength(1)
     // The type is used, so the import is not dead weight.
     expect(SubmissionUnknown).toBeDefined()
+  })
+})
+
+describe("a failed Signed write restores what the run had recorded", () => {
+  const digest = Digest.make(fakeDigest(77))
+  const signedTx = {
+    digest,
+    bytes: new Uint8Array([1, 2, 3]),
+    signatures: [Signature.make("sig")],
+    sender: SuiAddress.make(signer.address)
+  }
+  const at = DateTime.makeUnsafe(0)
+  const signedEntry = JournalEntry.cases.Signed.make({ _tag: "Signed", digest, signed: signedTx, signedAt: at })
+  const unknownEntry = JournalEntry.cases.Unknown.make({
+    _tag: "Unknown",
+    digest,
+    signed: signedTx,
+    lastError: "timeout",
+    attempts: 1,
+    at
+  })
+  const executedEntry = JournalEntry.cases.Executed.make({ _tag: "Executed", digest, at })
+
+  test("makeRunRecord: forget restores the earlier entry and signedHere membership", () => {
+    const fresh = makeRunRecord()
+    fresh.record(signedEntry)
+    fresh.forget(digest)
+    expect(fresh.entries()).toEqual([])
+    expect(fresh.signedHere().has(digest)).toBe(false)
+
+    const unknown = makeRunRecord()
+    unknown.record(signedEntry)
+    unknown.record(unknownEntry)
+    unknown.record(signedEntry)
+    unknown.forget(digest)
+    expect(unknown.entries()).toEqual([unknownEntry])
+    expect(unknown.signedHere().has(digest)).toBe(true)
+
+    const executed = makeRunRecord()
+    executed.record(signedEntry)
+    executed.record(executedEntry)
+    executed.record(signedEntry)
+    executed.forget(digest)
+    expect(executed.entries()).toEqual([executedEntry])
+    expect(executed.signedHere().has(digest)).toBe(true)
+
+    // An entry recorded without this run's own Signed (a reconcile of a held
+    // digest) keeps signedHere as it was: not signed here.
+    const foreign = makeRunRecord()
+    foreign.record(unknownEntry)
+    foreign.record(signedEntry)
+    foreign.forget(digest)
+    expect(foreign.entries()).toEqual([unknownEntry])
+    expect(foreign.signedHere().has(digest)).toBe(false)
+  })
+
+  test("Script.run: a resubmit whose Signed write fails still reports the Unknown entry, exit 3", async () => {
+    const inner = Journal.makeMemoryUnsafe()
+    const signedWrites = new Map<string, number>()
+    const failing: JournalService = {
+      ...inner,
+      put: (entry) =>
+        Effect.suspend(() => {
+          if (entry._tag !== "Signed") return inner.put(entry)
+          const count = (signedWrites.get(entry.digest) ?? 0) + 1
+          signedWrites.set(entry.digest, count)
+          return count >= 2 ? Effect.fail(new JournalError({ cause: "the store is read-only" })) : inner.put(entry)
+        })
+    }
+    let unknownDigest: string | undefined
+    const program = Effect.gen(function*() {
+      const error = yield* Tx.run(transfer, { signer }).pipe(fastTimeout, Effect.flip)
+      if (error._tag !== "SubmissionUnknown") return yield* Effect.die(error)
+      unknownDigest = error.digest
+      return yield* Tx.resubmit(error).pipe(fastTimeout)
+    }).pipe(Effect.provide(Layer.succeed(Journal, failing)))
+    const result = await run(program, scriptLayer([FakeOutcome.timeoutThen(false)]))
+    expect(unknownDigest).toBeDefined()
+    expect(signedWrites.get(unknownDigest!)).toBe(2)
+    expect(result.printed).toContain("JournalError")
+    expect(result.printed).toContain(`unresolved ${unknownDigest} (Unknown)`)
+    expect(result.code).toBe(3)
   })
 })
