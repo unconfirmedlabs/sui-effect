@@ -347,7 +347,7 @@ The full entries follow under "API".
 - `SubmitViaError` — Everything `submitVia` can fail with, before the sender's own errors.
 - `SubmitViaReply` — What a third party answers when it has submitted your bytes.
 - `TransactionExpiration` — re-exported from `@unconfirmed/sui-effect`.
-- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 - `UNRESOLVED_TAGS` — The tags whose entries still need an answer from the network.
 - `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
 - `VerifyOptions` — The options both verifiers take.
@@ -3982,6 +3982,7 @@ declare const Tx: {
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
     readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
+    readonly resubmit: (input: SubmissionUnknown | Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly recorded: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never>;
     readonly run: (recipe: Transaction | Recipe, opts: {
         readonly signer: Signer;
@@ -4014,7 +4015,15 @@ declare const Tx: {
          */
         readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
     }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>;
-    readonly reconcileAll: () => Effect.Effect<readonly ({
+    readonly reconcileAll: (opts?: {
+        /**
+         * Re-send, as identical bytes, every entry that is still
+         * `SubmissionUnknown` after reconciling. Defaults to `false`.
+         *
+         * @since 0.4.0
+         */
+        readonly resubmit?: boolean;
+    } | undefined) => Effect.Effect<readonly ({
         readonly _tag: "ExecutionFailed";
         readonly error: ExecutionFailed;
     } | {
@@ -4032,7 +4041,8 @@ declare const Tx: {
 
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
 `Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`,
-`Tx.submitVia`, `Tx.reconcile`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+`Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
+`Tx.reconcileAll`.
 
 ### `UNRESOLVED_TAGS` (const)
 
@@ -4562,8 +4572,17 @@ applied and aborted. A transaction the node does not know is only ever
   (two seconds by default, through the `Clock`) — both must hold again. Any
   other order, or a single observation, is `SubmissionUnknown`. Set
   `SubmitConfig.expiryEvidence: "never"` to disable the rule entirely, which
-  is what a deployment behind a mixed-node load balancer wants. The residual
-  risk is a node whose transaction index lags its epoch view;
+  is what a deployment behind a mixed-node load balancer wants. **Positive
+  evidence vetoes it**: when a pinned object names this digest as its last
+  mutation the transaction applied, whatever `getTransaction` said, and the
+  answer is the receipt or `SubmissionUnknown` — never `expired`. **A miss
+  only counts on a node that still holds the window**: on gRPC the node's
+  `lowestAvailableCheckpoint` must be at or before the first checkpoint of
+  the window's `minEpoch`, or the answer is `SubmissionUnknown` naming the
+  pruning. Transports that do not report their history (JSON-RPC, GraphQL)
+  cannot be checked; behind a pruning node on those, set `expiryEvidence:
+  "never"`. The residual risk is a node whose transaction index lags its
+  epoch view;
 - `"inputConsumed"` when the transaction that last mutated a pinned object is
   a **different** one **and its own effects report `inputVersion` equal to
   the version these bytes pinned**, so those exact bytes can never execute
@@ -4596,12 +4615,26 @@ Given only a `Digest` there can be no evidence, so an unknown transaction is
 always `SubmissionUnknown`. Pass the `Signed` bytes (or the
 `SubmissionUnknown` that carries them) to get the evidence rules.
 
+**A terminal answer is journalled** — `Executed`, `Failed` or `NotApplied`
+replaces the entry — when the journal holds this digest unresolved. A digest
+the journal has never seen is not written, and `SubmissionUnknown` leaves the
+entry as it was. To re-send bytes that are still unknown, use
+`resubmit`.
+
 **Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`.**
 
 ### `reconcileAll` (const)
 
 ```ts
-declare const reconcileAll: () => Effect.Effect<readonly ({
+declare const reconcileAll: (opts?: {
+    /**
+     * Re-send, as identical bytes, every entry that is still
+     * `SubmissionUnknown` after reconciling. Defaults to `false`.
+     *
+     * @since 0.4.0
+     */
+    readonly resubmit?: boolean;
+} | undefined) => Effect.Effect<readonly ({
     readonly _tag: "ExecutionFailed";
     readonly error: ExecutionFailed;
 } | {
@@ -4632,6 +4665,14 @@ expiry rule, the chain-identity guard and the versioned consumer check — so a
 startup never reports a transaction that applied as `NotApplied`, and a
 recovery read that fails becomes that entry's `SubmissionUnknown` rather than
 escaping as a `TransportError` the taxonomy would call "not applied".
+
+**`{ resubmit: true }` re-sends what is still unknown.** An entry that
+reconciles to `SubmissionUnknown` is sent again as its identical signed
+bytes, exactly as `resubmit` sends them — not when its validity window
+has closed or it belongs to another chain — and settles to whatever that
+send answers. Without it, an entry with no owned inputs can only be
+`SubmissionUnknown` until its window closes, and a program that reconciles
+before sending anything new is stuck that long.
 
 The whole call fails only if the journal itself cannot be **read**: a write
 that fails after an entry has been settled is logged and the answer stands,
@@ -4821,6 +4862,21 @@ node can answer it yes. The journal entry is settled as `NotApplied
 That holds for the **first** send only: a refusal after a timeout or a
 retryable failure says nothing about the earlier send, which may have
 landed, so it reconciles like any other ambiguous failure.
+
+A validator quorum's **lock conflict** — `FAILED_PRECONDITION`, "already
+locked by a different transaction" — is reconciled too, and when that ends
+`SubmissionUnknown` it is reconciled up to three more times,
+`SubmitConfig.reconcileRecheck` apart, because the winner of the race is
+usually readable a moment later and its effects are the `inputConsumed`
+evidence. Every `SubmissionUnknown` that comes out of a send names what the
+last send said as well as what the reconcile found.
+
+**An answer is journalled before anything can interrupt it.** The execute
+attempts are interruptible; from the moment the node has answered to the
+moment the journal holds that answer, they are not. An interrupt during the
+visibility wait afterwards still wins — the caller asked for it — but the
+journal already says `Executed`, and a warning says so. An execute answer for
+a digest other than the submitted one is not trusted; it reconciles.
 
 `JournalError` can only come from the `Signed` write, before anything has
 been sent. Once the network has answered, a journal write that fails is
@@ -5667,6 +5723,7 @@ export type FakeOutcome = {
 } | {
     readonly _tag: "transportError";
     readonly status: string;
+    readonly message?: string;
 } | {
     readonly _tag: "notFound";
 } | {
@@ -5802,6 +5859,24 @@ export interface FakeScript {
      * `NotApplied { inputConsumed }` rule.
      */
     readonly transactions?: Readonly<Record<string, FakeOutcome>>;
+    /**
+     * The history the node still holds, served through `client.ledgerService`
+     * the way a gRPC node serves `GetServiceInfo.lowestAvailableCheckpoint` and
+     * `GetEpoch.firstCheckpoint`.
+     *
+     * `Tx.reconcile` reads it before it calls a `getTransaction` miss evidence
+     * of expiry: a node that has pruned into a transaction's validity window
+     * misses transactions that did apply. `firstCheckpoints` is keyed by epoch;
+     * an epoch it does not name answers `NOT_FOUND`, the way a node that pruned
+     * the epoch does. Unscripted, the client has no `ledgerService` at all, which
+     * is what a JSON-RPC or GraphQL transport looks like.
+     *
+     * @since 0.4.0
+     */
+    readonly ledger?: {
+        readonly lowestAvailableCheckpoint?: bigint;
+        readonly firstCheckpoints?: Readonly<Record<string, bigint>>;
+    };
 }
 ```
 
