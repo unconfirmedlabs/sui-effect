@@ -12,7 +12,7 @@ import type { BcsType } from "@mysten/bcs"
 import { parseStructTag } from "@mysten/sui/utils"
 import { Effect, Schema, SchemaAST, SchemaIssue, SchemaTransformation } from "effect"
 import { DecodeError, decodePayload } from "./errors.ts"
-import { normalizeStructTagSafe, type ObjectId } from "./schemas.ts"
+import { type DynamicFieldName, normalizeStructTagSafe, type ObjectId } from "./schemas.ts"
 
 const SUI_TYPE_ANNOTATION = "sui-effect/suiType"
 
@@ -30,8 +30,8 @@ const normalizeSafe = normalizeStructTagSafe
  * {@link typeMatches}).
  *
  * **`expectedType` is optional.** A Move *return value* has no struct tag —
- * `sui.view(recipe, bcs.Address())` reads a `vector<u8>` off a command result —
- * and inventing one so the bridge has something to compare is worse than saying
+ * `sui.view(recipe, bcs.Address)` reads an `address` (32 fixed bytes; `bcs.Address`
+ * is a value, not a function) off a command result — and inventing one so the bridge has something to compare is worse than saying
  * there is nothing to compare. A codec built without an expected type carries
  * none, so nothing checks a tag before it parses: the re-serialize length check
  * is still what rejects mis-shaped bytes. Give the type whenever the bytes come
@@ -327,3 +327,67 @@ export const decodeContent = <T>(
     )
   )
 }
+
+/**
+ * The key of a dynamic field, built from **one** description of it: the Move
+ * type and the BCS bytes that `getDynamicFieldOption`,
+ * `getDynamicObjectFieldOption` and the transaction builder all need, so the
+ * type string and the layout cannot drift apart.
+ *
+ * Two forms:
+ *
+ * - `name(codec, key)` takes a `SuiSchema.bcs(layout, type)` codec — the type
+ *   comes from the codec — and the key as the codec decodes it (a `u64` field
+ *   is a `string`).
+ * - `name(layout, type, key)` takes the `@mysten/bcs` layout and the Move type,
+ *   and the key in the layout's **input** form, so `{ index: 0 }` is fine for a
+ *   `u64` field. Use it for a primitive key (`name(bcs.u64(), "u64", 7)`).
+ *
+ * The type is normalized. Throws when the codec carries no Move type (it was
+ * not built with one) or when the key does not serialize — both are bugs in
+ * the calling code, not runtime conditions. Never fails otherwise.
+ *
+ * @since 0.4.0
+ *
+ * @example
+ * ```ts
+ * import { bcs } from "@mysten/sui/bcs"
+ * import { SuiSchema } from "@unconfirmed/sui-effect"
+ *
+ * const PostKey = bcs.struct("PostKey", { index: bcs.u64() })
+ * const key = SuiSchema.name(PostKey, `${pkg}::board::PostKey`, { index: 0 })
+ * const field = sui.getDynamicFieldOption(boardId, key, { schema: Post })
+ * ```
+ */
+export function name<T>(codec: Schema.Codec<T, Uint8Array>, key: T): DynamicFieldName
+export function name<T extends Input, Input>(
+  layout: BcsType<T, Input>,
+  type: string,
+  key: Input
+): DynamicFieldName
+export function name<T extends Input, Input>(
+  codecOrLayout: Schema.Codec<T, Uint8Array> | BcsType<T, Input>,
+  typeOrKey: string | T,
+  key?: Input
+): DynamicFieldName {
+  if (isLayout(codecOrLayout)) {
+    const type = typeOrKey as string
+    return {
+      type: normalizeSafe(type),
+      bcs: codecOrLayout.serialize(key as Input).toBytes()
+    }
+  }
+  const type = expectedTypeOf(codecOrLayout)
+  if (type === undefined) {
+    throw new Error(
+      "SuiSchema.name: the codec carries no Move type; build it with SuiSchema.bcs(layout, type) " +
+        "or use SuiSchema.name(layout, type, key)"
+    )
+  }
+  return { type, bcs: Schema.encodeSync(codecOrLayout)(typeOrKey as T) }
+}
+
+/** A `@mysten/bcs` layout, recognised structurally (see `Sui.view`). Never fails. */
+const isLayout = <T, I>(value: Schema.Codec<T, Uint8Array> | BcsType<T, I>): value is BcsType<T, I> =>
+  typeof (value as { readonly read?: unknown }).read === "function" &&
+  typeof (value as { readonly serialize?: unknown }).serialize === "function"

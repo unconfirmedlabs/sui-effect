@@ -1,8 +1,8 @@
 /**
  * The public face of the BCS bridge, namespaced the way the spec spells it:
  * `SuiSchema.bcs(bcsType, expectedType)`, `SuiSchema.decodeWith(bcsType,
- * expectedType, map)`, `SuiSchema.decode(codec, bytes)` and
- * `SuiSchema.matchesType(expected, actual)`.
+ * expectedType, map)`, `SuiSchema.decode(codec, bytes)`,
+ * `SuiSchema.matchesType(expected, actual)` and `SuiSchema.name(codec, key)`.
  *
  * The rest of `domain/bcs.ts` (`expectedTypeOf`) is machinery `Sui` uses and
  * lives in `sui-effect/internal`.
@@ -13,5 +13,6 @@ export {
   bcs,
   decodeContent as decode,
   decodeWith,
+  name,
   typeMatches as matchesType
 } from "./bcs.ts"

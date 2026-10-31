@@ -243,10 +243,11 @@ The full entries follow under "API".
 - `CleverError` — A decoded `#[error]` constant.
 - `Coin` — A coin object.
 - `CoinMetadata` — The metadata of a coin type.
-- `CoinType` — A coin type: a struct tag used as the type argument of `0x2::coin::Coin`.
+- `CoinType` — A coin type in normalized form: the schema, plus `CoinType.normalize` for any spelling and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
 - `CommandResult` — The return values and mutated references of one command.
 - `DecodeError` — BCS content or a schema boundary did not decode.
 - `DecodeKind` — Which of the three things that can go wrong at a decode boundary went wrong.
+- `DecodedDynamicField` — `DynamicField` with its value decoded: what `getDynamicFieldOption` answers when it is given a `schema`.
 - `DescribeOptions` — What `describe` may be told.
 - `Digest` — A base58 transaction digest.
 - `DynamicField` — A dynamic field with its value.
@@ -267,7 +268,9 @@ The full entries follow under "API".
 - `JournalError` — The submission journal could not be read or written.
 - `KNOWN_CHAIN_IDS` — The genesis checkpoint digest of each public network whose chain identifier is fixed and known.
 - `KnownNetwork` — The four networks with a built-in default gRPC endpoint.
+- `ListOptions` — Where a ledger listing starts and which way it reads.
 - `ListOrder` — The ledger order a listing is read in.
+- `ListPage` — One page of a ledger listing (`streamEventPages`, `streamTransactionPages`, `tailEventPages`, `tailTransactionPages`): its items, and the cursor to resume from once they are processed.
 - `Mist` — An amount in MIST.
 - `MoveAbortInfo` — A Move abort, read off a `SimulationFailed` or an `ExecutionFailed` into the fields a caller matches on.
 - `MoveAbortMatch` — What `isMoveAbort` matches on.
@@ -279,7 +282,7 @@ The full entries follow under "API".
 - `NotAppliedEvidence` — Why a transaction provably never applied, and never will.
 - `ObjectDeleted` — The object existed and has been deleted or wrapped.
 - `ObjectEnvelope` — The fixed set of object fields sui-effect always requests: `content`, plus the owner, type, version and digest the SDK returns unconditionally.
-- `ObjectId` — A 32-byte Sui object id in the padded lowercase `0x` form: the schema, plus `ObjectId.normalize` for a shorthand spelling such as `"0x6"`.
+- `ObjectId` — A 32-byte Sui object id in the padded lowercase `0x` form: the schema (which pads on decode), plus `ObjectId.normalize` for a shorthand spelling such as `"0x6"` and `ObjectId.Strict` for user input.
 - `ObjectLookupError` — The failures of an object lookup.
 - `ObjectNotFound` — The object does not exist, or has never existed.
 - `ObjectRef` — Everything the transaction builder needs to consume an object again, plus the type and owner so a caller can tell a shared object from an owned one.
@@ -292,26 +295,29 @@ The full entries follow under "API".
 - `Published` — What `Executed.expectPublished` answers: the package id, the package's own changed ref, and the `UpgradeCap` that governs it.
 - `Recipe` — A synchronous transaction draft.
 - `SdkObjectRef` — The SDK's own object reference shape, as `Transaction#objectRef` takes it.
+- `ServiceInfo` — What a node says about itself: the chain, where its ledger head is, and — the part a reconciler or an indexer needs — how far back its history reaches.
 - `Signature` — A serialized signature, as every SDK signer returns it: the base64 of the flag, signature and public key bytes.
 - `SignedTransaction` — The signed bytes of a transaction, kept so an uncertain submission can be reconciled or re-submitted later without rebuilding.
 - `SigningError` — A signer refused or failed to produce a signature.
 - `Simulation` — The result of a successful simulation, with the fixed include set `Sui` asks for: effects, events, balance changes, object types and command results.
 - `SimulationFailed` — Simulation reported an execution failure.
 - `SimulationLookupError` — The failures of a simulation.
-- `StructTag` — A fully qualified Move struct tag, normalized with `normalizeStructTag` on decode so `0x2::sui::SUI` and its padded form compare equal.
+- `StructTag` — A fully qualified Move struct tag in normalized form: the schema, plus `StructTag.normalize` for any spelling.
 - `SubmissionUnknown` — Bytes may have reached the network and the outcome is unknown.
 - `Sui` — The opinionated tier.
-- `SuiAddress` — A 32-byte Sui account address in the padded lowercase `0x` form: the schema, plus `SuiAddress.normalize` for a shorthand spelling such as `"0x2"`.
+- `SuiAddress` — A 32-byte Sui account address in the padded lowercase `0x` form: the schema (which pads on decode), plus `SuiAddress.normalize` for a shorthand spelling such as `"0x2"` and `SuiAddress.Strict` for user input.
 - `SuiCore` — The mechanical tier over `@mysten/sui`.
 - `SuiCoreError` — Every failure `mapSdkError` can produce.
+- `SuiCoreReadOptions` — How the read tier behaves: the per-attempt request timeout and the retry schedule.
 - `SuiCoreService` — The mechanical tier: one member per `SuiClientTypes.TransportMethods` key, plus the four concrete conveniences `CoreClient` adds and the `use` hatch.
 - `SuiError` — Every failure sui-effect can produce.
 - `SuiGraphQL` — The SDK's GraphQL client as a service, so an extension can require it without constructing one.
-- `SuiGrpcLayerOptions` — Options for `SuiCore.layerGrpc`, mirroring `SuiGrpcClientOptions`.
+- `SuiGrpcLayerOptions` — Options for `SuiCore.layerGrpc`: `SuiGrpcClientOptions`, plus the read tier's `SuiCoreReadOptions`.
 - `SuiLayerOptions` — Options for `Sui.layerNoDepsWith`.
 - `SuiObject` — An object read through `Sui`, with its BCS content already decoded to `S` and a `ref` ready to feed straight back into the transaction builder.
 - `SuiSchema` — a namespace; its members are listed under it below.
 - `SuiService` — The opinionated tier over `SuiCore`.
+- `TailOptions` — Where a tail starts and how often it asks once it has caught up.
 - `TransactionEffects` — Transaction effects.
 - `TransactionExpiration` — When a transaction stops being valid.
 - `TransactionFilter` — A filter on transactions: exactly one of `sender` or `function`.
@@ -674,7 +680,7 @@ The full entries follow under "API".
 ## `@unconfirmed/sui-effect`
 
 
-95 exported symbols.
+101 exported symbols.
 
 ### `Balance` (const)
 
@@ -927,7 +933,8 @@ declare const CoinType: Schema
 // decodes to: CoinType
 ```
 
-A coin type: a struct tag used as the type argument of `0x2::coin::Coin`.
+A coin type in normalized form: the schema, plus `CoinType.normalize` for any
+spelling and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
 
 ### `CommandResult` (const)
 
@@ -979,6 +986,18 @@ Which of the three things that can go wrong at a decode boundary went wrong.
 Branch on this, never on `DecodeError`'s `issue`: `issue` is a human
 sentence and its wording changes between releases.
 
+### `DecodedDynamicField` (interface)
+
+```ts
+export interface DecodedDynamicField<S> extends DynamicField {
+    readonly content: S;
+}
+```
+
+`DynamicField` with its value decoded: what `getDynamicFieldOption`
+answers when it is given a `schema`. `content` is the decoded value; the
+raw bytes stay on `value.bcs`.
+
 ### `DescribeOptions` (interface)
 
 ```ts
@@ -1001,7 +1020,12 @@ declare const Digest: Schema
 // decodes to: Digest
 ```
 
-A base58 transaction digest. Not normalized; rejected when not 32 bytes.
+A base58 transaction digest. Not normalized — a digest has one spelling —
+and rejected when it is not 32 bytes.
+
+`Digest.make(value)` brands a value already known to be a digest (it
+validates and throws); `Schema.decodeUnknownEffect(Digest)` is for one from
+outside. There is no `normalize`, because there is nothing to normalize.
 
 ### `DynamicField` (const)
 
@@ -1180,8 +1204,12 @@ export declare class Executed extends Executed_base {
      * Never fails.
      */
     packagesPublished(): ReadonlyArray<ChangedRef>;
-    /** The net balance change for one address and coin type, in MIST. Never fails. */
-    balanceChange(address: SuiAddress, coinType: CoinType): bigint;
+    /**
+     * The net balance change for one address and coin type, in the coin's base
+     * unit (MIST for SUI). `coinType` is any spelling — `"0x2::sui::SUI"`,
+     * `CoinType.SUI` — compared under the one Move type rule. Never fails.
+     */
+    balanceChange(address: SuiAddress, coinType: CoinType | string): bigint;
     /** Computation plus storage less the storage rebate, in MIST. Can be negative. Never fails. */
     get gasUsedTotal(): bigint;
     /**
@@ -1570,6 +1598,23 @@ declare const KnownNetwork: Schema
 
 The four networks with a built-in default gRPC endpoint.
 
+### `ListOptions` (interface)
+
+```ts
+export interface ListOptions {
+    readonly order?: ListOrder;
+    /** Resume an ascending read strictly after this cursor; `null` is the start. */
+    readonly after?: string | null;
+    /** Resume a descending read strictly before this cursor; `null` is the newest. */
+    readonly before?: string | null;
+}
+```
+
+Where a ledger listing starts and which way it reads. The SDK's own
+pagination options, under its own names: `after` resumes an ascending read
+strictly after a cursor (a `ListPage.endCursor` you committed), `before` a
+descending one; `before` implies `order: "descending"`. Give at most one.
+
 ### `ListOrder` (type)
 
 ```ts
@@ -1577,6 +1622,29 @@ export type ListOrder = "ascending" | "descending";
 ```
 
 The ledger order a listing is read in. Mirrors the SDK's `order` option.
+
+### `ListPage` (interface)
+
+```ts
+export interface ListPage<A> {
+    readonly items: ReadonlyArray<A>;
+    /** Where to resume: pass as `after` (or `before` when descending). `null` only before any position is known. */
+    readonly endCursor: string | null;
+    /** Whether the node said there was more after this page. */
+    readonly hasNextPage: boolean;
+}
+```
+
+One page of a ledger listing (`streamEventPages`, `streamTransactionPages`,
+`tailEventPages`, `tailTransactionPages`): its items, and the cursor to
+resume from once they are processed.
+
+Commit `endCursor` **with** the items — in the same database transaction —
+and a restarted reader that passes it back as `after` (`before` for a
+descending read) neither skips nor repeats a page. Unlike the SDK's own
+`endCursor`, it is never `null` once there is a position to resume from: an
+empty page keeps the cursor it was read from, and a tail that has caught up
+on a filtered listing moves it to the ledger head (see `tailEvents`).
 
 ### `Mist` (const)
 
@@ -1780,8 +1848,9 @@ declare const ObjectId: Schema
 // decodes to: ObjectId
 ```
 
-A 32-byte Sui object id in the padded lowercase `0x` form: the schema, plus
-`ObjectId.normalize` for a shorthand spelling such as `"0x6"`.
+A 32-byte Sui object id in the padded lowercase `0x` form: the schema (which
+pads on decode), plus `ObjectId.normalize` for a shorthand spelling such as
+`"0x6"` and `ObjectId.Strict` for user input.
 
 ### `ObjectLookupError` (type)
 
@@ -1974,6 +2043,38 @@ export interface SdkObjectRef {
 ```
 
 The SDK's own object reference shape, as `Transaction#objectRef` takes it.
+
+### `ServiceInfo` (interface)
+
+```ts
+export interface ServiceInfo {
+    /** The chain identifier (genesis checkpoint digest). */
+    readonly chainId?: string;
+    /** The chain's human name (`mainnet`, `testnet`, …). */
+    readonly chain?: string;
+    /** The current epoch. */
+    readonly epoch?: bigint;
+    /** The latest checkpoint the node has executed. */
+    readonly checkpointHeight?: bigint;
+    /** That checkpoint's timestamp, in milliseconds since the epoch. */
+    readonly timestampMs?: number;
+    /**
+     * The oldest checkpoint whose data (transactions, events) the node still
+     * serves. A pruning node moves this forward: a transaction older than it
+     * answers `NOT_FOUND`, and a cursor older than it answers `OUT_OF_RANGE`.
+     */
+    readonly lowestAvailableCheckpoint?: bigint;
+    /** The oldest checkpoint whose object versions the node still serves. */
+    readonly lowestAvailableCheckpointObjects?: bigint;
+    /** The node's software version. */
+    readonly server?: string;
+}
+```
+
+What a node says about itself: the chain, where its ledger head is, and — the
+part a reconciler or an indexer needs — how far back its history reaches.
+Mirrors gRPC `LedgerService.GetServiceInfo`; every field is optional because
+the proto's are.
 
 ### `Signature` (const)
 
@@ -2336,8 +2437,8 @@ declare const StructTag: Schema
 // decodes to: StructTag
 ```
 
-A fully qualified Move struct tag, normalized with `normalizeStructTag` on
-decode so `0x2::sui::SUI` and its padded form compare equal.
+A fully qualified Move struct tag in normalized form: the schema, plus
+`StructTag.normalize` for any spelling.
 
 ### `SubmissionUnknown` (class)
 
@@ -2415,23 +2516,30 @@ declare const SuiAddress: Schema
 // decodes to: SuiAddress
 ```
 
-A 32-byte Sui account address in the padded lowercase `0x` form: the schema,
-plus `SuiAddress.normalize` for a shorthand spelling such as `"0x2"`.
+A 32-byte Sui account address in the padded lowercase `0x` form: the schema
+(which pads on decode), plus `SuiAddress.normalize` for a shorthand spelling
+such as `"0x2"` and `SuiAddress.Strict` for user input.
 
 ### `SuiCore` (class)
 
 ```ts
 export declare class SuiCore extends SuiCore_base {
-    /** Wraps a client the caller already built and configured. Never fails. */
-    static readonly layerFromClient: (client: ClientWithCoreApi) => Layer.Layer<SuiCore>;
+    /**
+     * Wraps a client the caller already built and configured; `options` sets the
+     * read tier's request timeout and retry schedule. Never fails.
+     */
+    static readonly layerFromClient: (client: ClientWithCoreApi, options?: SuiCoreReadOptions) => Layer.Layer<SuiCore>;
     /** Builds a `SuiGrpcClient` and wraps it. Never fails. */
     static readonly layerGrpc: (options: SuiGrpcLayerOptions) => Layer.Layer<SuiCore>;
     /**
-     * Reads `SUI_NETWORK` (required, no default) and `SUI_RPC_URL` (optional,
-     * defaulted from `defaultGrpcUrl` for the four known networks).
+     * Reads `SUI_NETWORK` (required, no default), `SUI_RPC_URL` (optional,
+     * defaulted from `defaultGrpcUrl` for the four known networks) and
+     * `SUI_RPC_TIMEOUT` (optional, a duration such as `30 seconds` or
+     * `Infinity`; the per-attempt `requestTimeout`, thirty seconds when unset).
      *
-     * Fails with: `ConfigError` (the layer) when `SUI_NETWORK` is missing, or
-     * when it names a network with no built-in URL and `SUI_RPC_URL` is not set.
+     * Fails with: `ConfigError` (the layer) when `SUI_NETWORK` is missing, when
+     * it names a network with no built-in URL and `SUI_RPC_URL` is not set, or
+     * when `SUI_RPC_TIMEOUT` is not a duration.
      */
     static readonly layerConfig: Layer.Layer<SuiCore, Config.ConfigError>;
 }
@@ -2446,6 +2554,41 @@ export type SuiCoreError = TransportError | ObjectNotFound | ObjectDeleted | Obj
 ```
 
 Every failure `mapSdkError` can produce.
+
+### `SuiCoreReadOptions` (interface)
+
+```ts
+export interface SuiCoreReadOptions {
+    /**
+     * How long **one attempt** of a read may take before it is abandoned — its
+     * request cancelled through the `AbortSignal` — and counted as a retryable
+     * `TransportError { status: "DEADLINE_EXCEEDED" }`, which the retry policy
+     * then retries like any other. Defaults to thirty seconds; `"Infinity"`
+     * turns it off.
+     *
+     * This is what stops a node that accepts the connection and never answers
+     * from hanging a program forever, the layer's own `getChainIdentifier`
+     * included. It is not the gRPC client's `timeout`, which only sets a
+     * `grpc-timeout` header the server may ignore. It does not apply to
+     * `executeTransaction` and `signAndExecuteTransaction` (`Tx.submit` has its
+     * own `SubmitConfig.executeTimeout`), `waitForTransaction` (which takes its
+     * own `timeout`) or `use`.
+     */
+    readonly requestTimeout?: Duration.Input;
+    /**
+     * The schedule a read is retried on, replacing the default (jittered
+     * exponential from 250 ms, capped at 10 s, five attempts in all). It sees
+     * every failure but is only consulted while the failure is a retryable
+     * `TransportError`; it decides the delays and when to stop, so give it a
+     * limit (`Schedule.recurs`, `Schedule.during`) unless retrying forever is
+     * meant.
+     */
+    readonly readRetry?: Schedule.Schedule<unknown, unknown>;
+}
+```
+
+How the read tier behaves: the per-attempt request timeout and the retry
+schedule. Every field is optional; the defaults are the spec's.
 
 ### `SuiCoreService` (interface)
 
@@ -2507,6 +2650,19 @@ export interface SuiCoreService {
         readonly objectId: string;
         readonly version: string | bigint;
     }) => Effect.Effect<VersionedObject, TransportError>;
+    /**
+     * What the node says about itself, including the lowest checkpoint it still
+     * serves — which is how a caller tells a pruned history from a missing
+     * transaction. Not a `TransportMethods` member: it reaches gRPC
+     * `LedgerService.GetServiceInfo` directly (or a client's own
+     * `getServiceInfo`, which is how a test double provides it).
+     *
+     * Fails with: `TransportError` — `status: "UNIMPLEMENTED"`, not retryable,
+     * on a transport that has no such call.
+     *
+     * @since 0.4.0
+     */
+    readonly getServiceInfo: () => Effect.Effect<ServiceInfo, TransportError>;
     /** Polls until a digest is visible. Fails with: `TransactionNotFound`, `TransportError`. */
     readonly waitForTransaction: <Include extends TransactionInclude = {}>(options: SuiClientTypes.WaitForTransactionOptions<Include>) => Effect.Effect<SuiClientTypes.TransactionResult<Include>, TransactionLookupError>;
     /** Simulates a transaction. Fails with: `SimulationFailed`, `TransportError`. */
@@ -2650,15 +2806,21 @@ other tag here.
 ### `SuiGrpcLayerOptions` (interface)
 
 ```ts
-export interface SuiGrpcLayerOptions {
+export interface SuiGrpcLayerOptions extends SuiCoreReadOptions {
     readonly network: SuiClientTypes.Network;
     readonly baseUrl: string;
+    /**
+     * The SDK's own `timeout`, in milliseconds: a `grpc-timeout` header on each
+     * call, which a server is free to ignore. To bound how long a read can
+     * actually take, use `requestTimeout`.
+     */
     readonly timeout?: number;
     readonly mvr?: SuiClientTypes.MvrOptions;
 }
 ```
 
-Options for `SuiCore.layerGrpc`, mirroring `SuiGrpcClientOptions`.
+Options for `SuiCore.layerGrpc`: `SuiGrpcClientOptions`, plus the read
+tier's `SuiCoreReadOptions`.
 
 ### `SuiLayerOptions` (interface)
 
@@ -2735,8 +2897,8 @@ with no type arguments matches every instantiation of it (see
 `typeMatches`).
 
 **`expectedType` is optional.** A Move *return value* has no struct tag —
-`sui.view(recipe, bcs.Address())` reads a `vector<u8>` off a command result —
-and inventing one so the bridge has something to compare is worse than saying
+`sui.view(recipe, bcs.Address)` reads an `address` (32 fixed bytes; `bcs.Address`
+is a value, not a function) off a command result — and inventing one so the bridge has something to compare is worse than saying
 there is nothing to compare. A codec built without an expected type carries
 none, so nothing checks a tag before it parses: the re-serialize length check
 is still what rejects mis-shaped bytes. Give the type whenever the bytes come
@@ -2801,6 +2963,32 @@ one silently is worse than saying so. Encode with the layout itself when you
 need bytes back.
 
 **Fails with: `DecodeError` (through the schema), when the bytes do not parse or `map` throws.**
+
+#### `name` (function)
+
+```ts
+export declare function name<T>(codec: Schema.Codec<T, Uint8Array>, key: T): DynamicFieldName;
+```
+
+The key of a dynamic field, built from **one** description of it: the Move
+type and the BCS bytes that `getDynamicFieldOption`,
+`getDynamicObjectFieldOption` and the transaction builder all need, so the
+type string and the layout cannot drift apart.
+
+Two forms:
+
+- `name(codec, key)` takes a `SuiSchema.bcs(layout, type)` codec — the type
+  comes from the codec — and the key as the codec decodes it (a `u64` field
+  is a `string`).
+- `name(layout, type, key)` takes the `@mysten/bcs` layout and the Move type,
+  and the key in the layout's **input** form, so `{ index: 0 }` is fine for a
+  `u64` field. Use it for a primitive key (`name(bcs.u64(), "u64", 7)`).
+
+The type is normalized. Throws when the codec carries no Move type (it was
+not built with one) or when the key does not serialize — both are bugs in
+the calling code, not runtime conditions.
+
+**Never fails otherwise.**
 
 #### `matchesType` (const)
 
@@ -2873,6 +3061,10 @@ export interface SuiService {
      * written as overloads, not `Effect.fn`, because `Effect.fn` cannot express
      * an overload set; the implementations are `Effect.fn` and carry the span.
      *
+     * A Move **package** is an object too, with `type: "package"` and no Move
+     * content: its `content` is an empty `Uint8Array` (the node sends none), and
+     * a `schema` read of one fails the type check.
+     *
      * Fails with: `ObjectNotFound`, `ObjectDeleted`, `ObjectUnavailable`,
      * `DecodeError`, `TransportError`.
      */
@@ -2944,8 +3136,13 @@ export interface SuiService {
             readonly expectedType?: string;
         }): Effect.Effect<ReadonlyArray<SuiObject<Uint8Array>>, BatchItemError | TransportError>;
     };
-    /** The balance of one coin type for one owner. Fails with: `TransportError`. */
-    readonly getBalance: (owner: SuiAddress, coinType?: CoinType) => Effect.Effect<Balance, TransportError>;
+    /**
+     * The balance of one coin type for one owner; `coinType` defaults to SUI.
+     *
+     * `coinType` is any spelling — a plain `"0x2::sui::SUI"` is fine — and is
+     * normalized by the SDK. Fails with: `TransportError`.
+     */
+    readonly getBalance: (owner: SuiAddress, coinType?: CoinType | string) => Effect.Effect<Balance, TransportError>;
     /**
      * Every balance an owner holds, one per coin type, paginated.
      *
@@ -2957,25 +3154,28 @@ export interface SuiService {
     /**
      * Every coin object of one coin type an owner holds, paginated. `coinType`
      * defaults to SUI, the way the SDK's `listCoins` does; it is the coin type,
-     * not the `0x2::coin::Coin<…>` object type.
+     * not the `0x2::coin::Coin<…>` object type, in any spelling (the SDK
+     * normalizes it).
      *
      * Fails with: `TransportError`.
      *
      * @since 0.4.0
      */
-    readonly streamCoins: (owner: SuiAddress, coinType?: CoinType) => Stream.Stream<Coin, TransportError>;
+    readonly streamCoins: (owner: SuiAddress, coinType?: CoinType | string) => Stream.Stream<Coin, TransportError>;
     /**
      * The metadata of a coin type; `None` when the coin type has no metadata
-     * object, which is what the node answers for it.
+     * object, which is what the node answers for it. `coinType` is any spelling;
+     * the SDK normalizes it.
      *
      * Fails with: `TransportError`.
      *
      * @since 0.4.0
      */
-    readonly getCoinMetadataOption: (coinType: CoinType) => Effect.Effect<Option.Option<CoinMetadata>, TransportError>;
+    readonly getCoinMetadataOption: (coinType: CoinType | string) => Effect.Effect<Option.Option<CoinMetadata>, TransportError>;
     /**
      * The address a SuiNS name points at; `None` when the name resolves to
-     * nothing.
+     * nothing, and when the node has no SuiNS for this network (`UNIMPLEMENTED`,
+     * which is what a localnet answers).
      *
      * Fails with: `TransportError`.
      *
@@ -2988,7 +3188,8 @@ export interface SuiService {
      * From `@mysten/sui` 2.33.2 the node's "no name" is an answer
      * (`{ data: { name: null } }`); before it, the gRPC transport threw
      * `NOT_FOUND`. Both are `None` here, so the answer does not depend on the SDK
-     * version.
+     * version. A node with no SuiNS for this network (`UNIMPLEMENTED`, which is
+     * what a localnet answers) is `None` too.
      *
      * Fails with: `TransportError`.
      *
@@ -2998,9 +3199,26 @@ export interface SuiService {
     /**
      * Reads one dynamic field; absence is `None`.
      *
-     * Fails with: `TransportError`.
+     * `name` is the key — its Move type and BCS bytes; `SuiSchema.name(codec,
+     * key)` builds one from the same codec that describes the key. With
+     * `opts.schema` the value is decoded too, onto `content`, after its type
+     * (`valueType`) is checked against `opts.expectedType` or the type the codec
+     * records — the same check `getObject` does, so a forgotten `actualType`
+     * cannot skip it. Written as an overload set for the same reason `getObject`
+     * is; the implementation is `Effect.fn`.
+     *
+     * Fails with: `DecodeError` (only with a `schema`), `TransportError`.
      */
-    readonly getDynamicFieldOption: (parent: ObjectId, name: DynamicFieldName) => Effect.Effect<Option.Option<DynamicField>, TransportError>;
+    readonly getDynamicFieldOption: {
+        <S>(parent: ObjectId, name: DynamicFieldName, opts: {
+            readonly schema: Schema.Codec<S, Uint8Array>;
+            readonly expectedType?: string;
+        }): Effect.Effect<Option.Option<DecodedDynamicField<S>>, DecodeError | TransportError>;
+        (parent: ObjectId, name: DynamicFieldName, opts?: {
+            readonly schema?: undefined;
+            readonly expectedType?: string;
+        }): Effect.Effect<Option.Option<DynamicField>, TransportError>;
+    };
     /**
      * Reads the object stored under a dynamic **object** field
      * (`0x2::dynamic_object_field`), decoding its content with `opts.schema`
@@ -3053,9 +3271,9 @@ export interface SuiService {
      * and decodes return value `result` (default 0) of command `command`
      * (default the last command).
      *
-     * The codec may be a bare `@mysten/bcs` `BcsType` — `bcs.Address()`,
-     * `bcs.vector(bcs.u64())` — because a Move **return value** has no struct tag
-     * to check it against. A `SuiSchema.bcs` codec works too, and so does one
+     * The codec may be a bare `@mysten/bcs` `BcsType` — `bcs.Address` (a value,
+     * 32 fixed bytes), `bcs.u64()`, `bcs.vector(bcs.u64())` — because a Move
+     * **return value** has no struct tag to check it against. A `SuiSchema.bcs` codec works too, and so does one
      * composed with `Schema.decodeTo(DomainClass, …)`; no type tag is compared
      * either way.
      *
@@ -3071,9 +3289,13 @@ export interface SuiService {
         readonly result?: number;
         readonly sender?: SuiAddress;
     }) => Effect.Effect<S, SimulationFailed | BuildError | DecodeError | TransportError>;
-    /** Every object an address owns, paginated. Fails with: `TransportError`. */
+    /**
+     * Every object an address owns, paginated; `opts.type` filters by Move type
+     * in any spelling (a bare generic such as `0x2::coin::Coin` matches every
+     * instantiation). Fails with: `TransportError`.
+     */
     readonly streamOwnedObjects: (owner: SuiAddress, opts?: {
-        readonly type?: StructTag;
+        readonly type?: StructTag | string;
     }) => Stream.Stream<SuiObject<Uint8Array>, TransportError>;
     /**
      * Every dynamic field of a parent, paginated.
@@ -3097,24 +3319,71 @@ export interface SuiService {
      *
      * `filter` is the SDK's `EventFilter`: exactly one of `sender`,
      * `emitModule` (`package::module`) or `eventType` (a module, or a full type;
-     * a bare generic matches every instantiation on gRPC and GraphQL). Decode an
+     * a bare generic matches every instantiation on gRPC and GraphQL). A full
+     * `eventType` is normalized here, because gRPC refuses an unpadded address
+     * in one. Decode an
      * event's payload with `SuiSchema.decode(codec, entry.bcs, { actualType:
      * entry.eventType })`. The stream follows `hasNextPage`, not the item count,
-     * so a scan-limited server's empty pages do not end it early.
+     * so a scan-limited server's empty pages do not end it early, and it **ends**
+     * once it has caught up — `tailEvents` is the one that follows the chain.
+     * `opts.after` / `opts.before` resume from a committed cursor; to commit one,
+     * read `streamEventPages` instead, which carries it.
+     *
+     * A malformed filter is a defect carrying the SDK's sentence, not a
+     * `TransportError`. Fails with: `TransportError` (an `OUT_OF_RANGE` status
+     * means the node has pruned the history the cursor points into).
+     *
+     * @since 0.4.0
+     */
+    readonly streamEvents: (filter?: EventFilter, opts?: ListOptions) => Stream.Stream<EventEntry, TransportError>;
+    /**
+     * `streamEvents` a page at a time, each page carrying the cursor to resume
+     * from: commit `page.endCursor` with the page's items and pass it back as
+     * `after`.
      *
      * Fails with: `TransportError`.
      *
      * @since 0.4.0
      */
-    readonly streamEvents: (filter?: EventFilter, opts?: {
-        readonly order?: ListOrder;
-    }) => Stream.Stream<EventEntry, TransportError>;
+    readonly streamEventPages: (filter?: EventFilter, opts?: ListOptions) => Stream.Stream<ListPage<EventEntry>, TransportError>;
+    /**
+     * Every event matching `filter`, oldest first, **without end**: once caught
+     * up it waits `opts.poll` (one second) and asks again from its last cursor.
+     *
+     * It survives a node restart: a retryable `TransportError` is retried every
+     * `poll` from the last cursor, logged at warning level. On a filtered tail it
+     * also keeps its cursor near the ledger head while nothing matches (see
+     * `ListPage`), so a pruning node does not prune past it. `Stream.retry` on
+     * the result starts again from `opts.after`, not from where it stopped: for a
+     * restartable indexer use `tailEventPages` and commit each page's
+     * `endCursor`.
+     *
+     * Fails with: `TransportError`, only when it is not retryable (a cursor the
+     * node has pruned past answers `OUT_OF_RANGE`).
+     *
+     * @since 0.4.0
+     */
+    readonly tailEvents: (filter?: EventFilter, opts?: TailOptions) => Stream.Stream<EventEntry, TransportError>;
+    /**
+     * `tailEvents` a page at a time, each page carrying the cursor to resume
+     * from. A caught-up filtered tail emits an **empty** page whenever it moves
+     * its cursor to the ledger head, so that position can be committed too.
+     *
+     * Fails with: `TransportError`, only when it is not retryable.
+     *
+     * @since 0.4.0
+     */
+    readonly tailEventPages: (filter?: EventFilter, opts?: TailOptions) => Stream.Stream<ListPage<EventEntry>, TransportError>;
     /**
      * Every transaction matching `filter` (all transactions when omitted),
      * paginated in ledger order, oldest first unless `{ order: "descending" }`.
      *
      * `filter` is the SDK's `TransactionFilter`: exactly one of `sender` or
-     * `function` (`package`, `package::module` or `package::module::function`).
+     * `function`. **A function filter must be fully qualified**
+     * (`package::module::function`): the SDK cannot continue a `package` or
+     * `package::module` filter past its first page, so this refuses one up front,
+     * as a defect, rather than failing after fifty transactions. (For a single
+     * page of a module filter, call `sui.core.listTransactions` directly.)
      * Each transaction is read with the execute include set and decoded to an
      * `Executed`. A transaction that applied and **failed** is an ordinary
      * entry in a history, so it is a `Result` failure carrying the
@@ -3125,9 +3394,35 @@ export interface SuiService {
      *
      * @since 0.4.0
      */
-    readonly streamTransactions: (filter?: TransactionFilter, opts?: {
-        readonly order?: ListOrder;
-    }) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
+    readonly streamTransactions: (filter?: TransactionFilter, opts?: ListOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
+    /**
+     * `streamTransactions` a page at a time, each page carrying the cursor to
+     * resume from (see `streamEventPages`).
+     *
+     * Fails with: `TransportError`.
+     *
+     * @since 0.4.0
+     */
+    readonly streamTransactionPages: (filter?: TransactionFilter, opts?: ListOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
+    /**
+     * Every transaction matching `filter`, oldest first, without end — the
+     * transaction twin of `tailEvents`, with the same polling, retry and
+     * filtered-cursor behaviour, and `streamTransactions`' rule for function
+     * filters.
+     *
+     * Fails with: `TransportError`, only when it is not retryable.
+     *
+     * @since 0.4.0
+     */
+    readonly tailTransactions: (filter?: TransactionFilter, opts?: TailOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
+    /**
+     * `tailTransactions` a page at a time (see `tailEventPages`).
+     *
+     * Fails with: `TransportError`, only when it is not retryable.
+     *
+     * @since 0.4.0
+     */
+    readonly tailTransactionPages: (filter?: TransactionFilter, opts?: TailOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
     /**
      * Serializes work for one sender, so two transactions from the same address
      * cannot pick the same gas coin. Adds no failures of its own.
@@ -3137,6 +3432,23 @@ export interface SuiService {
 ```
 
 The opinionated tier over `SuiCore`.
+
+### `TailOptions` (interface)
+
+```ts
+export interface TailOptions {
+    /** Resume strictly after this cursor (a committed `ListPage.endCursor`); `null` is the start. */
+    readonly after?: string | null;
+    readonly poll?: Duration.Input;
+}
+```
+
+Where a tail starts and how often it asks once it has caught up.
+
+`after` is a cursor to resume strictly after — a `ListPage.endCursor` the
+caller committed — and, omitted, the tail starts at the beginning of the
+history the node serves. `poll` is the wait between requests while there is
+nothing new, one second unless given.
 
 ### `TransactionEffects` (const)
 
