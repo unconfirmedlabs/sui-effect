@@ -69,7 +69,8 @@ export interface SubmitConfigService {
   /**
    * The largest gas budget `Tx.build` will accept. The budget itself is chosen
    * by the node's simulation during build; this is the ceiling above which
-   * building fails with `BuildError` rather than signing an expensive mistake.
+   * building fails with `PolicyDenied { rule: "maxGasBudget" }` rather than
+   * signing an expensive mistake.
    */
   readonly maxGasBudget: Mist
   /**
