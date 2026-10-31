@@ -197,7 +197,10 @@ package did not. Several signatures and one stored shape change; read
 - **`Script`**: a declared integer `exitCode` (1–255) on an error is honoured
   (after `ConfigError`, before `outcome`) — the plain field, or else Effect's
   own `[Runtime.errorExitCode]` marker, so an error written for
-  `Runtime.makeRunMain` exits the same under `Script.run`; `ScriptRunOptions.layer` accepts any
+  `Runtime.makeRunMain` exits the same under `Script.run`; `Script.run` reads
+  `SUI_LOG_LEVEL` (`Config.LogLevel`: `Debug`, `Warn`, … spelled exactly) into
+  the run's `References.MinimumLogLevel` — `SUI_LOG_LEVEL=Debug` shows the
+  read retries — and a value that is not a level exits 2; `ScriptRunOptions.layer` accepts any
   error type.
 - **Testing**: `fakeCoin`, `FakeEvent` (`json` optional),
   `FakeScript.visibilityDelay` (ms or `"never"`) and `SuiTest.setVisibilityDelay`,

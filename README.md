@@ -527,6 +527,7 @@ the wrapper retries a transaction that already ran.
 | `SUI_ALLOW_MAINNET` | only for mainnet | `1` or `true`; a script that means mainnet has to say so twice |
 | `SUI_RPC_URL` | no | The gRPC endpoint; defaulted per known network |
 | `SUI_RPC_TIMEOUT` | no | The per-attempt read timeout, a duration (`30 seconds`, the default) or `Infinity`. A read that runs out is a retryable `DEADLINE_EXCEEDED` and is retried; it never bounds an execute |
+| `SUI_LOG_LEVEL` | no | `Script.run` only: the run's minimum log level — `All`, `Trace`, `Debug`, `Info`, `Warn`, `Error`, `Fatal` or `None`, spelled exactly so (`Config.LogLevel`). Unset, Effect's default (`Info`). `Debug` shows `SuiCore`'s read retries; anything else is a `ConfigError`, exit 2 |
 | `SUI_PRIVATE_KEY` | `Script` only | A Bech32 `suiprivkey1…` key of any of the four schemes (Ed25519, Secp256k1, Secp256r1, and ML-DSA-65 on `@mysten/sui` 2.36 or later) **or a 32-byte hex seed** (64 hex characters, `0x` optional, read as Ed25519), through `Config.Redacted`. A key that does not decode fails with one fixed sentence and no cause: the Bech32 decoder quotes the whole input it rejected, so nothing derived from it is ever printed |
 
 `Script.layerReadOnly` provides `ScriptReadOnly`, which has no signer at all —

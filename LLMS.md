@@ -6433,7 +6433,10 @@ to stderr, and exits with `exitCode`.
 
 stdout carries only what the script itself printed: the logger is bound to
 stderr for the whole run, so `Effect.log` from the script or from anything it
-calls cannot land in the script's output. A `SubmissionUnknown` additionally
+calls cannot land in the script's output. `SUI_LOG_LEVEL` (`Debug`, `Warn`,
+… spelled as `Config.LogLevel` spells them) sets the run's minimum level;
+unset, it is Effect's default, `Info`, and a value that is not a level is a
+`ConfigError` (exit 2). A `SubmissionUnknown` additionally
 prints the base64 of the signed bytes and a line saying to reconcile, because
 those bytes are the durable record a script has.
 

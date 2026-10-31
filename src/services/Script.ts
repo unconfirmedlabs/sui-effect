@@ -24,6 +24,7 @@ import {
   Layer,
   Logger,
   Predicate,
+  References,
   Result,
   Runtime,
   Schema
@@ -100,6 +101,21 @@ const gateNetwork = (
       configError(`${what}: set ${MAINNET_GATE}=1 to let this script touch mainnet.`)
     )
   })
+
+/**
+ * `SUI_LOG_LEVEL` — `All`, `Trace`, `Debug`, `Info`, `Warn`, `Error`, `Fatal`
+ * or `None`, through `Config.LogLevel` — as the run's
+ * `References.MinimumLogLevel`. Unset, the level is left as it was (Effect's
+ * default is `Info`), so `SUI_LOG_LEVEL=Debug` is how a script shows the
+ * `SuiCore` read retries it logs at debug. A value that is not a level is a
+ * `ConfigError`, and the script exits 2.
+ */
+const logLevelLayer: Layer.Layer<never, Config.ConfigError> = Layer.unwrap(
+  Effect.map(
+    Config.option(Config.LogLevel("SUI_LOG_LEVEL")),
+    (level) => level._tag === "Some" ? Layer.succeed(References.MinimumLogLevel, level.value) : Layer.empty
+  )
+)
 
 /**
  * The network of the `SuiCore` a `NoDeps` layer was handed, through the same
@@ -703,7 +719,10 @@ const readUnresolved = async (
  *
  * stdout carries only what the script itself printed: the logger is bound to
  * stderr for the whole run, so `Effect.log` from the script or from anything it
- * calls cannot land in the script's output. A `SubmissionUnknown` additionally
+ * calls cannot land in the script's output. `SUI_LOG_LEVEL` (`Debug`, `Warn`,
+ * … spelled as `Config.LogLevel` spells them) sets the run's minimum level;
+ * unset, it is Effect's default, `Info`, and a value that is not a level is a
+ * `ConfigError` (exit 2). A `SubmissionUnknown` additionally
  * prints the base64 of the signed bytes and a line saying to reconcile, because
  * those bytes are the durable record a script has.
  *
@@ -749,7 +768,7 @@ export const run = async <A, E>(
   const fiber = Effect.runFork(
     effect.pipe(
       Effect.provide(
-        Layer.merge(options?.layer ?? Script.layer, Logger.layer([stderrLogger(write)]))
+        Layer.mergeAll(options?.layer ?? Script.layer, Logger.layer([stderrLogger(write)]), logLevelLayer)
       ),
       Effect.provideService(RunRecord, record)
     )
