@@ -1755,40 +1755,23 @@ journal for anything longer.
 
 `@unconfirmed/sui-effect/journal` needs a `KeyValueStore`, and Effect ships
 memory, filesystem, SQL and Web Storage layers — none of which exist in a DO.
-`KeyValueStore.makeStringOnly({ get, set, remove, clear, size })` is the whole
-adapter: five members over strings, and the journal uses nothing else (its
-entries are JSON and its unresolved index is one more key).
+`KeyValueStore.makeStringOnly({ get, set, remove, clear, size, keys })` is the
+whole adapter: six members over strings, and the journal uses nothing else. Its
+entries are JSON, one key per digest, and `listUnresolved` enumerates them
+through `keys` (a DO's `storage.list()`), so `keys` is the member the journal
+cannot do without. Wrap each call in `Effect.tryPromise` so a storage failure is
+a `KeyValueStoreError` — which the journal turns into `JournalError` — rather
+than a defect. `DurableStorage` is the slice of `DurableObjectStorage` the
+adapter touches; in a Worker, pass `ctx.storage` and use the real type.
 
-<!-- inline -->
-
-```ts
-import { KeyValueStore } from "effect/persistence"
-import { Effect, Layer } from "effect"
-import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
-
-const durableStore = (storage: DurableObjectStorage) =>
-  KeyValueStore.makeStringOnly({
-    get: (key) =>
-      Effect.map(
-        Effect.promise(() => storage.get<string>(key)),
-        Option.fromNullishOr
-      ),
-    set: (key, value) => Effect.promise(() => storage.put(key, value)),
-    remove: (key) => Effect.asVoid(Effect.promise(() => storage.delete(key))),
-    clear: Effect.promise(() => storage.deleteAll()),
-    size: Effect.map(Effect.promise(() => storage.list()), (map) => map.size)
-  })
-
-const journal = (storage: DurableObjectStorage) =>
-  layerKeyValueStore({ onUnresolved: "ignore" }).pipe(
-    Layer.provide(Layer.succeed(KeyValueStore.KeyValueStore, durableStore(storage)))
-  )
-```
+@@ recipes/durable-object.ts :: import { Effect, Layer } from "effect" ::   )
 
 Build it once per DO instance, alongside the runtime. `onUnresolved: "fail"`
 refuses to build while the store still holds unsettled entries, which is the
 right setting for a process whose startup is allowed to demand attention and
-the wrong one for a DO that must answer the next request.
+the wrong one for a DO that must answer the next request. A DO that lives for
+months calls `pruneSettled(before)` from `@unconfirmed/sui-effect/journal` in an
+alarm, so the scan `listUnresolved` does over every entry stays short.
 
 ## 19. Relay and sponsor envelopes
 

@@ -13,6 +13,10 @@ import { make } from "../src/services/JournalKeyValueStore.ts"
  * unresolved index. The port to `effect@4.0.3` changed the Schema check-ID
  * names and hashes, and none of it may reach the stored bytes: a store written
  * before the upgrade has to read, and be rewritten byte for byte, after it.
+ *
+ * 0.4.0 dropped the index (the journal lists through `KeyValueStore.keys`), so
+ * the `index` key is dead data now: it must not be read, rewritten, or fail
+ * anything, and every entry key must still round-trip exactly.
  */
 const STORE_FROM_RC112: Record<string, string> = {
   "index": "[\"8opHzTAnfzRpPEx21XtnrVTX28YQuCpAjcn1PczScKp\",\"LX3EUdRUBUa3TbsYXLEUdj9J3prXkWXvLYSWyYyc2Jr\"]",
@@ -23,6 +27,8 @@ const STORE_FROM_RC112: Record<string, string> = {
   "entry:QRSsyMWN1yHT9ir42bgNZUNZ4PdEhcSWCrL2AryKpyC": "{\"_tag\":\"NotApplied\",\"digest\":\"QRSsyMWN1yHT9ir42bgNZUNZ4PdEhcSWCrL2AryKpyC\",\"evidence\":\"inputConsumed\",\"at\":1700000000000}"
 }
 
+const ENTRY_KEYS = Object.keys(STORE_FROM_RC112).filter((key) => key.startsWith("entry:"))
+
 const DIGESTS = Object.keys(STORE_FROM_RC112)
   .filter((key) => key.startsWith("entry:"))
   .map((key) => Digest.make(key.slice("entry:".length)))
@@ -31,7 +37,7 @@ const run = <A>(effect: Effect.Effect<A, unknown, KeyValueStore.KeyValueStore>):
   Effect.runPromise(effect.pipe(Effect.provide(KeyValueStore.layerMemory)))
 
 describe("a journal written on effect rc.112", () => {
-  test("every entry decodes, the index is honoured, and a rewrite is byte-identical", async () => {
+  test("every entry decodes, the index is ignored, and a rewrite is byte-identical", async () => {
     const rewritten = await run(
       Effect.gen(function*() {
         const store = yield* KeyValueStore.KeyValueStore
@@ -40,6 +46,8 @@ describe("a journal written on effect rc.112", () => {
 
         const unresolved = yield* journal.listUnresolved
         expect(unresolved.map((entry) => entry._tag).sort()).toEqual(["Signed", "Unknown"])
+        // Listing never touched the old index.
+        expect(yield* store.get("index")).toBe(STORE_FROM_RC112["index"])
 
         const decoded = []
         for (const digest of DIGESTS) {
@@ -51,18 +59,33 @@ describe("a journal written on effect rc.112", () => {
           ["Executed", "Failed", "NotApplied", "Signed", "Unknown"]
         )
 
-        const fresh = yield* Effect.provide(KeyValueStore.KeyValueStore, KeyValueStore.layerMemory)
+        // `local: true`: without it the memoized `layerMemory` hands back the
+        // very store the fixture was loaded into.
+        const fresh = yield* Effect.provide(KeyValueStore.KeyValueStore, KeyValueStore.layerMemory, {
+          local: true
+        })
         const target = make(fresh)
-        // Same order the fixture was written in, so the index matches too.
-        for (const entry of decoded.sort((a, b) => DIGESTS.indexOf(a.digest) - DIGESTS.indexOf(b.digest))) {
-          yield* target.put(entry)
-        }
+        for (const entry of decoded) yield* target.put(entry)
         const out: Record<string, string | undefined> = {}
-        for (const key of Object.keys(STORE_FROM_RC112)) out[key] = yield* fresh.get(key)
+        for (const key of ENTRY_KEYS) out[key] = yield* fresh.get(key)
+        // A rewrite produces the entry keys and nothing else: no index.
+        expect([...(yield* fresh.keys)].sort()).toEqual([...ENTRY_KEYS].sort())
         return out
       })
     )
-    expect(rewritten).toEqual(STORE_FROM_RC112)
+    expect(rewritten).toEqual(Object.fromEntries(ENTRY_KEYS.map((key) => [key, STORE_FROM_RC112[key]])))
+  })
+
+  test("an index key holding garbage fails nothing", async () => {
+    const unresolved = await run(
+      Effect.gen(function*() {
+        const store = yield* KeyValueStore.KeyValueStore
+        for (const key of ENTRY_KEYS) yield* store.set(key, STORE_FROM_RC112[key]!)
+        yield* store.set("index", "not json at all")
+        return yield* make(store).listUnresolved
+      })
+    )
+    expect(unresolved.map((entry) => entry._tag).sort()).toEqual(["Signed", "Unknown"])
   })
 })
 
@@ -112,10 +135,11 @@ describe("a journal written by this version", () => {
         const journal = make(store)
         for (const entry of entries) yield* journal.put(entry)
         const out: Record<string, string | undefined> = {}
-        for (const key of Object.keys(STORE_FROM_RC112)) out[key] = yield* store.get(key)
+        for (const key of ENTRY_KEYS) out[key] = yield* store.get(key)
+        expect(yield* store.has("index")).toBe(false)
         return out
       })
     )
-    expect(written).toEqual(STORE_FROM_RC112)
+    expect(written).toEqual(Object.fromEntries(ENTRY_KEYS.map((key) => [key, STORE_FROM_RC112[key]])))
   })
 })

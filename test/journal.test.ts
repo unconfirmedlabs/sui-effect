@@ -7,7 +7,7 @@ import { isUnresolved, JournalEntry } from "../src/domain/journal-entry.ts"
 import { Digest, Signature, SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
 import { fakeDigest } from "../src/services/SuiCoreFake.ts"
-import { layerKeyValueStore, make } from "../src/services/JournalKeyValueStore.ts"
+import { layerKeyValueStore, make, pruneSettled } from "../src/services/JournalKeyValueStore.ts"
 
 const DIGEST = Digest.make("7YcE7X6LmUcbqHcRYMRT8vBTxtnCbfGJkH6yZPFpTFwn")
 const OTHER = Digest.make("11111111111111111111111111111111")
@@ -129,8 +129,8 @@ describe("JournalEntry", () => {
 
   test("NotApplied is terminal", () => {
     // It is a variant of its own precisely so it can be terminal: recording a
-    // proven-dead submission as `Unknown` would leave it in the unresolved
-    // index forever, and `onUnresolved: "fail"` would refuse to build over it.
+    // proven-dead submission as `Unknown` would leave it unresolved
+    // forever, and `onUnresolved: "fail"` would refuse to build over it.
     expect(isUnresolved(notAppliedEntry)).toBe(false)
     expect(isUnresolved(unknownEntry)).toBe(true)
   })
@@ -169,7 +169,7 @@ describe("the KeyValueStore journal", () => {
     effect: Effect.Effect<A, E, KeyValueStore.KeyValueStore>
   ) => Effect.runPromise(Effect.provide(effect, KeyValueStore.layerMemory, { local: true }))
 
-  test("entries survive as JSON and the index tracks what is unresolved", async () => {
+  test("entries survive as JSON and listUnresolved tracks what is unresolved", async () => {
     const result = await withStore(
       Effect.gen(function*() {
         const store = yield* KeyValueStore.KeyValueStore
@@ -237,7 +237,7 @@ describe("the KeyValueStore journal", () => {
     expect(ignored).toHaveLength(1)
   })
 
-  test("a NotApplied entry resolves the digest and leaves the index", async () => {
+  test("a NotApplied entry resolves the digest", async () => {
     const result = await withStore(
       Effect.gen(function*() {
         const store = yield* KeyValueStore.KeyValueStore
@@ -254,7 +254,7 @@ describe("the KeyValueStore journal", () => {
     )
     expect(result.before).toHaveLength(1)
     expect(result.after).toHaveLength(0)
-    // The answer is still readable; only the "still waiting" index drops it.
+    // The answer is still readable; only the "still waiting" list drops it.
     expect(Option.isSome(result.entry)).toBe(true)
     if (Option.isSome(result.entry)) expect(result.entry.value._tag).toBe("NotApplied")
   })
@@ -280,10 +280,9 @@ describe("the KeyValueStore journal", () => {
   ).pipe(Layer.provide(KeyValueStore.layerMemory))
 
   test("four concurrent puts all survive", async () => {
-    // `put` is a read-modify-write over a store with no compare-and-set. Two
-    // `Tx.run`s from different senders overlap all the time, and without a
-    // semaphore held across both writes each one reads the same index, appends
-    // its own digest and overwrites the others: four puts, one entry.
+    // Two `Tx.run`s from different senders overlap all the time. With the 0.3
+    // index, `put` was a read-modify-write that needed a lock; now it is one
+    // `set` per digest, and four interleaved puts are four entries.
     const digests = [1, 2, 3, 4].map((seed) => Digest.make(fakeDigest(seed)))
 
     const unresolved = await Effect.runPromise(
@@ -301,14 +300,21 @@ describe("the KeyValueStore journal", () => {
     expect(unresolved.map((entry) => entry.digest).sort()).toEqual([...digests].sort())
   })
 
-  test("building the layer makes no network calls: it only reads the index", async () => {
+  test("building the layer makes no network calls: it lists the store and reads its entries", async () => {
     const reads: Array<string> = []
+    let listed = 0
     const counting = Layer.effect(
       KeyValueStore.KeyValueStore,
       Effect.gen(function*() {
         const kv = yield* KeyValueStore.KeyValueStore
+        yield* make(kv).put(signedEntry)
+        yield* make(kv).put({ ...executedEntry, digest: OTHER })
         return KeyValueStore.make({
           ...kv,
+          keys: Effect.suspend(() => {
+            listed += 1
+            return kv.keys
+          }),
           get: (key) => {
             reads.push(key)
             return kv.get(key)
@@ -319,11 +325,148 @@ describe("the KeyValueStore journal", () => {
 
     await Effect.runPromise(
       Effect.asVoid(Journal).pipe(
-        Effect.provide(layerKeyValueStore({ onUnresolved: "fail" }).pipe(Layer.provide(counting)), {
+        Effect.provide(layerKeyValueStore({ onUnresolved: "ignore" }).pipe(Layer.provide(counting)), {
           local: true
         })
       )
     )
-    expect(reads).toEqual(["index"])
+    expect(listed).toBe(1)
+    expect(reads.sort()).toEqual([`entry:${OTHER}`, `entry:${DIGEST}`].sort())
+  })
+
+  test("a put is one write, and no index key is ever written", async () => {
+    const writes: Array<string> = []
+    const recording = Layer.effect(
+      KeyValueStore.KeyValueStore,
+      Effect.gen(function*() {
+        const kv = yield* KeyValueStore.KeyValueStore
+        return KeyValueStore.make({
+          ...kv,
+          set: (key, value) => {
+            writes.push(key)
+            return kv.set(key, value)
+          }
+        })
+      })
+    ).pipe(Layer.provide(KeyValueStore.layerMemory))
+
+    const keys = await Effect.runPromise(
+      Effect.gen(function*() {
+        const store = yield* KeyValueStore.KeyValueStore
+        const journal = make(store, { prefix: "p:" })
+        yield* journal.put(signedEntry)
+        yield* journal.put(executedEntry)
+        return yield* store.keys
+      }).pipe(Effect.provide(recording, { local: true }))
+    )
+    expect(writes).toEqual([`p:entry:${DIGEST}`, `p:entry:${DIGEST}`])
+    expect(keys).toEqual([`p:entry:${DIGEST}`])
+  })
+
+  test("listUnresolved is oldest first whatever order keys come back in", async () => {
+    const entryAt = (seed: number, millis: number): JournalEntry => {
+      const digest = Digest.make(fakeDigest(seed))
+      return seed % 2 === 0
+        ? JournalEntry.cases.Signed.make({
+          _tag: "Signed",
+          digest,
+          signed: { ...signed, digest },
+          signedAt: DateTime.makeUnsafe(millis)
+        })
+        : JournalEntry.cases.Unknown.make({
+          _tag: "Unknown",
+          digest,
+          signed: { ...signed, digest },
+          lastError: "timeout",
+          attempts: 1,
+          at: DateTime.makeUnsafe(millis)
+        })
+    }
+    const entries = [entryAt(1, 3_000), entryAt(2, 1_000), entryAt(3, 4_000), entryAt(4, 2_000)]
+    // A store whose `keys` answers in reverse insertion order: nothing about
+    // the listing may depend on what order the store enumerates in.
+    const reversed = Layer.effect(
+      KeyValueStore.KeyValueStore,
+      Effect.gen(function*() {
+        const kv = yield* KeyValueStore.KeyValueStore
+        return KeyValueStore.make({ ...kv, keys: Effect.map(kv.keys, (keys) => [...keys].reverse()) })
+      })
+    ).pipe(Layer.provide(KeyValueStore.layerMemory))
+
+    const listed = await Effect.runPromise(
+      Effect.gen(function*() {
+        const journal = make(yield* KeyValueStore.KeyValueStore)
+        for (const entry of entries) yield* journal.put(entry)
+        return yield* journal.listUnresolved
+      }).pipe(Effect.provide(reversed, { local: true }))
+    )
+    expect(listed.map((entry) => entry.digest)).toEqual(
+      [2, 4, 1, 3].map((seed) => Digest.make(fakeDigest(seed)))
+    )
+  })
+})
+
+describe("pruneSettled", () => {
+  const withStore = <A, E>(
+    effect: Effect.Effect<A, E, KeyValueStore.KeyValueStore>
+  ) => Effect.runPromise(Effect.provide(effect, KeyValueStore.layerMemory, { local: true }))
+
+  const OLD = DateTime.makeUnsafe(1_000)
+  const CUTOFF = DateTime.makeUnsafe(2_000)
+  const NEW = DateTime.makeUnsafe(3_000)
+  const d = (seed: number) => Digest.make(fakeDigest(seed))
+
+  test("deletes settled entries before the cutoff and nothing else", async () => {
+    const result = await withStore(
+      Effect.gen(function*() {
+        const store = yield* KeyValueStore.KeyValueStore
+        const journal = make(store)
+        yield* journal.put({ ...executedEntry, digest: d(1), at: OLD })
+        yield* journal.put({ ...failedEntry, digest: d(2), at: OLD })
+        yield* journal.put({ ...notAppliedEntry, digest: d(3), at: OLD })
+        yield* journal.put({ ...executedEntry, digest: d(4), at: NEW })
+        // Exactly at the cutoff is not "before" it.
+        yield* journal.put({ ...executedEntry, digest: d(5), at: CUTOFF })
+        // Unresolved entries survive however old they are.
+        yield* journal.put({ ...signedEntry, digest: d(6), signed: { ...signed, digest: d(6) }, signedAt: OLD })
+        yield* journal.put({ ...unknownEntry, digest: d(7), at: OLD })
+        // A 0.3 index key is left alone.
+        yield* store.set("index", "[]")
+        const pruned = yield* pruneSettled(CUTOFF)
+        return { pruned, keys: [...(yield* store.keys)].sort() }
+      })
+    )
+    expect(result.pruned).toBe(3)
+    expect(result.keys).toEqual(
+      ["index", ...[4, 5, 6, 7].map((seed) => `entry:${d(seed)}`)].sort()
+    )
+  })
+
+  test("honours the prefix", async () => {
+    const result = await withStore(
+      Effect.gen(function*() {
+        const store = yield* KeyValueStore.KeyValueStore
+        yield* make(store, { prefix: "a:" }).put({ ...executedEntry, digest: d(1), at: OLD })
+        yield* make(store, { prefix: "b:" }).put({ ...executedEntry, digest: d(2), at: OLD })
+        const pruned = yield* pruneSettled(CUTOFF, { prefix: "a:" })
+        return { pruned, keys: yield* store.keys }
+      })
+    )
+    expect(result.pruned).toBe(1)
+    expect(result.keys).toEqual([`b:entry:${d(2)}`])
+  })
+
+  test("an entry that does not decode fails the prune and deletes nothing", async () => {
+    const result = await withStore(
+      Effect.gen(function*() {
+        const store = yield* KeyValueStore.KeyValueStore
+        yield* make(store).put({ ...executedEntry, digest: d(1), at: OLD })
+        yield* store.set(`entry:${d(2)}`, "{not json")
+        const error = yield* Effect.flip(pruneSettled(CUTOFF))
+        return { error, size: yield* store.size }
+      })
+    )
+    expect(result.error._tag).toBe("JournalError")
+    expect(result.size).toBe(2)
   })
 })

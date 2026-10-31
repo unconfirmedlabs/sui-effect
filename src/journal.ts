@@ -52,3 +52,13 @@ export { layerKeyValueStore } from "./services/JournalKeyValueStore.ts"
  * process that wires the journal itself. Never fails.
  */
 export { make as makeKeyValueStore } from "./services/JournalKeyValueStore.ts"
+
+/**
+ * Deletes the settled entries (`Executed`, `Failed`, `NotApplied`) recorded
+ * before a cutoff from the durable journal's `KeyValueStore`, and answers how
+ * many it deleted; unresolved entries are never deleted. It keeps the scan
+ * `listUnresolved` does over every entry short in a long-lived service.
+ *
+ * Fails with: `JournalError`.
+ */
+export { pruneSettled } from "./services/JournalKeyValueStore.ts"
