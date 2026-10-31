@@ -4,10 +4,10 @@ import { decodeSuiPrivateKey, Signer as SdkSigner } from "@mysten/sui/cryptograp
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
 import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
-import { ConfigProvider, Effect } from "effect"
+import { ConfigProvider, Effect, Redacted } from "effect"
 import { SigningError } from "../src/domain/errors.ts"
 import { Signature, SuiAddress } from "../src/domain/schemas.ts"
-import { Signer } from "../src/services/Signer.ts"
+import { fromRedactedSecret, Signer } from "../src/services/Signer.ts"
 
 const bytes = new Uint8Array([1, 2, 3, 4])
 
@@ -223,5 +223,21 @@ describe("Signer.fromSdkSigner", () => {
   test("fromKeypair is the same function under its old name", () => {
     const keypair = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(4))
     expect(Signer.fromKeypair(keypair).address).toBe(Signer.fromSdkSigner(keypair).address)
+  })
+})
+
+describe("Signer.fromConfig wipes the secret it decoded", () => {
+  test("after a successful decode the Redacted can no longer be read", async () => {
+    const secret = Redacted.make(Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(4)).getSecretKey())
+    const signer = await Effect.runPromise(fromRedactedSecret(secret, "SUI_PRIVATE_KEY"))
+    expect(signer.scheme).toBe("ED25519")
+    expect(() => Redacted.value(secret)).toThrow()
+  })
+
+  test("after a failed decode too", async () => {
+    const secret = Redacted.make("suiprivkey1notakey")
+    const exit = await Effect.runPromiseExit(fromRedactedSecret(secret, "SUI_PRIVATE_KEY"))
+    expect(exit._tag).toBe("Failure")
+    expect(() => Redacted.value(secret)).toThrow()
   })
 })

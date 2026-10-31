@@ -307,6 +307,9 @@ package did not. Several signatures and one stored shape change; read
   `Tx.currentEpoch` and `Tx.expiryClosed` are gone from traces (the durable
   journal's `Journal.put` / `Journal.get`, `Tx.recover`, `Tx.inputEvidence`,
   `Tx.historyOf` and `Sui.getObjectsPage` remain).
+- `Signer.fromConfig` wipes the `Config.Redacted` it read
+  (`Redacted.wipeUnsafe`) as soon as the key is decoded, on success and
+  failure alike, so a stray reference to it can no longer be unwrapped.
 
 ### Fixed
 

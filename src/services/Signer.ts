@@ -233,8 +233,9 @@ const keypairFromSecret = async (value: string): Promise<Keypair | undefined> =>
  *   over, and reading it here is what keeps `fromHex` and the decoded bytes out
  *   of application code.
  *
- * The key is read with `Config.Redacted`, and the decoded bytes never leave
- * this function. Neither does anything derived from them: the failure carries
+ * The key is read with `Config.Redacted`, which is wiped
+ * (`Redacted.wipeUnsafe`) as soon as it has been decoded, and the decoded
+ * bytes never leave this function. Neither does anything derived from them: the failure carries
  * one fixed sentence and no `cause`, because the decoder's own message quotes
  * the input it rejected.
  *
@@ -245,25 +246,43 @@ const keypairFromSecret = async (value: string): Promise<Keypair | undefined> =>
 export const fromConfig = (
   name = "SUI_PRIVATE_KEY"
 ): Effect.Effect<Signer, Config.ConfigError> =>
-  Config.Redacted(name).pipe(
-    Effect.flatMap((redacted) =>
-      Effect.tryPromise({
-        try: async () => {
-          const keypair = await keypairFromSecret(Redacted.value(redacted))
-          if (keypair === undefined) {
-            throw new Error("unsupported key scheme")
-          }
-          return fromKeypair(keypair)
-        },
-        // No `cause`: it would carry the decoder's message, and the decoder's
-        // message carries the key.
-        catch: () =>
-          new Config.ConfigError(
-            new ConfigProvider.SourceError({ message: `${name} ${KEY_ERROR}` })
-          )
-      })
-    )
-  )
+  Config.Redacted(name).pipe(Effect.flatMap((redacted) => fromRedactedSecret(redacted, name)))
+
+/**
+ * The body of {@link fromConfig}: the signer a redacted secret names, with
+ * the `Redacted` wiped (`Redacted.wipeUnsafe`) once it has been decoded, on
+ * success and failure alike. Internal; exported through `src/internal.ts` so
+ * the wipe is testable.
+ *
+ * Fails with: `ConfigError` (the one fixed sentence, naming `name`).
+ */
+export const fromRedactedSecret = (
+  redacted: Redacted.Redacted<string>,
+  name: string
+): Effect.Effect<Signer, Config.ConfigError> =>
+  Effect.tryPromise({
+    try: async () => {
+      let keypair: Keypair | undefined
+      try {
+        keypair = await keypairFromSecret(Redacted.value(redacted))
+      } finally {
+        // The text is decoded; nothing reads it again. Dropping it from the
+        // redacted registry means a stray reference to this `Redacted` (a log
+        // of the config, a captured closure) can no longer be unwrapped.
+        Redacted.wipeUnsafe(redacted)
+      }
+      if (keypair === undefined) {
+        throw new Error("unsupported key scheme")
+      }
+      return fromKeypair(keypair)
+    },
+    // No `cause`: it would carry the decoder's message, and the decoder's
+    // message carries the key.
+    catch: () =>
+      new Config.ConfigError(
+        new ConfigProvider.SourceError({ message: `${name} ${KEY_ERROR}` })
+      )
+  })
 
 /**
  * A fresh Ed25519 credential that exists only for this process. For tests,

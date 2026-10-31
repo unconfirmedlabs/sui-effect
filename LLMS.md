@@ -4914,8 +4914,9 @@ Two spellings, told apart by the text itself:
   over, and reading it here is what keeps `fromHex` and the decoded bytes out
   of application code.
 
-The key is read with `Config.Redacted`, and the decoded bytes never leave
-this function. Neither does anything derived from them: the failure carries
+The key is read with `Config.Redacted`, which is wiped
+(`Redacted.wipeUnsafe`) as soon as it has been decoded, and the decoded
+bytes never leave this function. Neither does anything derived from them: the failure carries
 one fixed sentence and no `cause`, because the decoder's own message quotes
 the input it rejected.
 
