@@ -376,7 +376,9 @@ describe("error classes", () => {
       effects: f.effects
     })
     expect(SuiError.describe(error)).toBe(
-      `ExecutionFailed MoveAbort 0x${"0".repeat(62)}ab::escrow::claim code 3 (EAlreadyClaimed) in command 1`
+      // A clever error names its constant; the raw `abortCode` of one is a
+      // packed integer and is left out of the line (0.4.0).
+      `ExecutionFailed MoveAbort 0x${"0".repeat(62)}ab::escrow::claim EAlreadyClaimed in command 1`
     )
   })
 

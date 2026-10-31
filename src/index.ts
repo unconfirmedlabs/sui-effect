@@ -12,16 +12,19 @@
  * @since 0.1.0
  */
 
-/** The closed error taxonomy and its four helpers. */
+/** The closed error taxonomy and its helpers. */
 export {
   BuildError,
   DecodeError,
   DecodeKind,
+  type DescribeOptions,
   ExecutionFailed,
   ExtensionNotReady,
   GraphQLUnavailable,
   type HasOutcome,
   JournalError,
+  type MoveAbortInfo,
+  type MoveAbortMatch,
   NetworkMismatch,
   NotApplied,
   ObjectDeleted,

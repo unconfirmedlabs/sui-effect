@@ -303,6 +303,7 @@ export const decodeContent = <T>(
         // The type tag did not match, so not a byte was parsed: this is the
         // decode failure a caller may answer with "not one of mine".
         kind: "type",
+        actualType: actual,
         issue: `${
           context?.objectId === undefined ? "the bytes have" : `object ${context.objectId} has`
         } type ${actual}`
