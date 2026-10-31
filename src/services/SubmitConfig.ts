@@ -197,13 +197,17 @@ const DURATION_FIELDS: ReadonlyArray<DurationField> = [
 ]
 
 /**
- * {@link defaults} with `overrides` applied, every duration converted.
+ * `base` ({@link defaults} unless given) with `overrides` applied, every
+ * duration converted.
  *
  * An input that is not a valid `Duration.Input` — reachable only past the type
  * checker — throws, which is a defect at the edge that set it.
  */
-const resolve = (overrides: SubmitConfigOverrides): SubmitConfigService => {
-  const merged: Record<string, unknown> = { ...defaults, ...overrides }
+const resolve = (
+  overrides: SubmitConfigOverrides,
+  base: SubmitConfigService = defaults
+): SubmitConfigService => {
+  const merged: Record<string, unknown> = { ...base, ...overrides }
   for (const field of DURATION_FIELDS) {
     const value = overrides[field]
     if (value !== undefined) merged[field] = Duration.fromInputUnsafe(value)
@@ -245,9 +249,15 @@ const layer = (overrides: SubmitConfigOverrides): Layer.Layer<never> =>
   Layer.sync(SubmitConfigRef, () => resolve(overrides))
 
 /**
- * {@link defaults} with `overrides` applied, provided to one effect — the
- * `.pipe`-able form of {@link layer}, for overriding the lifecycle for a single
- * submission rather than for a whole application.
+ * The config **in force** with `overrides` applied, provided to one effect —
+ * the `.pipe`-able form of {@link layer}, for overriding the lifecycle for a
+ * single submission rather than for a whole application.
+ *
+ * It merges over whatever is in force where the effect runs, not over
+ * {@link defaults}, the way `Gate.with` does: a `SubmitConfig.layer` (or the
+ * fast config `layerTest` installs) stays in force for every field the
+ * overrides leave out, and two nested `with`s compose. Before 0.4.0 it reset
+ * to the defaults.
  *
  * Never fails, requires nothing.
  *
@@ -267,7 +277,13 @@ const layer = (overrides: SubmitConfigOverrides): Layer.Layer<never> =>
 const withOverrides =
   (overrides: SubmitConfigOverrides) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-    Effect.provideServiceEffect(effect, SubmitConfigRef, Effect.sync(() => resolve(overrides)))
+    Effect.provideServiceEffect(
+      effect,
+      SubmitConfigRef,
+      Effect.gen(function*() {
+        return resolve(overrides, yield* SubmitConfigRef)
+      })
+    )
 
 /**
  * The lifecycle settings.
@@ -298,8 +314,9 @@ export const SubmitConfig = Object.assign(SubmitConfigRef, {
    */
   layer,
   /**
-   * `defaults` with `overrides` applied, provided to one effect: the
-   * `.pipe`-able form of `layer`. Never fails, requires nothing.
+   * The config in force with `overrides` applied, provided to one effect:
+   * the `.pipe`-able form of `layer`, merging over what is in force rather
+   * than over `defaults`. Never fails, requires nothing.
    */
   with: withOverrides
 })
