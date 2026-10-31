@@ -98,13 +98,17 @@ export {
 /** The opinionated tier. */
 export {
   type BatchItemError,
+  type DecodedDynamicField,
   type EventFilter,
   type GetObjectError,
+  type ListOptions,
   type ListOrder,
+  type ListPage,
   type Recipe,
   Sui,
   type SuiLayerOptions,
   type SuiService,
+  type TailOptions,
   type TransactionFilter
 } from "./services/Sui.ts"
 
@@ -112,9 +116,11 @@ export {
 export {
   defaultGrpcUrl,
   type ObjectLookupError,
+  type ServiceInfo,
   type SimulationLookupError,
   SuiCore,
   type SuiCoreError,
+  type SuiCoreReadOptions,
   type SuiCoreService,
   type SuiGrpcLayerOptions,
   type TransactionLookupError,

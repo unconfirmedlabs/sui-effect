@@ -218,7 +218,9 @@ describe("streamTransactions", () => {
         return [
           yield* collect(sui.streamTransactions({ sender: ALICE })),
           yield* collect(sui.streamTransactions({ function: `0xabc::coin_maker::mint` })),
-          yield* collect(sui.streamTransactions({ function: `${PKG}::vault` })),
+          // A module filter cannot be paginated by the SDK, so the stream
+          // refuses it; one page of it is a `core.listTransactions` call.
+          (yield* sui.core.listTransactions({ filter: { function: `${PKG}::vault` } })).transactions,
           yield* SuiTest.calls("listTransactions")
         ] as const
       }),
