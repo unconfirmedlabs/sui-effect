@@ -2513,7 +2513,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-43 exported symbols.
+45 exported symbols.
 
 ### `Built` (const)
 
@@ -2882,10 +2882,8 @@ Re-exported from `@unconfirmed/sui-effect`.
 ### `SignatureScheme` (type)
 
 ```ts
-export type SignatureScheme = "ED25519" | "Secp256k1" | "Secp256r1" | "MLDSA65" | "MultiSig" | "ZkLogin" | "Passkey";
+type SignatureScheme = 'ED25519' | 'Secp256k1' | 'Secp256r1' | 'MultiSig' | 'ZkLogin' | 'Passkey' | 'MLDSA65';
 ```
-
-The signature schemes a `Signer` built by this module can carry.
 
 ### `Signed` (interface)
 
@@ -3177,6 +3175,35 @@ declare const UNRESOLVED_TAGS: readonly ["Signed", "Unknown"]
 ```
 
 The tags whose entries still need an answer from the network.
+
+### `Verify` (const)
+
+```ts
+declare const Verify: {
+    readonly verifyTransactionSignature: (bytes: Uint8Array<ArrayBufferLike>, signature: string, options?: VerifyOptions | undefined) => Effect.Effect<PublicKey, TransportError | SigningError, Sui>;
+    readonly verifyPersonalMessageSignature: (message: Uint8Array<ArrayBufferLike>, signature: string, options?: VerifyOptions | undefined) => Effect.Effect<PublicKey, TransportError | SigningError, Sui>;
+}
+```
+
+Signature verification, namespaced the way the SDK spells it:
+`Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
+Both have `R = Sui`.
+
+### `VerifyOptions` (interface)
+
+```ts
+export interface VerifyOptions {
+    /**
+     * The address the signature must have been produced by. Compared with the
+     * address the SDK derives from the signature's public key, which is always
+     * the padded, normalized form — so it is typed `SuiAddress`; normalize a
+     * shorthand with `SuiAddress.normalize` first.
+     */
+    readonly address?: SuiAddress;
+}
+```
+
+The options both verifiers take.
 
 ### `build` (const)
 
