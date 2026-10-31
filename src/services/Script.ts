@@ -25,6 +25,7 @@ import {
   Logger,
   Predicate,
   Result,
+  Runtime,
   Schema
 } from "effect"
 import * as Base64 from "effect/encoding/Base64"
@@ -400,9 +401,23 @@ const hasOutcomeField = (error: unknown): error is { readonly outcome: string } 
  * A declared exit code: an integer from 1 to 255. Zero is not one — a failure
  * that exits 0 would tell a wrapper it succeeded.
  */
-const hasExitCodeField = (error: unknown): error is { readonly exitCode: number } =>
-  Predicate.hasProperty(error, "exitCode") && typeof error.exitCode === "number" &&
-  Number.isInteger(error.exitCode) && error.exitCode >= 1 && error.exitCode <= 255
+const isExitCode = (code: unknown): code is number =>
+  typeof code === "number" && Number.isInteger(code) && code >= 1 && code <= 255
+
+/**
+ * The exit code an error declares, if it declares one: its plain `exitCode`
+ * field, or else Effect's own `[Runtime.errorExitCode]` marker — the one
+ * `Runtime.makeRunMain`'s teardown reads — so an error written for either
+ * runner exits the same under `Script.run`. Either must be an integer from 1
+ * to 255; anything else is no declaration at all.
+ */
+const declaredExitCode = (error: unknown): number | undefined => {
+  if (Predicate.hasProperty(error, "exitCode") && isExitCode(error.exitCode)) return error.exitCode
+  if (Predicate.hasProperty(error, Runtime.errorExitCode) && isExitCode(error[Runtime.errorExitCode])) {
+    return error[Runtime.errorExitCode]
+  }
+  return undefined
+}
 
 /** What {@link exitCode} needs to know beyond the `Exit` itself. */
 export interface ExitCodeOptions {
@@ -449,7 +464,8 @@ export interface ExitCodeOptions {
  * sees 130 has no reason to go looking for one.
  *
  * **A declared `exitCode` wins.** An error carrying an integer `exitCode`
- * field from 1 to 255 exits with it — which is how a script's own `BadInput`
+ * field from 1 to 255 — or Effect's own `[Runtime.errorExitCode]` marker, read
+ * when there is no such field — exits with it — which is how a script's own `BadInput`
  * says 2 ("fix the input, retrying will not help") instead of the 4 its
  * `outcome: "not_applied"` would give. Below that, an extension error that
  * declares an `outcome` is honoured, so a downstream SDK's own failures land
@@ -485,7 +501,7 @@ export const exitCode = <A, E>(
 }
 
 const rawExitCode = <E>(cause: Cause.Cause<E>, unresolved: number): number => {
-  if (Cause.hasInterrupts(cause) && !Cause.hasFails(cause) && !Cause.hasDies(cause)) {
+  if (Cause.hasInterruptsOnly(cause)) {
     return unresolved > 0 ? EXIT.unknown : EXIT.interrupted
   }
   if (Cause.hasDies(cause)) return EXIT.defect
@@ -509,7 +525,8 @@ const codeOfError = (error: unknown, unresolved: number): number => {
   if (isConfigError(error)) return EXIT.configuration
   // A declared exit code is the most specific thing an error can say about
   // itself: the author chose the number.
-  if (hasExitCodeField(error)) return error.exitCode
+  const declared = declaredExitCode(error)
+  if (declared !== undefined) return declared
   // **A declared `outcome` wins before anything else, tag or no tag.** That is
   // the order this function has always had, and it is load-bearing: a wrapper
   // that puts `outcome` on an error is saying what it knows about the chain,

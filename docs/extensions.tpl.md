@@ -1431,7 +1431,8 @@ unless you really mean one version.
 tag.
 
 **An error may declare its own exit code.** An integer `exitCode` (1–255) on an
-error is honoured by `Script.exitCode`, after `ConfigError` and before
+error — a plain field, or Effect's `[Runtime.errorExitCode]` marker when there
+is no such field — is honoured by `Script.exitCode`, after `ConfigError` and before
 `outcome` — which is how a user-input error exits 2 instead of 4. One rule
 overrides it: once this run applied a transaction, a failure that would exit 2,
 4 or 130 exits 5, and `Script.run` prints the applied digests with "do not send

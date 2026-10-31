@@ -130,7 +130,8 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 
 `ConfigError` (whose one line names the variable) and `SchemaError` also exit 2;
 a defect exits 1, an interrupt with nothing outstanding 130. An error that
-declares an integer `exitCode` from 1 to 255 exits with it. **Once a
+declares an integer `exitCode` from 1 to 255 — the plain field, or Effect's
+`[Runtime.errorExitCode]` marker — exits with it. **Once a
 transaction of this run applied**, a failure that would exit 2, 4 or 130 exits
 5 instead, because a retry would send a second transaction; an unresolved entry
 still exits 3.

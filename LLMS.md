@@ -436,7 +436,8 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 
 `ConfigError` (whose one line names the variable) and `SchemaError` also exit 2;
 a defect exits 1, an interrupt with nothing outstanding 130. An error that
-declares an integer `exitCode` from 1 to 255 exits with it. **Once a
+declares an integer `exitCode` from 1 to 255 — the plain field, or Effect's
+`[Runtime.errorExitCode]` marker — exits with it. **Once a
 transaction of this run applied**, a failure that would exit 2, 4 or 130 exits
 5 instead, because a retry would send a second transaction; an unresolved entry
 still exits 3.
@@ -6361,7 +6362,8 @@ is a submission outstanding, in which case it is 3, because a wrapper that
 sees 130 has no reason to go looking for one.
 
 **A declared `exitCode` wins.** An error carrying an integer `exitCode`
-field from 1 to 255 exits with it — which is how a script's own `BadInput`
+field from 1 to 255 — or Effect's own `[Runtime.errorExitCode]` marker, read
+when there is no such field — exits with it — which is how a script's own `BadInput`
 says 2 ("fix the input, retrying will not help") instead of the 4 its
 `outcome: "not_applied"` would give. Below that, an extension error that
 declares an `outcome` is honoured, so a downstream SDK's own failures land

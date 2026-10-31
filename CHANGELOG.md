@@ -195,7 +195,9 @@ package did not. Several signatures and one stored shape change; read
   `face.$reconcileAll()` (a reserved name). `SubmitConfig` overrides accept
   `Duration.Input` (`SubmitConfigOverrides`, exported from `/tx`).
 - **`Script`**: a declared integer `exitCode` (1–255) on an error is honoured
-  (after `ConfigError`, before `outcome`); `ScriptRunOptions.layer` accepts any
+  (after `ConfigError`, before `outcome`) — the plain field, or else Effect's
+  own `[Runtime.errorExitCode]` marker, so an error written for
+  `Runtime.makeRunMain` exits the same under `Script.run`; `ScriptRunOptions.layer` accepts any
   error type.
 - **Testing**: `fakeCoin`, `FakeEvent` (`json` optional),
   `FakeScript.visibilityDelay` (ms or `"never"`) and `SuiTest.setVisibilityDelay`,

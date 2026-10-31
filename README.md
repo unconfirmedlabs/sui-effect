@@ -553,8 +553,9 @@ bytes finish.
 | 130 | interrupted, with nothing outstanding in the journal |
 
 Two rules sit on top of the table. **An error may declare its own exit code**:
-an integer `exitCode` (1–255) is honoured after `ConfigError` and before
-`outcome`, which is how a bad-input error of your own exits 2 instead of 4.
+an integer `exitCode` (1–255) — a plain field, or Effect's own
+`[Runtime.errorExitCode]` marker when there is no such field — is honoured
+after `ConfigError` and before `outcome`, which is how a bad-input error of your own exits 2 instead of 4.
 And **once this run applied a transaction, nothing exits 2, 4 or 130**: the exit
 is 5, and the applied digests are printed with "do not send them again" — a
 timeout or a Ctrl-C after the execute answered must not read as "safe to
