@@ -24,7 +24,7 @@ every code block in it is copied from this directory.
 
 ```bash
 cd examples/extension-template
-bun run check        # tsc --noEmit && bun test
+bun run check        # tsc --noEmit && bun test && bun scripts/check-package.ts
 ```
 
 From the repository root, `bun run check:template` does the same thing.
@@ -44,7 +44,7 @@ than a published version, use the packed tarball, not `link:` or `bun link`:
 ```bash
 cd /path/to/sui-effect && bun run build && npm pack
 mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-*.tgz vendor/
-bun add -d ./vendor/unconfirmed-sui-effect-0.1.0.tgz
+bun add -d ./vendor/unconfirmed-sui-effect-<version>.tgz
 ```
 
 `link:` and `bun link` symlink the checkout, and **module resolution follows the

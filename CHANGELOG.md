@@ -3,6 +3,170 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
+## 0.4.0
+
+Effect 4.1 and `@mysten/sui` 2.38, a lifecycle that settles refusals in the
+journal, a journal with no index, and the `Sui` reads the SDK had and this
+package did not. Several signatures and one stored shape change; read
+"Migrating from 0.3.x" first.
+
+### Changed (breaking)
+
+- **The `effect` peer dependency is now `>=4.1.1 <4.2`.** 4.1.1 is the floor
+  because effect 4.1 made `KeyValueStore.keys` part of every store, and the
+  durable journal now lists through it (below). `@effect/platform-bun` (a
+  devDependency) moves to `4.1.1` with it, `@effect/language-service` to
+  `0.87.5`. 0.3.x remains the line for effect 4.0.x.
+- **`@mysten/sui` is developed against 2.38.0** (CI proves 2.30.0 and 2.38.0);
+  the peer stays `^2.28`. `@mysten/bcs` moves to `2.1.3`, peer `^2.1.3`.
+- **`SignatureScheme` is the SDK's own type, re-exported**, so it is exactly as
+  wide as the installed SDK and gains `"MLDSA65"` from `@mysten/sui` 2.36. A
+  consumer that `switch`es over it exhaustively with `satisfies never` stops
+  compiling on 2.36+ until it handles the new member.
+- **`Simulation` gains `gasPaymentMocked: boolean`**: `true` when the node
+  simulated with a mocked gas coin because the transaction had no gas payment.
+  It is the SDK's field (2.35+) when present and derived from
+  `effects.gasObject` the way the SDK derives it otherwise, so every SDK in the
+  peer range decodes. Code that builds a `Simulation` by hand must add it.
+- **`Tx.reconcile` and `Tx.reconcileAll` no longer declare `TransportError`.**
+  They never produced it: every recovery read failure already became
+  `SubmissionUnknown`. Remove any `catchTag("TransportError", …)` on them.
+- **The durable journal (`/journal`) keeps no `index` key and no put lock.**
+  `put` is one `set`; `listUnresolved` lists through `KeyValueStore.keys`,
+  oldest first by `signedAt`/`at`. **A custom `KeyValueStore` must implement
+  `keys`** (effect 4.1 requires it of every store anyway).
+- **Removed**: `Sui.getObjectsOrFail` (use `getObjectsStrict`, the same
+  function), the `ReconciledOutcome` type (use `Reconciled`), and the
+  `dispose` alias on `SuiExtension.fromService` faces (use `$dispose()`; a
+  service member may now itself be called `dispose`).
+- **A refused submission is journalled as terminal.** A gRPC `INVALID_ARGUMENT`
+  on the first send, or a `Tx.submitVia` sender error that declares
+  `outcome: "not_applied"`, now settles the `Signed` entry as
+  `NotApplied { evidence: "refused" }` (a new `NotAppliedEvidence` value)
+  instead of leaving it unresolved. **A 0.3 reader cannot decode such an
+  entry**: roll a durable store back to 0.3 only after pruning or settling
+  them by hand.
+- **A gRPC `INVALID_ARGUMENT` escapes `Tx.submit` as `TransportError` only on
+  the first send.** After a timeout or a retryable failure the earlier send may
+  have landed, so a later refusal reconciles like any other ambiguous failure
+  (usually `SubmissionUnknown`).
+- **The fake's resolver mirrors the SDK's core resolver**: its budget simulate
+  runs only when the recipe left the budget unset. A test that presets a
+  budget now sees `Tx.build`'s explicit simulate (no `resolver: true`) instead
+  of a resolver one; call-count assertions on `simulateTransaction` may move.
+
+### Added
+
+- **`Tx.build` simulates on every transport.** The gRPC resolver simulates
+  whenever it runs, but the core resolver every other transport uses
+  (JSON-RPC, GraphQL) simulates only to choose a budget it was not given, so a
+  recipe that called `tx.setGasBudget(...)` there was resolved and signed
+  without ever being shown to execute: a Move abort became a charged
+  `ExecutionFailed` instead of a free `SimulationFailed`. `Tx.build` now asks,
+  against the resolving client and before the build, whether the SDK will
+  simulate, and runs one explicit simulate when it will not.
+- **`Tx.build` retries the SDK resolver** on a retryable `TransportError`, on
+  the read schedule (five attempts). The resolver's own reads went straight to
+  the SDK under none of `SuiCore`'s retries; nothing has been signed yet.
+- **`Signer.fromConfig` builds ML-DSA-65 keys.** `MLDSA65Keypair` is imported
+  on demand, because `@mysten/sui/keypairs/mldsa65` first shipped in 2.36 and
+  the peer range admits older SDKs, where a static import would not load.
+- **`Verify.verifyTransactionSignature` and
+  `Verify.verifyPersonalMessageSignature`** on `@unconfirmed/sui-effect/tx`:
+  the Effect face of `@mysten/sui/verify`, `R = Sui`, answering the public key.
+  With `{ address }` the signature must also be that address's. An invalid
+  signature is `SigningError`; a zkLogin or multisig check that could not reach
+  the node is `TransportError`, never a verdict.
+- **`Sui.streamEvents(filter?, { order? })` and
+  `Sui.streamTransactions(filter?, { order? })`** over the SDK's `EventFilter`
+  and `TransactionFilter`. Both page on `hasNextPage`, so a scan-limited
+  server's empty pages do not end the stream; transactions are
+  `Result<Executed, ExecutionFailed>` per entry.
+- **`Sui.streamCoins(owner, coinType?)`, `Sui.streamBalances(owner)` and
+  `Sui.getCoinMetadataOption(coinType)`.**
+- **`Sui.getDynamicObjectFieldOption(parent, name, { schema?, expectedType? })`**,
+  which checks the object's type the way `getObject` does.
+- **`Sui.resolveNameServiceAddressOption(name)` and
+  `Sui.defaultNameServiceNameOption(address)`**; "no name" is `None` on every
+  SDK in range (2.33.2 changed it from a thrown `NOT_FOUND` to `name: null`).
+- **Schemas `EventEntry`, `Coin`, `CoinMetadata` and `Nonce`; types
+  `EventFilter`, `TransactionFilter`, `ListOrder`**, all from the package root.
+- **`pruneSettled(before, { prefix? })`** in `@unconfirmed/sui-effect/journal`
+  deletes settled entries recorded before a cutoff and answers the count; it
+  never deletes a `Signed` or `Unknown` entry.
+- **The fake serves the ledger reads**: `listEvents`, `listTransactions`,
+  `getDynamicObjectField`, `resolveNameServiceAddress` and
+  `defaultNameServiceName`, with `FakeScript.scanLimit`, `FakeScript.names`,
+  `FakeExecution.sender` and `FakeExecution.moveCalls`.
+- **`LLMS.md` opens with a "start here" section** (`docs/llms-head.md`): the
+  subpath map, five recipes that are tested files, the two tiers and the
+  positional-versus-options rule, the error table with outcomes and exit codes,
+  `SubmitConfig`'s defaults, ten invariants and an index of every export by
+  subpath. The extension template's test suite and manifest are now named by
+  path rather than reprinted.
+
+### Changed
+
+- `Sui.view` accepts a `Recipe`, a `Transaction` or serialized bytes, like
+  `Sui.simulate`.
+- `SuiGraphQL.query`'s `run` receives the Effect's `AbortSignal` as a second
+  argument; pass it as the query's `signal` so `Effect.timeout` and
+  interruption cancel the request. One-argument callbacks still compile.
+- Every `TransportError` for a node reply that did not decode now carries a
+  `DecodeError { kind: "shape", issues }` as its `cause`, not a string.
+- Several journal instances or processes over one prefix no longer lose each
+  other's entries (the single-writer limitation is gone with the index).
+- A store written by 0.3 reads unchanged; its `index` key is ignored and left
+  in place, so rolling back is safe (see the `"refused"` caveat above), and it
+  can be deleted by hand.
+- `Tx.run` documents that the gas owner's lock comes from `opts.gasOwner`
+  only: a gas owner only the recipe sets is not known when the locks are
+  chosen, so pass it as `gasOwner` too.
+- Internal journal and entry helpers no longer open spans, so `Tx.executedEntry`
+  and friends are gone from traces.
+- The extension template's peer on `@unconfirmed/sui-effect` is
+  `>=0.4.0 <0.5.0`.
+- CI's effect matrix installs `effect` and `@effect/platform-bun` as one pair
+  with no fallback, and the README no longer claims TypeScript 7 (`tsgo`)
+  consumers are checked: CI typechecks the packed tarball with `tsc` 5.9.3.
+- `test/live.devnet.test.ts` (behind `SUI_LIVE=1`) funds through
+  `requestSuiFromFaucetV3`, which pays into the address balance, so it also
+  exercises address-balance gas.
+
+### Fixed
+
+- A `Signed` entry for a refused submission no longer stays unresolved until
+  its epoch window closes.
+- Coin-reservation refs in `gasData.payment` (address-balance gas) are no
+  longer read as pinned objects during reconcile.
+- `Script.run` and `Script.report` no longer reject or skip `exit` when an
+  injected `stderr` writer throws; `Script.run` now ends in `Script.report`.
+- The extension guide's Durable Object `KeyValueStore` adapter compiles on
+  effect 4.1 (it adds `keys`, drops a stray `Option`, and turns storage
+  rejections into `KeyValueStoreError`); it is now a typechecked, tested
+  template file, `examples/extension-template/recipes/durable-object.ts`.
+- `LLMS.md` shows `SubmitConfig`'s docs and example, prints qualified "Never
+  fails; …" sentences whole, has no raw `{@link}` in signature blocks, and no
+  summary is cut short at a prose line starting with `@`.
+- `examples/script-claim.ts`'s header put `UnexpectedEffects` on exit 4; it
+  exits 5 (applied), as `Script.exitCode` and the README always said.
+
+### Migrating from 0.3.x
+
+1. Move to `effect@4.1.1` (and every `@effect/*` package you use at `4.1.1`)
+   together. A custom `KeyValueStore` behind the durable journal needs `keys`;
+   `KeyValueStore.makeStringOnly` takes it as a sixth member.
+2. Replace `getObjectsOrFail` with `getObjectsStrict`, `ReconciledOutcome` with
+   `Reconciled`, and `face.dispose()` with `face.$dispose()`.
+3. Delete `catchTag("TransportError", …)` around `Tx.reconcile` and
+   `Tx.reconcileAll`; the compiler points at each one.
+4. Handle `NotApplied { evidence: "refused" }` wherever you `switch` on
+   `evidence`, and `"MLDSA65"` wherever you `switch` on `SignatureScheme`.
+5. A hand-built `Simulation` needs `gasPaymentMocked`.
+6. Pass the `AbortSignal` through in `SuiGraphQL.query` callbacks.
+7. Durable journals need no migration. Once 0.4 has written a `"refused"` entry,
+   a 0.3 process cannot read that entry back.
+
 ## 0.3.0
 
 ### Changed (breaking)

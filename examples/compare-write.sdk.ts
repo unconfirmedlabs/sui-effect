@@ -1,5 +1,5 @@
 /**
- * Claims an escrow through a PTB, written against the canonical 2.30 SDK.
+ * Claims an escrow through a PTB, written against the canonical 2.38 SDK.
  *
  * Compare with `examples/compare-write.effect.ts`, which does the same thing
  * through `Tx.run` and notes what that adds over this file. Both sign with
@@ -22,8 +22,10 @@ const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
 const RECEIPT_TYPE = `${PKG}::escrow::Receipt`
 const EscrowBcs = bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() })
 
-// The scheme flag on a Bech32 key names one of three keypair classes;
-// nothing else decodes it, and a fourth scheme has no keypair class at all.
+// The scheme flag on a Bech32 key names one of four keypair classes and
+// nothing decodes it for you. ML-DSA-65's class (2.36+) is left out so this
+// file compiles on every SDK the peer range admits; sui-effect's
+// `Signer.fromConfig` loads it on demand where it exists.
 const KEYPAIR_FOR: Record<string, undefined | ((secretKey: Uint8Array) => Keypair)> = {
   ED25519: Ed25519Keypair.fromSecretKey,
   Secp256k1: Secp256k1Keypair.fromSecretKey,

@@ -1281,7 +1281,7 @@ const settle = Effect.fnUntraced(function*(
       yield* journalSettled(yield* failedEntry(failure))
       return Reconciled.cases.ExecutionFailed.make({ _tag: "ExecutionFailed", error: failure })
     case "NotApplied":
-      // Terminal, so the entry leaves the unresolved index: without this a
+      // Terminal, so the entry stops being unresolved: without this a
       // durable journal would hold a proven-dead submission forever and
       // `onUnresolved: "fail"` would refuse to build for the life of it.
       yield* journalSettled(yield* notAppliedEntry(failure))
@@ -1915,8 +1915,8 @@ export const recorded: (
  * long-lived application makes after building a durable `Journal`.
  *
  * **Only unresolved entries come back.** `Signed` and `Unknown` are the tags
- * that still need an answer; a digest that already settled is not in the
- * journal's unresolved index and is not in this array. Ask about one of those
+ * that still need an answer; a digest that already settled is not among the
+ * journal's unresolved entries and is not in this array. Ask about one of those
  * with {@link recorded}.
  *
  * Nothing here fails per entry: each one settles to an `Executed`, an

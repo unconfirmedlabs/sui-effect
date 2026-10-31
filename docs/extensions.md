@@ -654,7 +654,7 @@ out of fifty is not a failed read. Two idioms, and you should pick deliberately:
   `Result.getOrElse(result, () => fallback)` per item, or a `Map` keyed by id so
   a caller can ask about one;
 - **hard** — every id must be there: `sui.getObjectsStrict(ids, opts)` (named
-  `getObjectsOrFail` before 0.1.2, and still reachable under that name), which
+  `getObjectsOrFail` before 0.1.2; that alias was removed in 0.4.0), which
   fails with the first item's error (`ObjectNotFound`, `ObjectDeleted`,
   `ObjectUnavailable` or `DecodeError`) and otherwise hands back the objects in
   the order of the ids.
@@ -917,8 +917,8 @@ for the malformed case; so should you.
 Two things not to promise in the docs you write around it. `Config.option` turns
 an **empty** variable into "unset", so `FOO=""` takes the default rather than
 failing — do not write "an empty value is a `ConfigError`" above a
-`Config.option`. And `Effect.withConfigProvider` does not exist in Effect v4
-(4.0.3): a test provides the provider like anything else, with
+`Config.option`. And `Effect.withConfigProvider` does not exist in Effect v4: a
+test provides the provider like anything else, with
 `ConfigProvider.layer(ConfigProvider.fromEnvRecord({ … }))` or
 `Effect.provideService(effect, ConfigProvider.ConfigProvider, provider)`.
 
@@ -1051,7 +1051,7 @@ different extensions on the same client. After that:
 - a plain value passes through;
 - a rejection is **the same tagged error instance**, so a Promise consumer can
   still switch on `_tag` and read `outcome`;
-- `dispose()` releases everything the layer acquired.
+- `$dispose()` releases everything the layer acquired.
 
 ### Synchronous members, `$ready` and `warm`
 
@@ -1286,8 +1286,8 @@ describe("the Promise face type", () => {
 property of the extended client's type — no cast, and no `| undefined` under
 `noUncheckedIndexedAccess`. `options.sui` pins the chain identifier the node
 must report, which is how an extension whose deployment names a custom network's
-`chainIdentifier` refuses to run against another chain. And `$dispose()` (still
-available as `dispose()`) is not final: it releases what the layer acquired and
+`chainIdentifier` refuses to run against another chain. And `$dispose()` is not
+final: it releases what the layer acquired and
 forgets the runtime, and the next call builds a fresh one, so dispose when the
 consumer is done rather than between calls. Registering the same extension
 twice, or on two clients, still gives two independent runtimes and two layer
@@ -1517,11 +1517,16 @@ that sorts out the two failures:
 import { SuiGraphQL } from "@unconfirmed/sui-effect"
 
 const chainId = SuiGraphQL.query(
-  (client) => client.query({ query: "{ chainIdentifier }", variables: {} }),
+  (client, signal) => client.query({ query: "{ chainIdentifier }", variables: {}, signal }),
   "chainIdentifier"
 )
 // Effect<…, GraphQLUnavailable | TransportError, SuiGraphQL>
 ```
+
+`run` receives the Effect's `AbortSignal` as its second argument. Pass it as the
+query's `signal`, so `Effect.timeout` and interruption cancel the request the
+way they cancel every `SuiCore` call; a one-argument callback still compiles,
+and is a request nothing can cancel.
 
 A rejection from `SuiGraphQL.layerUnavailable` is already a
 `GraphQLUnavailable` and is passed through unchanged; anything else becomes
@@ -2021,7 +2026,7 @@ conversion is mechanical except where the behaviour deliberately changed.
 | `TransactionFailedError { digest, status }` | `ExecutionFailed { digest, reason, command, effects }` |
 | `getObjectContent` | `sui.getObject(id)` — with no schema, `content` is the raw bytes |
 | `getOptionalObjectContent` | `sui.getObjectOption` — `None` for missing and deleted, which is also the blessed way to express domain absence |
-| `getObjectsContent` | `sui.getObjects` — chunked, integrity-checked, a per-item `Result` instead of silently dropping errored ids; `sui.getObjectsStrict` (the deprecated `getObjectsOrFail`) when every id must be there |
+| `getObjectsContent` | `sui.getObjects` — chunked, integrity-checked, a per-item `Result` instead of silently dropping errored ids; `sui.getObjectsStrict` when every id must be there |
 | `listDynamicFields` | `sui.streamDynamicFields` |
 | filtering dynamic fields by key type | filter entries on `name.type` with `SuiSchema.matchesType` (never `normalizeStructTag`, which throws on the primitive key types), then decode `name.bcs` with `SuiSchema.decode(keyCodec, entry.name.bcs)`; the entry carries both |
 | `deriveDynamicFieldID` + `getObjectOption` for existence | `sui.getDynamicFieldOption(parent, name)` — one call, `None` for absent |
@@ -2137,7 +2142,7 @@ module-level state, `run*` outside an entrypoint.
   "@mysten/bcs": "^2.1.3",
   "@mysten/sui": "^2.28",
   "effect": ">=4.1.1 <4.2",
-  "@unconfirmed/sui-effect": ">=0.3.0 <0.4.0"
+  "@unconfirmed/sui-effect": ">=0.4.0 <0.5.0"
 },
 "peerDependenciesMeta": {
   "@unconfirmed/sui-effect": {
@@ -2257,7 +2262,7 @@ even for a peer a local dependency already satisfies, and an unpublished name
 
 Put both halves of the swap on the release checklist:
 
-1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.1.0 <0.3.0"`, which is what the template ships since 0.2.0 — a range rather than a caret, because 0.x carets do not span a minor and the 0.1 and 0.2 surfaces differ only in the `optionalKey` rule of §2);
+1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.4.0 <0.5.0"`, which is what the template ships for 0.4.x — a range rather than a caret, written out so the one minor it spans is explicit: a 0.x minor may break, and 0.4.0 did, see `CHANGELOG.md`);
 2. **delete the `peerDependenciesMeta` entry.** Left in, it turns a genuinely
    missing peer into a silent `undefined` at import time;
 3. re-run the isolated-consumer check against the published package.
@@ -2555,7 +2560,9 @@ the page to read before the conversion rather than after it.
   resolve a just-created object for a while **even after `waitForTransaction`
   returned**: visibility of a transaction is not visibility of its objects in
   the resolver path. Retry the build, do not re-read and despair.
-- **Use stable `effect@4.0.3` or a later 4.0.x.** Release candidates are not
+- **Use `effect@4.1.1` or a later 4.1.x**, matching the sui-effect peer range
+  (`>=4.1.1 <4.2`; a custom `KeyValueStore` must implement `keys`, which 4.1
+  added). Release candidates are not
   supported: rc.113 renamed `Config.nonEmptyString`, `Config.string` and
   `Config.redacted`, and rc.118 moved `effect/unstable/*` to `effect/*` — and
   two copies of `effect` in one process is a different
@@ -2580,8 +2587,18 @@ the page to read before the conversion rather than after it.
   `SuiSchema.matchesType`; `normalizeStructTag` throws on `u64`, `bool`,
   `address` and `vector<u8>`.
 - **`Stream.runCollect` returns a plain `Array`** in Effect v4, not a `Chunk`.
-- **`Effect.withConfigProvider` does not exist** in 4.0.3: provide the
-  `ConfigProvider` service.
+- **Allowances are SDK pass-through.** `tx.balance({ allowance, … })`,
+  `tx.coin({ allowance, … })` and `tx.withdrawal({ from: "allowance", allowance,
+  funder })` (`@mysten/sui` 2.31+) go in a recipe like any other command, and
+  `Tx.build` resolves them through the SDK. sui-effect has no helper for them,
+  and the fake's resolver models neither `FundsWithdrawal` inputs nor
+  address-balance gas, so a recipe that uses them is tested against a network,
+  not on `layerTest`.
+- **Funding a dev address is SDK pass-through too.** Call
+  `requestSuiFromFaucetV3({ host: getFaucetHost("devnet"), recipient })` from
+  `@mysten/sui/faucet` (2.34+; devnet and testnet run the proof-of-work V3
+  faucet). It pays into the **address balance**, not a coin object, which
+  `sui.getBalance(owner).balance` counts and `streamCoins` does not list.
 - **`SuiError.describe` covers `GraphQLUnavailable` and `ExtensionNotReady`**,
   and `Script.run` prints them like any other tag.
 - **Write a `PromiseFace<Service>` type test per namespace**, and put `test` in
