@@ -91,6 +91,7 @@ export {
   type ChangedRef,
   Executed,
   objectRefOf,
+  type Published,
   type SdkObjectRef,
   sdkRefOf
 } from "./domain/executed.ts"

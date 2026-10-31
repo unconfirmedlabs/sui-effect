@@ -25,7 +25,15 @@ import { TestClock } from "effect/testing"
 import type { ChangedRef, Recipe, Sui, SuiCore } from "@unconfirmed/sui-effect"
 import { KNOWN_CHAIN_IDS, ObjectId, SuiAddress, SuiError, SuiSchema } from "@unconfirmed/sui-effect"
 import type { PromiseFace } from "@unconfirmed/sui-effect/extension"
-import { FakeOutcome, layerExtensionTest, layerTest, SuiCoreFake, SuiTest } from "@unconfirmed/sui-effect/testing"
+import {
+  fakeCoin,
+  fakeDigest,
+  FakeOutcome,
+  layerExtensionTest,
+  layerTest,
+  SuiCoreFake,
+  SuiTest
+} from "@unconfirmed/sui-effect/testing"
 import { Journal, Signer } from "@unconfirmed/sui-effect/tx"
 import type { EscrowObject, EscrowService } from "../src/Escrow.ts"
 import { DEPLOYMENTS, Escrow } from "../src/Escrow.ts"
@@ -66,17 +74,7 @@ const escrowObject = (amount: string) => ({
 /** Everything the fake serves: one escrow, one gas coin, one scripted execution. */
 const script = {
   objects: [escrowObject("5")],
-  coins: [
-    {
-      objectId: padded("c01"),
-      version: "2",
-      digest: "11111111111111111111111111111111",
-      type: `0x2::coin::Coin<0x2::sui::SUI>`,
-      balance: "1000000000",
-      owner,
-      previousTransaction: null
-    } as unknown as SuiClientTypes.Coin
-  ],
+  coins: [fakeCoin({ objectId: padded("c01"), owner: SENDER, balance: 1_000_000_000n, version: 2n })],
   execute: [
     FakeOutcome.succeed({
       created: [{ objectId: RECEIPT_ID, type: RECEIPT_TYPE, version: 4n, owner }],
@@ -94,20 +92,13 @@ const provide = <A, E>(
   effect: Effect.Effect<A, E, Escrow | Sui | SuiCore | SuiCoreFake | TestClock.TestClock>,
   state: { readonly settled?: boolean } = {}
 ) =>
-  Effect.runPromise(
-    Effect.provide(
-      effect,
-      Layer.mergeAll(
-        layerExtensionTest(Escrow.layerTest(state), script),
-        // The program's own clock, for retries and timeouts. The chain's clock
-        // is `SuiTest.setClock`.
-        TestClock.layer(),
-        // The default journal is a process-wide memory journal, so a test that
-        // submits provides its own to stay isolated.
-        Journal.layerMemory
-      ),
-      { local: true }
-    )
+  effect.pipe(
+    // The extension's layer over the fake, plus a fresh memory journal (the
+    // default one is process-wide) and the program's own `TestClock`, all
+    // built locally so no test shares state with another. The chain's clock is
+    // `SuiTest.setClock`.
+    SuiTest.provide(layerExtensionTest(Escrow.layerTest(state), script)),
+    Effect.runPromise
   )
 
 describe("Escrow", () => {
@@ -642,7 +633,7 @@ describe("the errors", () => {
   test("SuiError.toJson keeps the outcome, though it is a class field", () => {
     const error = new EscrowSettlementUnknown({
       escrowId: ESCROW_ID,
-      digest: "1".repeat(32) as never,
+      digest: fakeDigest(1),
       message: "the operator never confirmed"
     })
     const json = SuiError.toJson(error)
@@ -666,7 +657,7 @@ describe("the errors", () => {
       new EscrowNotFound({ escrowId: ESCROW_ID }),
       new EscrowSettlementUnknown({
         escrowId: ESCROW_ID,
-        digest: "1".repeat(32) as never,
+        digest: fakeDigest(1),
         message: "the operator never confirmed"
       }),
       new EscrowUnsupportedNetwork({ network: "devnet" })

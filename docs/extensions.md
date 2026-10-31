@@ -1546,20 +1546,13 @@ const provide = <A, E>(
   effect: Effect.Effect<A, E, Escrow | Sui | SuiCore | SuiCoreFake | TestClock.TestClock>,
   state: { readonly settled?: boolean } = {}
 ) =>
-  Effect.runPromise(
-    Effect.provide(
-      effect,
-      Layer.mergeAll(
-        layerExtensionTest(Escrow.layerTest(state), script),
-        // The program's own clock, for retries and timeouts. The chain's clock
-        // is `SuiTest.setClock`.
-        TestClock.layer(),
-        // The default journal is a process-wide memory journal, so a test that
-        // submits provides its own to stay isolated.
-        Journal.layerMemory
-      ),
-      { local: true }
-    )
+  effect.pipe(
+    // The extension's layer over the fake, plus a fresh memory journal (the
+    // default one is process-wide) and the program's own `TestClock`, all
+    // built locally so no test shares state with another. The chain's clock is
+    // `SuiTest.setClock`.
+    SuiTest.provide(layerExtensionTest(Escrow.layerTest(state), script)),
+    Effect.runPromise
   )
 ```
 
@@ -1589,17 +1582,7 @@ and scripted outcomes for simulate, execute and `getTransaction`:
 ```ts
 const script = {
   objects: [escrowObject("5")],
-  coins: [
-    {
-      objectId: padded("c01"),
-      version: "2",
-      digest: "11111111111111111111111111111111",
-      type: `0x2::coin::Coin<0x2::sui::SUI>`,
-      balance: "1000000000",
-      owner,
-      previousTransaction: null
-    } as unknown as SuiClientTypes.Coin
-  ],
+  coins: [fakeCoin({ objectId: padded("c01"), owner: SENDER, balance: 1_000_000_000n, version: 2n })],
   execute: [
     FakeOutcome.succeed({
       created: [{ objectId: RECEIPT_ID, type: RECEIPT_TYPE, version: 4n, owner }],
