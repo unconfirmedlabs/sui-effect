@@ -18,17 +18,17 @@ import { bcs as suiBcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import type { Transaction } from "@mysten/sui/transactions"
-import { Duration, Effect, Fiber, Layer, Option } from "effect"
+import { DateTime, Duration, Effect, Fiber, Layer, Option } from "effect"
 import { TestClock } from "effect/testing"
 import { SuiError } from "../src/domain/errors.ts"
 import { EXECUTE_INCLUDE } from "../src/domain/executed.ts"
-import type { JournalEntry } from "../src/domain/journal-entry.ts"
+import { JournalEntry } from "../src/domain/journal-entry.ts"
 import { Journal } from "../src/services/Journal.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
 import type { SubmitConfigService } from "../src/services/SubmitConfig.ts"
 import { SubmitConfig } from "../src/services/SubmitConfig.ts"
 import { Sui } from "../src/services/Sui.ts"
-import { FakeOutcome, type SuiCoreFake } from "../src/services/SuiCoreFake.ts"
+import { FakeOutcome, fakeDigest, type SuiCoreFake } from "../src/services/SuiCoreFake.ts"
 import { Tx } from "../src/services/Tx.ts"
 import { layerTest, SuiTest } from "../src/testing.ts"
 
@@ -512,5 +512,73 @@ describe("sponsor#8 / wallet#6: Tx.resubmit re-sends the identical bytes", () =>
     expect(resent.map((r) => r._tag)).toEqual(["Executed"])
     expect(sends).toHaveLength(2)
     expect(Option.map(entry, (e: JournalEntry) => e._tag)).toEqual(Option.some("Executed"))
+  })
+})
+
+describe("a reconcile answer for another digest is not an answer", () => {
+  /** A digest that is neither ours nor {@link OTHER_DIGEST}. */
+  const THIRD_DIGEST = fakeDigest(201)
+
+  test("getTransaction answering another digest is SubmissionUnknown, and the entry stays unresolved", async () => {
+    const { result, entry, foreign } = await run(
+      Effect.gen(function*() {
+        const signed = yield* signedClaim
+        const journal = yield* Journal
+        yield* journal.put(JournalEntry.cases.Signed.make({
+          _tag: "Signed",
+          digest: signed.digest,
+          signed,
+          signedAt: yield* DateTime.now
+        }))
+        const result = yield* Effect.result(Tx.reconcile(signed))
+        return { result, entry: yield* entryOf(signed.digest), foreign: yield* entryOf(OTHER_DIGEST) }
+      }),
+      { ...baseScript, getTransaction: [FakeOutcome.succeed({ digest: OTHER_DIGEST })] }
+    )
+    expect(result._tag).toBe("Failure")
+    if (result._tag === "Failure") {
+      expect(result.failure._tag).toBe("SubmissionUnknown")
+      expect(SuiError.describe(result.failure)).toContain(OTHER_DIGEST)
+    }
+    expect(Option.map(entry, (e: JournalEntry) => e._tag)).toEqual(Option.some("Signed"))
+    expect(Option.isNone(foreign)).toBe(true)
+  })
+
+  test("an ExecutionFailed for another digest is not trusted either", async () => {
+    const error = await run(
+      Effect.gen(function*() {
+        const signed = yield* signedClaim
+        return yield* Effect.flip(Tx.reconcile(signed))
+      }),
+      {
+        ...baseScript,
+        getTransaction: [FakeOutcome.failWith(
+          { $kind: "MoveAbort", message: "aborted", MoveAbort: { abortCode: "3" } } as never,
+          { digest: OTHER_DIGEST }
+        )]
+      }
+    )
+    expect(error._tag).toBe("SubmissionUnknown")
+  })
+
+  test("a consumer whose answer carries the wrong digest is not inputConsumed evidence", async () => {
+    const error = await run(
+      Effect.gen(function*() {
+        const signed = yield* signedClaim
+        yield* SuiTest.bumpVersion(ESCROW_ID, { consumedBy: OTHER_DIGEST })
+        // Asked about OTHER_DIGEST, the node answers for a third transaction
+        // whose effects would otherwise prove our pinned version consumed.
+        yield* SuiTest.recordTransaction(
+          OTHER_DIGEST,
+          FakeOutcome.succeed({
+            digest: THIRD_DIGEST,
+            mutated: [{ objectId: ESCROW_ID, type: ESCROW_TYPE, version: 4n, inputVersion: 3n, owner }]
+          })
+        )
+        return yield* Effect.flip(Tx.reconcile(signed))
+      }),
+      { ...baseScript, getTransaction: [FakeOutcome.notFound()] }
+    )
+    expect(error._tag).toBe("SubmissionUnknown")
   })
 })

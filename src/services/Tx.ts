@@ -1945,8 +1945,8 @@ type InputEvidence =
  * A transaction that **failed** on chain still consumed its inputs, so its
  * effects are read out of `ExecutionFailed` as readily as out of `Executed`.
  * `undefined` means the question cannot be answered here — the node does not
- * serve that transaction, or its effects do not mention this object (it was
- * created rather than consumed).
+ * serve that transaction, it answered for **another** digest, or its effects
+ * do not mention this object (it was created rather than consumed).
  *
  * Fails with: `TransportError`.
  */
@@ -1961,11 +1961,15 @@ const consumedVersionOf = Effect.fnUntraced(function*(
   if (found._tag === "Failure" && found.failure._tag === "TransportError") {
     return yield* found.failure
   }
-  const effects = found._tag === "Success"
-    ? found.success.effects
+  const answer = found._tag === "Success"
+    ? found.success
     : found.failure._tag === "ExecutionFailed"
-    ? found.failure.effects
+    ? found.failure
     : undefined
+  // An answer about another transaction is inconclusive, never evidence: its
+  // effects would turn a confused node into a false `inputConsumed`.
+  if (answer === undefined || answer.digest !== decoded.value) return undefined
+  const effects = answer.effects
   if (effects === undefined) return undefined
   const wanted = normalizeSuiAddress(objectId)
   for (const change of effects.changedObjects) {
@@ -2271,6 +2275,12 @@ const chainOfSigned = (signed: Signed): string | undefined =>
  * submission whose outcome is genuinely unknown. Every read failure here
  * becomes `SubmissionUnknown` carrying the digest, the bytes and the cause.
  *
+ * **An answer for another digest is not trusted**, here as on the send side:
+ * a `getTransaction` that answers an `Executed` or `ExecutionFailed` for a
+ * different transaction is `SubmissionUnknown` naming both digests, and a
+ * consuming transaction's answer for a different digest is not
+ * `inputConsumed` evidence.
+ *
  * Given only a `Digest` there can be no evidence, so an unknown transaction is
  * always `SubmissionUnknown`. Pass the `Signed` bytes (or the
  * `SubmissionUnknown` that carries them) to get the evidence rules.
@@ -2397,13 +2407,33 @@ const recover = Effect.fn("Tx.recover")(function*(
     }
   }
 
+  /**
+   * An answer about another transaction is no answer about this one: returned,
+   * it would settle the caller on a foreign receipt and journal it under the
+   * foreign digest, leaving this entry unresolved. It becomes a non-retryable
+   * `TransportError`, which the caller of `recover` turns into
+   * `SubmissionUnknown`.
+   */
+  const answeredForAnother = (answered: string) =>
+    new TransportError({
+      method: "getTransaction",
+      retryable: false,
+      cause: `the node answered for transaction ${answered}, not the requested ${digest}`
+    })
+
   /** One `getTransaction`, with "the node does not know it" as a value. */
   const lookup = Effect.fnUntraced(function*(): Effect.fn.Return<
     Executed | undefined,
     ExecutionFailed | TransportError
   > {
     const found = yield* Effect.result(sui.getTransaction(digest))
-    if (found._tag === "Success") return found.success
+    if (found._tag === "Success") {
+      if (found.success.digest !== digest) return yield* answeredForAnother(found.success.digest)
+      return found.success
+    }
+    if (found.failure._tag === "ExecutionFailed" && found.failure.digest !== digest) {
+      return yield* answeredForAnother(found.failure.digest)
+    }
     if (found.failure._tag !== "TransactionNotFound") return yield* found.failure
     return undefined
   })

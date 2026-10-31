@@ -5361,6 +5361,12 @@ about whether the transaction applied, and `SuiError.outcome` puts
 submission whose outcome is genuinely unknown. Every read failure here
 becomes `SubmissionUnknown` carrying the digest, the bytes and the cause.
 
+**An answer for another digest is not trusted**, here as on the send side:
+a `getTransaction` that answers an `Executed` or `ExecutionFailed` for a
+different transaction is `SubmissionUnknown` naming both digests, and a
+consuming transaction's answer for a different digest is not
+`inputConsumed` evidence.
+
 Given only a `Digest` there can be no evidence, so an unknown transaction is
 always `SubmissionUnknown`. Pass the `Signed` bytes (or the
 `SubmissionUnknown` that carries them) to get the evidence rules.
