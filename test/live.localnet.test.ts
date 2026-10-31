@@ -230,7 +230,7 @@ describe.skipIf(!LOCALNET)("localnet, with SUI_LOCALNET=1", () => {
   )
 
   test(
-    "an address-balance transaction with no owned input needs a ValidDuring expiration",
+    "an address-balance transaction needs a ValidDuring expiration and cannot use tx.gas",
     async () => {
       const signer = await funded()
       await local(Tx.foldCoins({ signer }))
@@ -250,6 +250,20 @@ describe.skipIf(!LOCALNET)("localnet, with SUI_LOCALNET=1", () => {
       )
       expect(failure._tag).toBe("BuildError")
       expect(failure.message).toContain("ValidDuring")
+
+      // And the gas coin of an empty payment is empty: a node simulates a split
+      // of it successfully and fails it on chain, so the build refuses it.
+      const gasCoin = await local(
+        Effect.flip(
+          Tx.build((tx) => {
+            const [coin] = tx.splitCoins(tx.gas, [1_000n])
+            tx.transferObjects([coin!], signer.address)
+            tx.setGasPayment([])
+          }, { sender: signer.address })
+        )
+      )
+      expect(gasCoin._tag).toBe("BuildError")
+      expect(gasCoin.message).toContain("uses tx.gas")
     },
     5 * MINUTE
   )

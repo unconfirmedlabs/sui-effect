@@ -572,15 +572,15 @@ const gasPaymentKindOf = (data: TransactionDataBuilder): GasPaymentKind => {
  * `Transaction` gives before it is built. Never fails; data this version
  * cannot read answers `true`, which keeps an unset payment unset.
  */
+const mentionsGasCoin = (value: unknown): boolean => {
+  if (Array.isArray(value)) return value.some(mentionsGasCoin)
+  if (typeof value !== "object" || value === null) return false
+  if ((value as { readonly $kind?: unknown }).$kind === "GasCoin") return true
+  return Object.values(value).some(mentionsGasCoin)
+}
 const usesGasCoin = (tx: Transaction): boolean => {
-  const walk = (value: unknown): boolean => {
-    if (Array.isArray(value)) return value.some(walk)
-    if (typeof value !== "object" || value === null) return false
-    if ((value as { readonly $kind?: unknown }).$kind === "GasCoin") return true
-    return Object.values(value).some(walk)
-  }
   try {
-    return walk(tx.getData().commands)
+    return mentionsGasCoin(tx.getData().commands)
   } catch {
     return true
   }
@@ -809,9 +809,11 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  * must hold at least the gas budget plus the SUI the bytes withdraw from it in
  * its SUI address balance, coins not counted; the simulation does not check it
  * and the node refuses the bytes at execution. That costs one `getBalance`
- * read, for those transactions only. And bytes paying from an address balance
+ * read, for those transactions only. Bytes paying from an address balance
  * with no address-owned input need a `ValidDuring` expiration, which a node
- * otherwise refuses outright; the default expiration is one.
+ * otherwise refuses outright (the default expiration is one), and must not use
+ * `tx.gas`: with an empty payment the gas coin is empty, which a simulation
+ * does not show and execution fails on, charging gas.
  *
  * `Built.gasOwner` is read out of the bytes: it is present whenever the bytes
  * name a gas owner other than the sender, whether `opts.gasOwner` or the
@@ -821,7 +823,8 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  * the node refused to resolve the transaction, a zero-gas requirement was not
  * met, the payer's address balance cannot cover the budget and withdrawals,
  * coins were chosen under `gasPayment: "requireAddressBalance"`, or an
- * address-balance payment lacks an epoch-bounded expiration),
+ * address-balance payment lacks an epoch-bounded expiration or is used with
+ * `tx.gas`),
  * `SimulationFailed` (the transaction would abort on chain), `PolicyDenied`
  * (rule `"maxGasBudget"`: the budget the node chose is over
  * `SubmitConfig.maxGasBudget`), `TransportError`.
@@ -861,7 +864,8 @@ export const build = Effect.fn("Tx.build")(function*(
   // only to one that was left to the resolver.
   const paymentLength = paymentLengthOf(tx)
   const paymentSet = paymentLength !== undefined
-  const explicitlyEmpty = !paymentSet && config.gasPayment === "requireAddressBalance" && !usesGasCoin(tx)
+  const pinnedByPolicy = !paymentSet && config.gasPayment === "requireAddressBalance" && !usesGasCoin(tx)
+  const explicitlyEmpty = pinnedByPolicy
     ? yield* Effect.try({
       // Pinned before the build, so the resolver lists no coins at all and a
       // balance that cannot cover the budget is the check's `BuildError`.
@@ -959,6 +963,25 @@ export const build = Effect.fn("Tx.build")(function*(
       yield* Effect.logDebug(
         `${payer} pays for gas with coin objects rather than its address balance; Tx.foldCoins moves them into it`
       ).pipe(Effect.annotateLogs({ payer }))
+    }
+    if (kind === "addressBalance" && mentionsGasCoin(data.value.commands)) {
+      // With an empty payment the gas coin is an empty coin: a node simulates
+      // such bytes successfully (it mocks a gas coin) and then executes them as
+      // a failure, "InsufficientCoinBalance", charging gas (observed on
+      // localnet, protocol 139). Refused before anyone signs.
+      return yield* new BuildError({
+        message: pinnedByPolicy
+          // The recipe did not name tx.gas: an SDK intent (tx.coin, tx.balance)
+          // split it because the balance could not cover the amount.
+          ? `${gasOwner ?? opts.sender} must pay from its address balance (SubmitConfig.gasPayment is` +
+            ' "requireAddressBalance"), which does not cover what the transaction spends, so the SDK' +
+            " took it from tx.gas, whose coin is empty under an address-balance payment: fold its coins" +
+            " into its address balance first (Tx.foldCoins)"
+          : "the transaction uses tx.gas but pays for gas from an address balance, where the gas coin" +
+            " is empty: it would fail on chain and be charged. Use tx.coin({ balance }) (with" +
+            " useGasCoin: false under Tx.sponsored) instead of tx.splitCoins(tx.gas, ...)",
+        cause: { payment: kind }
+      })
     }
     if (kind === "addressBalance" && ownedInputsOf(data.value).length === 0) {
       // A node refuses such bytes outright: "Transactions must either have

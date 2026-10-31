@@ -5,9 +5,7 @@ import type { SuiAddress } from "../../src/index.ts"
 import { type Signer, Tx } from "../../src/tx.ts"
 
 export const payOrResend = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
-  Tx.run((tx) => {
-    tx.transferObjects([tx.splitCoins(tx.gas, [amount])], recipient)
-  }, { signer }).pipe(
+  Tx.run(Tx.sendFunds({ amount, recipient }), { signer }).pipe(
     // `SubmissionUnknown` carries the bytes; `Tx.resubmit` sends them again and settles them.
     Effect.catchTag("SubmissionUnknown", (unknown) => Tx.resubmit(unknown))
   )

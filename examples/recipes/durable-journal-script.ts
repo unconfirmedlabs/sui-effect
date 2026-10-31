@@ -16,9 +16,7 @@ export const payOnce = (recipient: SuiAddress, amount: bigint) =>
   Effect.gen(function*() {
     yield* Tx.reconcileAll({ resubmit: true })
     const { signer } = yield* Script
-    const executed = yield* Tx.run((tx) => {
-      tx.transferObjects([tx.splitCoins(tx.gas, [amount])], recipient)
-    }, { signer })
+    const executed = yield* Tx.run(Tx.sendFunds({ amount, recipient }), { signer })
     return executed.digest
   })
 

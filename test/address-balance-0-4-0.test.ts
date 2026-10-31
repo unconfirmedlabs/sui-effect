@@ -136,6 +136,19 @@ describe("gas comes from the address balance by default", () => {
     expect(error.message).toContain("Tx.foldCoins")
   })
 
+  test("requireAddressBalance names Tx.foldCoins when an intent fell back to tx.gas", async () => {
+    // tx.balance for SUI splits the gas coin when the balance cannot cover the
+    // amount; under a pinned empty payment that coin is empty.
+    const error = await run(
+      Tx.build(Tx.sendFunds({ amount: 2_000_000_000n, recipient: RECIPIENT }), { sender: SENDER }).pipe(
+        Effect.flip,
+        SubmitConfig.with({ gasPayment: "requireAddressBalance" })
+      )
+    )
+    expect(error._tag).toBe("BuildError")
+    expect(error.message).toContain("Tx.foldCoins")
+  })
+
   test("requireAddressBalance refuses coins chosen for a tx.gas user", async () => {
     const error = await run(
       Tx.build((tx) => {
@@ -185,6 +198,20 @@ describe("the explicit empty payment check", () => {
     )
     expect(error._tag).toBe("BuildError")
     expect(error.message).toContain("ValidDuring")
+  })
+
+  test("refuses tx.gas, whose coin is empty under an empty payment", async () => {
+    // A node simulates such bytes successfully and fails them on chain,
+    // charging gas: "InsufficientCoinBalance in command 0" (localnet, protocol 139).
+    const error = await run(
+      Tx.build((tx) => {
+        const [coin] = tx.splitCoins(tx.gas, [1_000n])
+        tx.transferObjects([coin!], RECIPIENT)
+        tx.setGasPayment([])
+      }, { sender: SENDER }).pipe(Effect.flip)
+    )
+    expect(error._tag).toBe("BuildError")
+    expect(error.message).toContain("uses tx.gas but pays for gas from an address balance")
   })
 
   test("an address-owned input satisfies the rule without one", async () => {
