@@ -34,7 +34,17 @@ package did not. Several signatures and one stored shape change; read
 - **The durable journal (`/journal`) keeps no `index` key and no put lock.**
   `put` is one `set`; `listUnresolved` lists through `KeyValueStore.keys`,
   oldest first by `signedAt`/`at`. **A custom `KeyValueStore` must implement
-  `keys`** (effect 4.1 requires it of every store anyway).
+  `keys`** (effect 4.1 requires it of every store anyway). Listing now reads
+  and decodes **every** entry under the prefix, settled ones included, so one
+  undecodable entry fails the layer build, `Tx.reconcileAll` and
+  `pruneSettled` with `JournalError` (0.3 decoded only the entries its index
+  named). A 0.3 store reads with no migration; its `index` key is ignored,
+  left in place and no longer maintained, so **rolling back to 0.3 is not
+  safe as is**: 0.3 lists only through that index, and a `Signed` or
+  `Unknown` entry 0.4 wrote is invisible to a 0.3 `listUnresolved`,
+  `Tx.reconcileAll` and `onUnresolved: "fail"` (only `Tx.recorded(digest)`
+  finds it). Drain the store with `Tx.reconcileAll()` on 0.4 before rolling
+  back, and while 0.3 and 0.4 processes share it.
 - **Removed**: `Sui.getObjectsOrFail` (use `getObjectsStrict`, the same
   function), the `ReconciledOutcome` type (use `Reconciled`), and the
   `dispose` alias on `SuiExtension.fromService` faces (use `$dispose()`; a
@@ -44,8 +54,8 @@ package did not. Several signatures and one stored shape change; read
   `outcome: "not_applied"`, now settles the `Signed` entry as
   `NotApplied { evidence: "refused" }` (a new `NotAppliedEvidence` value)
   instead of leaving it unresolved. **A 0.3 reader cannot decode such an
-  entry**: roll a durable store back to 0.3 only after pruning or settling
-  them by hand.
+  entry**: delete them (by hand, or `pruneSettled` with a later cutoff) before a 0.3
+  process reads the store, besides draining it (above).
 - **A gRPC `INVALID_ARGUMENT` escapes `Tx.submit` as `TransportError` only on
   the first send.** After a timeout or a retryable failure the earlier send may
   have landed, so a later refusal reconciles like any other ambiguous failure
@@ -78,8 +88,41 @@ package did not. Several signatures and one stored shape change; read
   `"function"`; `instanceof Promise`, `await` and iteration are unchanged; a cold
   recipe builder's result throws `ExtensionNotReady` (naming the member) when
   applied. In `bun:test` write `expect(Promise.resolve(cold)).rejects`.
-- **`SuiAddress` / `ObjectId` decoding refuses `""`, a bare `"0x"` and non-hex**,
-  which used to decode to the zero address.
+- **`SuiAddress` / `ObjectId` decoding refuses `""`, a bare `"0x"`, an
+  upper-case `"0X"` prefix and non-hex**; the first two used to decode to the
+  zero address and `0X…` to the id. `SuiAddress.normalize` and
+  `ObjectId.normalize` run the same decode, so they now **throw** a
+  `SchemaError` on those inputs, where 0.3 returned the zero address or
+  accepted the `0X` spelling.
+- **Exit codes changed, and they are the wrapper contract.** Under
+  `Script.run`, once this run applied a transaction (`Executed` or `Failed` for
+  bytes it signed) and left nothing unresolved, a failure that would exit 2, 4
+  or 130 exits **5**. While an entry of this run is unresolved, **any** would-be
+  2, 4 or 130 exits **3**; 0.3 rewrote only a timeout or an interrupt, so a
+  not-applied error such as `ObjectNotFound` exited 4. An error that declares
+  an integer `exitCode` (1–255), as a plain field or as Effect's
+  `[Runtime.errorExitCode]`, now exits with it (after `ConfigError`, before
+  `outcome`), so an error that already carried such a field changes code.
+  `Script.exitCode` and `Script.report` apply the same rules to the counts they
+  are given (`report` has no applied count, so it never answers 5 for one).
+- **`Script.run` reads `SUI_LOG_LEVEL`**, which 0.3 ignored, through
+  `Config.LogLevel`, and that is case-sensitive: `Debug` works, while `debug`
+  is a `ConfigError` and the script exits 2 before its program runs.
+- **Every `SuiCore` layer bounds each read attempt at 30 seconds** (the new
+  `requestTimeout` default, under "Added"). A read that used to wait as long as
+  the node took now fails at 30 s with a retryable `TransportError { status:
+  "DEADLINE_EXCEEDED" }` and is retried on the read policy, so a slow but
+  answering read can now fail. Execute, `signAndExecuteTransaction`,
+  `waitForTransaction` and `use` are not bounded.
+- **Interfaces gained required members.** `SuiService` gained fourteen
+  (`streamEvents`, `streamEventPages`, `streamTransactions`,
+  `streamTransactionPages`, `tailEvents`, `tailEventPages`, `tailTransactions`,
+  `tailTransactionPages`, `streamCoins`, `streamBalances`,
+  `getCoinMetadataOption`, `getDynamicObjectFieldOption`,
+  `resolveNameServiceAddressOption`, `defaultNameServiceNameOption`),
+  `SuiCoreService` gained `getServiceInfo` and `ExtensionFace` gained
+  `$reconcileAll`. A hand-written implementation of one of them that does not
+  spread a real one stops compiling.
 - **SDK caller-argument errors are defects**, not `TransportError`: a malformed
   filter, an unpaginable function filter, `after` with `before`. The stream and
   tail transaction readers refuse a `pkg` or `pkg::module` function filter up
@@ -109,8 +152,11 @@ package did not. Several signatures and one stored shape change; read
   against the resolving client and before the build, whether the SDK will
   simulate, and runs one explicit simulate when it will not.
 - **`Tx.build` retries the SDK resolver** on a retryable `TransportError`, on
-  the read schedule (five attempts). The resolver's own reads went straight to
-  the SDK under none of `SuiCore`'s retries; nothing has been signed yet.
+  `SuiCore`'s effective read policy (`core.readPolicy("use")`: the layer's
+  `readRetry` when it was given one, else five attempts), each retry logged at
+  debug and counted like a `SuiCore` read. The resolver's own reads went
+  straight to the SDK under none of `SuiCore`'s retries; nothing has been
+  signed yet.
 - **`Signer.fromConfig` builds ML-DSA-65 keys.** `MLDSA65Keypair` is imported
   on demand, because `@mysten/sui/keypairs/mldsa65` first shipped in 2.36 and
   the peer range admits older SDKs, where a static import would not load.
@@ -177,7 +223,8 @@ package did not. Several signatures and one stored shape change; read
   the same height): behind a load-balanced endpoint (the public fullnodes) it
   can skip matches for good, so run a filtered tail whose completeness matters
   against a single, sticky node. A full `eventType` filter is normalized.
-- **A per-attempt read `requestTimeout`** (30 s by default, `"Infinity"` off,
+- **A per-attempt read `requestTimeout`** (30 s by default — a new default on
+  every `SuiCore` layer, see "Changed (breaking)" — `"Infinity"` off,
   `SUI_RPC_TIMEOUT` under `layerConfig`) ending in a retryable
   `DEADLINE_EXCEEDED`, and a `readRetry` schedule option; each read retry is
   logged at debug. `SuiCoreReadOptions` on `layerFromClient`/`makeFromClient`;
@@ -198,7 +245,8 @@ package did not. Several signatures and one stored shape change; read
   (`SubmitConfigOverrides`) and `journal` (`JournalService`), and
   `face.$reconcileAll()` (a reserved name). `SubmitConfig` overrides accept
   `Duration.Input` (`SubmitConfigOverrides`, exported from `/tx`).
-- **`Script`**: a declared integer `exitCode` (1–255) on an error is honoured
+- **`Script`** (both changes are also breaking; see above): a declared integer
+  `exitCode` (1–255) on an error is honoured
   (after `ConfigError`, before `outcome`) — the plain field, or else Effect's
   own `[Runtime.errorExitCode]` marker, so an error written for
   `Runtime.makeRunMain` exits the same under `Script.run`; `Script.run` reads
@@ -254,9 +302,9 @@ package did not. Several signatures and one stored shape change; read
   `DecodeError { kind: "shape", issues }` as its `cause`, not a string.
 - Several journal instances or processes over one prefix no longer lose each
   other's entries (the single-writer limitation is gone with the index).
-- A store written by 0.3 reads unchanged; its `index` key is ignored and left
-  in place, so rolling back is safe (see the `"refused"` caveat above), and it
-  can be deleted by hand.
+- A store written by 0.3 reads with no migration; its `index` key is ignored,
+  left in place and no longer maintained (rolling back is not safe as is: see
+  the durable journal under "Changed (breaking)").
 - **`Tx.run` takes the gas owner's lock only when gas is paid with coins.**
   An empty payment (address-balance gas, `Tx.sponsored`) selects no coin, so
   one sponsor serves many senders concurrently (twenty concurrent sponsored
@@ -269,12 +317,12 @@ package did not. Several signatures and one stored shape change; read
   address**, which fixes gas equivocation between a warm and a lazy
   registration, or two clients.
 - `Script.run` finds the journal wherever the program provided it and reports
-  only this run's entries. A failure after this run's transaction applied exits
-  5, never 2, 4 or 130 (`ExitCodeOptions.applied`), and prints "N submission(s)
-  of this run applied on chain: … do not send them again". A failure while
-  this run left a submission unresolved exits 3, never 2, 4 or 130, applied
-  transactions or not (`ExitCodeOptions.unresolved`): before, an applied run
-  with an unresolved entry that then failed with a not-applied error such as
+  only this run's entries. The exit-code rules are under "Changed (breaking)":
+  after this run applied a transaction it exits 5
+  (`ExitCodeOptions.applied`) and prints "N submission(s) of this run applied
+  on chain: … do not send them again"; while it left a submission unresolved
+  it exits 3 (`ExitCodeOptions.unresolved`) — before, an applied run with an
+  unresolved entry that then failed with a not-applied error such as
   `ObjectNotFound` exited 4, and a wrapper's retry re-sent the applied intent.
   Diagnostics are one
   line per failure through `SuiError.describe` (a `ConfigError` names the
@@ -294,8 +342,6 @@ package did not. Several signatures and one stored shape change; read
   template's exports: it reads every subpath of `package.json`'s `exports`,
   learns each one's names from its `src/` file and requires the packed `dist/`
   to export them, so the documented rename no longer breaks it.
-- Internal journal and entry helpers no longer open spans, so `Tx.executedEntry`
-  and friends are gone from traces.
 - The extension template's peer on `@unconfirmed/sui-effect` is
   `>=0.4.0 <0.5.0`.
 - CI's effect matrix installs `effect` and `@effect/platform-bun` as one pair
@@ -304,12 +350,9 @@ package did not. Several signatures and one stored shape change; read
 - `test/live.devnet.test.ts` (behind `SUI_LIVE=1`) funds through
   `requestSuiFromFaucetV3`, which pays into the address balance, so it also
   exercises address-balance gas.
-- `Tx.build` retries its resolver on `SuiCore`'s **effective** read policy
-  (`core.readPolicy("use")`), so `SuiCoreReadOptions.readRetry` now governs it
-  and each retry is logged at debug and counted; before, it ran a private copy
-  of the default schedule that ignored `readRetry` and logged nothing.
 - Per-item and nested helpers no longer open spans of their own, so a batch
-  read or a stream is no longer one span per object: `Sui.decodeObject`,
+  read or a stream is no longer one span per object: the journal entry
+  builders (`Tx.executedEntry` and friends), `Sui.decodeObject`,
   `Sui.simulateRaw`, `Sui.fromSimulationResult`,
   `Executed.fromTransactionResult`, the in-memory journal's `Journal.put` /
   `Journal.get`, and `Tx.inputStateOf`, `Tx.consumedVersionOf`,
@@ -361,7 +404,7 @@ package did not. Several signatures and one stored shape change; read
 - Coin-reservation refs in `gasData.payment` (address-balance gas) are no
   longer read as pinned objects during reconcile.
 - `Script.run` and `Script.report` no longer reject or skip `exit` when an
-  injected `stderr` writer throws; `Script.run` now ends in `Script.report`.
+  injected `stderr` writer throws.
 - The extension guide's Durable Object `KeyValueStore` adapter compiles on
   effect 4.1 (it adds `keys`, drops a stray `Option`, and turns storage
   rejections into `KeyValueStoreError`); it is now a typechecked, tested
@@ -398,7 +441,8 @@ package did not. Several signatures and one stored shape change; read
 ### Migrating from 0.3.x
 
 1. Move to `effect@4.1.1` (and every `@effect/*` package you use at `4.1.1`)
-   together. A custom `KeyValueStore` behind the durable journal needs `keys`;
+   together, and `@mysten/bcs` to `^2.1.3` (the new peer floor). A custom
+   `KeyValueStore` behind the durable journal needs `keys`;
    `KeyValueStore.makeStringOnly` takes it as a sixth member.
 2. Replace `getObjectsOrFail` with `getObjectsStrict`, `ReconciledOutcome` with
    `Reconciled`, and `face.dispose()` with `face.$dispose()`.
@@ -408,8 +452,13 @@ package did not. Several signatures and one stored shape change; read
    `evidence`, and `"MLDSA65"` wherever you `switch` on `SignatureScheme`.
 5. A hand-built `Simulation` needs `gasPaymentMocked`.
 6. Pass the `AbortSignal` through in `SuiGraphQL.query` callbacks.
-7. Durable journals need no migration. Once 0.4 has written a `"refused"` entry,
-   a 0.3 process cannot read that entry back.
+7. Durable journals need no migration to be read by 0.4. Rolling back does: 0.4
+   no longer maintains 0.3's `index` key, so a 0.3 process does not see the
+   `Signed`/`Unknown` entries 0.4 wrote, and cannot decode a `"refused"` one.
+   Before rolling back, or while 0.3 and 0.4 processes share a store, run
+   `Tx.reconcileAll()` on 0.4 until nothing is unresolved (or settle the
+   entries by hand) and delete the `"refused"` entries. A store holding an
+   entry that does not decode now fails the layer build: repair or remove it.
 8. Catch the gas ceiling as `PolicyDenied` (`rule: "maxGasBudget"`), not
    `BuildError`; add `PolicyDenied` wherever you handle `Tx.build`'s union.
 9. A `catchTag("TransportError", …)` around `Tx.build` that meant "the node
@@ -427,9 +476,11 @@ package did not. Several signatures and one stored shape change; read
     replace `Option.isSome(x)` / `x.value` with an `undefined` check. A test of a
     cold call writes `expect(Promise.resolve(cold)).rejects`, and code that
     checked `typeof cold === "object"` sees `"function"`.
-13. An address or id decoded from `""`, `"0x"` or non-hex is now a decode
-    failure; decode a value a human typed with `SuiAddress.Strict` /
-    `ObjectId.Strict`.
+13. An address or id decoded from `""`, `"0x"`, a `"0X…"` spelling or non-hex
+    is now a decode failure, and `SuiAddress.normalize` / `ObjectId.normalize`
+    throw a `SchemaError` on the same inputs: lower-case a `0X` prefix first,
+    and guard an empty value before normalizing it. Decode a value a human typed
+    with `SuiAddress.Strict` / `ObjectId.Strict`.
 14. A `catchTag("TransportError", …)` that handled a malformed filter or a
     `pkg`/`pkg::module` function filter on `streamTransactions` now sees a
     defect: fix the filter (fully qualified `pkg::module::function`, or
@@ -440,6 +491,26 @@ package did not. Several signatures and one stored shape change; read
     with a digest other than the bytes' own is now a defect — remove the
     `digest` override; `layerTest` re-sends without delay, so a test that
     counted on the production schedule sets `SubmitConfig.with({ resubmit })`.
+    The fake's resolver simulates only when the recipe left the budget unset:
+    a test that presets a budget and asserted on a `resolver: true`
+    `simulateTransaction` call now sees `Tx.build`'s explicit simulate (no
+    `resolver` flag) instead; `FakeScript.buildSimulate` answers only the
+    resolver's simulate, so script that test's outcome with `simulate`.
+17. Wrapper scripts: re-read your exit-code handling. 5 now also follows a
+    timeout, an interrupt or a not-applied error once the run applied a
+    transaction ("do not send it again"); 3 now follows **any** would-be 2, 4
+    or 130 while a submission of the run is unresolved; an error carrying an
+    integer `exitCode` field (or `[Runtime.errorExitCode]`) exits with it. Spell
+    `SUI_LOG_LEVEL` exactly as `Config.LogLevel` does (`Debug`, not `debug`) or
+    leave it unset, or the script exits 2 before it runs.
+18. A read that legitimately takes longer than 30 seconds needs a longer
+    `requestTimeout`: pass it in `SuiCore.layerGrpc({ ..., requestTimeout })`
+    or `layerFromClient(client, { requestTimeout })`, or set
+    `SUI_RPC_TIMEOUT` (e.g. `2 minutes`) under `layerConfig` and `Script.layer`;
+    `"Infinity"` restores 0.3's unbounded reads.
+19. A hand-written `SuiService`, `SuiCoreService` or `ExtensionFace` object
+    (not a spread of a real one) must add the new members listed under
+    "Changed (breaking)".
 
 ## 0.3.0
 
