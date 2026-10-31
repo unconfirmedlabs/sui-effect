@@ -22,7 +22,7 @@ import { fromBase58, normalizeSuiAddress } from "@mysten/sui/utils"
 
 /** The shape `Transaction#setExpiration` accepts, which the SDK does not export. */
 type SdkExpiration = NonNullable<Parameters<Transaction["setExpiration"]>[0]>
-import { DateTime, Duration, Effect, Option, Schema } from "effect"
+import { DateTime, Duration, Effect, Option, Result, Schema } from "effect"
 import {
   BuildError,
   ExecutionFailed,
@@ -148,6 +148,42 @@ const REFUSED_OUTRIGHT: ReadonlySet<string> = new Set(["INVALID_ARGUMENT", "3"])
 /** Whether a transport failure is the node refusing the submission outright. */
 const refusedOutright = (error: TransportError): boolean =>
   !error.retryable && error.status !== undefined && REFUSED_OUTRIGHT.has(error.status)
+
+/** The readable text of whatever a failure carried as its cause. Never fails. */
+const reasonOf = (cause: unknown): string => {
+  if (typeof cause === "string") return cause
+  if (typeof cause === "object" && cause !== null) {
+    if (typeof (cause as { readonly _tag?: unknown })._tag === "string") {
+      return SuiError.describe(cause as { readonly _tag: string })
+    }
+    const message = (cause as { readonly message?: unknown }).message
+    if (typeof message === "string" && message.length > 0) return message
+  }
+  return String(cause)
+}
+
+/**
+ * What a validator quorum says when **another transaction holds a lock on an
+ * input these bytes pinned**: `FAILED_PRECONDITION`, "rejected as invalid by
+ * more than 1/3 of validators by stake (non-retriable)", "already locked by a
+ * different transaction". It is not a refusal of the request — the bytes were
+ * well-formed and reached validators — so it is reconciled; but it names a
+ * race that is usually settled a moment later, when the winner's effects
+ * become readable and the `inputConsumed` evidence with them.
+ */
+const LOCK_CONFLICT = /already locked by a different transaction|rejected as invalid by more than 1\/3 of validators/i
+
+/** Whether a send failed on another transaction's lock. Never fails. */
+const lockConflict = (error: TransportError): boolean =>
+  !error.retryable && LOCK_CONFLICT.test(reasonOf(error.cause))
+
+/**
+ * How many more times a lock-conflicted submission is reconciled,
+ * `SubmitConfig.reconcileRecheck` apart, while the answer is still
+ * `SubmissionUnknown`. Every round is the full evidence rule set; the rounds
+ * only give the winner of the race time to become readable.
+ */
+const LOCK_CONFLICT_RECHECKS = 3
 
 const decodeExpiration = Schema.decodeUnknownOption(TransactionExpiration)
 const decodeDigest = Schema.decodeUnknownEffect(Digest)
@@ -989,16 +1025,32 @@ const awaitVisible = (
   config.awaitVisibility === false ? Effect.void : sui.core
     .waitForTransaction({ digest })
     .pipe(
-      Effect.timeout(config.visibilityTimeout),
-      // `Effect.ignore`, not `Effect.ignoreCause`: a timeout, a
-      // `TransportError` and a `TransactionNotFound` are the failures this is
-      // allowed to swallow — a **defect** is a bug, and turning one into a
-      // warning line hid it behind an outcome that was going to stand anyway.
-      Effect.ignore({
-        log: "Warn",
-        message: "the transaction executed but did not become visible to reads within" +
-          " SubmitConfig.visibilityTimeout; the outcome stands"
-      }),
+      Effect.timeoutOption(config.visibilityTimeout),
+      Effect.flatMap((visible) =>
+        visible._tag === "Some" ? Effect.void : Effect.logWarning(
+          "the transaction executed but did not become visible to reads within" +
+            ` SubmitConfig.visibilityTimeout (${Duration.format(config.visibilityTimeout)}); the outcome stands`
+        )
+      ),
+      // One line, not a cause with a stack: a `TransportError` or a
+      // `TransactionNotFound` here is the failure this is allowed to swallow,
+      // and the outcome it would be printed beside is going to stand anyway. A
+      // **defect** is still a bug and is not caught.
+      Effect.catch((error) =>
+        Effect.logWarning(
+          "the transaction executed but waiting for it to become visible failed; the outcome" +
+            ` stands: ${SuiError.describe(error)}`
+        )
+      ),
+      // An interrupt here is the caller's to make, and it wins — but the
+      // journal already says `Executed`, and a person reading the log should
+      // not have to guess that.
+      Effect.onInterrupt(() =>
+        Effect.logWarning(
+          "interrupted while waiting for an executed transaction to become visible; it executed," +
+            " and the journal records it as Executed"
+        )
+      ),
       Effect.annotateLogs({ digest }),
       Effect.withSpan("Tx.awaitVisible")
     )
@@ -1029,6 +1081,21 @@ const awaitVisible = (
  * retryable failure says nothing about the earlier send, which may have
  * landed, so it reconciles like any other ambiguous failure.
  *
+ * A validator quorum's **lock conflict** — `FAILED_PRECONDITION`, "already
+ * locked by a different transaction" — is reconciled too, and when that ends
+ * `SubmissionUnknown` it is reconciled up to three more times,
+ * `SubmitConfig.reconcileRecheck` apart, because the winner of the race is
+ * usually readable a moment later and its effects are the `inputConsumed`
+ * evidence. Every `SubmissionUnknown` that comes out of a send names what the
+ * last send said as well as what the reconcile found.
+ *
+ * **An answer is journalled before anything can interrupt it.** The execute
+ * attempts are interruptible; from the moment the node has answered to the
+ * moment the journal holds that answer, they are not. An interrupt during the
+ * visibility wait afterwards still wins — the caller asked for it — but the
+ * journal already says `Executed`, and a warning says so. An execute answer for
+ * a digest other than the submitted one is not trusted; it reconciles.
+ *
  * `JournalError` can only come from the `Signed` write, before anything has
  * been sent. Once the network has answered, a journal write that fails is
  * logged with `Effect.logError` and the answer stands, because "the journal is
@@ -1045,11 +1112,22 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
   "Tx.submit"
 )(function*(
   signed: Signed
-): Effect.fn.Return<
-  Executed,
-  ExecutionFailed | NotApplied | SubmissionUnknown | JournalError | TransportError,
-  Sui
-> {
+): Effect.fn.Return<Executed, SubmitError, Sui> {
+  return yield* send(signed, false)
+})
+
+/**
+ * The body of {@link submit} and {@link resubmit}.
+ *
+ * `resent` says whether these bytes may already have been sent by an earlier
+ * call — a previous process, a `SubmissionUnknown` being retried. A refusal on
+ * the first execute of *this* call is then not "the node refused and nothing
+ * executed": the earlier send may have landed, and only a reconcile can say.
+ */
+const send = Effect.fnUntraced(function*(
+  signed: Signed,
+  resent: boolean
+): Effect.fn.Return<Executed, SubmitError, Sui> {
   yield* Effect.annotateCurrentSpan({ "sui.digest": signed.digest })
   const sui = yield* Sui
   const config = yield* SubmitConfig
@@ -1084,28 +1162,49 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
     )
   })
 
-  const result = yield* once.pipe(
-    Effect.retry({
-      schedule: config.resubmit,
-      times: Math.max(config.resubmitAttempts - 1, 0),
-      while: (error: TransportError) => error.retryable
-    }),
-    Effect.flatMap(fromTransactionResult),
-    Effect.catchTag("DecodeError", (error) =>
-      Effect.fail(
-        new TransportError({ method: "executeTransaction", retryable: false, cause: error })
-      )),
-    Effect.result
+  // The execute attempts are interruptible — an interrupt cancels the request
+  // in flight and leaves the `Signed` entry, which is the honest record of
+  // bytes that may be on the wire. **Once an answer is in, nothing may
+  // interrupt before it is journalled**: an interrupt that landed between the
+  // node's "executed" and the journal write used to leave a transaction that
+  // applied recorded as merely sent.
+  const result = yield* Effect.uninterruptibleMask((restore) =>
+    restore(
+      once.pipe(
+        Effect.retry({
+          schedule: config.resubmit,
+          times: Math.max(config.resubmitAttempts - 1, 0),
+          while: (error: TransportError) => error.retryable
+        })
+      )
+    ).pipe(
+      Effect.flatMap(fromTransactionResult),
+      Effect.catchTag("DecodeError", (error) =>
+        Effect.fail(
+          new TransportError({ method: "executeTransaction", retryable: false, cause: error })
+        )),
+      Effect.result,
+      Effect.tap((answered) => {
+        if (answered._tag === "Success") {
+          return answered.success.digest === signed.digest
+            ? Effect.flatMap(executedEntry(answered.success), journalSettled)
+            : Effect.void
+        }
+        return answered.failure._tag === "ExecutionFailed" && answered.failure.digest === signed.digest
+          ? Effect.flatMap(failedEntry(answered.failure), journalSettled)
+          : Effect.void
+      })
+    )
   )
 
   if (result._tag === "Success") {
-    yield* journalSettled(yield* executedEntry(result.success))
+    if (result.success.digest !== signed.digest) return yield* answeredForAnother(signed, result.success.digest, attempts)
     yield* awaitVisible(sui, config, signed.digest)
     return result.success
   }
   const failure = result.failure
   if (failure._tag === "ExecutionFailed") {
-    yield* journalSettled(yield* failedEntry(failure))
+    if (failure.digest !== signed.digest) return yield* answeredForAnother(signed, failure.digest, attempts)
     return yield* failure
   }
   // The node refused the request outright — malformed bytes, a missing
@@ -1113,17 +1212,46 @@ export const submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Su
   // about some other transaction with that digest. Fail with what the node
   // said, and settle the journal entry so no startup reconciles it again.
   //
-  // Only on the **first** send. After a timeout or a retryable failure the
-  // earlier bytes may already be on chain, and a later refusal (a proxy, a
-  // node answering an already-finalized submission differently) says nothing
-  // about them: that is the ambiguous case, and it reconciles.
-  if (attempts === 1 && refusedOutright(failure)) {
+  // Only on the **first** send of bytes never sent before. After a timeout or
+  // a retryable failure — or when this is a re-send of bytes an earlier call
+  // may have landed — a refusal says nothing about the earlier send: that is
+  // the ambiguous case, and it reconciles.
+  if (!resent && attempts === 1 && refusedOutright(failure)) {
     yield* journalRefused(signed)
     return yield* failure
   }
   // Bytes may have reached the network: the only honest next step is to ask.
-  return yield* reconcileSigned(signed, failure, attempts)
+  // Another transaction's lock on a pinned input is a race whose winner is
+  // usually readable a moment later, so that case asks a few more times.
+  return yield* reconcileSigned(
+    signed,
+    failure,
+    attempts,
+    lockConflict(failure) ? LOCK_CONFLICT_RECHECKS : 0
+  )
 })
+
+/**
+ * An execute answer for a digest other than the one submitted is not an
+ * answer about these bytes: whatever produced it — a proxy, a confused node —
+ * the chain is asked about the digest that was signed. Never journals the
+ * foreign answer.
+ */
+const answeredForAnother = (
+  signed: Signed,
+  answered: string,
+  attempts: number
+): Effect.Effect<Executed, ExecutionFailed | NotApplied | SubmissionUnknown, Sui> =>
+  reconcileSigned(
+    signed,
+    new TransportError({
+      method: "executeTransaction",
+      retryable: false,
+      cause: `the node answered for transaction ${answered}, not the submitted ${signed.digest}`
+    }),
+    attempts,
+    0
+  )
 
 /**
  * What a third party answers when it has submitted your bytes.
@@ -1156,11 +1284,26 @@ const executedOfReply = (
   const kind = (reply as { readonly $kind?: unknown }).$kind
   if (kind === "Transaction" || kind === "FailedTransaction") {
     return fromTransactionResult(reply as Parameters<typeof fromTransactionResult>[0]).pipe(
-      Effect.catchTag("DecodeError", () => none)
+      Effect.catchTag("DecodeError", () => none),
+      // An answer about another digest is not an answer about these bytes,
+      // applied or failed: ask the chain about the digest that was signed.
+      Effect.map((executed) => executed !== undefined && executed.digest === signed.digest ? executed : undefined),
+      Effect.catchTag("ExecutionFailed", (failed) =>
+        failed.digest === signed.digest ? Effect.fail(failed) : none)
     )
   }
   const record = reply as { readonly digest?: unknown; readonly effects?: unknown }
-  if (record.digest === undefined && record.effects === undefined) return none
+  // A digest with no effects is an acknowledgement, not an envelope: decoding
+  // it filled every absent field with "nothing happened" and answered a hollow
+  // `Executed` — no gas, nothing created — for a transaction that may have
+  // done anything. Only the chain can say what it did.
+  if (typeof record.effects !== "object" || record.effects === null) return none
+  // A reduced envelope says nothing about *why* a transaction failed, and
+  // decoding one that reports failure produced an `Executed` for it. The chain
+  // has the reason.
+  const status = (record.effects as { readonly status?: unknown }).status ??
+    (reply as { readonly status?: unknown }).status
+  if ((status as { readonly success?: unknown } | undefined)?.success === false) return none
   return Executed.fromPartial(reply).pipe(
     // A reply this cannot read is not a failure: the digest is known and the
     // chain is the authority. Fall through to the reconcile.
@@ -1233,7 +1376,8 @@ export const submitVia = Effect.fn("Tx.submitVia")(function*<E, R>(
         retryable: false,
         cause: "the service answered without an execute envelope; asking the chain"
       }),
-      1
+      1,
+      0
     )
   }
   const failure = sent.failure
@@ -1251,26 +1395,56 @@ export const submitVia = Effect.fn("Tx.submitVia")(function*<E, R>(
   return yield* reconcileSigned(
     signed,
     new TransportError({ method: "submitVia", retryable: false, cause: failure }),
-    1
+    1,
+    0
   )
 })
 
 /**
  * Reconciles signed bytes and records what that settled to: the one
- * settle-and-journal step `Tx.submit`, `Tx.submitVia` and `Tx.reconcileAll`
- * share.
+ * settle-and-journal step `Tx.submit`, `Tx.submitVia`, `Tx.resubmit` and
+ * `Tx.reconcileAll` share.
+ *
+ * `rechecks` is how many more reconciles are run, `SubmitConfig.reconcileRecheck`
+ * apart, while the answer is still `SubmissionUnknown` — read-only rounds, each
+ * under the full evidence rules, for the lock-conflict race whose winner
+ * becomes readable a moment later.
  *
  * `Executed`, `Failed` and `NotApplied` are terminal entries; anything still
  * unknown is rewritten as `Unknown`, carrying the bytes, `lastError` (the
- * reconcile's own answer when there is none) and `attempts`. A journal write
- * that fails is logged and the answer stands. Never fails.
+ * reconcile's own answer when there is none) and `attempts`. The write is
+ * uninterruptible once the reconcile has answered, so an interrupt cannot
+ * separate an answer from its record. A journal write that fails is logged and
+ * the answer stands. Never fails.
  */
 const settle = Effect.fnUntraced(function*(
   signed: Signed,
   attempts: number,
-  lastError: string | undefined
+  lastError: string | undefined,
+  rechecks = 0
 ): Effect.fn.Return<Reconciled, never, Sui> {
-  const result = yield* Effect.result(reconcile(signed))
+  const config = yield* SubmitConfig
+  const answer = Effect.gen(function*() {
+    let result = yield* Effect.result(reconcileUnjournaled(signed))
+    for (let round = 0; round < rechecks; round++) {
+      if (result._tag !== "Failure" || result.failure._tag !== "SubmissionUnknown") break
+      yield* Effect.sleep(config.reconcileRecheck)
+      result = yield* Effect.result(reconcileUnjournaled(signed))
+    }
+    return result
+  })
+  return yield* Effect.uninterruptibleMask((restore) =>
+    Effect.flatMap(restore(answer), (result) => record(signed, attempts, lastError, result))
+  )
+})
+
+/** Journals one reconcile answer as {@link settle} does, and returns it. Never fails. */
+const record = Effect.fnUntraced(function*(
+  signed: Signed,
+  attempts: number,
+  lastError: string | undefined,
+  result: Result.Result<Executed, ExecutionFailed | NotApplied | SubmissionUnknown>
+): Effect.fn.Return<Reconciled> {
   if (result._tag === "Success") {
     yield* journalSettled(yield* executedEntry(result.success))
     return Reconciled.cases.Executed.make({ _tag: "Executed", executed: result.success })
@@ -1294,14 +1468,31 @@ const settle = Effect.fnUntraced(function*(
   }
 })
 
-/** `reconcile` plus the journal bookkeeping `submit` owes after it. */
+/**
+ * `reconcile` plus the journal bookkeeping `submit` owes after it.
+ *
+ * A `SubmissionUnknown` answer carries **what the last send said** as well as
+ * what the reconcile found: "the node does not know this digest" alone hid the
+ * validator's own refusal text — the lock conflict naming the transaction that
+ * won — in the journal's `lastError`, where a person reading stderr never saw
+ * it.
+ */
 const reconcileSigned = Effect.fn("Tx.reconcileSigned")(function*(
   signed: Signed,
   lastError: TransportError,
-  attempts: number
+  attempts: number,
+  rechecks: number
 ): Effect.fn.Return<Executed, ExecutionFailed | NotApplied | SubmissionUnknown, Sui> {
-  const settled = yield* settle(signed, attempts, SuiError.describe(lastError))
-  return settled._tag === "Executed" ? settled.executed : yield* settled.error
+  const sent = SuiError.describe(lastError)
+  const settled = yield* settle(signed, attempts, sent, rechecks)
+  if (settled._tag === "Executed") return settled.executed
+  if (settled._tag !== "SubmissionUnknown") return yield* settled.error
+  const error = settled.error
+  return yield* new SubmissionUnknown({
+    digest: error.digest,
+    ...(error.signed === undefined ? {} : { signed: error.signed }),
+    cause: `${reasonOf(error.cause)}; the last send failed with ${sent}`
+  })
 })
 
 const inputOf = (input: ReconcileInput): { digest: Digest; signed?: Signed } => {
@@ -1532,6 +1723,122 @@ const expiryClosed = Effect.fn("Tx.expiryClosed")(function*(
   return false
 })
 
+/** The first epoch a transaction can be applied in, when its expiration says. */
+const minEpochOf = (expiration: TransactionExpiration | undefined): bigint | undefined => {
+  if (expiration === undefined) return undefined
+  switch (expiration.$kind) {
+    case "ValidDuring":
+      return expiration.ValidDuring.minEpoch ?? undefined
+    case "Validity":
+      return expiration.Validity.minEpoch ?? undefined
+    default:
+      return undefined
+  }
+}
+
+/**
+ * The two `LedgerService` calls a gRPC client exposes that say how much history
+ * the node still holds, duck-typed so that a transport without them (JSON-RPC,
+ * GraphQL, an older SDK) is simply "does not say" rather than a type error.
+ */
+interface LedgerReader {
+  readonly getServiceInfo: (
+    input: object,
+    options?: { readonly abort?: AbortSignal }
+  ) => { readonly response: PromiseLike<{ readonly lowestAvailableCheckpoint?: unknown }> }
+  readonly getEpoch: (
+    input: { readonly epoch: bigint; readonly readMask?: { readonly paths: ReadonlyArray<string> } },
+    options?: { readonly abort?: AbortSignal }
+  ) => {
+    readonly response: PromiseLike<{ readonly epoch?: { readonly firstCheckpoint?: unknown } }>
+  }
+}
+
+const ledgerOf = (client: ClientWithCoreApi): LedgerReader | undefined => {
+  const ledger = (client as { readonly ledgerService?: unknown }).ledgerService
+  if (typeof ledger !== "object" || ledger === null) return undefined
+  const record = ledger as Record<string, unknown>
+  return typeof record["getServiceInfo"] === "function" && typeof record["getEpoch"] === "function"
+    ? (ledger as LedgerReader)
+    : undefined
+}
+
+/** Whether the node still holds every checkpoint a transaction could have landed in. */
+type History =
+  | { readonly _tag: "Covered" }
+  | { readonly _tag: "Unreported" }
+  | { readonly _tag: "Pruned"; readonly reason: string }
+
+/**
+ * Whether a `getTransaction` miss on this node can mean "it never applied".
+ *
+ * The expiry rule reads a miss as absence, which is only true on a node whose
+ * history reaches back to the start of the transaction's validity window. A
+ * pruning fullnode forgets transactions minutes after they land, so a miss
+ * there says nothing. On gRPC the node says how far back it reaches
+ * (`GetServiceInfo.lowestAvailableCheckpoint`) and where the window starts
+ * (`GetEpoch(minEpoch).firstCheckpoint`; an expiration with no `minEpoch`
+ * starts at genesis): the miss counts only when the lowest available checkpoint
+ * is at or before that first checkpoint. Anything the node does not answer —
+ * no lowest checkpoint, the window's epoch no longer served — is `Pruned`,
+ * because "I cannot tell" is not evidence.
+ *
+ * A transport that exposes no such call (JSON-RPC, GraphQL, the test fake
+ * unless `FakeScript.ledger` is set) is `Unreported`, and the rule runs as it
+ * always has: behind a pruning node on those transports set
+ * `SubmitConfig.expiryEvidence: "never"`.
+ *
+ * Read **after** the misses it vouches for: a node only ever prunes forward, so
+ * history that covers the window now covered it at every earlier lookup.
+ *
+ * Fails with: `TransportError`.
+ */
+const historyOf = Effect.fn("Tx.historyOf")(function*(
+  sui: Sui["Service"],
+  signed: Signed
+): Effect.fn.Return<History, TransportError> {
+  const start = minEpochOf(signed.expiration) ?? 0n
+  const answered = yield* Effect.result(
+    sui.core.use(async (client, signal): Promise<History> => {
+      const ledger = ledgerOf(client)
+      if (ledger === undefined) return { _tag: "Unreported" }
+      const info = await ledger.getServiceInfo({}, { abort: signal }).response
+      const lowest = info.lowestAvailableCheckpoint
+      if (typeof lowest !== "bigint") {
+        return { _tag: "Pruned", reason: "the node does not say how much history it holds" }
+      }
+      if (lowest === 0n) return { _tag: "Covered" }
+      const epoch = await ledger.getEpoch(
+        { epoch: start, readMask: { paths: ["epoch", "first_checkpoint"] } },
+        { abort: signal }
+      ).response
+      const first = epoch.epoch?.firstCheckpoint
+      if (typeof first !== "bigint") {
+        return {
+          _tag: "Pruned",
+          reason: `the node does not say where epoch ${start}, where this transaction's window starts, begins`
+        }
+      }
+      return lowest <= first ? { _tag: "Covered" } : {
+        _tag: "Pruned",
+        reason: `the node has pruned its history to checkpoint ${lowest}, after checkpoint ${first}` +
+          ` where this transaction's window (epoch ${start}) starts, so a miss there is not evidence`
+      }
+    })
+  )
+  if (answered._tag === "Success") return answered.success
+  const failure = answered.failure
+  if (failure._tag === "TransportError") {
+    // A node that will not say where an old epoch starts has, in practice,
+    // pruned it: that is "cannot tell", which never concludes anything.
+    if (failure.status === "NOT_FOUND" || failure.status === "5") {
+      return { _tag: "Pruned", reason: `the node no longer serves epoch ${start}, where this transaction's window starts` }
+    }
+    return yield* failure
+  }
+  return { _tag: "Pruned", reason: `the node's history could not be read: ${SuiError.describe(failure)}` }
+})
+
 /**
  * The chain these bytes belong to: the one the expiration names, or the one
  * `Tx.build` recorded for the variants that name none. `undefined` when neither
@@ -1557,8 +1864,17 @@ const chainOfSigned = (signed: Signed): string | undefined =>
  *   (two seconds by default, through the `Clock`) — both must hold again. Any
  *   other order, or a single observation, is `SubmissionUnknown`. Set
  *   `SubmitConfig.expiryEvidence: "never"` to disable the rule entirely, which
- *   is what a deployment behind a mixed-node load balancer wants. The residual
- *   risk is a node whose transaction index lags its epoch view;
+ *   is what a deployment behind a mixed-node load balancer wants. **Positive
+ *   evidence vetoes it**: when a pinned object names this digest as its last
+ *   mutation the transaction applied, whatever `getTransaction` said, and the
+ *   answer is the receipt or `SubmissionUnknown` — never `expired`. **A miss
+ *   only counts on a node that still holds the window**: on gRPC the node's
+ *   `lowestAvailableCheckpoint` must be at or before the first checkpoint of
+ *   the window's `minEpoch`, or the answer is `SubmissionUnknown` naming the
+ *   pruning. Transports that do not report their history (JSON-RPC, GraphQL)
+ *   cannot be checked; behind a pruning node on those, set `expiryEvidence:
+ *   "never"`. The residual risk is a node whose transaction index lags its
+ *   epoch view;
  * - `"inputConsumed"` when the transaction that last mutated a pinned object is
  *   a **different** one **and its own effects report `inputVersion` equal to
  *   the version these bytes pinned**, so those exact bytes can never execute
@@ -1591,9 +1907,59 @@ const chainOfSigned = (signed: Signed): string | undefined =>
  * always `SubmissionUnknown`. Pass the `Signed` bytes (or the
  * `SubmissionUnknown` that carries them) to get the evidence rules.
  *
+ * **A terminal answer is journalled** — `Executed`, `Failed` or `NotApplied`
+ * replaces the entry — when the journal holds this digest unresolved. A digest
+ * the journal has never seen is not written, and `SubmissionUnknown` leaves the
+ * entry as it was. To re-send bytes that are still unknown, use
+ * {@link resubmit}.
+ *
  * Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`.
  */
 export const reconcile = Effect.fn("Tx.reconcile")(function*(
+  input: ReconcileInput
+): Effect.fn.Return<Executed, ExecutionFailed | NotApplied | SubmissionUnknown, Sui> {
+  const answer = yield* Effect.uninterruptibleMask((restore) =>
+    Effect.flatMap(
+      restore(Effect.result(reconcileUnjournaled(input))),
+      (result) => Effect.as(recordIfHeld(inputOf(input).digest, result), result)
+    )
+  )
+  return yield* Effect.fromResult(answer)
+})
+
+/**
+ * Writes a terminal reconcile answer over the journal's entry for the digest —
+ * **only when the journal holds that digest unresolved**. A `Tx.reconcile` that
+ * proved an entry `NotApplied` and left it `Unknown` answered the same question
+ * again on every call and kept `onUnresolved: "fail"` refusing to start. A
+ * digest the journal has never seen is not written: asking about a
+ * transaction is not taking responsibility for it. A `SubmissionUnknown`
+ * leaves the entry as it was. Never fails: a journal that cannot be read or
+ * written is logged, and the answer stands.
+ */
+const recordIfHeld = (
+  digest: Digest,
+  result: Result.Result<Executed, ExecutionFailed | NotApplied | SubmissionUnknown>
+): Effect.Effect<void> =>
+  Effect.gen(function*() {
+    if (result._tag === "Failure" && result.failure._tag === "SubmissionUnknown") return
+    const journal = yield* Journal
+    const held = yield* journal.get(digest)
+    if (held._tag !== "Some" || !isUnresolved(held.value)) return
+    const entry = result._tag === "Success"
+      ? yield* executedEntry(result.success)
+      : result.failure._tag === "ExecutionFailed"
+      ? yield* failedEntry(result.failure)
+      : yield* notAppliedEntry(result.failure as NotApplied)
+    yield* journalSettled(entry)
+  }).pipe(
+    Effect.catchTag("JournalError", (error) =>
+      Effect.logError("the submission journal could not be read; the outcome stands", error)),
+    Effect.annotateLogs({ digest })
+  )
+
+/** {@link reconcile} without the journal write. */
+const reconcileUnjournaled = Effect.fnUntraced(function*(
   input: ReconcileInput
 ): Effect.fn.Return<Executed, ExecutionFailed | NotApplied | SubmissionUnknown, Sui> {
   const sui = yield* Sui
@@ -1664,44 +2030,60 @@ const recover = Effect.fn("Tx.recover")(function*(
     return yield* unknown("the node does not know this digest and the signed bytes are not available")
   }
 
-  if (config.expiryEvidence === "epochThenMiss") {
-    // Ordered, and repeated: closed, then missing, then — after a delay —
-    // closed and missing again. Anything else proves nothing.
+  // The expiry rule is ordered and repeated: closed, then missing, then —
+  // after a delay — closed and missing again. Anything else proves nothing.
+  let expired = false
+  if (config.expiryEvidence === "epochThenMiss" && (yield* expiryClosed(sui, config, signed))) {
+    const second = yield* lookup()
+    if (second !== undefined) return second
+    yield* Effect.sleep(config.reconcileRecheck)
     if (yield* expiryClosed(sui, config, signed)) {
-      const second = yield* lookup()
-      if (second !== undefined) return second
-      yield* Effect.sleep(config.reconcileRecheck)
-      if (yield* expiryClosed(sui, config, signed)) {
-        const third = yield* lookup()
-        if (third !== undefined) return third
-        return yield* new NotApplied({ digest, evidence: "expired" })
-      }
+      const third = yield* lookup()
+      if (third !== undefined) return third
+      expired = true
     }
   }
 
+  // Read **before** a closed window is allowed to conclude anything: positive
+  // evidence that these bytes applied vetoes "expired". A `getTransaction` miss
+  // is only evidence of absence on a node that still holds the window, and a
+  // node that pruned it (or a proxy that drops the lookup) misses transactions
+  // that did apply — while the live object still names them.
   const evidence = yield* inputEvidence(sui, digest, signed)
+  if (evidence._tag === "AppliedByUs") {
+    // Object ${objectId} names this very transaction as the one that last
+    // mutated it, so it applied; the `getTransaction` above was answered by a
+    // node that had not caught up, or no longer holds it. Ask once more for
+    // the receipt.
+    const again = yield* lookup()
+    if (again !== undefined) return again
+    return yield* unknown(
+      `object ${evidence.objectId} names this transaction as the one that last mutated it,` +
+        " so it applied, but the node does not serve it" +
+        (expired ? " (its validity window has closed; do not re-send it)" : "")
+    )
+  }
+
+  let pruned: string | undefined
+  if (expired) {
+    const history = yield* historyOf(sui, signed)
+    if (history._tag !== "Pruned") return yield* new NotApplied({ digest, evidence: "expired" })
+    pruned = history.reason
+  }
+
   switch (evidence._tag) {
     case "ConsumedByOther":
       return yield* new NotApplied({ digest, evidence: "inputConsumed" })
-    case "AppliedByUs": {
-      // Object ${objectId} names this very transaction as the one that last
-      // mutated it, so it applied; the `getTransaction` above was answered by a
-      // node that had not caught up. Ask once more for the receipt.
-      const again = yield* lookup()
-      if (again !== undefined) return again
-      return yield* unknown(
-        `object ${evidence.objectId} names this transaction as the one that last mutated it,` +
-          " so it applied, but the node still does not serve it"
-      )
-    }
     case "Unreadable":
       return yield* unknown(
         `object ${evidence.objectId} has moved on or is gone, and ${evidence.reason},` +
-          " so nothing is proven"
+          " so nothing is proven" + (pruned === undefined ? "" : `; ${pruned}`)
       )
     case "NoEvidence":
       return yield* unknown(
-        "the node does not know this digest and nothing proves it cannot land"
+        pruned === undefined
+          ? "the node does not know this digest and nothing proves it cannot land"
+          : `the validity window has closed, but ${pruned}`
       )
   }
 })
@@ -1911,6 +2293,84 @@ export const recorded: (
 )
 
 /**
+ * Re-sends signed bytes whose outcome is unknown — the **identical** bytes,
+ * never a rebuild — and settles them the way {@link submit} does.
+ *
+ * Safe by construction: the bytes have one digest, and Sui executes a digest at
+ * most once, so a re-send can only land the transaction that was already
+ * signed, or tell you it already landed. This is the way out of a
+ * `SubmissionUnknown` that `reconcile` cannot settle yet — a submission with no
+ * owned inputs whose evidence can only be the expiry window, a node that lost
+ * the request — without waiting for that window to close.
+ *
+ * What it does **not** do is send bytes that cannot help:
+ *
+ * - a digest the journal already holds as **settled** is not sent again:
+ *   `Executed` or `Failed` is read back with `reconcile`, and `NotApplied`
+ *   fails with that `NotApplied`;
+ * - bytes built for another chain than this `Sui`'s are not sent; the
+ *   reconcile names both chains;
+ * - bytes whose validity window has observably closed are not sent; they are
+ *   reconciled, which is where the expiry rule decides.
+ *
+ * Unlike a first `Tx.submit`, a refusal (`INVALID_ARGUMENT`) on the re-send is
+ * **not** taken as "nothing executed": an earlier send of the same bytes may
+ * have landed, so the refusal reconciles like any other ambiguous answer.
+ *
+ * Given a `SubmissionUnknown` that carries no bytes (one that came from
+ * reconciling a bare digest), there is nothing to send and this is `reconcile`.
+ *
+ * Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`,
+ * `JournalError` (reading the journal, or the `Signed` write before the send),
+ * `TransportError` (in the union for `SubmitError`'s sake; a re-send never
+ * fails with one).
+ *
+ * @since 0.4.0
+ */
+export const resubmit = Effect.fn("Tx.resubmit")(function*(
+  input: Signed | SubmissionUnknown
+): Effect.fn.Return<Executed, SubmitError, Sui> {
+  const { digest, signed } = inputOf(input)
+  yield* Effect.annotateCurrentSpan({ "sui.digest": digest })
+  if (signed === undefined) return yield* reconcile(digest)
+  const journal = yield* Journal
+  const held = yield* journal.get(digest)
+  if (held._tag === "Some") {
+    switch (held.value._tag) {
+      case "Executed":
+      case "Failed":
+        return yield* reconcile(signed)
+      case "NotApplied":
+        return yield* new NotApplied({ digest, evidence: held.value.evidence })
+    }
+  }
+  return yield* resend(signed)
+})
+
+/**
+ * The body of {@link resubmit} once the journal has been consulted: the chain
+ * and expiry checks, then the send. Shared with `reconcileAll({ resubmit })`.
+ */
+const resend = Effect.fnUntraced(function*(
+  signed: Signed
+): Effect.fn.Return<Executed, SubmitError, Sui> {
+  const sui = yield* Sui
+  const config = yield* SubmitConfig
+  const chain = chainOfSigned(signed)
+  const closed = chain !== undefined && chain !== sui.chainId
+    ? true
+    : yield* expiryClosed(sui, config, signed).pipe(
+      // Cannot tell: re-sending identical bytes is safe either way.
+      Effect.catchTag("TransportError", () => Effect.succeed(false))
+    )
+  if (closed) {
+    const settled = yield* settle(signed, 1, undefined)
+    return settled._tag === "Executed" ? settled.executed : yield* settled.error
+  }
+  return yield* send(signed, true)
+})
+
+/**
  * Settles every unresolved entry in the journal: the explicit startup call a
  * long-lived application makes after building a durable `Journal`.
  *
@@ -1928,29 +2388,67 @@ export const recorded: (
  * recovery read that fails becomes that entry's `SubmissionUnknown` rather than
  * escaping as a `TransportError` the taxonomy would call "not applied".
  *
+ * **`{ resubmit: true }` re-sends what is still unknown.** An entry that
+ * reconciles to `SubmissionUnknown` is sent again as its identical signed
+ * bytes, exactly as {@link resubmit} sends them — not when its validity window
+ * has closed or it belongs to another chain — and settles to whatever that
+ * send answers. Without it, an entry with no owned inputs can only be
+ * `SubmissionUnknown` until its window closes, and a program that reconciles
+ * before sending anything new is stuck that long.
+ *
  * The whole call fails only if the journal itself cannot be **read**: a write
  * that fails after an entry has been settled is logged and the answer stands,
  * the same rule `Tx.submit` follows.
  *
  * Fails with: `JournalError`.
  */
-export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(): Effect.fn.Return<
-  ReadonlyArray<Reconciled>,
-  JournalError,
-  Sui
-> {
+export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(
+  opts?: {
+    /**
+     * Re-send, as identical bytes, every entry that is still
+     * `SubmissionUnknown` after reconciling. Defaults to `false`.
+     *
+     * @since 0.4.0
+     */
+    readonly resubmit?: boolean
+  }
+): Effect.fn.Return<ReadonlyArray<Reconciled>, JournalError, Sui> {
   const journal = yield* Journal
   const entries = yield* journal.listUnresolved
   return yield* Effect.forEach(
     entries.filter(isUnresolved),
-    (entry) => settle(entry.signed, entry._tag === "Unknown" ? entry.attempts : 1, undefined)
+    (entry) => Effect.gen(function*() {
+      const settled = yield* settle(entry.signed, entry._tag === "Unknown" ? entry.attempts : 1, undefined)
+      if (opts?.resubmit !== true || settled._tag !== "SubmissionUnknown") return settled
+      const sent = yield* Effect.result(resend(entry.signed))
+      if (sent._tag === "Success") {
+        return Reconciled.cases.Executed.make({ _tag: "Executed", executed: sent.success })
+      }
+      const failure = sent.failure
+      switch (failure._tag) {
+        case "ExecutionFailed":
+          return Reconciled.cases.ExecutionFailed.make({ _tag: "ExecutionFailed", error: failure })
+        case "NotApplied":
+          return Reconciled.cases.NotApplied.make({ _tag: "NotApplied", error: failure })
+        case "SubmissionUnknown":
+          return Reconciled.cases.SubmissionUnknown.make({ _tag: "SubmissionUnknown", error: failure })
+        default:
+          // The `Signed` write before the re-send failed (nothing was sent), or
+          // — never on a re-send — a refusal: the entry is as unknown as it was.
+          yield* Effect.logWarning(
+            `the re-send was not made: ${SuiError.describe(failure)}; the entry stays unknown`
+          ).pipe(Effect.annotateLogs({ digest: entry.digest }))
+          return settled
+      }
+    })
   )
 })
 
 /**
  * The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
  * `Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`,
- * `Tx.submitVia`, `Tx.reconcile`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+ * `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
+ * `Tx.reconcileAll`.
  */
 export const Tx = {
   build,
@@ -1961,6 +2459,7 @@ export const Tx = {
   submit,
   submitVia,
   reconcile,
+  resubmit,
   recorded,
   run,
   reconcileAll
