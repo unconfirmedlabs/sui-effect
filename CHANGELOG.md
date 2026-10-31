@@ -5,8 +5,9 @@ change, newest release first.
 
 ## 0.4.0
 
-Effect 4.1 and `@mysten/sui` 2.38, a lifecycle that settles refusals in the
-journal, a journal with no index, and the `Sui` reads the SDK had and this
+Effect 4.1 and `@mysten/sui` 2.38, gas from the address balance by default
+with a sender lock that no longer serializes what pins nothing, coin folding, a
+lifecycle that settles refusals in the journal, a journal with no index, and the `Sui` reads the SDK had and this
 package did not. Several signatures and one stored shape change; read
 "Migrating from 0.3.x" first.
 
@@ -140,6 +141,42 @@ package did not. Several signatures and one stored shape change; read
   than the bytes' own stops the test with a defect; the fake's `getDynamicField`
   compares key types under `typeMatches`; `FakeExecution.events[].json` is
   optional.
+- **`SubmitConfig.lockSender` is a `LockSenderPolicy`** (`"whenPinned" |
+  "always" | "never"`), not a boolean: `SubmitConfigService.lockSender` and
+  `SubmitConfig.defaults.lockSender` change type. Overrides
+  (`SubmitConfigOverrides`, `SubmitConfig.with`, `SubmitConfig.layer`, a
+  Promise face's `submit`) still accept a boolean: `true` is `"always"`,
+  `false` is `"never"`.
+- **The sender lock defaults to `"whenPinned"`.** `Tx.run` holds it for every
+  build, and through signing, `onSigned` and submission only when the built
+  bytes pin an owned or receiving input or a gas coin. Address-balance runs
+  from one sender are no longer serialized through submission (on localnet ten
+  `Tx.sendFunds` runs took 1,044 ms against 8,069 ms under `"always"`), and a
+  sponsored run with no owned input holds no lock past its build. Lock-free
+  runs can together overdraw a balance: the overdrawing one executes as
+  `ExecutionFailed` (`InsufficientFundsForWithdraw`, no gas charged).
+- **The explicit-empty-payment check counts withdrawals and expirations.** An
+  explicit empty gas payment (`Tx.sponsored`, `gasPayment:
+  "requireAddressBalance"`) now needs the payer's SUI address balance to cover
+  the budget **plus** the SUI the bytes withdraw from it, and empty-payment
+  bytes with no owned input need a `ValidDuring`/`Validity` expiration (a node
+  refuses them otherwise); either miss is a `BuildError` before signing.
+  `Tx.build` no longer re-reads the balance when the resolver itself chose an
+  empty payment.
+- **Address-balance bytes that use `tx.gas` are a `BuildError`.** With an
+  empty payment the gas coin is empty: such bytes used to build (the node
+  mocks a gas coin to simulate) and then fail on chain, charging gas
+  (`InsufficientCoinBalance in command 0`, verified on localnet). Under
+  `requireAddressBalance`, when an SDK intent (`tx.coin` / `tx.balance` for
+  SUI) fell back to splitting `tx.gas` because the balance did not cover the
+  amount, the message names `Tx.foldCoins`.
+- **Testing: the fake's resolver pays from a scripted address balance** when it
+  covers the budget plus withdrawals and the PTB does not use `tx.gas`, as the
+  SDK's does, so a test that scripted an owner-less balance alongside coins now
+  builds with `payment: []`. Executions move balances (gas, withdrawals,
+  `send_funds` deposits, consumed coins deleted). A payer with neither coins nor
+  a balance fails the build with `BuildError` ("No valid gas coins found for the
+  transaction.") instead of building with an empty payment.
 
 ### Added
 
@@ -290,6 +327,41 @@ package did not. Several signatures and one stored shape change; read
   supply it.
 - `FakeScript.readOptions` (`SuiCoreReadOptions`) builds the fake's `SuiCore`
   with a custom `readRetry` / `requestTimeout`.
+- **Address-balance gas and coin folding.** `Tx.planFold({ owner, coinType?,
+  maxCoinsPerTransaction? })` reads an owner's coins, SUI address balance and
+  gas price and answers a `FoldPlan` (`batches` of `FoldBatch`, at most 500
+  coins each, SUI first; `skipped` dust); `Tx.fold(batch)` is one batch's
+  recipe, with `FoldGas` saying how it pays (`"foldedCoins"`: SUI pays for its
+  own fold through `coin::send_funds<SUI>(GasCoin)`, so a coin-only account
+  needs nothing first; `"addressBalance"`; `"auto"`); `Tx.foldCoins({ signer
+  })` plans and runs every batch, answering `FoldResult { plan, executed }`.
+  On localnet five 200-SUI faucet coins folded in one transaction to zero
+  coins and 1,000,003,939,506 MIST of balance, and 290 coins in one (net gas
+  negative). `Tx.sendFunds({ coinType?, amount, recipient, useGasCoin? })` is
+  `balance::send_funds` of a `tx.balance`, the canonical transfer into a
+  recipient's address balance.
+- **`SubmitConfig.gasPayment`** (`GasPaymentPolicy`): `"preferAddressBalance"`
+  (the default; the resolver pays from the address balance when it covers the
+  budget, coins otherwise) or `"requireAddressBalance"` (the payment is pinned
+  to the balance before the build, and coins are a `BuildError` naming
+  `Tx.foldCoins`). `LockSenderPolicy` and `GasPaymentPolicy` are exported from
+  `/tx`.
+- **Span attributes** `sui.gas_payment` on `Tx.build` (`addressBalance`,
+  `coinReservation`, `coins`) and `sui.sender_lock` on `Tx.run` (`held`,
+  `build`, `none`).
+- **Testing: the fake models address balances** per owner and coin type,
+  seeded from `FakeScript.balances[].addressBalance`;
+  `SuiTest.setAddressBalance(owner, amount, coinType?)` sets one and
+  `SuiTest.addressBalance(owner, coinType?)` reads it. Like a node, the fake
+  refuses with `INVALID_ARGUMENT` an empty payment or a withdrawal the balance
+  cannot cover and empty-payment bytes with no owned input and no `ValidDuring`
+  expiration.
+- `test/live.localnet.test.ts`, behind `SUI_LOCALNET=1`: folding a faucet
+  account to zero coins, concurrent sends from one sender, a sponsor's balance
+  paying for an empty sender, the coin fallback and the `requireAddressBalance`
+  refusal, the `ValidDuring` rule, reconcile and resubmit of bytes that pin
+  nothing, and 301 SUI coins plus a published coin type folded in two
+  transactions.
 
 ### Changed
 
@@ -513,6 +585,32 @@ package did not. Several signatures and one stored shape change; read
 19. A hand-written `SuiService`, `SuiCoreService` or `ExtensionFace` object
     (not a spread of a real one) must add the new members listed under
     "Changed (breaking)".
+20. `lockSender: true` → `"always"` if you relied on serialized submissions
+    (a flow that spends a balance down to zero); nothing to do otherwise.
+    `false` → `"never"`. Code that reads `SubmitConfigService.lockSender` (or
+    `SubmitConfig.defaults.lockSender`) as a boolean compares against the
+    policy strings instead.
+21. A sponsor or `requireAddressBalance` payer whose balance covered the budget
+    but not the SUI the transaction also withdraws now fails `Tx.build`: fund
+    the balance for both. With `SubmitConfig.expiration: "epoch"` or `"none"`, or
+    a recipe's own non-`ValidDuring` expiration, an address-balance
+    transaction with no owned input now fails `Tx.build`: leave `expiration` at
+    `"validDuring"`.
+    A sponsored (`Tx.sponsored`) or `requireAddressBalance` recipe that uses
+    `tx.gas` now fails `Tx.build` instead of failing on chain: replace
+    `tx.splitCoins(tx.gas, [amount])` with `tx.coin({ balance: amount,
+    useGasCoin: false })` or `Tx.sendFunds({ ..., useGasCoin: false })`.
+22. Tests: a fake script with an owner-less `addressBalance` beside coins now
+    pays gas from the balance (`payment: []`); add a balance entry with
+    `addressBalance: "0"` for the payer to keep coin gas, or update the
+    assertion. A test that built for a payer with no coins and no balance now
+    gets `BuildError`: script a coin or an `addressBalance` for it.
+23. Fold coin-funded accounts once with `Tx.foldCoins({ signer })` (the
+    localnet faucet pays coins; the devnet/testnet V3 faucet pays the balance)
+    and prefer `Tx.sendFunds` / `tx.coin({ balance })` to
+    `tx.splitCoins(tx.gas, ...)`, so transactions pin nothing and stop
+    serializing on the sender lock. Optional: unfolded accounts keep working on
+    coin gas.
 
 ## 0.3.0
 

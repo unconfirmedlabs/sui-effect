@@ -852,12 +852,18 @@ a remote service, the sender is a wallet — uses the explicit lifecycle instead
 
 **Two ways to pay, and they lock differently.** `Tx.sponsored({ sender,
 gasOwner })` leaves the gas payment empty, which means *the gas owner's SUI
-address balance pays*: no coin is selected, so `Tx.run` takes only the sender's
-lock and one sponsor can pay for many senders at once. That balance must cover
-the budget — faucet SUI arrives as coins, and a sponsor deposits into its
-address balance with `coin::into_balance` and `balance::send_funds<SUI>` — and
-`Tx.build` refuses with `BuildError`, before anything is signed, when it does
-not. The alternative is coin-paid sponsorship: `Tx.run(recipe, { signer,
+address balance pays*: no coin is selected, so `Tx.run` never takes the
+sponsor's lock and one sponsor can pay for many senders at once; with no owned
+input the bytes pin nothing, so the sender's lock is held for the build alone.
+That balance must cover the budget plus what the bytes withdraw from it —
+localnet faucet SUI arrives as coins, and a sponsor folds them into its address
+balance with `Tx.foldCoins({ signer: sponsor })` — and `Tx.build` refuses with
+`BuildError`, before anything is signed, when it does not. A recipe fragment
+that may run under `Tx.sponsored` never uses `tx.gas`: with an empty payment the
+gas coin is empty, the simulate passes (the node mocks one) and execution fails
+charging gas, so `Tx.build` refuses such bytes with `BuildError`. Draw funds
+with `tx.coin({ balance, useGasCoin: false })` or `Tx.sendFunds({ ...,
+useGasCoin: false })`, never `tx.splitCoins(tx.gas, ...)`. The alternative is coin-paid sponsorship: `Tx.run(recipe, { signer,
 gasOwner, sponsor })` **without** `Tx.sponsored` selects the sponsor's coins,
 and then the sponsor's lock is held too, in ascending address order, because
 two runs could pick the same coin. Either way the gas owner is read from the
@@ -1394,7 +1400,10 @@ builds — two copies of whatever *your* layer holds.
 
 **The sender lock is process-wide; the base is shared per client per chain
 id.** The sender lock — one semaphore per address — is what stops two
-`Tx.run`s from selecting the same gas coin. Every Promise-face registration
+`Tx.run`s from selecting the same gas coin. Under the default
+`SubmitConfig.lockSender: "whenPinned"` it covers every build, and the
+submission only when the bytes pin an owned input or a gas coin; gas from the
+address balance (the default) pins none. Every Promise-face registration
 takes **the same** lock per address, on every client and whatever chain id it
 pinned, so a `warm` and a lazy registration, or two clients, cannot equivocate
 one coin. (Before 0.4.0 the lock map belonged to each shared base, and a warm
@@ -1888,6 +1897,16 @@ the gas owner's SUI **address balance** covers the budget when the gas payment
 is empty (`Tx.sponsored`), so a sponsored-flow fixture scripts a balance with an
 `addressBalance` for the sponsor, or the build fails with `BuildError`.
 
+The fake models those **address balances** (0.4.0): seeded from
+`FakeScript.balances[].addressBalance`, set with `SuiTest.setAddressBalance`,
+read back with `SuiTest.addressBalance`. Its resolver pays gas from the payer's
+balance when it covers the budget and the PTB does not use `tx.gas`, and from
+coins otherwise, the way the SDK's does; a payer with neither fails the build
+with `BuildError` ("No valid gas coins found"). So an owner-less balance
+scripted beside coins means address-balance gas (`payment: []`); script
+`addressBalance: "0"` for the payer when a test means coin gas. Executions
+charge gas to the balance, debit withdrawals and follow `send_funds` deposits.
+
 ### The fixture package's `node_modules` is not your source
 
 An isolated-consumer fixture — a directory with its own `package.json` that
@@ -2172,7 +2191,7 @@ conversion is mechanical except where the behaviour deliberately changed.
 | `TxThunk` | `Recipe = (tx) => void`. Every thunk in the SDKs is already synchronous; a **consumer's** `async (tx) => …` is not, and it hoists its `await` in front of the recipe — the read happens in the surrounding Effect, the recipe stays pure |
 | `buildTx(...thunks)` | compose recipes: `(tx) => { a(tx); b(tx) }`, then `Tx.build`. When what you need is a `Transaction` **object** to hand to something else, build it yourself: `const tx = new Transaction(); recipe(tx)` — `Tx.build` returns signed-ready bytes and needs a sender |
 | `signAndExecute` / `execThunks` | `Tx.run(recipe, { signer })`; the separate `waitForTransaction` is gone |
-| `ParallelTransactionExecutor` | `Tx.run` per PTB, under the sender lock. Parallel submission from one address needs distinct gas owners (`Tx.sponsored`) and is otherwise deferred: the lock is what stops two transactions picking the same gas coin |
+| `ParallelTransactionExecutor` | `Tx.run` per PTB. With gas from the address balance (the default, once the coins are folded with `Tx.foldCoins`) a PTB with no owned input pins nothing, so under `lockSender: "whenPinned"` runs from one address are serialized only for their builds and submitted concurrently; a PTB that pins a coin or an owned object holds the sender lock through submit, which is what stops two transactions picking the same gas coin |
 | `ExecResult` and its extractors | `Executed` with `created(type)`, `createdWhere(predicate)`, `packagesPublished()`, `balanceChange(address, coinType)`, `expectCreated` |
 | a `register(client)` building a class of Promise methods | the service above plus `SuiExtension.fromService`, with `warm` when the surface has synchronous members |
 | a hand-rolled idempotent submitter (persist the signed bytes, execute, wait, re-poll by digest on error, resubmit the identical bytes) | `Tx.build` → `Tx.sign` → `Tx.submit` with a durable `Journal` (`@unconfirmed/sui-effect/journal`), and `Tx.reconcileAll()` at startup. The journal write before the first send, the verbatim resubmit and the reconcile are all in `Tx.submit`; what stays yours is the domain record, which goes in `Tx.run`'s `onSigned` hook |
@@ -2540,11 +2559,12 @@ for hours, a cached failed build is a much longer outage than in a tab.
 semaphore in one runtime's memory. Two isolates, two Durable Objects, two
 regions — two locks, and nothing stops both picking the same gas coin. Either
 serialize submissions for an address through one Durable Object (which is what
-DOs are for), or stop depending on the lock: with `tx.setGasPayment([])` there is
-no gas coin to equivocate on, the node picks from the address balance, and
-`SubmitConfig.lockSender: false` is then correct rather than reckless. A
-sponsored transaction built with `Tx.sponsored` already has an empty gas
-payment, and `Tx.build` preserves it through the resolver.
+DOs are for), or stop depending on the lock: gas from the address balance — the
+default, and a guarantee under `SubmitConfig.gasPayment:
+"requireAddressBalance"` — leaves no gas coin to equivocate on, so a PTB with no
+owned input pins nothing and `SubmitConfig.lockSender: "never"` is then correct
+rather than reckless. A sponsored transaction built with `Tx.sponsored` already
+has an empty gas payment, and `Tx.build` preserves it through the resolver.
 
 **Time is not wall-clock time in a DO alarm.** `Tx.submit`'s resubmit schedule
 and `visibilityTimeout` are Effect sleeps inside one invocation; a Durable
@@ -2731,13 +2751,21 @@ the page to read before the conversion rather than after it.
 - **Allowances are SDK pass-through.** `tx.balance({ allowance, … })`,
   `tx.coin({ allowance, … })` and `tx.withdrawal({ from: "allowance", allowance,
   funder })` (`@mysten/sui` 2.31+) go in a recipe like any other command, and
-  `Tx.build` resolves them through the SDK. sui-effect has no helper for them,
-  and the fake's resolver models no `FundsWithdrawal` inputs, so a recipe that
-  uses them is tested against a network, not on `layerTest`.
+  `Tx.build` resolves them through the SDK. sui-effect has no helper for them;
+  the fake debits a `FundsWithdrawal` from its source (an allowance's from its
+  funder) but checks no allowance limit, so a limit is tested against a
+  network, not on `layerTest`.
 - **`Tx.sponsored` spends the sponsor's SUI address balance**, not its coins,
   and `Tx.build` refuses with `BuildError` when that balance is below the
-  budget. Coin-paid sponsorship is `Tx.run(recipe, { signer, gasOwner,
+  budget plus the SUI the bytes withdraw from it, or when the bytes use
+  `tx.gas` (empty under an address-balance payment). Coin-paid sponsorship is `Tx.run(recipe, { signer, gasOwner,
   sponsor })` without `Tx.sponsored` (section 5).
+- **Gas comes from the address balance by default**, so write recipe fragments
+  that keep it that way: `tx.coin({ balance })` / `tx.balance(...)` rather than
+  `tx.splitCoins(tx.gas, ...)` (a `tx.gas` user pays with a coin or a coin
+  reservation), and `Tx.sendFunds` for a plain transfer into a balance. A
+  consumer folds its coins once with `Tx.foldCoins({ signer })`; until then the
+  resolver pays with coins and the run holds the sender lock through submit.
 - **A lost submission is re-sent, not rebuilt.** `Tx.resubmit(error)` re-sends a
   `SubmissionUnknown`'s identical bytes (and refuses when the journal already
   says `NotApplied`); `Tx.reconcileAll({ resubmit: true })` does it for every
@@ -2749,8 +2777,8 @@ the page to read before the conversion rather than after it.
   `sui.getBalance(owner).balance` counts and `streamCoins` does not list.
   **Localnet runs the V2 faucet** (`requestSuiFromFaucetV2({ host:
   getFaucetHost("localnet"), recipient })`, `POST /v2/gas`), which pays a
-  **coin** — so a sponsor funded there has nothing in its address balance until
-  it deposits with `coin::into_balance` and `balance::send_funds<SUI>`.
+  **coin** — so an account funded there pays gas with coins, and a sponsor has
+  nothing in its address balance, until it folds them with `Tx.foldCoins`.
 - **`SuiError.describe` covers `GraphQLUnavailable` and `ExtensionNotReady`**,
   and `Script.run` prints them like any other tag.
 - **Write a `PromiseFace<Service>` type test per namespace**, and put `test` in

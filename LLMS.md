@@ -31,11 +31,11 @@ subpath by subpath; the examples and the extension template come last.
 | Import | What it exports |
 |---|---|
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
-| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `submit`, `submitVia`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, …), `Verify`, `SubmitConfig` and `SubmitConfigOverrides`, `Journal`, `JournalEntry` |
+| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `submit`, `submitVia`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, …), `Verify`, `SubmitConfig`, `SubmitConfigOverrides`, `LockSenderPolicy` and `GasPaymentPolicy`, `FoldBatch` / `FoldPlan` / `FoldGas` / `FoldResult`, `Journal`, `JournalEntry` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
 | `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)` (an `Effect<Option<A>>` member becomes `Promise<A \| undefined>`, `FaceValue`), and `SuiExtension.leaf` |
 | `@unconfirmed/sui-effect/script` | `Script` / `ScriptReadOnly` (layers that read `SUI_NETWORK`, `SUI_PRIVATE_KEY`, …), `Script.run`, `Script.report`, `Script.exitCode` |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig` |
+| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig`; the fake models address balances (`SuiTest.setAddressBalance`, `SuiTest.addressBalance`) |
 
 ## Recipes
 
@@ -72,10 +72,9 @@ import { Mist, type SuiAddress } from "@unconfirmed/sui-effect"
 import { type Signer, SubmitConfig, Tx } from "@unconfirmed/sui-effect/tx"
 
 export const pay = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
-  Tx.run((tx) => {
-    const [coin] = tx.splitCoins(tx.gas, [amount])
-    tx.transferObjects([coin!], recipient)
-  }, { signer }).pipe(
+  // Into the recipient's address balance, out of the sender's when it covers
+  // the amount: with gas from the balance too, the bytes pin nothing.
+  Tx.run(Tx.sendFunds({ amount, recipient }), { signer }).pipe(
     Effect.map((executed) => executed.digest),
     // A ceiling, not a budget: above it the build fails with `PolicyDenied { rule: "maxGasBudget" }`.
     SubmitConfig.with({ maxGasBudget: Mist.make(1_000_000_000n) })
@@ -149,9 +148,7 @@ import type { SuiAddress } from "@unconfirmed/sui-effect"
 import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
 
 export const payOrResend = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
-  Tx.run((tx) => {
-    tx.transferObjects([tx.splitCoins(tx.gas, [amount])], recipient)
-  }, { signer }).pipe(
+  Tx.run(Tx.sendFunds({ amount, recipient }), { signer }).pipe(
     // `SubmissionUnknown` carries the bytes; `Tx.resubmit` sends them again and settles them.
     Effect.catchTag("SubmissionUnknown", (unknown) => Tx.resubmit(unknown))
   )
@@ -182,9 +179,7 @@ export const payOnce = (recipient: SuiAddress, amount: bigint) =>
   Effect.gen(function*() {
     yield* Tx.reconcileAll({ resubmit: true })
     const { signer } = yield* Script
-    const executed = yield* Tx.run((tx) => {
-      tx.transferObjects([tx.splitCoins(tx.gas, [amount])], recipient)
-    }, { signer })
+    const executed = yield* Tx.run(Tx.sendFunds({ amount, recipient }), { signer })
     return executed.digest
   })
 
@@ -413,6 +408,14 @@ test("a counter the fake serves decodes, and a missing one is None", async () =>
 - Reads go through `Sui`; writes go through `Tx`. Nothing calls `SuiCore.executeTransaction` directly.
 - `Signer` is a value, never a service: pass it as a parameter. `SubmitConfig` and `Journal` are `Context.Reference`s with working defaults.
 
+## Gas and the address balance
+
+- **Gas comes from the payer's SUI address balance by default** (`SubmitConfig.gasPayment: "preferAddressBalance"`): the resolver pays from it when it covers the budget and the transaction does not use `tx.gas`, and from coins otherwise. The `Tx.build` span attribute `sui.gas_payment` names the choice (`addressBalance`, `coinReservation`, `coins`). `"requireAddressBalance"` makes coins a `BuildError`.
+- **Bytes that pin nothing do not hold the sender lock past their build.** Under `lockSender: "whenPinned"` (the default) `Tx.run` locks every build, and keeps the lock through submit only when the bytes pin an owned input or a gas coin. Lock-free runs can together overdraw a balance (the overdrawing one is `ExecutionFailed`, `InsufficientFundsForWithdraw`, no gas charged): a spend-to-zero flow sets `lockSender: "always"`.
+- **Fold coins into the balance** with `Tx.foldCoins({ signer })`: `Tx.planFold` (reads only) then one `Tx.run(Tx.fold(batch))` per batch, SUI first. SUI pays for its own fold, so a coin-only account needs nothing first. Preview a batch with `Tx.build(Tx.fold(batch), { sender })` and `sui.simulate(built.bytes)`. The localnet faucet (V2) pays coins, so fold first; the devnet/testnet faucet (V3) pays the balance.
+- **Transfer into a balance** with `Tx.sendFunds({ coinType?, amount, recipient })` (`balance::send_funds`; keep `useGasCoin` at its default `true`, `false` under `Tx.sponsored`). In your own recipes prefer `tx.coin({ balance })` / `tx.balance(...)` to `tx.splitCoins(tx.gas, ...)`, which pays gas with a coin.
+- Address-balance gas is checked before signing: an explicit empty payment needs the budget plus the payer's SUI withdrawals in the balance, and with no owned input a `ValidDuring` expiration (the default), and must not use `tx.gas` (its coin is empty: the simulate passes, execution fails and charges gas); each miss is a `BuildError`. A sponsored recipe uses `tx.coin({ balance, useGasCoin: false })` / `Tx.sendFunds({ ..., useGasCoin: false })`, never `tx.splitCoins(tx.gas, ...)`.
+
 ## Errors
 
 Every failure is one flat `Schema.TaggedError`. `SuiError.outcome(e)` puts it on
@@ -426,7 +429,7 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 | `NetworkMismatch` | `not_applied` | 2 | The node is on another chain than the layer was built for |
 | `DecodeError` | `not_applied` | 4 | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
 | `SimulationFailed` | `not_applied` | 4 | Simulation reported an execution failure; no gas charged |
-| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget); policy (`preflight`, and the gas ceiling as `rule: "maxGasBudget"`); the journal write before the first send |
+| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, and the gas ceiling as `rule: "maxGasBudget"`); the journal write before the first send |
 | `GraphQLUnavailable` / `ExtensionNotReady` | `not_applied` | 4 | No usable GraphQL endpoint; a synchronous Promise-face member called before its runtime existed |
 | `NotApplied` | `not_applied` | 4 | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
 | `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged |
@@ -464,14 +467,15 @@ layer option (30 s; `SUI_RPC_TIMEOUT` for `layerConfig`).
 | `validFor` | unset | An extra wall-clock bound; no Sui network accepts one yet |
 | `maxGasBudget` | 50 SUI | The ceiling above which `Tx.build` fails with `PolicyDenied { rule: "maxGasBudget" }` |
 | `preflight` | unset | `(simulation) => Effect<void, PolicyDenied>`, run before signing |
-| `lockSender` | `true` | Whether `Tx.run` holds the sender lock from build through submit |
+| `lockSender` | `"whenPinned"` | When `Tx.run` holds the sender lock: every build, and through submit only when the bytes pin an owned input or gas coin (`"always"`: build through submit, the pre-0.4.0 rule; `"never"`). `true` / `false` mean `"always"` / `"never"` |
+| `gasPayment` | `"preferAddressBalance"` | How an unset gas payment is chosen: the address balance when it covers the budget, else coins (`"requireAddressBalance"`: the balance or `BuildError`) |
 | `resubmit` | exponential from 250 ms, capped at 30 s, jittered | How `Tx.submit` re-sends the identical bytes |
 | `resubmitAttempts` | `5` | Sends in total, the first included |
 | `executeTimeout` | 60 s | One `executeTransaction`; a timeout is retryable |
 | `expiryMargin` | 30 s | Skew allowed on the wall-clock expiry rule |
 | `expiryEvidence` | `"epochThenMiss"` | Whether a closed expiry window may prove `NotApplied` (`"never"` behind a mixed-node load balancer) |
 | `reconcileRecheck` | 2 s | The pause between the two observations the expiry rule needs |
-| `awaitVisibility` | `true` | Wait for the execution to be readable before returning (and releasing the lock); it delays every return, `lockSender: false` included |
+| `awaitVisibility` | `true` | Wait for the execution to be readable before returning (and releasing the lock); it delays every return, `lockSender: "never"` included |
 | `visibilityTimeout` | 15 s | How long that wait may take; it never changes the outcome |
 | `nonce` | a random `u32` | The nonce on a default `ValidDuring` expiration |
 
@@ -506,7 +510,7 @@ process-wide.
 4. Once bytes may have been sent no `TransportError` escapes; it becomes `SubmissionUnknown`. The one exception is a gRPC `INVALID_ARGUMENT` on the first send: the node refused, nothing ran, and the journal entry is settled as `NotApplied { evidence: "refused" }`. A `Tx.resubmit` never takes a refusal that way: an earlier send of the same bytes may have landed.
 5. `JournalError` escapes only from the `Signed` write, before anything is sent.
 6. `NotApplied { inputConsumed }` is built only on a **different** transaction's effects reporting the exact pinned `inputVersion`; an input that merely moved on is not evidence. Positive evidence vetoes expiry: a pinned object naming the transaction's own digest is never answered `NotApplied { expired }`, and neither is a miss on a gRPC node that has pruned into the validity window (JSON-RPC and GraphQL cannot report pruning: set `expiryEvidence: "never"` behind pruning nodes there).
-7. A sponsored `Tx.run` needs `sponsor` whenever the gas owner is not the sender — `opts.gasOwner`, or one the recipe set itself (`Tx.sponsored`), which `Tx.run` reads from the recipe before locking. The gas owner's lock is taken only when gas is paid with its coins; an address-balance payment (`Tx.sponsored`) locks the sender alone, so one sponsor pays for many senders at once.
+7. A sponsored `Tx.run` needs `sponsor` whenever the gas owner is not the sender — `opts.gasOwner`, or one the recipe set itself (`Tx.sponsored`), which `Tx.run` reads from the recipe before locking. The gas owner's lock is taken only when gas is paid with its coins; an address-balance payment (`Tx.sponsored`) locks the sender alone, so one sponsor pays for many senders at once. Under the default `lockSender: "whenPinned"` the locks cover every build, and the submission only when the bytes pin an owned input or a gas coin.
 8. Every SDK call forwards the Effect's `AbortSignal`, so `Effect.timeout` and interruption cancel the request.
 9. One Move type rule everywhere: a bare expected tag matches every instantiation of the generic; a parameterized one is compared in full.
 10. A test that runs `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default journal is process-wide; `layerTest` is the production `Sui`, so fixtures use `localnet`.
@@ -5006,15 +5010,17 @@ the gas payment is an explicit empty list (what `Tx.sponsored` sets, or the
 must hold at least the gas budget plus the SUI the bytes withdraw from it in
 its SUI address balance, coins not counted; the simulation does not check it
 and the node refuses the bytes at execution. That costs one `getBalance`
-read, for those transactions only. And bytes paying from an address balance
+read, for those transactions only. Bytes paying from an address balance
 with no address-owned input need a `ValidDuring` expiration, which a node
-otherwise refuses outright; the default expiration is one.
+otherwise refuses outright (the default expiration is one), and must not use
+`tx.gas`: with an empty payment the gas coin is empty, which a simulation
+does not show and execution fails on, charging gas.
 
 `Built.gasOwner` is read out of the bytes: it is present whenever the bytes
 name a gas owner other than the sender, whether `opts.gasOwner` or the
 recipe set it.
 
-**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the node refused to resolve the transaction, a zero-gas requirement was not met, the payer's address balance cannot cover the budget and withdrawals, coins were chosen under `gasPayment: "requireAddressBalance"`, or an address-balance payment lacks an epoch-bounded expiration), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
+**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the node refused to resolve the transaction, a zero-gas requirement was not met, the payer's address balance cannot cover the budget and withdrawals, coins were chosen under `gasPayment: "requireAddressBalance"`, or an address-balance payment lacks an epoch-bounded expiration or is used with `tx.gas`), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
 
 ### `chainOf` (const)
 
