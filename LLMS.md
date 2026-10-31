@@ -351,14 +351,16 @@ The full entries follow under "API".
 - `SubmitViaError` — Everything `submitVia` can fail with, before the sender's own errors.
 - `SubmitViaReply` — What a third party answers when it has submitted your bytes.
 - `TransactionExpiration` — re-exported from `@unconfirmed/sui-effect`.
-- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 - `UNRESOLVED_TAGS` — The tags whose entries still need an answer from the network.
 - `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
 - `VerifyOptions` — The options both verifiers take.
+- `attach` — Attaches a signature somebody else made — a sender's wallet, a remote sponsor, an HSM — to built or already signed bytes, after checking it.
 - `build` — Builds a transaction into signable bytes.
 - `chainOf` — re-exported from `@unconfirmed/sui-effect`.
 - `cosign` — Adds one more signature to already signed bytes, for a sponsored or multi-party transaction.
 - `ephemeral` — A fresh Ed25519 credential that exists only for this process.
+- `fromBytes` — Turns transaction bytes that came from somewhere else into a `Built`, reading everything the lifecycle needs out of the bytes themselves.
 - `fromConfig` — Reads a secret key from configuration and builds its signer.
 - `fromKeypair` — `fromSdkSigner` under the name the spec gave it when a keypair was the only thing it took.
 - `fromSdkSigner` — Wraps any `@mysten/sui/cryptography` `Signer`.
@@ -757,6 +759,12 @@ declare const Built: Schema
 A transaction built into bytes and ready to sign, with the expiration the
 builder settled on recorded so `Tx.reconcile` can decide, later and without
 the builder, whether the transaction can still land.
+
+Every field but `chain` is read back out of `bytes`. Bytes that arrived from
+somewhere else — a sponsor handed a sender's transaction — become a `Built`
+through `Tx.fromBytes`, never by hand: a hand-built value that leaves out
+`expiration` or `chain` silently disables the expiry rule and the chain guard
+`Tx.reconcile` depends on.
 
 ### `ChangedObject` (const)
 
@@ -1986,6 +1994,7 @@ declare const SignedTransaction: Schema
 //     readonly bytes: Uint8Array<ArrayBufferLike>;
 //     readonly sender: SuiAddress;
 //     readonly signatures: readonly Signature[];
+//     readonly gasOwner?: SuiAddress | undefined;
 //     readonly expiration?: {
 //         readonly $kind: "None";
 //         readonly None: true;
@@ -3533,7 +3542,7 @@ every field the builder needs.
 ### `sdkRefOf` (const)
 
 ```ts
-declare const sdkRefOf: (ref: ChangedRef | ObjectRef) => SdkObjectRef | undefined
+declare const sdkRefOf: (ref: ChangedRef | ObjectRef | Coin) => SdkObjectRef | undefined
 ```
 
 The shape `Transaction#objectRef` and `Inputs.ObjectRef` want: `objectId`
@@ -3553,6 +3562,12 @@ on `ref.owner.Shared.initialSharedVersion`), and a **receiving** object with
 `tx.receivingRef(...)`, which takes the same three fields this returns.
 Passing a shared object by `objectRef` produces bytes a validator rejects.
 
+A `Coin` from `Sui.listCoins` / `Sui.streamCoins` is accepted too
+(since 0.4.0): it is an owned object with its id under `objectId`, which is
+exactly what a coin passed to `tx.objectRef` or `tx.setGasPayment` needs,
+and it always carries a version and a digest, so for a `Coin` the answer is
+never `undefined`.
+
 `undefined` when the effects did not carry a version or a digest — a deleted
 object has no output version, and nothing can be consumed without both.
 
@@ -3561,7 +3576,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-44 exported symbols.
+46 exported symbols.
 
 ### `Built` (const)
 
@@ -3640,6 +3655,7 @@ declare const JournalEntry: Schema
 //         readonly bytes: Uint8Array<ArrayBufferLike>;
 //         readonly sender: SuiAddress;
 //         readonly signatures: readonly Signature[];
+//         readonly gasOwner?: SuiAddress | undefined;
 //         readonly expiration?: {
 //             readonly $kind: "None";
 //             readonly None: true;
@@ -3689,6 +3705,7 @@ declare const JournalEntry: Schema
 //         readonly bytes: Uint8Array<ArrayBufferLike>;
 //         readonly sender: SuiAddress;
 //         readonly signatures: readonly Signature[];
+//         readonly gasOwner?: SuiAddress | undefined;
 //         readonly expiration?: {
 //             readonly $kind: "None";
 //             readonly None: true;
@@ -4160,9 +4177,11 @@ declare const Tx: {
     readonly build: (input: Transaction | Recipe, opts: {
         readonly sender: SuiAddress;
         readonly gasOwner?: SuiAddress;
-    }) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError, Sui>;
+    }) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
     readonly sign: (built: Built, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
     readonly cosign: (signed: Signed, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
+    readonly fromBytes: (bytes: Uint8Array<ArrayBufferLike>) => Effect.Effect<Built, BuildError, Sui>;
+    readonly attach: (target: Built | Signed, signature: string) => Effect.Effect<Signed, TransportError | SigningError, Sui>;
     readonly sponsored: (opts: {
         readonly sender: SuiAddress;
         readonly gasOwner: SuiAddress;
@@ -4171,6 +4190,12 @@ declare const Tx: {
         readonly coinType: CoinType;
         readonly amount: bigint;
         readonly recipient: SuiAddress;
+        /**
+         * Fail the build unless the resolved gas price and budget are both zero.
+         *
+         * @since 0.4.0
+         */
+        readonly requireZeroGas?: boolean;
     }) => Recipe;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
@@ -4233,9 +4258,9 @@ declare const Tx: {
 ```
 
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
-`Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`,
-`Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
-`Tx.reconcileAll`.
+`Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
+`Tx.gaslessStablecoinTransfer`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
+`Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 
 ### `UNRESOLVED_TAGS` (const)
 
@@ -4274,13 +4299,36 @@ export interface VerifyOptions {
 
 The options both verifiers take.
 
+### `attach` (const)
+
+```ts
+declare const attach: (target: Built | Signed, signature: string) => Effect.Effect<Signed, TransportError | SigningError, Sui>
+```
+
+Attaches a signature somebody else made — a sender's wallet, a remote
+sponsor, an HSM — to built or already signed bytes, after checking it.
+
+The signature is verified against the bytes (`Verify.verifyTransactionSignature`,
+so a zkLogin or multisig signature is checked through the node), and the
+address it was made by must be the sender or the gas owner the bytes name.
+A `Built` becomes a `Signed` carrying that one signature; a `Signed` gains it.
+The same signature attached twice is attached once.
+
+```ts
+const built = yield* Tx.fromBytes(senderBytes)
+const withSender = yield* Tx.attach(built, senderSignature)
+const signed = yield* Tx.cosign(withSender, sponsor)
+```
+
+**Fails with: `SigningError` (the signature is empty, does not parse, is not valid for these bytes, or was made by an address the bytes will not accept), `TransportError` (a zkLogin or multisig check could not reach a usable answer).**
+
 ### `build` (const)
 
 ```ts
 declare const build: (input: Transaction | Recipe, opts: {
     readonly sender: SuiAddress;
     readonly gasOwner?: SuiAddress;
-}) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError, Sui>
+}) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>
 ```
 
 Builds a transaction into signable bytes.
@@ -4322,7 +4370,28 @@ prove a transaction can no longer land.
 through submit. Called on its own, two concurrent builds for one address can
 pick the same gas coin.
 
-**Fails with: `BuildError` (the recipe threw, an input could not be resolved, or the budget the node chose is over `SubmitConfig.maxGasBudget`), `SimulationFailed` (the transaction would abort on chain), `TransportError`.**
+**A refusal from the resolver is a `BuildError`.** The SDK resolves inputs
+and gas through the node, and a node that refuses the transaction itself —
+a function that does not exist, an object owned by another address, gas
+selection with nothing to select (gRPC `INVALID_ARGUMENT` or
+`FAILED_PRECONDITION`), an input it cannot find (`NOT_FOUND`) — is reported
+with the node's message, the `TransportError` kept as the cause; so is the
+SDK resolver's own refusal ("Insufficient balance of <coin> for owner
+<address>"). A `TransportError` that remains is the network, named
+`"Tx.build"`.
+
+**Gas from an address balance is checked before anything is signed.** When
+the gas payment is an explicit empty list (what `Tx.sponsored` sets), the
+payer — the gas owner, or the sender — must hold at least the gas budget in
+its SUI address balance, coins not counted; the simulation does not check
+it and the node refuses the bytes at execution. That costs one
+`getBalance` read, for those transactions only.
+
+`Built.gasOwner` is read out of the bytes: it is present whenever the bytes
+name a gas owner other than the sender, whether `opts.gasOwner` or the
+recipe set it.
+
+**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the node refused to resolve the transaction, a zero-gas requirement was not met, or the payer's address balance cannot cover the budget), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
 
 ### `chainOf` (const)
 
@@ -4360,6 +4429,33 @@ over `crypto.getRandomValues`). A `TestClock`-style deterministic key would
 be a security bug, not a convenience.
 
 **Never fails.**
+
+### `fromBytes` (const)
+
+```ts
+declare const fromBytes: (bytes: Uint8Array<ArrayBufferLike>) => Effect.Effect<Built, BuildError, Sui>
+```
+
+Turns transaction bytes that came from somewhere else into a `Built`,
+reading everything the lifecycle needs out of the bytes themselves.
+
+This is how a stateless sponsor, a wallet bridge or a service that was
+handed someone's transaction gets back into the lifecycle: `sign`, `attach`,
+`cosign` and `submit` all take what this returns. The sender, the gas owner
+and the expiration are read out of the bytes, and the digest is computed from
+them, so nothing is taken on trust. **Never build a `Built` by hand**: one
+that leaves out `expiration` or `chain` silently disables `Tx.reconcile`'s
+expiry rule and chain guard.
+
+`chain` is the chain of the `Sui` in context. Bytes whose expiration names a
+chain (the default `ValidDuring` does) must name that one; bytes whose
+expiration names none (`Epoch`, `None`) cannot be checked, and are taken to
+be for this chain.
+
+Unlike `Tx.build`, nothing is simulated: run `sui.simulate(built.bytes)` (or
+a `SubmitConfig.preflight`) before co-signing bytes you did not build.
+
+**Fails with: `BuildError` (the bytes are not a full transaction this SDK can read, name no sender, or are bound to another chain).**
 
 ### `fromConfig` (const)
 
@@ -4443,6 +4539,12 @@ declare const gaslessStablecoinTransfer: (opts: {
     readonly coinType: CoinType;
     readonly amount: bigint;
     readonly recipient: SuiAddress;
+    /**
+     * Fail the build unless the resolved gas price and budget are both zero.
+     *
+     * @since 0.4.0
+     */
+    readonly requireZeroGas?: boolean;
 }) => Recipe
 ```
 
@@ -4464,6 +4566,13 @@ This sends to the recipient's address balance. The SDK may source the amount
 from the sender's address balance, coin objects, or both, and resolves the
 required eligible helper calls itself.
 
+**`requireZeroGas: true`** makes "gasless" a requirement rather than a hope.
+Without it, a coin type or amount that does not qualify — or a transport
+that does not detect eligibility, such as JSON-RPC — still builds, and the
+sender quietly pays SUI gas. With it, the recipe installs a build plugin
+that checks what the resolver chose, and `Tx.build` fails with `BuildError`
+unless the gas price and the gas budget are both zero.
+
 **Never fails; the recipe it returns can throw only if the SDK rejects an input, which `Tx.build` reports as `BuildError` before anything is signed.**
 
 ### `isUnresolved` (const)
@@ -4478,6 +4587,7 @@ declare const isUnresolved: (value: {
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
         readonly chain?: string;
+        readonly gasOwner?: SuiAddress;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -4527,6 +4637,7 @@ declare const isUnresolved: (value: {
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
         readonly chain?: string;
+        readonly gasOwner?: SuiAddress;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -4653,6 +4764,7 @@ declare const isUnresolved: (value: {
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
         readonly chain?: string;
+        readonly gasOwner?: SuiAddress;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -4697,6 +4809,7 @@ declare const isUnresolved: (value: {
         readonly signatures: readonly Signature[];
         readonly bytes: Uint8Array<ArrayBufferLike>;
         readonly chain?: string;
+        readonly gasOwner?: SuiAddress;
         readonly expiration?: {
             readonly $kind: "None";
             readonly None: true;
@@ -4963,6 +5076,14 @@ sender and gas owner differ, both locks are held, in ascending address order
 — a fixed order, so two runs that each need the same pair cannot deadlock by
 taking them the other way round.
 
+**Except when gas comes from an address balance.** A transaction whose gas
+payment is an explicit empty list — `Tx.sponsored` sets one — selects no
+coins, so there is nothing for two runs to race over and the gas owner's
+lock is not taken: one sponsor can pay for many senders at once, each run
+serialized only on its own sender. (Before 0.4.0 every such run waited for
+the sponsor's lock, which made twenty concurrent sponsored runs take as long
+as twenty sequential ones.)
+
 When `SubmitConfig.preflight` is set it costs one extra simulate, and is
 where spend limits and target policies refuse a transaction before anything
 is signed.
@@ -4973,18 +5094,17 @@ validator rejects. So when `opts.gasOwner` differs from the signer's address
 — or when the recipe itself set a different gas owner, which `Tx.sponsored`
 does — `opts.sponsor` is required and co-signs the same bytes. Without it
 `Tx.run` fails with `SigningError` naming the address whose signature is
-missing, before anything is built when the gas owner was given as an option
-and immediately after the build when it came out of the recipe. Use the
+missing, before anything is built (the recipe is applied first, so a gas
+owner it sets is known by then too). Use the
 explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
 two parties cannot both sign in one process.
 
-**The gas owner's lock comes from `opts.gasOwner` only.** The locks are taken
-before anything is built, so a gas owner the recipe sets itself is not known
-when they are chosen, and a recipe that does so without
-`tx.setGasPayment([])` has the gas owner's coins selected under the sender's
-lock alone. Pass the same address as `opts.gasOwner` whenever the recipe sets
-one (`Tx.sponsored` pays from an address balance and selects no coins, but
-passing it costs nothing).
+**The locks are chosen from the recipe itself.** The recipe is applied to a
+fresh `Transaction` before any lock is taken, so a gas owner it sets itself
+(`Tx.sponsored` does) and the gas payment it leaves are known when the locks
+are chosen — passing the same address as `opts.gasOwner` changes nothing.
+The recipe runs outside the lock: it only describes commands, and anything
+it reads from the chain belongs in the resolver, which runs inside.
 
 **`onSigned` is the hook between signing and sending.** A program with its
 own record to keep — a batch row, an outbox, an idempotency key — has to
@@ -5024,6 +5144,14 @@ Turns a recipe into a sponsored one: the sender owns the transaction, the
 gas owner pays, and gas comes from the sponsor's address balance rather than
 from coin objects, so the two parties never have to agree on a gas coin and
 can sign in either order.
+
+**The gas owner must hold SUI in its address balance**, not just in coin
+objects: gas is drawn from that balance, and `Tx.build` refuses with
+`BuildError` when it holds less than the budget. A sponsor funded by a
+faucet holds coins; move SUI into the balance once with
+`0x2::balance::send_funds<0x2::sui::SUI>`, or sponsor with coins instead by
+passing `gasOwner` to `Tx.run`/`Tx.build` without `Tx.sponsored` (the gas
+owner's coins are then selected under its sender lock).
 
 **Never fails; the recipe it returns throws only if the recipe it wraps does, which `Tx.build` reports as `BuildError`.**
 

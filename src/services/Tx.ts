@@ -46,7 +46,7 @@ import {
   maxTimestampMsOf,
   Nonce,
   ObjectId,
-  type Signature,
+  Signature,
   SignedTransaction,
   SuiAddress,
   TransactionExpiration,
@@ -55,6 +55,7 @@ import {
 } from "../domain/schemas.ts"
 import { readSchedule } from "./SuiCore.ts"
 import { Journal } from "./Journal.ts"
+import { verifyTransactionSignature } from "./Verify.ts"
 import type { Signer } from "./Signer.ts"
 import type { SubmitConfigService } from "./SubmitConfig.ts"
 import { SubmitConfig } from "./SubmitConfig.ts"
@@ -191,6 +192,8 @@ const decodeDigestOption = Schema.decodeUnknownOption(Digest)
 const decodeVersion = Schema.decodeUnknownOption(Version)
 const decodeObjectId = Schema.decodeUnknownOption(ObjectId)
 const decodeNonce = Schema.decodeUnknownEffect(Nonce)
+const decodeAddress = Schema.decodeUnknownOption(SuiAddress)
+const decodeSignature = Schema.decodeUnknownOption(Signature)
 
 /**
  * How many times `Tx.build` runs the SDK's resolver before a retryable
@@ -518,6 +521,128 @@ const gasBudgetOf = (data: TransactionDataBuilder): bigint | undefined => {
   return budget === null || budget === undefined ? undefined : BigInt(budget)
 }
 
+const gasPriceOf = (data: TransactionDataBuilder): bigint | undefined => {
+  const price = data.gasData.price
+  return price === null || price === undefined ? undefined : BigInt(price)
+}
+
+/**
+ * The gas owner the bytes name, when it is someone other than the sender, as
+ * the padded address. `undefined` for a transaction the sender pays for.
+ * Never fails.
+ */
+const gasOwnerOf = (data: TransactionDataBuilder): SuiAddress | undefined => {
+  const owner = data.gasData.owner
+  if (typeof owner !== "string" || owner.length === 0) return undefined
+  const normalized = normalizeSuiAddress(owner)
+  if (typeof data.sender === "string" && normalizeSuiAddress(data.sender) === normalized) return undefined
+  return Option.getOrUndefined(decodeAddress(normalized))
+}
+
+/**
+ * Whether gas comes from the payer's **address balance**: the payment is an
+ * explicit empty list, which is what `Tx.sponsored` sets. Such a transaction
+ * selects no gas coins, so it cannot race another one for a coin. A coin
+ * reservation ref is the resolver drawing on the address balance too, but the
+ * resolver chose it and checked the balance itself; it is not this case.
+ */
+const paysFromAddressBalance = (data: TransactionDataBuilder): boolean => {
+  const payment = data.gasData.payment
+  return payment !== null && payment !== undefined && payment.length === 0
+}
+
+/**
+ * The statuses with which a node refuses to **resolve** a transaction: the
+ * request reached it and the answer is about the transaction, not the network.
+ * A missing function, an object owned by someone else, gas selection that
+ * found nothing to select — all `INVALID_ARGUMENT` (`3`), with
+ * `FAILED_PRECONDITION` (`9`) for an input in a state that cannot be used.
+ * Nothing has been signed, so each of them is a `BuildError`.
+ */
+const REFUSED_TO_RESOLVE: ReadonlySet<string> = new Set(["INVALID_ARGUMENT", "3", "FAILED_PRECONDITION", "9"])
+
+/** Whether a value is an `Error` thrown as itself, not a subclass of it. */
+const isPlainError = (cause: unknown): cause is Error =>
+  cause instanceof Error && Object.getPrototypeOf(cause) === Error.prototype && cause.name === "Error"
+
+/** The node's own words, out of whatever a transport failure carried. */
+const nodeMessageOf = (cause: unknown): string => {
+  if (typeof cause === "string") return cause
+  if (cause instanceof Error && cause.message.length > 0) return cause.message
+  if (typeof cause === "object" && cause !== null) {
+    const message = (cause as { readonly message?: unknown }).message
+    if (typeof message === "string" && message.length > 0) return message
+  }
+  return String(cause)
+}
+
+/**
+ * Thrown by the build plugin `gaslessStablecoinTransfer({ requireZeroGas })`
+ * installs, when the resolver did not set zero gas. A class of its own so
+ * `Tx.build` can tell it from a transport failure and report it as the
+ * `BuildError` it is.
+ */
+class ZeroGasNotResolved extends Error {
+  constructor(price: string, budget: string) {
+    super(
+      `the transaction was required to be gasless, but the resolver set gas price ${price} and` +
+        ` budget ${budget}: the coin type, the amount or the transport does not qualify for` +
+        " gasless execution (only gRPC and GraphQL resolution detect it)"
+    )
+    this.name = "ZeroGasNotResolved"
+  }
+}
+
+/**
+ * What a `TransportError` out of the SDK's resolver means to `Tx.build`.
+ *
+ * The resolver runs inside `SuiCore.use`, so its failures arrive named
+ * `"use"` — a name that says nothing to the caller of `Tx.build`. A node that
+ * refused the transaction itself (`REFUSED_TO_RESOLVE`), could not find an
+ * input (`NOT_FOUND`), an SDK resolver that refused with a plain `Error`, or a
+ * zero-gas requirement that was not met is a `BuildError` carrying the message and the `TransportError` as its
+ * cause; anything else is still a `TransportError`, renamed `"Tx.build"`, with
+ * its status and retryability intact.
+ */
+const resolverError = (
+  error: TransportError,
+  unresolved: ReadonlyArray<string>
+): BuildError | TransportError => {
+  if (error.cause instanceof ZeroGasNotResolved) {
+    return new BuildError({ message: error.cause.message, cause: error })
+  }
+  if (error.status === "NOT_FOUND") {
+    return new BuildError({
+      message: "an input could not be resolved: the node answered NOT_FOUND" +
+        (unresolved.length === 0 ? "" : ` for one of ${unresolved.join(", ")}`),
+      cause: error
+    })
+  }
+  if (!error.retryable && error.status !== undefined && REFUSED_TO_RESOLVE.has(error.status)) {
+    return new BuildError({
+      message: `the node refused to resolve the transaction (${error.status}): ${nodeMessageOf(error.cause)}`,
+      cause: error
+    })
+  }
+  if (!error.retryable && error.status === undefined && isPlainError(error.cause)) {
+    // The SDK's own resolver refuses with a bare `Error` — "Insufficient
+    // balance of <coin> for owner <address>", "Could not resolve gas payment"
+    // — after reads that succeeded. A transport failure is never one: a
+    // rejected `fetch` is a `TypeError`, a node's answer an `RpcError` or an
+    // HTTP status error, each of which carries a name or a status.
+    return new BuildError({
+      message: `the SDK could not resolve the transaction: ${error.cause.message}`,
+      cause: error
+    })
+  }
+  return new TransportError({
+    method: "Tx.build",
+    retryable: error.retryable,
+    ...(error.status === undefined ? {} : { status: error.status }),
+    cause: error.cause
+  })
+}
+
 const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, BuildError> =>
   typeof input === "function"
     ? Effect.try({
@@ -570,15 +695,38 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  * through submit. Called on its own, two concurrent builds for one address can
  * pick the same gas coin.
  *
+ * **A refusal from the resolver is a `BuildError`.** The SDK resolves inputs
+ * and gas through the node, and a node that refuses the transaction itself —
+ * a function that does not exist, an object owned by another address, gas
+ * selection with nothing to select (gRPC `INVALID_ARGUMENT` or
+ * `FAILED_PRECONDITION`), an input it cannot find (`NOT_FOUND`) — is reported
+ * with the node's message, the `TransportError` kept as the cause; so is the
+ * SDK resolver's own refusal ("Insufficient balance of <coin> for owner
+ * <address>"). A `TransportError` that remains is the network, named
+ * `"Tx.build"`.
+ *
+ * **Gas from an address balance is checked before anything is signed.** When
+ * the gas payment is an explicit empty list (what `Tx.sponsored` sets), the
+ * payer — the gas owner, or the sender — must hold at least the gas budget in
+ * its SUI address balance, coins not counted; the simulation does not check
+ * it and the node refuses the bytes at execution. That costs one
+ * `getBalance` read, for those transactions only.
+ *
+ * `Built.gasOwner` is read out of the bytes: it is present whenever the bytes
+ * name a gas owner other than the sender, whether `opts.gasOwner` or the
+ * recipe set it.
+ *
  * Fails with: `BuildError` (the recipe threw, an input could not be resolved,
- * or the budget the node chose is over `SubmitConfig.maxGasBudget`),
- * `SimulationFailed` (the transaction would abort on chain),
- * `TransportError`.
+ * the node refused to resolve the transaction, a zero-gas requirement was not
+ * met, or the payer's address balance cannot cover the budget),
+ * `SimulationFailed` (the transaction would abort on chain), `PolicyDenied`
+ * (rule `"maxGasBudget"`: the budget the node chose is over
+ * `SubmitConfig.maxGasBudget`), `TransportError`.
  */
 export const build = Effect.fn("Tx.build")(function*(
   input: Recipe | Transaction,
   opts: { readonly sender: SuiAddress; readonly gasOwner?: SuiAddress }
-): Effect.fn.Return<Built, BuildError | SimulationFailed | TransportError, Sui> {
+): Effect.fn.Return<Built, BuildError | SimulationFailed | PolicyDenied | TransportError, Sui> {
   yield* Effect.annotateCurrentSpan({
     "sui.sender": opts.sender,
     ...(opts.gasOwner === undefined ? {} : { "sui.gas_owner": opts.gasOwner })
@@ -633,19 +781,12 @@ export const build = Effect.fn("Tx.build")(function*(
       ),
       // A gRPC resolver that cannot find an input answers `NOT_FOUND` from
       // `simulateTransaction` rather than raising the SDK's `ObjectError`, and
-      // that arrived as a bare `TransportError { method: "use" }` naming
-      // nothing. It is a `BuildError` like every other unresolvable input, and
-      // it names the object inputs the resolver was about to look up.
-      Effect.catchTag("TransportError", (error) =>
-        Effect.fail(
-          error.status === "NOT_FOUND"
-            ? new BuildError({
-              message: "an input could not be resolved: the node answered NOT_FOUND" +
-                (unresolved.length === 0 ? "" : ` for one of ${unresolved.join(", ")}`),
-              cause: error
-            })
-            : error
-        ))
+      // one that refuses the transaction itself — a function that does not
+      // exist, an object owned by someone else, gas selection with nothing to
+      // select — answers `INVALID_ARGUMENT`. Both used to arrive as a bare
+      // `TransportError { method: "use" }`; they are `BuildError`s with the
+      // node's message, and what is left is renamed after this function.
+      Effect.catchTag("TransportError", (error) => Effect.fail(resolverError(error, unresolved)))
     )
 
   if (!simulated) {
@@ -659,10 +800,39 @@ export const build = Effect.fn("Tx.build")(function*(
   const data = dataOfBytes(bytes)
   const budget = Option.getOrUndefined(Option.map(data, gasBudgetOf))
   if (budget !== undefined && budget > config.maxGasBudget) {
-    return yield* new BuildError({
-      message: `the gas budget ${budget} is over the configured maximum ${config.maxGasBudget}`,
-      cause: budget
+    // A configured limit refusing the transaction before it is signed is what
+    // `PolicyDenied` means; a `BuildError` whose cause was a bare `2988000n`
+    // told a sponsor nothing it could act on.
+    return yield* new PolicyDenied({
+      rule: "maxGasBudget",
+      message: `the gas budget ${budget} MIST exceeds SubmitConfig.maxGasBudget ${config.maxGasBudget} MIST`
     })
+  }
+
+  const gasOwner = Option.match(data, {
+    // Bytes this version cannot read keep what the caller said.
+    onNone: () =>
+      opts.gasOwner === undefined || normalizeSuiAddress(opts.gasOwner) === normalizeSuiAddress(opts.sender)
+        ? undefined
+        : opts.gasOwner,
+    onSome: gasOwnerOf
+  })
+
+  if (Option.isSome(data) && paysFromAddressBalance(data.value) && budget !== undefined && budget > 0n) {
+    // Gas from an address balance is not something the build simulation
+    // checks: a sponsor whose SUI is all in coin objects builds, signs and
+    // sends bytes the node then refuses with "Insufficient address balance".
+    // One balance read here makes that a `BuildError` before anyone signs.
+    const payer = gasOwner ?? opts.sender
+    const { addressBalance } = yield* sui.getBalance(payer)
+    if (addressBalance < budget) {
+      return yield* new BuildError({
+        message: `${payer} pays for gas from its address balance, which holds ${addressBalance} MIST,` +
+          ` less than the gas budget ${budget} MIST: deposit SUI into it first` +
+          " (0x2::balance::send_funds<0x2::sui::SUI>), or pay with coins by leaving the gas payment unset",
+        cause: { payer, addressBalance, budget }
+      })
+    }
   }
 
   const digest = yield* decodeDigest(TransactionDataBuilder.getDigestFromBytes(bytes)).pipe(
@@ -679,7 +849,7 @@ export const build = Effect.fn("Tx.build")(function*(
     // reason about them with a node on another one — including for the
     // expiration variants that name no chain themselves.
     chain: sui.chainId,
-    ...(opts.gasOwner === undefined ? {} : { gasOwner: opts.gasOwner }),
+    ...(gasOwner === undefined ? {} : { gasOwner }),
     ...(expiration === undefined ? {} : { expiration })
   }
 })
@@ -817,6 +987,7 @@ export const sign = Effect.fn("Tx.sign")(function*(
     bytes: built.bytes,
     signatures: [signature],
     sender: built.sender,
+    ...(built.gasOwner === undefined ? {} : { gasOwner: built.gasOwner }),
     ...(built.expiration === undefined ? {} : { expiration: built.expiration }),
     // Carried forward from the build, so `Tx.reconcile` knows which chain these
     // bytes belong to even when the expiration names none.
@@ -849,6 +1020,14 @@ export const cosign = Effect.fn("Tx.cosign")(function*(
  * gas owner pays, and gas comes from the sponsor's address balance rather than
  * from coin objects, so the two parties never have to agree on a gas coin and
  * can sign in either order.
+ *
+ * **The gas owner must hold SUI in its address balance**, not just in coin
+ * objects: gas is drawn from that balance, and `Tx.build` refuses with
+ * `BuildError` when it holds less than the budget. A sponsor funded by a
+ * faucet holds coins; move SUI into the balance once with
+ * `0x2::balance::send_funds<0x2::sui::SUI>`, or sponsor with coins instead by
+ * passing `gasOwner` to `Tx.run`/`Tx.build` without `Tx.sponsored` (the gas
+ * owner's coins are then selected under its sender lock).
  *
  * Never fails; the recipe it returns throws only if the recipe it wraps does,
  * which `Tx.build` reports as `BuildError`.
@@ -884,6 +1063,13 @@ export const sponsored = (opts: {
  * from the sender's address balance, coin objects, or both, and resolves the
  * required eligible helper calls itself.
  *
+ * **`requireZeroGas: true`** makes "gasless" a requirement rather than a hope.
+ * Without it, a coin type or amount that does not qualify — or a transport
+ * that does not detect eligibility, such as JSON-RPC — still builds, and the
+ * sender quietly pays SUI gas. With it, the recipe installs a build plugin
+ * that checks what the resolver chose, and `Tx.build` fails with `BuildError`
+ * unless the gas price and the gas budget are both zero.
+ *
  * Never fails; the recipe it returns can throw only if the SDK rejects an
  * input, which `Tx.build` reports as `BuildError` before anything is signed.
  *
@@ -893,8 +1079,15 @@ export const gaslessStablecoinTransfer = (opts: {
   readonly coinType: CoinType
   readonly amount: bigint
   readonly recipient: SuiAddress
+  /**
+   * Fail the build unless the resolved gas price and budget are both zero.
+   *
+   * @since 0.4.0
+   */
+  readonly requireZeroGas?: boolean
 }): Recipe =>
 (tx: Transaction) => {
+  if (opts.requireZeroGas === true) tx.addBuildPlugin(requireZeroGasPlugin)
   tx.moveCall({
     target: "0x2::balance::send_funds",
     typeArguments: [opts.coinType],
@@ -904,6 +1097,141 @@ export const gaslessStablecoinTransfer = (opts: {
     ]
   })
 }
+
+/**
+ * The build plugin behind `requireZeroGas`: it lets the rest of the build —
+ * the resolver included, which always runs last — finish, then refuses gas
+ * data that is not zero. A kind-only build resolves no gas and is let through.
+ */
+const requireZeroGasPlugin: TransactionPlugin = async (transactionData, options, next) => {
+  await next()
+  if (options.onlyTransactionKind === true) return
+  const price = gasPriceOf(transactionData)
+  const budget = gasBudgetOf(transactionData)
+  if (price !== 0n || budget !== 0n) {
+    throw new ZeroGasNotResolved(String(price ?? "unset"), String(budget ?? "unset"))
+  }
+}
+
+/**
+ * Turns transaction bytes that came from somewhere else into a {@link Built},
+ * reading everything the lifecycle needs out of the bytes themselves.
+ *
+ * This is how a stateless sponsor, a wallet bridge or a service that was
+ * handed someone's transaction gets back into the lifecycle: `sign`, `attach`,
+ * `cosign` and `submit` all take what this returns. The sender, the gas owner
+ * and the expiration are read out of the bytes, and the digest is computed from
+ * them, so nothing is taken on trust. **Never build a `Built` by hand**: one
+ * that leaves out `expiration` or `chain` silently disables `Tx.reconcile`'s
+ * expiry rule and chain guard.
+ *
+ * `chain` is the chain of the `Sui` in context. Bytes whose expiration names a
+ * chain (the default `ValidDuring` does) must name that one; bytes whose
+ * expiration names none (`Epoch`, `None`) cannot be checked, and are taken to
+ * be for this chain.
+ *
+ * Unlike `Tx.build`, nothing is simulated: run `sui.simulate(built.bytes)` (or
+ * a `SubmitConfig.preflight`) before co-signing bytes you did not build.
+ *
+ * Fails with: `BuildError` (the bytes are not a full transaction this SDK can
+ * read, name no sender, or are bound to another chain).
+ *
+ * @since 0.4.0
+ */
+export const fromBytes = Effect.fn("Tx.fromBytes")(function*(
+  bytes: Uint8Array
+): Effect.fn.Return<Built, BuildError, Sui> {
+  const sui = yield* Sui
+  const parsed = dataOfBytes(bytes)
+  if (Option.isNone(parsed)) {
+    return yield* new BuildError({
+      message: "these bytes are not a transaction this SDK can read (kind-only bytes are not enough:" +
+        " build them into a full transaction first)",
+      cause: bytes.length
+    })
+  }
+  const data = parsed.value
+  const sender = typeof data.sender === "string" ? decodeAddress(normalizeSuiAddress(data.sender)) : Option.none()
+  if (Option.isNone(sender)) {
+    return yield* new BuildError({ message: "these transaction bytes name no sender", cause: data.sender })
+  }
+  const digest = yield* decodeDigest(TransactionDataBuilder.getDigestFromBytes(bytes)).pipe(
+    Effect.mapError((issue) =>
+      new BuildError({ message: `these bytes have no readable digest: ${issue.message}`, cause: issue })
+    )
+  )
+  const expiration = expirationOf(data)
+  const named = chainOf(expiration)
+  if (named !== undefined && named !== sui.chainId) {
+    return yield* new BuildError({
+      message: `these bytes are bound to chain ${named}, but this client is on ${sui.chainId}`,
+      cause: named
+    })
+  }
+  const gasOwner = gasOwnerOf(data)
+  return {
+    digest,
+    bytes,
+    sender: sender.value,
+    chain: sui.chainId,
+    ...(gasOwner === undefined ? {} : { gasOwner }),
+    ...(expiration === undefined ? {} : { expiration })
+  }
+})
+
+/**
+ * Attaches a signature somebody else made — a sender's wallet, a remote
+ * sponsor, an HSM — to built or already signed bytes, after checking it.
+ *
+ * The signature is verified against the bytes (`Verify.verifyTransactionSignature`,
+ * so a zkLogin or multisig signature is checked through the node), and the
+ * address it was made by must be the sender or the gas owner the bytes name.
+ * A `Built` becomes a `Signed` carrying that one signature; a `Signed` gains it.
+ * The same signature attached twice is attached once.
+ *
+ * ```ts
+ * const built = yield* Tx.fromBytes(senderBytes)
+ * const withSender = yield* Tx.attach(built, senderSignature)
+ * const signed = yield* Tx.cosign(withSender, sponsor)
+ * ```
+ *
+ * Fails with: `SigningError` (the signature is empty, does not parse, is not
+ * valid for these bytes, or was made by an address the bytes will not accept),
+ * `TransportError` (a zkLogin or multisig check could not reach a usable
+ * answer).
+ *
+ * @since 0.4.0
+ */
+export const attach = Effect.fn("Tx.attach")(function*(
+  target: Built | Signed,
+  signature: string
+): Effect.fn.Return<Signed, SigningError | TransportError, Sui> {
+  yield* Effect.annotateCurrentSpan({ "sui.digest": target.digest })
+  const decoded = decodeSignature(signature)
+  if (Option.isNone(decoded)) {
+    return yield* new SigningError({ cause: "the signature to attach is empty" })
+  }
+  const publicKey = yield* verifyTransactionSignature(target.bytes, decoded.value)
+  const address = normalizeSuiAddress(publicKey.toSuiAddress())
+  const allowed = signersOfBytes(target.bytes)
+  if (allowed.length > 0 && !allowed.includes(address)) {
+    return yield* new SigningError({
+      cause: `the signature was made by ${address}, which is neither the transaction's sender` +
+        ` nor its gas owner (${allowed.join(", ")}); the node would reject it`
+    })
+  }
+  const existing: ReadonlyArray<Signature> = "signatures" in target ? target.signatures : []
+  const signatures = existing.includes(decoded.value) ? existing : [...existing, decoded.value]
+  return {
+    digest: target.digest,
+    bytes: target.bytes,
+    signatures,
+    sender: target.sender,
+    ...(target.gasOwner === undefined ? {} : { gasOwner: target.gasOwner }),
+    ...(target.expiration === undefined ? {} : { expiration: target.expiration }),
+    ...(target.chain === undefined ? {} : { chain: target.chain })
+  }
+})
 
 const journalSigned = Effect.fnUntraced(function*(signed: Signed) {
   const journal = yield* Journal
@@ -2089,6 +2417,29 @@ const recover = Effect.fn("Tx.recover")(function*(
 })
 
 /**
+ * Who a not-yet-built transaction says will pay for gas, and whether it pays
+ * from an address balance: `opts.gasOwner` first, then what the recipe set.
+ * A `Transaction` whose data cannot be read answers neither, which keeps the
+ * old behaviour — `opts.gasOwner` alone, both locks. Never fails.
+ */
+const gasIntentOf = (
+  tx: Transaction,
+  gasOwner: SuiAddress | undefined
+): { readonly gasOwner: SuiAddress | undefined; readonly addressBalance: boolean } => {
+  try {
+    const data = tx.getData()
+    const set = data.gasData.owner
+    const owner = gasOwner ?? (typeof set === "string" && set.length > 0
+      ? Option.getOrUndefined(decodeAddress(normalizeSuiAddress(set)))
+      : undefined)
+    const payment = data.gasData.payment
+    return { gasOwner: owner, addressBalance: payment !== null && payment !== undefined && payment.length === 0 }
+  } catch {
+    return { gasOwner, addressBalance: false }
+  }
+}
+
+/**
  * The signer for an address the bytes require a second signature from, or a
  * `SigningError` saying which address is missing one.
  */
@@ -2132,6 +2483,14 @@ const assertSponsor = (
  * — a fixed order, so two runs that each need the same pair cannot deadlock by
  * taking them the other way round.
  *
+ * **Except when gas comes from an address balance.** A transaction whose gas
+ * payment is an explicit empty list — `Tx.sponsored` sets one — selects no
+ * coins, so there is nothing for two runs to race over and the gas owner's
+ * lock is not taken: one sponsor can pay for many senders at once, each run
+ * serialized only on its own sender. (Before 0.4.0 every such run waited for
+ * the sponsor's lock, which made twenty concurrent sponsored runs take as long
+ * as twenty sequential ones.)
+ *
  * When `SubmitConfig.preflight` is set it costs one extra simulate, and is
  * where spend limits and target policies refuse a transaction before anything
  * is signed.
@@ -2142,18 +2501,17 @@ const assertSponsor = (
  * — or when the recipe itself set a different gas owner, which `Tx.sponsored`
  * does — `opts.sponsor` is required and co-signs the same bytes. Without it
  * `Tx.run` fails with `SigningError` naming the address whose signature is
- * missing, before anything is built when the gas owner was given as an option
- * and immediately after the build when it came out of the recipe. Use the
+ * missing, before anything is built (the recipe is applied first, so a gas
+ * owner it sets is known by then too). Use the
  * explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.submit`) when the
  * two parties cannot both sign in one process.
  *
- * **The gas owner's lock comes from `opts.gasOwner` only.** The locks are taken
- * before anything is built, so a gas owner the recipe sets itself is not known
- * when they are chosen, and a recipe that does so without
- * `tx.setGasPayment([])` has the gas owner's coins selected under the sender's
- * lock alone. Pass the same address as `opts.gasOwner` whenever the recipe sets
- * one (`Tx.sponsored` pays from an address balance and selects no coins, but
- * passing it costs nothing).
+ * **The locks are chosen from the recipe itself.** The recipe is applied to a
+ * fresh `Transaction` before any lock is taken, so a gas owner it sets itself
+ * (`Tx.sponsored` does) and the gas payment it leaves are known when the locks
+ * are chosen — passing the same address as `opts.gasOwner` changes nothing.
+ * The recipe runs outside the lock: it only describes commands, and anything
+ * it reads from the chain belongs in the resolver, which runs inside.
  *
  * **`onSigned` is the hook between signing and sending.** A program with its
  * own record to keep — a batch row, an outbox, an idempotency key — has to
@@ -2217,22 +2575,31 @@ export const run = Effect.fn("Tx.run")(function*(
   const sui = yield* Sui
   const config = yield* SubmitConfig
   const sender = opts.signer.address
+  // Applied before any lock is chosen, so what the recipe set — its own gas
+  // owner, an address-balance payment — decides which locks the run needs.
+  const tx = yield* toTransaction(recipe)
+  const intended = gasIntentOf(tx, opts.gasOwner)
   // Normalized on both sides: `0x2` and its 64-character spelling are one
   // address, and comparing them as written took two locks on one account — in
   // whichever order the two spellings happened to sort.
-  const locked = opts.gasOwner === undefined ||
-      normalizeSuiAddress(opts.gasOwner) === normalizeSuiAddress(sender)
+  const payer = intended.gasOwner !== undefined &&
+      normalizeSuiAddress(intended.gasOwner) !== normalizeSuiAddress(sender)
+    ? intended.gasOwner
+    : undefined
+  // An address-balance payment selects no coins, so the gas owner has nothing
+  // to lock: only its sender's lock serializes the run.
+  const locked = payer === undefined || intended.addressBalance
     ? [sender]
-    : [sender, opts.gasOwner].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+    : [sender, payer].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
 
-  // Before anything is built: a gas owner the caller named, with no signer for
-  // it, can never produce bytes a validator accepts.
-  if (opts.gasOwner !== undefined && normalizeSuiAddress(opts.gasOwner) !== normalizeSuiAddress(sender)) {
-    yield* assertSponsor(opts.gasOwner, opts.sponsor)
+  // Before anything is built: a gas owner with no signer for it can never
+  // produce bytes a validator accepts.
+  if (payer !== undefined) {
+    yield* assertSponsor(payer, opts.sponsor)
   }
 
   const body = Effect.gen(function*() {
-    const built = yield* build(recipe, {
+    const built = yield* build(tx, {
       sender,
       ...(opts.gasOwner === undefined ? {} : { gasOwner: opts.gasOwner })
     })
@@ -2446,14 +2813,16 @@ export const reconcileAll = Effect.fn("Tx.reconcileAll")(function*(
 
 /**
  * The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
- * `Tx.cosign`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.submit`,
- * `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
- * `Tx.reconcileAll`.
+ * `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
+ * `Tx.gaslessStablecoinTransfer`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
+ * `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
  */
 export const Tx = {
   build,
   sign,
   cosign,
+  fromBytes,
+  attach,
   sponsored,
   gaslessStablecoinTransfer,
   submit,

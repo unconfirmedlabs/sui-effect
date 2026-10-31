@@ -856,6 +856,14 @@ export const SignedTransaction = Schema.Struct({
   bytes: Schema.Uint8ArrayFromBase64,
   signatures: Schema.Array(Signature),
   sender: SuiAddress,
+  /**
+   * The address that pays for gas, present only when it is not the sender:
+   * the party whose second signature a sponsored transaction carries. Read out
+   * of the bytes, so it is what was signed rather than what was intended.
+   *
+   * @since 0.4.0
+   */
+  gasOwner: Schema.optionalKey(SuiAddress),
   expiration: Schema.optionalKey(TransactionExpiration),
   /**
    * The chain identifier the bytes were built against, recorded by `Tx.build`
@@ -903,11 +911,22 @@ export type NotAppliedEvidence = typeof NotAppliedEvidence.Type
  * A transaction built into bytes and ready to sign, with the expiration the
  * builder settled on recorded so `Tx.reconcile` can decide, later and without
  * the builder, whether the transaction can still land.
+ *
+ * Every field but `chain` is read back out of `bytes`. Bytes that arrived from
+ * somewhere else — a sponsor handed a sender's transaction — become a `Built`
+ * through `Tx.fromBytes`, never by hand: a hand-built value that leaves out
+ * `expiration` or `chain` silently disables the expiry rule and the chain guard
+ * `Tx.reconcile` depends on.
  */
 export const Built = Schema.Struct({
   digest: Digest,
   bytes: Schema.Uint8ArrayFromBase64,
   sender: SuiAddress,
+  /**
+   * The address that pays for gas, present only when it is not the sender.
+   * Read out of the bytes, so a gas owner a recipe set itself (`Tx.sponsored`
+   * does) is recorded as well as one passed to `Tx.build`.
+   */
   gasOwner: Schema.optionalKey(SuiAddress),
   expiration: Schema.optionalKey(TransactionExpiration),
   /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */

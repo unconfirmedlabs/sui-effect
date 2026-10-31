@@ -127,7 +127,10 @@ const baseScript = {
   chainId: CHAIN_ID,
   clockTimestampMs: CLOCK_MS,
   objects: [escrow],
-  coins: [coinOf("c01", owner), coinOf("c02", sponsorOwner)]
+  coins: [coinOf("c01", owner), coinOf("c02", sponsorOwner)],
+  // Gas for the sponsored paths comes from an address balance, which
+  // `Tx.build` checks covers the budget before anything is signed.
+  balances: [{ coinType: "0x2::sui::SUI", balance: "1000000000", coinBalance: "0", addressBalance: "1000000000" }]
 }
 
 const claim = (tx: Transaction) => {

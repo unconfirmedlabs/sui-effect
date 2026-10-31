@@ -549,7 +549,7 @@ describe("C. the minor findings", () => {
     // `0x2` and its padded spelling are one address; comparing them as written
     // took two locks on one account.
     const source = readFileSync("src/services/Tx.ts", "utf8")
-    expect(source).toContain("normalizeSuiAddress(opts.gasOwner) === normalizeSuiAddress(sender)")
+    expect(source).toContain("normalizeSuiAddress(intended.gasOwner) !== normalizeSuiAddress(sender)")
   })
 
   test("awaitVisible swallows failures, never defects", async () => {
