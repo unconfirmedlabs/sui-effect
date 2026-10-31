@@ -552,12 +552,13 @@ const INSPECT = Symbol.for("nodejs.util.inspect.custom")
  * through to the real `ColdCall` Promise: `then`/`catch`/`finally` are its
  * own, `instanceof Promise` holds (the prototype is `ColdCall.prototype`), and
  * `Symbol.asyncIterator` is the cold iteration. `typeof` is `"function"`.
- * Never fails.
+ * `applied` gets the arguments, so a placeholder that really is a function
+ * (`face.m.bind(null, id)`) can answer the call. Never fails.
  */
 const coldCall = (
   settled: Promise<unknown>,
   iterate: () => AsyncGenerator<unknown, void, undefined>,
-  applied: () => never,
+  applied: (args: ReadonlyArray<unknown>) => unknown,
   label: string
 ): Promise<unknown> & AsyncIterable<unknown> => {
   const placeholder = new ColdCall<unknown>((resolve, reject) => {
@@ -565,10 +566,17 @@ const coldCall = (
   })
   // Handled, so an un-awaited cold call is a no-op rather than a process abort.
   void placeholder.catch(() => {})
-  const target = function coldCall() {}
+  // A **bound** function: callable and constructible like a plain one, but
+  // with no own `prototype`. A plain function's `prototype` is
+  // non-configurable, so the `has` trap below answering `false` for it is a
+  // Proxy-invariant `TypeError` on `"prototype" in coldCall`.
+  const target = function coldCall() {}.bind(null)
   return new Proxy(target, {
-    apply: () => applied(),
-    construct: () => applied(),
+    apply: (_target, _this, args: ReadonlyArray<unknown>) => applied(args),
+    construct: (_target, args: ReadonlyArray<unknown>) => {
+      applied(args)
+      throw new TypeError(`${label} is not a constructor`)
+    },
     getPrototypeOf: () => ColdCall.prototype,
     has: (_target, key) => key === Symbol.asyncIterator || Reflect.has(placeholder, key),
     get: (_target, key) => {
@@ -591,6 +599,10 @@ const coldCall = (
  * where it can: `packageId.length`, `packageId.startsWith("0x")`,
  * `amount.toFixed(2)` throw `ExtensionNotReady` naming the value, instead of
  * answering a placeholder that is truthy and says nothing.
+ *
+ * `call`, `apply` and `bind` are **not** here: a placeholder is a function
+ * too, and `face.claim.bind(null, id)` (a React `onClick`, a debounce) has to
+ * work cold the way `face.claim(id)` does. See `functionMethod` below.
  */
 const VALUE_ONLY = new Set<string>([
   "length",
@@ -623,11 +635,14 @@ const VALUE_ONLY = new Set<string>([
   "constructor",
   "hasOwnProperty",
   "isPrototypeOf",
-  "propertyIsEnumerable",
-  "call",
-  "apply",
-  "bind"
+  "propertyIsEnumerable"
 ])
+
+/** The `Function.prototype` methods a cold placeholder answers as a function would. */
+type FunctionMethod = "call" | "apply" | "bind"
+
+const isFunctionMethod = (key: string): key is FunctionMethod =>
+  key === "call" || key === "apply" || key === "bind"
 
 /** The runtime half of {@link FaceValue}. */
 const faceValue = (value: unknown): unknown =>
@@ -806,6 +821,11 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       options.layer.pipe(Layer.provideMerge(Layer.merge(base, references)))
 
     const runtimeOf = (): Runtime => {
+      // A warm registration re-warms (see `ensureWarm`) rather than building a
+      // lazy runtime: a lazy one here would be replaced by the next member
+      // read's re-warm, which is how `$reconcileAll()` after `$dispose()` used
+      // to leak a runtime.
+      if (runtime === undefined) ensureWarm()
       if (runtime === undefined) runtime = ManagedRuntime.make(runtimeLayer(baseOf()))
       return runtime
     }
@@ -842,7 +862,11 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       // lazy registration on this chain joins.
       const base = baseEntry().shared
       const warmRuntime: Runtime = ManagedRuntime.make(runtimeLayer(base))
+      // A runtime this replaces (a lazy one, or a warm build that threw) is
+      // released, not dropped: dropped, it would pin the shared base forever.
+      const previous = runtime
       runtime = warmRuntime
+      if (previous !== undefined) void previous.dispose()
       instance = warmRuntime.runSync(service as unknown as Effect.Effect<Shape, never, Self>)
     }
 
@@ -868,49 +892,95 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         for (const key of path) current = (current as Record<string, unknown>)[key]
         return current
       }
-      const node = (...args: ReadonlyArray<unknown>) => {
-        const settled = at().then((member) => {
-          const mapped = mapMember(member, bridge)
-          if (typeof mapped !== "function") {
-            // The member was a plain value, and the caller used it as a
-            // function because nothing knew what it was yet.
-            throw notReady(path)
-          }
-          const result = (mapped as (...a: ReadonlyArray<unknown>) => unknown)(...args)
-          // A member that returns an `Effect` or a `Stream` is typed as
-          // Promise-returning or as an `AsyncIterable`, so answering with
-          // either is the truth. A member that returns anything else is typed
-          // as **synchronous**, and a Promise of its value is not the value:
-          // say so instead of handing back something the type says cannot be
-          // awaited.
-          if (result instanceof Promise) return result
-          if (typeof result === "object" && result !== null && Symbol.asyncIterator in result) {
-            return result
-          }
-          throw notReady(path)
-        })
-        // Both faces at once, because until the runtime exists nothing knows
-        // which one this member has. `PromiseFace` types an `Effect`-returning
-        // method as `Promise` and a `Stream`-returning one as `AsyncIterable`;
-        // a bare Promise of an `AsyncIterable` satisfies neither `for await`
-        // nor the declared type, which is what a cold Stream call used to hand
-        // back. So the returned value is a **real `Promise`** and an async
-        // iterable: awaited it is the Promise, iterated it awaits the runtime
-        // and then delegates to the real stream.
-        return coldCall(
+      /**
+       * Calls the resolved member at `at` with `args`, as the cold call of it.
+       *
+       * A member that returns an `Effect` or a `Stream` is typed as
+       * Promise-returning or as an `AsyncIterable`, so answering with either
+       * is the truth. A member that returns anything else is typed as
+       * **synchronous**, and a Promise of its value is not the value: say so
+       * instead of handing back something the type says cannot be awaited.
+       */
+      const invoke = (
+        member: unknown,
+        args: ReadonlyArray<unknown>,
+        at: ReadonlyArray<string>
+      ): unknown => {
+        const mapped = mapMember(member, bridge)
+        if (typeof mapped !== "function") {
+          // The member was a plain value, and the caller used it as a
+          // function because nothing knew what it was yet.
+          throw notReady(at)
+        }
+        const result = (mapped as (...a: ReadonlyArray<unknown>) => unknown)(...args)
+        if (result instanceof Promise) return result
+        if (typeof result === "object" && result !== null && Symbol.asyncIterator in result) {
+          return result
+        }
+        throw notReady(at)
+      }
+      // Both faces at once, because until the runtime exists nothing knows
+      // which one this member has. `PromiseFace` types an `Effect`-returning
+      // method as `Promise` and a `Stream`-returning one as `AsyncIterable`; a
+      // bare Promise of an `AsyncIterable` satisfies neither `for await` nor
+      // the declared type, which is what a cold Stream call used to hand back.
+      // So the returned value is a **real `Promise`** and an async iterable:
+      // awaited it is the Promise, iterated it awaits the runtime and then
+      // delegates to the real stream.
+      const cold = (
+        settled: Promise<unknown>,
+        at: ReadonlyArray<string>,
+        applied: (args: ReadonlyArray<unknown>) => unknown = () => {
+          throw notReady(at)
+        }
+      ) =>
+        coldCall(
           settled,
           async function*() {
             const value = await settled
             if (typeof value !== "object" || value === null || !(Symbol.asyncIterator in value)) {
-              throw notReady(path)
+              throw notReady(at)
             }
             yield* value as AsyncIterable<unknown>
           },
-          () => {
-            throw notReady(path)
-          },
+          applied,
           label
         )
+      const node = (...args: ReadonlyArray<unknown>) => cold(at().then((member) => invoke(member, args, path)), path)
+      /**
+       * `node.call`, `node.apply`, `node.bind`, cold.
+       *
+       * Nothing knows yet whether `path` is a function — then these are
+       * `Function.prototype`'s, and `face.claim.bind(null, id)` must work the
+       * way `face.claim(id)` does — or a namespace with a member of that name
+       * (`face.coupons.apply(code)`). So the answer is decided once the
+       * member is resolved: a function gets the `Function.prototype` method,
+       * a namespace gets its own member called with these arguments. A cold
+       * `bind` is also callable at once: applied, it is the cold call of
+       * `path` with the bound arguments first.
+       */
+      const functionMethod = (key: FunctionMethod) => (...args: ReadonlyArray<unknown>) => {
+        const settled = at().then((member) => {
+          if (typeof mapMember(member, bridge) !== "function") {
+            return invoke((member as Record<string, unknown>)[key], args, [...path, key])
+          }
+          switch (key) {
+            case "call":
+              return invoke(member, args.slice(1), path)
+            case "apply": {
+              const spread = args[1]
+              return invoke(member, spread === undefined || spread === null ? [] : Array.from(spread as ArrayLike<unknown>), path)
+            }
+            case "bind": {
+              const bound = args.slice(1)
+              const mapped = mapMember(member, bridge) as (...a: ReadonlyArray<unknown>) => unknown
+              return (...rest: ReadonlyArray<unknown>) => mapped(...bound, ...rest)
+            }
+          }
+        })
+        return key === "bind"
+          ? cold(settled, [...path, key], (rest) => node(...args.slice(1), ...rest))
+          : cold(settled, [...path, key])
       }
       const label = `${options.name}.${path.join(".")}`
       // Inspectors that read the proxy's target rather than its traps (Bun's
@@ -946,12 +1016,14 @@ export const fromService = <Self, Shape, E, const Name extends string>(
           if (key === INSPECT) return () => rendered
           if (key === Symbol.toStringTag) return "ExtensionNotReady"
           if (typeof key !== "string") return undefined
+          if (isFunctionMethod(key)) return functionMethod(key)
           return lazy([...path, key])
         }
       })
     }
 
     const ready = async (): Promise<void> => {
+      ensureWarm()
       await resolve()
     }
 
@@ -983,8 +1055,10 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       if (instance === undefined && options.warm !== undefined) warmUp(options.warm)
     }
 
-    const reconcile = (): Promise<ReadonlyArray<Reconciled>> =>
-      runtimeOf().runPromise(reconcileAll())
+    const reconcile = (): Promise<ReadonlyArray<Reconciled>> => {
+      ensureWarm()
+      return runtimeOf().runPromise(reconcileAll())
+    }
 
     const own = (key: string): unknown => {
       if (key === "$ready") return ready
@@ -998,6 +1072,11 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         if (typeof key !== "string") return undefined
         const reserved = own(key)
         if (reserved !== undefined) return reserved
+        // The face is never a Promise. Answering a lazy node for `then` made
+        // `await client.ext` (an `async` function returning the face,
+        // `Promise.resolve(face)`) call it, build the runtime, and never
+        // settle.
+        if (key === "then") return undefined
         ensureWarm()
         if (instance !== undefined) {
           const member = (instance as Record<string, unknown>)[key]

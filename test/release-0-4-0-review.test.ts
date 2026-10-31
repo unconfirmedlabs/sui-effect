@@ -234,3 +234,121 @@ describe("toJson over awkward causes", () => {
     expect(neverThrows(new TransportError({ method: "m", retryable: false, cause: { n: 1n } }))).toEqual(allOk)
   })
 })
+
+class Probe extends Context.Service<Probe, {
+  readonly find: (key: string) => Effect.Effect<string>
+  readonly coupons: {
+    readonly apply: (code: string) => Effect.Effect<string>
+    readonly call: (code: string) => Effect.Effect<string>
+    readonly bind: (code: string) => Effect.Effect<string>
+  }
+}>()("review/Probe") {}
+
+let built = 0
+let released = 0
+const probeLayer: Layer.Layer<Probe, never, Sui> = Layer.effect(
+  Probe,
+  Effect.gen(function*() {
+    yield* Sui
+    built += 1
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        released += 1
+      })
+    )
+    return {
+      find: (key: string) => Effect.succeed(`found ${key}`),
+      coupons: {
+        apply: (code: string) => Effect.succeed(`applied ${code}`),
+        call: (code: string) => Effect.succeed(`called ${code}`),
+        bind: (code: string) => Effect.succeed(`bound ${code}`)
+      }
+    }
+  })
+)
+
+const probe = (warm?: { readonly chainId: string }) =>
+  SuiExtension.fromService(Probe, {
+    name: "probe",
+    layer: probeLayer,
+    ...(warm === undefined ? {} : { warm })
+  })
+
+/** Whether `p` settles within `ms`, and how. */
+const settles = <A>(p: PromiseLike<A>, ms = 300) =>
+  Promise.race([
+    Promise.resolve(p).then(() => "resolved", () => "rejected"),
+    new Promise<string>((resolve) => setTimeout(() => resolve("pending"), ms))
+  ])
+
+describe("the cold Promise face", () => {
+  test("awaiting the face itself settles, and builds nothing", async () => {
+    built = 0
+    const face = probe().register(fakeClient())
+    expect(await settles(Promise.resolve(face))).toBe("resolved")
+    expect(await settles((async () => face)())).toBe("resolved")
+    expect(built).toBe(0)
+    await face.$dispose()
+  })
+
+  test("awaiting a cold namespace settles rather than hanging", async () => {
+    const face = probe().register(fakeClient())
+    expect(await settles(Promise.resolve(face.coupons))).not.toBe("pending")
+    await face.$dispose()
+  })
+
+  test("a cold Effect member works through call, apply and bind", async () => {
+    const face = probe().register(fakeClient())
+    expect(await face.find.call(null, "a")).toBe("found a")
+    expect(await face.find.apply(null, ["b"])).toBe("found b")
+    const bound = face.find.bind(null, "c")
+    expect(typeof bound).toBe("function")
+    expect(await bound()).toBe("found c")
+    // A bound function that takes the rest of its arguments later.
+    expect(await face.find.bind(null)("d")).toBe("found d")
+    await face.$dispose()
+  })
+
+  test("a namespace member named apply, call or bind is still that member", async () => {
+    const face = probe().register(fakeClient())
+    expect(await face.coupons.apply("X")).toBe("applied X")
+    expect(await face.coupons.call("Y")).toBe("called Y")
+    expect(await face.coupons.bind("Z")).toBe("bound Z")
+    await face.$dispose()
+  })
+
+  test("call, apply and bind behave the same once warm", async () => {
+    const face = probe().register(fakeClient())
+    await face.$ready()
+    expect(await face.find.call(null, "a")).toBe("found a")
+    expect(await face.find.apply(null, ["b"])).toBe("found b")
+    expect(await face.find.bind(null, "c")()).toBe("found c")
+    expect(await face.coupons.apply("X")).toBe("applied X")
+    await face.$dispose()
+  })
+
+  test("'prototype' in a cold call answers instead of breaking a Proxy invariant", async () => {
+    const face = probe().register(fakeClient())
+    const cold = face.find("here")
+    expect(typeof ("prototype" in (cold as object))).toBe("boolean")
+    expect(await cold).toBe("found here")
+    await face.$dispose()
+  })
+})
+
+describe("a warm registration after $dispose", () => {
+  for (const use of ["$ready", "$reconcileAll"] as const) {
+    test(`${use} then a member read builds one runtime, and every build is released`, async () => {
+      built = 0
+      released = 0
+      const face = probe({ chainId: CHAIN_ID }).register(fakeClient())
+      expect(built).toBe(1)
+      await face.$dispose()
+      expect(released).toBe(1)
+      await face[use]()
+      expect(await face.find("here")).toBe("found here")
+      await face.$dispose()
+      expect({ built, released }).toEqual({ built: 2, released: 2 })
+    })
+  }
+})
