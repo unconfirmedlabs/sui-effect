@@ -92,6 +92,7 @@ export {
 /** A transaction that reached the chain, with accessors over its effects. */
 export {
   type ChangedRef,
+  EXECUTE_INCLUDE,
   Executed,
   objectRefOf,
   type Published,

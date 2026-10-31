@@ -579,7 +579,11 @@ export interface Published {
   readonly upgradeCap: ChangedRef
 }
 
-/** The `include` set every execute, simulate and transaction read asks for. */
+/**
+ * The `include` set every execute, simulate and transaction read asks for, and
+ * the one `Executed.fromTransactionResult` is typed over: a `SuiCore` read made
+ * with `{ include: EXECUTE_INCLUDE }` is a result that method accepts.
+ */
 export const EXECUTE_INCLUDE = {
   effects: true,
   events: true,
