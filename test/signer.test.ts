@@ -74,11 +74,13 @@ describe("Signer.fromConfig", () => {
     if (mod === undefined) return
     const keypair = mod.MLDSA65Keypair.generate()
     const secret = keypair.getSecretKey()
-    expect(decodeSuiPrivateKey(secret).scheme).toBe("MLDSA65")
+    // Widened to `string`: on an SDK before 2.36 `SignatureScheme` has no
+    // `"MLDSA65"`, and the SDK matrix typechecks this file against 2.30.
+    expect<string>(decodeSuiPrivateKey(secret).scheme).toBe("MLDSA65")
     const signer = await run(
       Effect.provide(Signer.fromConfig(), withEnv({ SUI_PRIVATE_KEY: secret }))
     )
-    expect(signer.scheme).toBe("MLDSA65")
+    expect<string>(signer.scheme).toBe("MLDSA65")
     expect(signer.address).toBe(SuiAddress.make(keypair.toSuiAddress()))
   })
 

@@ -22,6 +22,9 @@ export {
   type SignatureScheme
 } from "./services/Signer.ts"
 
+/** Signature verification: the Effect face of `@mysten/sui/verify`. */
+export { Verify, type VerifyOptions } from "./services/Verify.ts"
+
 /** The lifecycle settings, with the spec's defaults in force by default. */
 export {
   type ExpirationPolicy,
