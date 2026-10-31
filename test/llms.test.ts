@@ -12,10 +12,45 @@ import { describe, expect, setDefaultTimeout, test } from "bun:test"
 
 // The generators shell out to the TypeScript checker over dist/; five seconds is tight on a CI runner.
 setDefaultTimeout(120_000)
+import { execFileSync } from "node:child_process"
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { errorsOf, missingDeclaration, recipeOf, render, summaryOf } from "../scripts/llms.ts"
 
 const missing = missingDeclaration()
+
+/**
+ * `LLMS.md` documents the SDKs pinned in `devDependencies`: `Signer.ts`
+ * re-exports the SDK's `SignatureScheme`, and the generator expands the
+ * installed union, so another installed `@mysten/sui` (the CI `sui-sdk-matrix`
+ * leg) legitimately generates a different file.
+ *
+ * The pin is read from the **committed** `package.json` when there is a git
+ * checkout, because that leg installs its version with `bun add -d`, which
+ * rewrites the working copy's pin to match; without git it is the working copy.
+ */
+const pinnedPackageJson = (): string => {
+  try {
+    return execFileSync("git", ["show", "HEAD:package.json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+  } catch {
+    return readFileSync("package.json", "utf8")
+  }
+}
+
+const sdkDrift = (): string | undefined => {
+  const pinned: { readonly devDependencies?: Readonly<Record<string, string>> } = JSON.parse(pinnedPackageJson())
+  for (const name of ["@mysten/sui", "effect"]) {
+    const want = pinned.devDependencies?.[name]
+    const installed: { readonly version: string } = JSON.parse(
+      readFileSync(`node_modules/${name}/package.json`, "utf8")
+    )
+    if (want !== installed.version) {
+      return `installed ${name} ${installed.version} is not the pinned devDependency ${want ?? "(none)"}`
+    }
+  }
+  return undefined
+}
+
+const drift = sdkDrift()
 
 describe("the error sentence", () => {
   test("Fails with: is printed whole and taken out of the prose", () => {
@@ -79,8 +114,10 @@ describe("LLMS.md", () => {
     expect(existsSync("LLMS.md")).toBe(true)
   })
 
-  test.skipIf(missing !== undefined)(
-    "is what `bun scripts/llms.ts` generates from the current sources",
+  test.skipIf(missing !== undefined || drift !== undefined)(
+    drift === undefined
+      ? "is what `bun scripts/llms.ts` generates from the current sources"
+      : `is what \`bun scripts/llms.ts\` generates from the current sources (skipped: ${drift})`,
     () => {
       const committed = readFileSync("LLMS.md", "utf8")
       const generated = render()
