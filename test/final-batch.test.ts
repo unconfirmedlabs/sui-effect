@@ -128,6 +128,14 @@ describe("A2. every CI job can pass as written", () => {
     expect(job).toContain('"$GITHUB_WORKSPACE/node_modules/.bin/tsc"')
   })
 
+  test("the effect matrix installs effect and @effect/platform-bun as one pair, with no fallback", () => {
+    // `… || bun add -d effect@X` used to keep platform-bun at the lockfile's
+    // version beside another effect when the pair did not resolve.
+    const install = /bun add -d effect@[^\n]*/.exec(jobNamed("effect-matrix"))?.[0] ?? ""
+    expect(install).toContain("@effect/platform-bun@${{ matrix.effect }}")
+    expect(install).not.toContain("||")
+  })
+
   test("the LLMS generator never kills the test run", () => {
     // It used to `process.exit(1)` when `dist/` was absent, which took the
     // whole `bun test` down with it. `test/llms.test.ts` skips instead.

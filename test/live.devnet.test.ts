@@ -14,12 +14,17 @@
  * SUI_LIVE=1 bun test test/live.devnet.test.ts
  * ```
  *
- * It funds a throwaway key from the devnet faucet. If the faucet refuses or
+ * It funds a throwaway key from the devnet faucet with
+ * `requestSuiFromFaucetV3`, the proof-of-work faucet devnet and testnet run
+ * since `@mysten/sui` 2.34. V3 pays into the recipient's **address balance**,
+ * not a coin object, so the transactions below also exercise the resolver's
+ * address-balance gas path; `Sui.getBalance` sums both. If the faucet refuses or
  * rate-limits, the test skips loudly rather than failing: a faucet outage is
- * not a regression in this package.
+ * not a regression in this package. So does an SDK older than 2.34, which has
+ * no V3 helper.
  */
 import { describe, expect, test } from "bun:test"
-import { getFaucetHost, requestSuiFromFaucetV2 } from "@mysten/sui/faucet"
+import { getFaucetHost } from "@mysten/sui/faucet"
 import { Transaction } from "@mysten/sui/transactions"
 import { SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
 import { DateTime, Duration, Effect, Layer, Schedule } from "effect"
@@ -45,19 +50,44 @@ const live = <A, E>(effect: Effect.Effect<A, E, Sui | SuiCore>): Promise<A> =>
   Effect.runPromise(Effect.provide(effect, layer, { local: true }))
 
 /**
+ * `@mysten/sui/faucet`'s V3 helper, which first shipped in 2.34.
+ *
+ * Loaded through a variable specifier and typed here, the way `Signer` loads
+ * `MLDSA65Keypair`: the CI SDK matrix typechecks this file against 2.30.0 too,
+ * where a static `import { requestSuiFromFaucetV3 }` is a compile error.
+ */
+const FAUCET_MODULE = "@mysten/sui/faucet"
+
+interface FaucetV3Module {
+  readonly requestSuiFromFaucetV3?: (input: {
+    readonly host: string
+    readonly recipient: string
+    readonly signal?: AbortSignal
+    readonly timeout?: number
+  }) => Promise<{ readonly status: string; readonly digest: string; readonly amountMist: string }>
+}
+
+/**
  * A funded throwaway signer, or `undefined` when the faucet would not play.
  *
- * The faucet answers before the coin is queryable, so this waits for the
+ * The faucet answers before the payout is queryable, so this waits for the
  * balance to appear rather than assuming it.
  */
 const funded = async () => {
   const signer = await Effect.runPromise(ephemeral)
+  const faucet: FaucetV3Module = await import(FAUCET_MODULE)
+  if (faucet.requestSuiFromFaucetV3 === undefined) {
+    return { signer, reason: "the installed @mysten/sui predates requestSuiFromFaucetV3 (2.34)" }
+  }
   try {
-    const response = await requestSuiFromFaucetV2({
+    const response = await faucet.requestSuiFromFaucetV3({
       host: getFaucetHost("devnet"),
-      recipient: signer.address
+      recipient: signer.address,
+      // Fetching the challenge and solving the proof of work; the SDK's own
+      // default is three minutes.
+      timeout: 3 * MINUTE
     })
-    if (response.status !== "Success") {
+    if (response.status !== "success") {
       return { signer, reason: `the faucet answered ${JSON.stringify(response.status)}` }
     }
   } catch (cause) {
@@ -70,13 +100,13 @@ const funded = async () => {
         Effect.flatMap(sui.getBalance(signer.address), (value) =>
           value.balance > 0n
             ? Effect.succeed(value.balance)
-            : Effect.fail("the faucet coin is not visible yet" as const)),
+            : Effect.fail("the faucet payout is not visible yet" as const)),
         { schedule: Schedule.spaced("2 seconds"), times: 15 }
       ).pipe(Effect.orElseSucceed(() => 0n))
     })
   )
   return balance === 0n
-    ? { signer, reason: "the faucet coin never became visible" }
+    ? { signer, reason: "the faucet payout never became visible" }
     : { signer, reason: undefined }
 }
 
@@ -167,6 +197,7 @@ describe.skipIf(!LIVE)("devnet, with SUI_LIVE=1", () => {
         expect(failure._tag).toBe("SimulationFailed")
       }
     },
-    120_000
+    // The V3 faucet's proof of work alone may take minutes.
+    300_000
   )
 })

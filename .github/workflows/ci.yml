@@ -35,7 +35,11 @@ jobs:
         with:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
-      - run: bun add -d effect@${{ matrix.effect }} @effect/platform-bun@${{ matrix.effect }} || bun add -d effect@${{ matrix.effect }}
+      # The pair moves together or the job fails: a fallback that installed
+      # `effect` alone would keep platform-bun at the lockfile's version and
+      # test two copies of effect side by side. Bump the matrix only once
+      # @effect/platform-bun has published the same version.
+      - run: bun add -d effect@${{ matrix.effect }} @effect/platform-bun@${{ matrix.effect }}
       # `bun run build` first: `test/llms.test.ts` compares LLMS.md against the
       # emitted declarations in `dist/`, and skips with a message without them.
       - run: bun run typecheck && bun run build && bun test test/
