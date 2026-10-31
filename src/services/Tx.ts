@@ -592,6 +592,17 @@ const usesGasCoin = (tx: Transaction): boolean => {
  * SDK's resolver adds it to the budget before it pays gas from the balance,
  * and so does `Tx.build`'s check. Never fails.
  */
+/**
+ * Where a `FundsWithdrawal` draws from, as every supported SDK spells it: 2.28
+ * to 2.3x know `Sender` and `Sponsor`, and allowances (2.38) add
+ * `SenderAllowance`. Declared here so the read typechecks against both.
+ */
+interface WithdrawSource {
+  readonly Sender?: unknown
+  readonly Sponsor?: unknown
+  readonly SenderAllowance?: { readonly funder: string }
+}
+
 const suiWithdrawalsFrom = (data: TransactionDataBuilder, payer: string): bigint => {
   const target = normalizeSuiAddress(payer)
   const sui = normalizeStructTag(SUI_TYPE_ARG)
@@ -601,7 +612,7 @@ const suiWithdrawalsFrom = (data: TransactionDataBuilder, payer: string): bigint
     if (withdrawal === undefined) continue
     try {
       if (normalizeStructTag(withdrawal.typeArg.Balance) !== sui) continue
-      const source = withdrawal.withdrawFrom
+      const source: WithdrawSource = withdrawal.withdrawFrom
       const owner = source.SenderAllowance !== undefined
         ? source.SenderAllowance.funder
         : source.Sender !== undefined

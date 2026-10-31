@@ -1515,7 +1515,12 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       if (input.$kind !== "FundsWithdrawal") continue
       const withdrawal = input.FundsWithdrawal
       if (withdrawal.reservation.$kind !== "MaxAmountU64") continue
-      const from = withdrawal.withdrawFrom
+      // Spelled out so it typechecks on SDKs before allowances (2.30), whose
+      // `withdrawFrom` has no `SenderAllowance`.
+      const from: {
+        readonly Sender?: unknown
+        readonly SenderAllowance?: { readonly funder: string }
+      } = withdrawal.withdrawFrom
       const source = from.SenderAllowance
         ? from.SenderAllowance.funder
         : from.Sender
