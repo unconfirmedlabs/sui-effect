@@ -65,7 +65,9 @@ const isKeyScheme = (value: string): value is KeyScheme =>
  * keypair. Afterwards both members fail with `SigningError { reason:
  * "locked" }`; there is no unlock — open the account again (`Keystore.unlock`,
  * `Signer.fromMnemonic`) for a new signer. `lock` is idempotent and never
- * fails.
+ * fails. A `lock` racing a signature cannot land mid-signature: the signature
+ * either answers by the real key (it was computed before the lock) or fails
+ * with `reason: "locked"`.
  *
  * A `LockableSigner` **is** a `Signer`: every function that takes a signer
  * takes this one, and it carries no secret either — the keypair lives in a
