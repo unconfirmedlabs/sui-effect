@@ -247,6 +247,19 @@ export const wipeHeldKey = (held: HeldKey): void => {
   sdkSecretOf(held.keypair)?.fill(0)
 }
 
+/**
+ * The keypair of a {@link HeldKey}, for a caller that keeps only the keypair
+ * (`Signer.fromConfig`). The held buffer is zeroed when it is not the one the
+ * keypair signs with — Ed25519, whose constructor copied it — so no orphaned
+ * copy of the secret is left for the collector. An ECDSA keypair signs with
+ * the held buffer itself, which is therefore kept.
+ */
+export const keypairOf = (held: HeldKey): Keypair => {
+  const own = sdkSecretOf(held.keypair)
+  if (own !== undefined && own !== held.secret) held.secret.fill(0)
+  return held.keypair
+}
+
 const decodeSignature = Schema.decodeUnknownEffect(Signature)
 
 /** The rejection a locked signer's sign thunk answers, told apart from the SDK's own. */

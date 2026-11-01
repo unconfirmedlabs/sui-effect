@@ -11,7 +11,7 @@ import { SigningError, SuiError } from "../src/domain/errors.ts"
 import { KeyError } from "../src/domain/keys.ts"
 import { SuiAddress } from "../src/domain/schemas.ts"
 import { fromRedactedSecret, Signer } from "../src/services/Signer.ts"
-import { holdKey, wipeHeldKey } from "../src/services/SignerKeys.ts"
+import { holdKey, keypairOf, wipeHeldKey } from "../src/services/SignerKeys.ts"
 
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 const fail = async <A, E>(effect: Effect.Effect<A, E>): Promise<E> => {
@@ -293,4 +293,23 @@ describe("Signer.fromConfig copies before it builds", () => {
     const publicKey = await verifyPersonalMessageSignature(message, signature)
     expect(publicKey.toSuiAddress()).toBe(keypair.toSuiAddress())
   })
+})
+
+describe("keypairOf keeps no orphaned copy of the secret (0.5.0)", () => {
+  for (const scheme of ["ED25519", "Secp256k1", "Secp256r1"] as const) {
+    test(`${scheme}: the held buffer is zeroed unless the keypair signs with it`, async () => {
+      const held = holdKey(scheme, new Uint8Array(32).fill(9))
+      const keypair = keypairOf(held)
+      const sdkOwn = Reflect.get(Reflect.get(keypair, "keypair"), "secretKey")
+      if (sdkOwn === held.secret) {
+        expect(held.secret.some((byte) => byte !== 0)).toBe(true)
+      } else {
+        expect(held.secret.every((byte) => byte === 0)).toBe(true)
+      }
+      // Ed25519 copies, so its held buffer is the orphan this zeroes.
+      if (scheme === "ED25519") expect(sdkOwn).not.toBe(held.secret)
+      const { signature } = await keypair.signPersonalMessage(message)
+      expect((await verifyPersonalMessageSignature(message, signature)).toSuiAddress()).toBe(keypair.toSuiAddress())
+    })
+  }
 })

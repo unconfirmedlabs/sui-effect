@@ -26,6 +26,7 @@ import {
   heldFromSecretKey,
   holdKey,
   type KeyScheme,
+  keypairOf as heldKeypairOf,
   lockable,
   type LockableSigner,
   type MnemonicLength
@@ -203,7 +204,7 @@ const keypairOf = async (
     case "ED25519":
     case "Secp256k1":
     case "Secp256r1":
-      return holdKey(parsed.scheme, parsed.secretKey).keypair
+      return heldKeypairOf(holdKey(parsed.scheme, parsed.secretKey))
     case "MLDSA65": {
       const module: MLDSA65Module = await import(MLDSA65_MODULE)
       return module.MLDSA65Keypair.fromSecretKey(parsed.secretKey)
