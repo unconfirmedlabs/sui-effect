@@ -12,12 +12,26 @@
 import type { Keypair, Signer as SdkSigner, SignatureScheme } from "@mysten/sui/cryptography"
 import { decodeSuiPrivateKey, SUI_PRIVATE_KEY_PREFIX } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
-import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
-import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
 import { fromHex } from "@mysten/sui/utils"
-import { Config, ConfigProvider, Effect, Redacted, Schema } from "effect"
+import { Config, ConfigProvider, Effect, Redacted, Schema, type Scope } from "effect"
 import { SigningError } from "../domain/errors.ts"
+import type { KeyError } from "../domain/keys.ts"
 import { Signature, SuiAddress } from "../domain/schemas.ts"
+import {
+  derivationPath as derivationPathOf,
+  type FromMnemonicOptions,
+  type FromSecretKeyOptions,
+  generateMnemonic as generateMnemonicOf,
+  heldFromMnemonic,
+  heldFromSecretKey,
+  holdKey,
+  type KeyScheme,
+  lockable,
+  type LockableSigner,
+  type MnemonicLength
+} from "./SignerKeys.ts"
+
+export type { FromMnemonicOptions, FromSecretKeyOptions, KeyScheme, LockableSigner, MnemonicLength }
 
 /**
  * The signature schemes a {@link Signer} can carry: the SDK's own
@@ -175,16 +189,19 @@ interface MLDSA65Module {
   readonly MLDSA65Keypair: { readonly fromSecretKey: (secretKey: Uint8Array) => Keypair }
 }
 
+/**
+ * The keypair a decoded secret names. The three classic schemes are built over
+ * a **copy** (`holdKey`): the ECDSA keypairs keep a reference to the bytes they
+ * are given, and the decoded buffer is zeroed by the caller once this returns.
+ */
 const keypairOf = async (
   parsed: { scheme: string; secretKey: Uint8Array }
 ): Promise<Keypair | undefined> => {
   switch (parsed.scheme) {
     case "ED25519":
-      return Ed25519Keypair.fromSecretKey(parsed.secretKey)
     case "Secp256k1":
-      return Secp256k1Keypair.fromSecretKey(parsed.secretKey)
     case "Secp256r1":
-      return Secp256r1Keypair.fromSecretKey(parsed.secretKey)
+      return holdKey(parsed.scheme, parsed.secretKey).keypair
     case "MLDSA65": {
       const module: MLDSA65Module = await import(MLDSA65_MODULE)
       return module.MLDSA65Keypair.fromSecretKey(parsed.secretKey)
@@ -225,9 +242,19 @@ const HEX_SEED = /^(?:0x)?[0-9a-fA-F]{64}$/
  */
 const keypairFromSecret = async (value: string): Promise<Keypair | undefined> => {
   const text = value.trim()
-  if (text.startsWith(SUI_PRIVATE_KEY_PREFIX)) return keypairOf(decodeSuiPrivateKey(text))
-  if (HEX_SEED.test(text)) return Ed25519Keypair.fromSecretKey(fromHex(text))
-  return undefined
+  const decoded = text.startsWith(SUI_PRIVATE_KEY_PREFIX)
+    ? decodeSuiPrivateKey(text)
+    : HEX_SEED.test(text)
+    ? { scheme: "ED25519", secretKey: fromHex(text) }
+    : undefined
+  if (decoded === undefined) return undefined
+  try {
+    return await keypairOf(decoded)
+  } finally {
+    // Every keypair above was built over its own copy (ML-DSA-65 copies the
+    // seed before expanding it); the decoded bytes are this function's, and nothing reads them again.
+    decoded.secretKey.fill(0)
+  }
 }
 
 /**
@@ -351,14 +378,145 @@ export const remote = (signer: RemoteSigner): Signer => ({
 })
 
 /**
+ * A signer derived from a BIP-39 recovery phrase, **checked first**: the word
+ * count (12, 15, 18, 21 or 24), every word in the English list, and the
+ * checksum. The SDK's `deriveKeypair` checks none of them, so a phrase with one
+ * word wrong derives a valid account nobody has ever funded; here it is a
+ * `KeyError { reason: "invalidMnemonic" }` and nothing is derived. The phrase
+ * is normalized (trimmed, lowercased, single-spaced) before the check; no
+ * BIP-39 passphrase is used, which is what every Sui wallet does.
+ *
+ * Paths are the standard Sui ones (`Signer.derivationPath`):
+ * `m/44'/784'/{account}'/0'/0'` (Ed25519, the default),
+ * `m/54'/784'/{account}'/0/0` (Secp256k1), `m/74'/784'/{account}'/0/0`
+ * (Secp256r1). An explicit `path` must have its scheme's shape (the SDK's
+ * `isValidHardenedPath` / `isValidBIP32Path`, with the scheme's own purpose)
+ * and every level below 2^31.
+ *
+ * The answer is a {@link LockableSigner}: it holds the derived key in a buffer
+ * nobody else references, and `lock` zeroes it. The BIP-39 seed and the HD
+ * nodes are zeroed before this returns. A `Redacted` phrase is read, not
+ * wiped: it is the caller's (`Redacted.wipeUnsafe` it when done).
+ *
+ * Fails with: `KeyError` (`invalidMnemonic`, `invalidPath`,
+ * `unsupportedScheme`). The message names a bad word's position, never a word.
+ *
+ * @since 0.5.0
+ */
+export const fromMnemonic: (
+  phrase: Redacted.Redacted<string> | string,
+  options?: FromMnemonicOptions
+) => Effect.Effect<LockableSigner, KeyError> = Effect.fn("Signer.fromMnemonic")(function*(
+  phrase: Redacted.Redacted<string> | string,
+  options?: FromMnemonicOptions
+) {
+  const { held } = yield* heldFromMnemonic(phrase, options)
+  return lockable(held)
+})
+
+/**
+ * A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag
+ * names the scheme; a contradicting `scheme` option is refused), a 32-byte hex
+ * seed (`0x` optional), or 32 raw bytes — the last two read as
+ * `options.scheme`, default `ED25519`.
+ *
+ * **The bytes are copied before any keypair is built over them.** The SDK's
+ * Secp256k1/Secp256r1 keypairs keep a reference to the array they are given,
+ * so building over the caller's buffer would let a later write to it change
+ * the key, and zeroing it break the signer. Here the caller's `Uint8Array` is
+ * copied and left untouched, decoded bytes are zeroed once copied, and the
+ * answer is a {@link LockableSigner} whose `lock` zeroes the copy. A
+ * `Redacted` input is read, not wiped.
+ *
+ * Fails with: `KeyError` (`invalidSecretKey` — the message is fixed and never
+ * quotes the input — or `unsupportedScheme` for `MLDSA65`, `ZkLogin`, … and a
+ * contradicting `scheme`).
+ *
+ * @since 0.5.0
+ */
+export const fromSecretKey: (
+  secret: Redacted.Redacted<string> | string | Uint8Array,
+  options?: FromSecretKeyOptions
+) => Effect.Effect<LockableSigner, KeyError> = Effect.fn("Signer.fromSecretKey")(function*(
+  secret: Redacted.Redacted<string> | string | Uint8Array,
+  options?: FromSecretKeyOptions
+) {
+  return lockable(yield* heldFromSecretKey(secret, options))
+})
+
+/**
+ * A fresh BIP-39 English recovery phrase, `words` long (default 12: 128 bits
+ * of entropy; 24 is 256), redacted.
+ *
+ * The entropy comes from `crypto.getRandomValues`, **not** Effect's `Random`:
+ * `Random` is a seedable, test-controllable PRNG whose purpose is to be
+ * reproducible, and a phrase a `TestRandom` could reproduce is a key anyone
+ * could. The entropy buffer is zeroed once the phrase exists; the phrase is a
+ * string, which no runtime can wipe — hand it to the person and drop it.
+ *
+ * Fails with: `KeyError` (`unavailable` on a platform without
+ * `crypto.getRandomValues` — React Native without a polyfill;
+ * `invalidMnemonic` for a length BIP-39 does not define).
+ *
+ * @since 0.5.0
+ */
+export const generateMnemonic: (
+  words?: MnemonicLength
+) => Effect.Effect<Redacted.Redacted<string>, KeyError> = Effect.fn("Signer.generateMnemonic")(function*(
+  words?: MnemonicLength
+) {
+  return yield* generateMnemonicOf(words)
+})
+
+/**
+ * The standard Sui derivation path of `scheme` at `account` (default 0):
+ * `m/44'/784'/{a}'/0'/0'` (Ed25519), `m/54'/784'/{a}'/0/0` (Secp256k1),
+ * `m/74'/784'/{a}'/0/0` (Secp256r1) — account 0 is the SDK's
+ * `DEFAULT_*_DERIVATION_PATH`.
+ *
+ * **Throws** a `RangeError` when `account` is not an integer in `[0, 2^31)` —
+ * a wiring mistake. Otherwise never fails.
+ *
+ * @since 0.5.0
+ */
+export const derivationPath = (scheme: KeyScheme, account?: number): string => derivationPathOf(scheme, account)
+
+/**
+ * A {@link LockableSigner} that is locked when the scope closes: acquire with
+ * `acquire`, release with `lock`, whatever the scope's exit.
+ *
+ * ```ts
+ * Effect.scoped(Effect.gen(function*() {
+ *   const signer = yield* Signer.scoped(keystore.unlock(address, password))
+ *   return yield* Tx.run(recipe, { signer })
+ * }))
+ * ```
+ *
+ * Fails with: whatever `acquire` fails with.
+ *
+ * @since 0.5.0
+ */
+export const scoped = <E, R>(
+  acquire: Effect.Effect<LockableSigner, E, R>
+): Effect.Effect<LockableSigner, E, R | Scope.Scope> => Effect.acquireRelease(acquire, (signer) => signer.lock)
+
+/**
  * The constructors, namespaced the way the spec spells them:
  * `Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.fromConfig`,
- * `Signer.ephemeral`, `Signer.remote`. The type `Signer` is the interface above.
+ * `Signer.ephemeral`, `Signer.remote`, and for keys the process holds
+ * `Signer.fromMnemonic`, `Signer.fromSecretKey`, `Signer.generateMnemonic`,
+ * `Signer.derivationPath` and `Signer.scoped`. The type `Signer` is the
+ * interface above.
  */
 export const Signer = {
   fromSdkSigner,
   fromKeypair,
   fromConfig,
   ephemeral,
-  remote
+  remote,
+  fromMnemonic,
+  fromSecretKey,
+  generateMnemonic,
+  derivationPath,
+  scoped
 } as const

@@ -1,9 +1,10 @@
 /**
  * The durable `Journal`, over `KeyValueStore` from `effect/persistence`.
  *
- * This is the only file in the package that imports `effect/persistence`
- * (`@stability unstable` upstream), and it is reachable only through the
- * `sui-effect/journal` subpath, so the core modules stay on stable Effect.
+ * This file and `Keystore.ts` are the only ones in the package that import
+ * `effect/persistence` (`@stability unstable` upstream), each reachable only
+ * through its own subpath (`/journal`, `/keystore`), so the core modules stay
+ * on stable Effect.
  *
  * Building the layer does no network work: it lists the store's entries and,
  * when asked to, refuses to start while any are unresolved. What

@@ -1,9 +1,9 @@
 /**
  * `sui-effect/journal`: the durable submission journal.
  *
- * Separate from `sui-effect/tx` because it is the only part of the package
- * that imports `effect/persistence` (`KeyValueStore`, still unstable
- * upstream), and an application that does not need durability should not take
+ * Separate from `sui-effect/tx` because it imports `effect/persistence`
+ * (`KeyValueStore`, still unstable upstream; `sui-effect/keystore` is the
+ * only other module that does), and an application that does not need durability should not take
  * that dependency.
  *
  * Building the layer does no network work. Settling what a previous run left
