@@ -32,6 +32,8 @@ import {
 } from "./SignerKeys.ts"
 
 export type { FromMnemonicOptions, FromSecretKeyOptions, KeyScheme, LockableSigner, MnemonicLength }
+import { createPasskey, passkey, wallet } from "./AccountSigners.ts"
+import { zkLogin } from "./ZkLoginSigner.ts"
 
 /**
  * The signature schemes a {@link Signer} can carry: the SDK's own
@@ -503,10 +505,11 @@ export const scoped = <E, R>(
 /**
  * The constructors, namespaced the way the spec spells them:
  * `Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.fromConfig`,
- * `Signer.ephemeral`, `Signer.remote`, and for keys the process holds
+ * `Signer.ephemeral`, `Signer.remote`; for keys the process holds
  * `Signer.fromMnemonic`, `Signer.fromSecretKey`, `Signer.generateMnemonic`,
- * `Signer.derivationPath` and `Signer.scoped`. The type `Signer` is the
- * interface above.
+ * `Signer.derivationPath` and `Signer.scoped`; and the account signers
+ * (0.5.0) `Signer.zkLogin`, `Signer.passkey`, `Signer.createPasskey`,
+ * `Signer.wallet`. The type `Signer` is the interface above.
  */
 export const Signer = {
   fromSdkSigner,
@@ -518,5 +521,9 @@ export const Signer = {
   fromSecretKey,
   generateMnemonic,
   derivationPath,
-  scoped
+  scoped,
+  zkLogin,
+  passkey,
+  createPasskey,
+  wallet
 } as const

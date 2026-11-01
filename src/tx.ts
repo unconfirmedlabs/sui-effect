@@ -114,3 +114,17 @@ export {
   Signature,
   TransactionExpiration
 } from "./domain/schemas.ts"
+
+/** Account signers (0.5.0): zkLogin sessions and their store, passkeys, Wallet Standard wallets. */
+export {
+  type SecretSealer,
+  ZkLogin,
+  ZkLoginSession,
+  ZkLoginSignatureInputs,
+  type ZkLoginSignerOptions,
+  ZkLoginStoredSession
+} from "./services/ZkLoginSigner.ts"
+export { type PasskeyProvider, type StandardWallet, type StandardWalletAccount } from "./services/AccountSigners.ts"
+
+/** The sender's check on sponsored bytes a service assembled. */
+export { verifySponsored } from "./services/Sponsored.ts"
