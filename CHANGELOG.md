@@ -86,9 +86,11 @@ code or stored data; read "Migrating from 0.4.x" first.
   turn its probabilities into refusals, `requireIntent` (a `Tx.run` or
   `Enoki.run` that declares nothing is refused before the recipe is applied)
   and `onUnavailable` (`"deny"` by default). `Gate.with` merges over the gate in
-  force. `Tx.sendAll` passes its `intent` through; `Tx.foldCoins` takes none,
-  so under `requireIntent` every fold is refused with `intent.required` — run
-  it under `Gate.with({ requireIntent: false })`. **`@unconfirmed/sui-effect/gate`**: the Jev screen (`layerJev`,
+  force. `Tx.sendAll` passes its `intent` through. `Tx.foldCoins` takes an
+  `intent?`; without one, under `requireIntent` each batch declares the fold's
+  own claim-free intent (the coins go into the owner's own balance), so any
+  batch whose simulation moves value out of the account is refused, and with no
+  gate a fold checks no intent and costs no extra simulate. **`@unconfirmed/sui-effect/gate`**: the Jev screen (`layerJev`,
   `layerJevConfig` over `TYPESAFE_API_KEY`, `TYPESAFE_MODEL`,
   `TYPESAFE_BASE_URL`, and `makeJev`) over `effect/http`'s `HttpClient`.
 - **`Tx.prepare(input, { sender, gasOwner?, intent?, maxEpoch? })`**: `Tx.run`'s

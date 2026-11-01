@@ -3963,6 +3963,17 @@ export interface FoldResult {
 }
 
 /**
+ * The intent a fold declares for itself under `Gate.requireIntent`: the coins
+ * go into the owner's own address balance, so it claims no outflow, no
+ * recipient and no object, and anything else its simulation does is refused.
+ */
+const foldIntentOf = (batch: FoldBatch): Intent => ({
+  summary: `Fold ${batch.coins.length} coin object${batch.coins.length === 1 ? "" : "s"} into the owner's own address balance; nothing leaves the account.`,
+  author: "task",
+  claims: { outflows: [], recipients: [], objects: [] }
+})
+
+/**
  * Folds the signer's coin objects into its address balance: {@link planFold}
  * for `signer.address`, then one {@link run} of {@link fold} per batch, in
  * order — SUI first, paying for its own fold, so a fresh account whose SUI is
@@ -4012,7 +4023,19 @@ export const foldCoins = Effect.fn("Tx.foldCoins")(function*<E = never>(opts: {
    * @since 0.5.0
    */
   readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>
+  /**
+   * The intent every batch is verified against, as `Tx.run`'s `intent`. When
+   * omitted and `Gate.requireIntent` is on, each batch declares the fold's own
+   * intent — a summary saying the coins go into the owner's own address
+   * balance, and **no claims**, so the claims check refuses a batch whose
+   * simulation moves anything out of the account. When omitted and the gate
+   * requires nothing, no intent is checked (0.4.0's cost: no extra simulate).
+   *
+   * @since 0.5.0
+   */
+  readonly intent?: Intent
 }): Effect.fn.Return<FoldResult, RunError | E, Sui> {
+  const gate = yield* Gate
   if (opts.plan !== undefined && normalizeSuiAddress(opts.plan.owner) !== normalizeSuiAddress(opts.signer.address)) {
     return yield* new BuildError({
       message: `this fold plan is for ${opts.plan.owner}'s coins, and the signer is ${opts.signer.address}`,
@@ -4027,10 +4050,12 @@ export const foldCoins = Effect.fn("Tx.foldCoins")(function*<E = never>(opts: {
   const approve = opts.approve
   const executed: Array<Executed> = []
   for (const batch of plan.batches) {
+    const intent: Intent | undefined = opts.intent ?? (gate.requireIntent ? foldIntentOf(batch) : undefined)
     executed.push(
       yield* run(fold(batch), {
         signer: opts.signer,
-        ...(approve === undefined ? {} : { approve: (prepared: Prepared) => approve(prepared, batch) })
+        ...(approve === undefined ? {} : { approve: (prepared: Prepared) => approve(prepared, batch) }),
+        ...(intent === undefined ? {} : { intent })
       })
     )
   }

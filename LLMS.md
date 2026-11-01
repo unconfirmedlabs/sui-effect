@@ -5615,6 +5615,17 @@ declare const Tx: {
          * @since 0.5.0
          */
         readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>;
+        /**
+         * The intent every batch is verified against, as `Tx.run`'s `intent`. When
+         * omitted and `Gate.requireIntent` is on, each batch declares the fold's own
+         * intent — a summary saying the coins go into the owner's own address
+         * balance, and **no claims**, so the claims check refuses a batch whose
+         * simulation moves anything out of the account. When omitted and the gate
+         * requires nothing, no intent is checked (0.4.0's cost: no extra simulate).
+         *
+         * @since 0.5.0
+         */
+        readonly intent?: Intent;
     }) => Effect.Effect<FoldResult, RunError | E, Sui>;
     readonly foldMovement: (batch: FoldBatch, effects: Simulation | Executed) => import("./Fold.ts").FoldMovement;
     readonly sendAll: <E = never>(opts: {
@@ -6356,6 +6367,17 @@ declare const foldCoins: <E = never>(opts: {
      * @since 0.5.0
      */
     readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>;
+    /**
+     * The intent every batch is verified against, as `Tx.run`'s `intent`. When
+     * omitted and `Gate.requireIntent` is on, each batch declares the fold's own
+     * intent — a summary saying the coins go into the owner's own address
+     * balance, and **no claims**, so the claims check refuses a batch whose
+     * simulation moves anything out of the account. When omitted and the gate
+     * requires nothing, no intent is checked (0.4.0's cost: no extra simulate).
+     *
+     * @since 0.5.0
+     */
+    readonly intent?: Intent;
 }) => Effect.Effect<FoldResult, RunError | E, Sui>
 ```
 

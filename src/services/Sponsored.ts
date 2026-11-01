@@ -44,7 +44,7 @@ const sameBytes = (left: Uint8Array, right: Uint8Array): boolean =>
  *
  * @since 0.5.0
  */
-export const verifySponsored = Effect.fn("verifySponsored")(function*(
+export const verifySponsored = Effect.fn("Tx.verifySponsored")(function*(
   built: Built,
   expect: {
     readonly sender: string

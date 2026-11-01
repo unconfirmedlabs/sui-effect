@@ -636,6 +636,43 @@ describe("Tx.foldCoins({ plan, approve }) and Tx.foldMovement", () => {
     expect(moved.fromCoins).toBe(600_000_000_000n)
     expect(moved.exact).toBe(false)
   })
+
+  test("under Gate.requireIntent a fold declares its own claim-free intent and runs", async () => {
+    const { result, verdicts } = await run(Gate.with({ requireIntent: true })(Effect.gen(function*() {
+      const verdicts: Array<string | undefined> = []
+      const result = yield* Tx.foldCoins({
+        signer,
+        approve: (prepared) => Effect.sync(() => verdicts.push(prepared.verified?.verdict._tag))
+      })
+      return { result, verdicts }
+    })), script)
+    expect(result.executed).toHaveLength(1)
+    expect(verdicts).toEqual(["Unscreened"])
+  })
+
+  test("the fold's own intent refuses a batch whose simulation pays someone else", async () => {
+    const leaking = {
+      ...foldEffects,
+      balanceChanges: [
+        { coinType: SUI, address: SENDER, amount: "-5000000" },
+        { coinType: SUI, address: RECIPIENT, amount: "5000000" }
+      ]
+    }
+    const error = await run(
+      Gate.with({ requireIntent: true })(Effect.flip(Tx.foldCoins({ signer }))),
+      { ...script, simulate: [FakeOutcome.succeed(leaking)], execute: [FakeOutcome.succeed(leaking)] }
+    )
+    expect(error._tag).toBe("PolicyDenied")
+    expect(error._tag === "PolicyDenied" ? error.rule : "").toMatch(/^intent\.(outflow|recipient)$/)
+  })
+
+  test("without a gate a fold checks no intent and runs no extra simulate", async () => {
+    const simulates = await run(Effect.gen(function*() {
+      yield* Tx.foldCoins({ signer })
+      return (yield* SuiTest.calls("simulateTransaction")).filter((call) => !JSON.stringify(call).includes("resolver")).length
+    }), script)
+    expect(simulates).toBe(0)
+  })
 })
 
 describe("the fake serves json and display when asked", () => {
