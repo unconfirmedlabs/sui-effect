@@ -16,7 +16,9 @@ import { Transaction } from "@mysten/sui/transactions"
 import { fromBase64, normalizeSuiAddress, toBase64 } from "@mysten/sui/utils"
 import { Effect, Schema } from "effect"
 import type { Executed } from "../domain/executed.ts"
+import type { JournalError, SimulationFailed } from "../domain/errors.ts"
 import { BuildError, PolicyDenied, SigningError, TransportError } from "../domain/errors.ts"
+import type { Intent } from "../domain/intent.ts"
 import type { Built } from "../domain/built.ts"
 import { SuiAddress } from "../domain/schemas.ts"
 import type { SignatureScheme } from "@mysten/sui/cryptography"
@@ -24,7 +26,19 @@ import { type StandardWallet, type StandardWalletAccount, wallet as walletSigner
 import type { Signer } from "./Signer.ts"
 import { verifySponsored } from "./Sponsored.ts"
 import { type Recipe, Sui } from "./Sui.ts"
-import { fromBytes, type Signed, submitVia, type SubmitViaError } from "./Tx.ts"
+import { SubmitConfig } from "./SubmitConfig.ts"
+import {
+  fromBytes,
+  keepsSponsoredSenderLock,
+  lockedRun,
+  prepare,
+  type Prepared,
+  requireIntentOf,
+  sign,
+  type Signed,
+  submitVia,
+  type SubmitViaError
+} from "./Tx.ts"
 import { checkSessionBound, signatureOfString } from "./ZkLoginSigner.ts"
 
 /**
@@ -347,8 +361,119 @@ export const execute = Effect.fn("Enoki.execute")(function*(
 })
 
 /**
+ * The whole Enoki-sponsored run, with the same front half as `Tx.run`:
+ * {@link sponsor} → `Tx.prepare(built, { sender, intent })` (one simulate of
+ * exactly Enoki's bytes, `SubmitConfig.preflight`, the intent's claims and
+ * screen) → `approve(prepared)` → `Tx.sign` (`prepared.verified` when there
+ * is an intent) → `onSigned` → {@link execute}, through the journal.
+ *
+ * **The sender lock follows `Tx.run`'s rule for the sender's own pins.**
+ * Under `SubmitConfig.lockSender: "whenPinned"` (the default) the sponsor
+ * request — which resolves the sender's object inputs — runs under the
+ * sender's lock, and the lock is held on through approval, signing and
+ * execution only when Enoki's bytes pin an owned or receiving input. The gas
+ * coins are Enoki's and are not the sender's to race, so a sponsored
+ * transaction that pins nothing of the sender's (pure values, shared objects,
+ * withdrawals) is approved, signed and executed with the lock released, and
+ * a person taking their time never holds it. `"always"` holds it throughout,
+ * `"never"` takes none. `Gate.requireIntent` applies, as it does to `Tx.run`.
+ *
+ * `options.signer` is the sender: an Enoki zkLogin session
+ * (`Enoki.fromFlow`, `Enoki.fromWallet`, `Signer.zkLogin`) or any other
+ * signer Enoki sponsors. `options.jwt`, `allowedAddresses` and
+ * `allowedMoveCallTargets` are {@link sponsor}'s; `refused` is
+ * {@link execute}'s.
+ *
+ * Fails with: `EnokiError` (a refusal: the sponsor request answered 4xx, or
+ * the execute call failed in a way `refused` recognises), `TransportError`
+ * (Enoki could not be reached for the sponsor request, or the simulate),
+ * `BuildError`, `PolicyDenied` (`enoki.digest`, `sponsored.*`,
+ * `prepare.sender`, `intent.*`, `preflight`), `SimulationFailed`,
+ * `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`,
+ * `JournalError`, and `E` — whatever `approve` fails with.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { Enoki, type EnokiClient, type EnokiFlow } from "@unconfirmed/sui-effect/enoki"
+ * import { Tx } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const client: EnokiClient
+ * declare const flow: EnokiFlow
+ *
+ * const program = Effect.gen(function*() {
+ *   const signer = yield* Enoki.fromFlow(flow, { network: "testnet" })
+ *   return yield* Enoki.run(client, Tx.sendFunds({ amount: 1_000n, recipient: signer.address }), {
+ *     signer,
+ *     network: "testnet",
+ *     approve: (prepared) => Effect.log(`gas ${prepared.simulation.gasUsedTotal}, paid by ${prepared.built.gas.owner}`)
+ *   })
+ * })
+ * ```
+ */
+export const run = Effect.fn("Enoki.run")(function*<E = never>(
+  client: EnokiClient,
+  transaction: Recipe | Uint8Array,
+  options: {
+    readonly signer: Signer
+    readonly network?: "mainnet" | "testnet" | "devnet"
+    readonly jwt?: string
+    readonly allowedAddresses?: ReadonlyArray<string>
+    readonly allowedMoveCallTargets?: ReadonlyArray<string>
+    /** What the transaction is declared to do; see `Tx.run`. */
+    readonly intent?: Intent
+    /** Shown the prepared, sponsored transaction before the sender signs; failing refuses. */
+    readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>
+    /** `Tx.run`'s `onSigned`: after the sender's signature, before Enoki is called. */
+    readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>
+    /** {@link execute}'s `refused`. */
+    readonly refused?: (cause: unknown) => boolean
+  }
+): Effect.fn.Return<
+  Executed,
+  EnokiError | TransportError | BuildError | PolicyDenied | SimulationFailed | SigningError | SubmitViaError | E,
+  Sui
+> {
+  const sui = yield* Sui
+  const config = yield* SubmitConfig
+  const sender = options.signer.address
+  yield* Effect.annotateCurrentSpan({ "sui.sender": sender })
+  yield* requireIntentOf(options.intent)
+  const approve = options.approve
+  return yield* lockedRun({
+    sui,
+    policy: config.lockSender,
+    locked: [sender],
+    drains: undefined,
+    build: sponsor(client, transaction, {
+      sender,
+      ...(options.network === undefined ? {} : { network: options.network }),
+      ...(options.jwt === undefined ? {} : { jwt: options.jwt }),
+      ...(options.allowedAddresses === undefined ? {} : { allowedAddresses: options.allowedAddresses }),
+      ...(options.allowedMoveCallTargets === undefined ? {} : { allowedMoveCallTargets: options.allowedMoveCallTargets })
+    }),
+    keeps: keepsSponsoredSenderLock,
+    inFlightOn: () => [sender],
+    finish: (built) =>
+      Effect.gen(function*() {
+        yield* Effect.annotateCurrentSpan({ "sui.digest": built.digest })
+        const prepared = yield* prepare(built, {
+          sender,
+          ...(options.intent === undefined ? {} : { intent: options.intent })
+        })
+        if (approve !== undefined) yield* approve(prepared)
+        const signed = yield* sign(prepared.verified ?? prepared.built, options.signer)
+        if (options.onSigned !== undefined) yield* options.onSigned(signed)
+        return yield* execute(client, signed, options.refused === undefined ? undefined : { refused: options.refused })
+      })
+  })
+})
+
+/**
  * The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`,
- * `Enoki.sponsor`, `Enoki.execute`.
+ * `Enoki.sponsor`, `Enoki.execute`, `Enoki.run`.
  *
  * @since 0.5.0
  */
@@ -356,5 +481,6 @@ export const Enoki = {
   fromFlow,
   fromWallet,
   sponsor,
-  execute
+  execute,
+  run
 } as const

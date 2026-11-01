@@ -30,5 +30,6 @@ export {
   execute,
   fromFlow,
   fromWallet,
+  run,
   sponsor
 } from "./services/Enoki.ts"
