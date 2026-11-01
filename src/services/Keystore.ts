@@ -43,7 +43,9 @@ import { Base64 } from "effect/encoding"
 import { KeyValueStore } from "effect/persistence"
 import type { KeyError } from "../domain/keys.ts"
 import { KeystoreError } from "../domain/keys.ts"
+import { SigningError } from "../domain/errors.ts"
 import { SuiAddress } from "../domain/schemas.ts"
+import type { SecretSealer } from "./ZkLoginSigner.ts"
 import {
   type FromMnemonicOptions,
   type FromSecretKeyOptions,
@@ -320,7 +322,7 @@ const derive = (
   password: Redacted.Redacted<string>,
   salt: Uint8Array<ArrayBuffer>,
   iterations: number,
-  address: SuiAddress
+  address: SuiAddress | undefined
 ): Effect.Effect<Derived, KeystoreError> =>
   Effect.tryPromise({
     try: async () => {
@@ -353,7 +355,7 @@ const sameBytes = (a: Uint8Array, b: Uint8Array): boolean => {
   return diff === 0
 }
 
-const decode64 = (field: string, value: string, address: SuiAddress): Effect.Effect<Uint8Array<ArrayBuffer>, KeystoreError> => {
+const decode64 = (field: string, value: string, address: SuiAddress | undefined): Effect.Effect<Uint8Array<ArrayBuffer>, KeystoreError> => {
   const decoded = Base64.decode(value)
   if (Result.isFailure(decoded)) {
     return Effect.fail(keystoreError("corrupt", `the record's ${field} is not base64`, address))
@@ -679,6 +681,155 @@ export const make = (
     return service
   })
 
+const SEALER_AAD_DOMAIN = "sui-effect/keystore/sealer/v1"
+
+/**
+ * One secret sealed by {@link sealer}, as the string `seal` answers: the
+ * keystore's KDF and cipher parameters and its key-check value, version 1.
+ * Every byte field is standard base64.
+ *
+ * @since 0.5.0
+ */
+export const SealedSecret = Schema.Struct({
+  version: Schema.Literal(1),
+  kdf: Schema.Struct({ name: Schema.Literal("PBKDF2-SHA256"), iterations: Schema.Int, salt: Schema.String }),
+  cipher: Schema.Struct({ name: Schema.Literal("AES-256-GCM"), iv: Schema.String }),
+  check: Schema.String,
+  ciphertext: Schema.String
+})
+/** @since 0.5.0 */
+export type SealedSecret = typeof SealedSecret.Type
+
+const SealedSecretJson = Schema.fromJsonString(SealedSecret)
+const decodeSealedSecret = Schema.decodeUnknownEffect(SealedSecretJson)
+const encodeSealedSecret = Schema.encodeEffect(SealedSecretJson)
+
+/** The AAD a sealed secret is bound to: the sealer's domain, then the caller's bytes. */
+const sealerAad = (aad: Uint8Array): Uint8Array<ArrayBuffer> => {
+  const domain = utf8(`${SEALER_AAD_DOMAIN}\n`)
+  const out = new Uint8Array(domain.length + aad.length)
+  out.set(domain)
+  out.set(aad, domain.length)
+  return out
+}
+
+/** A keystore failure as the `SigningError` a `SecretSealer` speaks. */
+const asSigningError = (error: KeystoreError): SigningError =>
+  error.reason === "wrongPassword"
+    ? new SigningError({ reason: "locked", cause: error })
+    : error.reason === "unavailable"
+    ? new SigningError({ reason: "unavailable", cause: error })
+    : new SigningError({ cause: error })
+
+/**
+ * A `SecretSealer` (what `ZkLogin.save` and `ZkLogin.load` take) in the
+ * keystore's format: PBKDF2-HMAC-SHA256 over `password` (600 000 iterations
+ * by default, 16-byte random salt, 512 bits: the AES key and the key-check
+ * value), AES-256-GCM with a fresh 12-byte IV per seal, and as AAD
+ * `sui-effect/keystore/sealer/v1`, a newline, then the caller's `aad` — for
+ * a zkLogin session, its address — so a blob copied under another account's
+ * entry does not unseal. The blob is {@link SealedSecret} as JSON.
+ *
+ * The password is held by the sealer for as long as the sealer lives: make
+ * one when the person unlocks and drop it when they lock. Each `seal` and
+ * `unseal` costs one PBKDF2 derivation.
+ *
+ * **Throws** a `RangeError` when `options.iterations` is not an integer of at
+ * least {@link MIN_LAYER_ITERATIONS}, `Keystore.layer`'s floor. Its members
+ * fail with: `SigningError` — `reason: "locked"` for a wrong password,
+ * `reason: "unavailable"` without WebCrypto, and no reason for an empty
+ * password, an empty secret or a blob that was edited, moved or is not one.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Effect, Redacted } from "effect"
+ * import { KeyValueStore } from "effect/persistence"
+ * import { Keystore } from "@unconfirmed/sui-effect/keystore"
+ * import { ZkLogin, type ZkLoginSession } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const session: ZkLoginSession
+ * declare const ephemeralSecretKey: Redacted.Redacted<Uint8Array>
+ *
+ * const program = Effect.gen(function*() {
+ *   const store = yield* KeyValueStore.KeyValueStore
+ *   const sealer = Keystore.sealer(Redacted.make("correct horse battery staple"))
+ *   yield* ZkLogin.save(store, "zklogin", { session, ephemeralSecretKey, sealer })
+ *   return yield* ZkLogin.load(store, "zklogin", { sealer })
+ * })
+ * ```
+ */
+export const sealer = (
+  password: Redacted.Redacted<string>,
+  options?: { readonly iterations?: number }
+): SecretSealer => {
+  const iterations = options?.iterations ?? DEFAULT_ITERATIONS
+  if (!Number.isSafeInteger(iterations) || iterations < MIN_LAYER_ITERATIONS) {
+    throw new RangeError(
+      `Keystore.sealer: iterations must be an integer of at least ${MIN_LAYER_ITERATIONS}, got ${iterations}`
+    )
+  }
+  return {
+    seal: Effect.fn("Keystore.seal")(function*(secret: Redacted.Redacted<Uint8Array>, aad: Uint8Array) {
+      return yield* Effect.gen(function*() {
+        yield* nonEmpty(password)
+        const plaintext = Redacted.value(secret)
+        if (plaintext.length === 0) {
+          return yield* keystoreError("corrupt", "there is no secret to seal: it is empty")
+        }
+        const crypto = yield* requireCrypto()
+        const salt = crypto.random(SALT_BYTES)
+        const iv = crypto.random(IV_BYTES)
+        const { check, key } = yield* derive(crypto, password, salt, iterations, undefined)
+        const data = new Uint8Array(plaintext.length)
+        data.set(plaintext)
+        const ciphertext = yield* Effect.tryPromise({
+          try: () => crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: sealerAad(aad), tagLength: 128 }, key, data),
+          catch: () => keystoreError("unavailable", "this platform's WebCrypto could not encrypt the secret")
+        }).pipe(Effect.ensuring(Effect.sync(() => data.fill(0))))
+        return yield* encodeSealedSecret({
+          version: KEYSTORE_VERSION,
+          kdf: { name: "PBKDF2-SHA256", iterations, salt: Base64.encode(salt) },
+          cipher: { name: "AES-256-GCM", iv: Base64.encode(iv) },
+          check: Base64.encode(check),
+          ciphertext: Base64.encode(new Uint8Array(ciphertext))
+        }).pipe(Effect.orDie)
+      }).pipe(Effect.mapError(asSigningError))
+    }),
+    unseal: Effect.fn("Keystore.unseal")(function*(sealed: string, aad: Uint8Array) {
+      return yield* Effect.gen(function*() {
+        const record = yield* decodeSealedSecret(sealed).pipe(
+          Effect.mapError(() => keystoreError("corrupt", "this is not a secret Keystore.sealer sealed"))
+        )
+        const stored = record.kdf.iterations
+        if (stored < MIN_STORED_ITERATIONS || stored > MAX_STORED_ITERATIONS) {
+          return yield* keystoreError("corrupt", `the sealed secret names ${stored} PBKDF2 iterations, outside [1000, 10000000]`)
+        }
+        const salt = yield* decode64("salt", record.kdf.salt, undefined)
+        const iv = yield* decode64("iv", record.cipher.iv, undefined)
+        const check = yield* decode64("check", record.check, undefined)
+        const ciphertext = yield* decode64("ciphertext", record.ciphertext, undefined)
+        if (salt.length < SALT_BYTES || iv.length !== IV_BYTES || check.length !== 32 || ciphertext.length <= TAG_BYTES) {
+          return yield* keystoreError("corrupt", "the sealed secret has a truncated salt, iv, check value or ciphertext")
+        }
+        const crypto = yield* requireCrypto()
+        const derived = yield* derive(crypto, password, salt, stored, undefined)
+        if (!sameBytes(derived.check, check)) {
+          return yield* keystoreError("wrongPassword", "the password does not unseal this secret")
+        }
+        const plaintext = yield* Effect.tryPromise({
+          try: () =>
+            crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: sealerAad(aad), tagLength: 128 }, derived.key, ciphertext),
+          catch: () =>
+            keystoreError("corrupt", "the sealed secret does not verify under its own password: it was edited or moved from another entry")
+        })
+        return Redacted.make(new Uint8Array(plaintext), { label: "secret" })
+      }).pipe(Effect.mapError(asSigningError))
+    })
+  }
+}
+
 /**
  * The sealed keystore: `Keystore.layer(options?)` over a `KeyValueStore`,
  * `Keystore.layerTest` in memory for tests.
@@ -693,6 +844,9 @@ export class Keystore extends Context.Service<Keystore, KeystoreService>()(
    * builds its own layer. No floor on `iterations`. Never fails.
    */
   static readonly make = make
+
+  /** See {@link sealer}: a `SecretSealer` (for `ZkLogin.save`/`load`) in the keystore's format. */
+  static readonly sealer = sealer
 
   /**
    * The keystore over the `KeyValueStore` in context. Builds without reading
