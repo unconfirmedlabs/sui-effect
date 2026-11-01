@@ -559,6 +559,7 @@ The full entries follow under "API".
 - `BatchItemError` — What can go wrong decoding one object of a batch read.
 - `BuildError` — The transaction could not be built into bytes.
 - `Built` — A transaction built into bytes and ready to sign, with the expiration the builder settled on recorded so `Tx.reconcile` can decide, later and without the builder, whether the transaction can still land.
+- `BuiltGas` — The gas a built transaction carries, read back out of its bytes: `budget` and `price` in MIST, the `owner` who pays (the sender unless it is sponsored), the `payment` refs, and the `source` they amount to.
 - `ChangedObject` — One object touched by a transaction.
 - `ChangedRef` — What the effects say about one object a transaction touched.
 - `CleverError` — A decoded `#[error]` constant.
@@ -584,6 +585,8 @@ The full entries follow under "API".
 - `ExecutionStatus` — Whether a transaction succeeded.
 - `ExtensionNotReady` — A synchronous member of a Promise-faced extension was called before its runtime existed.
 - `GasCostSummary` — Gas cost breakdown.
+- `GasPaymentRef` — One entry of a transaction's gas payment, as the bytes name it: the SDK's own `{ objectId, version, digest }`.
+- `GasPaymentSource` — How built bytes pay for gas, as `Tx.build` reads it back out of them (and as the span attribute `sui.gas_payment` names it): - `"addressBalance"`: an empty payment; gas is drawn from the payer's SUI address balance at execution, and the bytes pin no gas coin.
 - `GetObjectError` — What can go wrong reading one object with a schema.
 - `GraphQLUnavailable` — The GraphQL endpoint an extension needs is not usable: none was configured, or the one that was could not be reached.
 - `HasOutcome` — An extension error may declare its own `outcome`, and `SuiError.outcome` and `Script.run` honour it before anything else.
@@ -646,6 +649,7 @@ The full entries follow under "API".
 - `TransactionFilter` — A filter on transactions: exactly one of `sender` or `function`.
 - `TransactionLookupError` — The failures of a transaction lookup.
 - `TransactionNotFound` — No transaction with this digest is known to the node.
+- `TransferredRef` — A changed object whose **owner changed**: what `Executed.transferred` and `Simulation.transferred` return.
 - `TransportError` — A request did not reach a usable answer.
 - `UnchangedConsensusObject` — Mirrors `SuiClientTypes.UnchangedConsensusObject`.
 - `UnexpectedEffects` — The effects of an applied transaction did not contain what the caller expected.
@@ -666,6 +670,7 @@ The full entries follow under "API".
 - `ExpiryEvidencePolicy` — Whether `Tx.reconcile` is allowed to conclude that an expiration window closed on a transaction the node does not know.
 - `FoldBatch` — One fold transaction's worth of coins: what `fold` turns into a recipe.
 - `FoldGas` — How one fold transaction pays for gas.
+- `FoldMovement` — What one fold moves, read off its simulation (or its execution): `consumed`, the batch's coins the effects delete, with the balances the plan read them at; `fromCoins`, their total; `toAddressBalance`, what the owner's address balance of the coin type gains; and `netChange`, the owner's net balance change, which is all `balanceChanges` reports.
 - `FoldPlan` — What `planFold` answers: the transactions that fold an owner's coins, in the order they must run, and the SUI dust that cannot pay for its own fold.
 - `FoldResult` — What `foldCoins` did: the plan it ran, and one `Executed` per batch, in order.
 - `GasPaymentPolicy` — How `Tx.build` treats a gas payment the recipe left unset.
@@ -680,6 +685,7 @@ The full entries follow under "API".
 - `LockSenderPolicy` — When `Tx.run` holds the sender lock.
 - `OutflowClaim` — The most of one coin the sender may lose, in base units, gas excluded.
 - `Parties` — Whose transaction it is.
+- `Prepared` — Built bytes and what the lifecycle learned about them before anything is signed: the simulation of exactly those bytes, and the verified intent when one was declared.
 - `ReconcileInput` — What `Tx.reconcile` can be asked about.
 - `Reconciled` — What one entry of `Tx.reconcileAll` settled to, as a tagged union.
 - `RemoteSigner` — What `remote` needs to know about a credential it does not hold.
@@ -698,7 +704,7 @@ The full entries follow under "API".
 - `SubmitViaError` — Everything `submitVia` can fail with, before the sender's own errors.
 - `SubmitViaReply` — What a third party answers when it has submitted your bytes.
 - `TransactionExpiration` — re-exported from `@unconfirmed/sui-effect`.
-- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.foldMovement`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 - `UNRESOLVED_TAGS` — The tags whose entries still need an answer from the network.
 - `Verdict` — How far a transaction was checked.
 - `Verified` — A `Built` whose simulated effects stayed inside a declared `Intent`.
@@ -714,6 +720,7 @@ The full entries follow under "API".
 - `ephemeral` — A fresh Ed25519 credential that exists only for this process.
 - `fold` — The recipe for one fold transaction: merge the batch's coins and deposit them into the owner's address balance with `0x2::coin::send_funds<T>`.
 - `foldCoins` — Folds the signer's coin objects into its address balance: `planFold` for `signer.address`, then one `run` of `fold` per batch, in order — SUI first, paying for its own fold, so a fresh account whose SUI is all coins needs no address balance to start.
+- `foldMovement` — The coin → address-balance movement of one fold, which its balance changes do not show: a node nets them per address, so a fold of 1,000 SUI of coins reports only the gas (`+3,939,506` MIST on localnet, protocol 139, for five faucet coins whose storage rebate beat the gas), and the coins' balances are not in the effects at all — the coins are simply deleted, and the deposit is an accumulator write with no amount on it.
 - `fromBytes` — Turns transaction bytes that came from somewhere else into a `Built`, reading everything the lifecycle needs out of the bytes themselves.
 - `fromConfig` — Reads a secret key from configuration and builds its signer.
 - `fromKeypair` — `fromSdkSigner` under the name the spec gave it when a keypair was the only thing it took.
@@ -723,6 +730,7 @@ The full entries follow under "API".
 - `maxEpochOf` — re-exported from `@unconfirmed/sui-effect`.
 - `maxTimestampMsOf` — re-exported from `@unconfirmed/sui-effect`.
 - `planFold` — Plans the transactions that fold an owner's coin objects into its address balance.
+- `prepare` — Build (or take) a transaction, simulate exactly its bytes, run `SubmitConfig.preflight` and, given an intent, `Tx.verify`'s checks — and sign nothing.
 - `reconcile` — Finds out what happened to a transaction that was sent but never answered for.
 - `reconcileAll` — Settles every unresolved entry in the journal: the explicit startup call a long-lived application makes after building a durable `Journal`.
 - `recorded` — What the journal recorded for one digest, if anything.
@@ -808,7 +816,7 @@ The full entries follow under "API".
 ## `@unconfirmed/sui-effect`
 
 
-103 exported symbols.
+107 exported symbols.
 
 ### `Balance` (const)
 
@@ -856,6 +864,17 @@ declare const Built: Schema
 //     readonly bytes: Uint8Array<ArrayBufferLike>;
 //     readonly digest: Digest;
 //     readonly sender: SuiAddress;
+//     readonly gas: {
+//         readonly budget: Mist;
+//         readonly price: Mist;
+//         readonly owner: SuiAddress;
+//         readonly payment: readonly {
+//             readonly objectId: ObjectId;
+//             readonly version: Version;
+//             readonly digest: string;
+//         }[];
+//         readonly source: "addressBalance" | "coinReservation" | "coins";
+//     };
 //     readonly gasOwner?: SuiAddress | undefined;
 //     readonly expiration?: {
 //         readonly $kind: "None";
@@ -889,6 +908,7 @@ declare const Built: Schema
 //         };
 //     } | undefined;
 //     readonly chain?: string | undefined;
+//     readonly simulation?: Simulation | undefined;
 // }
 ```
 
@@ -896,11 +916,43 @@ A transaction built into bytes and ready to sign, with the expiration the
 builder settled on recorded so `Tx.reconcile` can decide, later and without
 the builder, whether the transaction can still land.
 
-Every field but `chain` is read back out of `bytes`. Bytes that arrived from
-somewhere else — a sponsor handed a sender's transaction — become a `Built`
-through `Tx.fromBytes`, never by hand: a hand-built value that leaves out
-`expiration` or `chain` silently disables the expiry rule and the chain guard
-`Tx.reconcile` depends on.
+Every field but `chain` and `simulation` is read back out of `bytes`. Bytes
+that arrived from somewhere else — a sponsor handed a sender's transaction,
+a dapp's request — become a `Built` through `Tx.fromBytes`, never by hand: a
+hand-built value that leaves out `expiration` or `chain` silently disables
+the expiry rule and the chain guard `Tx.reconcile` depends on.
+
+`gas` (0.5.0) is the gas data the bytes carry. `simulation` (0.5.0) is
+present only when `Tx.build` itself simulated **exactly these bytes** — the
+explicit simulate it runs when the SDK's resolver did not (a preset budget
+off gRPC, or nothing to resolve). On gRPC the resolver simulates the
+transaction before its budget is set, which is a different transaction, so
+there is no `simulation` there. The lifecycle reuses it (`Tx.run`,
+`Tx.prepare`, `Tx.verify`) only when it is the very object `Tx.build` made
+in this process; one that arrived inside a decoded `Built` is simulated
+again. Neither field is carried into `Signed` or the journal.
+
+### `BuiltGas` (const)
+
+```ts
+declare const BuiltGas: Schema
+// decodes to:
+// {
+//     readonly budget: Mist;
+//     readonly price: Mist;
+//     readonly owner: SuiAddress;
+//     readonly payment: readonly {
+//         readonly objectId: ObjectId;
+//         readonly version: Version;
+//         readonly digest: string;
+//     }[];
+//     readonly source: "addressBalance" | "coinReservation" | "coins";
+// }
+```
+
+The gas a built transaction carries, read back out of its bytes: `budget`
+and `price` in MIST, the `owner` who pays (the sender unless it is
+sponsored), the `payment` refs, and the `source` they amount to.
 
 ### `ChangedObject` (const)
 
@@ -1168,13 +1220,13 @@ declare const DynamicField: Schema
 // decodes to:
 // {
 //     readonly type: string;
-//     readonly digest: string;
 //     readonly $kind: "DynamicField" | "DynamicObject";
 //     readonly value: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
 //     };
 //     readonly version: Version;
+//     readonly digest: string;
 //     readonly name: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
@@ -1235,7 +1287,7 @@ with `{ include: EXECUTE_INCLUDE }` is a result that method accepts.
 
 ```ts
 declare const Event: Schema
-// decodes to: { readonly sender: SuiAddress; readonly bcs: Uint8Array<ArrayBufferLike>; readonly packageId: ObjectId; readonly module: string; readonly eventType: string; readonly json?: unknown; }
+// decodes to: { readonly bcs: Uint8Array<ArrayBufferLike>; readonly packageId: ObjectId; readonly module: string; readonly sender: SuiAddress; readonly eventType: string; readonly json?: unknown; }
 ```
 
 An emitted Move event. Mirrors `SuiClientTypes.Event` with the branded ids
@@ -1254,10 +1306,10 @@ which in practice means a relay or sponsor envelope decoded through
 declare const EventEntry: Schema
 // decodes to:
 // {
-//     readonly sender: SuiAddress;
 //     readonly bcs: Uint8Array<ArrayBufferLike>;
 //     readonly packageId: ObjectId;
 //     readonly module: string;
+//     readonly sender: SuiAddress;
 //     readonly eventType: string;
 //     readonly checkpoint: bigint | null;
 //     readonly transactionDigest: Digest;
@@ -1285,12 +1337,13 @@ The SDK's `SuiClientTypes.EventFilter`, under its own name.
 ```ts
 export declare class Executed extends Executed_base {
     readonly digest: Digest;
+    readonly checkpoint: bigint | null;
     readonly effects: TransactionEffects;
     readonly events: ReadonlyArray<Event>;
     readonly balanceChanges: ReadonlyArray<BalanceChange>;
     readonly objectTypes: { readonly [x: string]: string; };
-    readonly checkpoint: bigint | null;
     readonly timestampMs: number | null;
+    readonly sender?: SuiAddress | undefined;
     /**
      * Objects this transaction created, optionally filtered by Move type through
      * `typeMatches`: a bare tag matches every instantiation of the generic, a
@@ -1306,7 +1359,11 @@ export declare class Executed extends Executed_base {
      * Never fails.
      */
     createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef>;
-    /** Objects this transaction mutated in place, optionally filtered by type. Never fails. */
+    /**
+     * Objects this transaction mutated in place, optionally filtered by type.
+     * An object that changed owner is mutated too, and is also in
+     * `transferred`. Never fails.
+     */
     mutated(type?: string): ReadonlyArray<ChangedRef>;
     /**
      * Objects this transaction deleted or wrapped. The refs carry the versions the
@@ -1332,6 +1389,23 @@ export declare class Executed extends Executed_base {
      */
     wrapped(): ReadonlyArray<ChangedRef>;
     /**
+     * Objects whose **owner changed**, optionally filtered by type: they existed
+     * going in, still exist with the same id, and their input owner and output
+     * owner differ. Owners are compared by kind and party — an address, an
+     * object (a dynamic object field's parent), shared, immutable, a consensus
+     * address — never by version, so a transfer to someone else, a freeze, a
+     * move under a dynamic object field and a move between `AddressOwner` and
+     * `ConsensusAddressOwner` all count, while a consensus object whose
+     * `startVersion` moved does not. A created object is not transferred (its
+     * owner is on `created`'s ref), and neither is a deleted or wrapped
+     * one. Either owner unknown — a reduced envelope that left it out, or the
+     * `Unknown` variant — is not evidence of a change and is left out. Each ref
+     * is the output side, with `inputOwner` the owner going in. Never fails.
+     *
+     * @since 0.5.0
+     */
+    transferred(type?: string): ReadonlyArray<TransferredRef>;
+    /**
      * Packages this transaction published (`PackageWrite` plus `Created`), as
      * full refs like every other accessor. A package's `type` is the literal
      * `package` when the node reports one, and the ref falls back to it when the
@@ -1342,7 +1416,10 @@ export declare class Executed extends Executed_base {
     /**
      * The net balance change for one address and coin type, in the coin's base
      * unit (MIST for SUI). `coinType` is any spelling — `"0x2::sui::SUI"`,
-     * `CoinType.SUI` — compared under the one Move type rule. Never fails.
+     * `CoinType.SUI` — compared under the one Move type rule. It covers coin
+     * objects and the address balance alike, netted per address: a fold that
+     * moves 1,000 SUI of coins into its owner's address balance reports only
+     * the gas it cost (`Tx.foldMovement` reports the movement). Never fails.
      */
     balanceChange(address: SuiAddress, coinType: CoinType | string): bigint;
     /** Computation plus storage less the storage rebate, in MIST. Can be negative. Never fails. */
@@ -1353,7 +1430,9 @@ export declare class Executed extends Executed_base {
      *
      * This is what `Tx.submit` uses, exported so a caller holding a result from
      * somewhere else — `client.core.executeTransaction`, a sponsor's SDK call —
-     * can get the accessors without re-implementing the decode.
+     * can get the accessors without re-implementing the decode. `sender` is
+     * filled when the result carries the transaction data (it was read with
+     * `transaction: true` as well).
      *
      * Fails with: `ExecutionFailed` (the transaction applied and failed),
      * `DecodeError` (the response does not carry the include set).
@@ -1380,7 +1459,8 @@ export declare class Executed extends Executed_base {
      *   `createdWhere`, still list every created id.
      * - `balanceChanges` and `events` default to `[]`, `checkpoint` and
      *   `timestampMs` to `null`, `gasUsed` to zeros, and `effects.status` to
-     *   success.
+     *   success. `sender` (or `transaction.sender`) is kept when it is an
+     *   address.
      * - **JSON spellings are accepted** where the SDK's types are not JSON:
      *   `bcs` as base64 or as an array of byte values as well as a
      *   `Uint8Array`, and every `u64` (versions, balances, gas, `checkpoint`)
@@ -1508,7 +1588,10 @@ or map the fields you need.
 
 The data fields are `digest`, `effects`, `events`, `balanceChanges`,
 `objectTypes` (object id to Move type), `checkpoint` (`null` until the node
-says) and `timestampMs` (`null` likewise).
+says), `timestampMs` (`null` likewise) and `sender` (0.5.0).
+
+The accessors are **one implementation shared with `Simulation`**, so
+a preview reads a simulation exactly the way a receipt reads an execution.
 
 ### `ExecutionFailed` (class)
 
@@ -1661,6 +1744,35 @@ declare const GasCostSummary: Schema
 ```
 
 Gas cost breakdown. Mirrors `SuiClientTypes.GasCostSummary`.
+
+### `GasPaymentRef` (const)
+
+```ts
+declare const GasPaymentRef: Schema
+// decodes to: { readonly objectId: ObjectId; readonly version: Version; readonly digest: string; }
+```
+
+One entry of a transaction's gas payment, as the bytes name it: the SDK's
+own `{ objectId, version, digest }`. A coin reservation is one of these too
+(version `0`); `BuiltGas.source` says which kind the payment is.
+
+### `GasPaymentSource` (const)
+
+```ts
+declare const GasPaymentSource: Schema
+// decodes to: "addressBalance" | "coinReservation" | "coins"
+```
+
+How built bytes pay for gas, as `Tx.build` reads it back out of them (and
+as the span attribute `sui.gas_payment` names it):
+
+- `"addressBalance"`: an empty payment; gas is drawn from the payer's SUI
+  address balance at execution, and the bytes pin no gas coin.
+- `"coinReservation"`: every payment ref is a **coin reservation** — gas
+  drawn from the balance through a synthetic coin (version `0`), which is
+  what a `tx.gas` user whose payer has a balance gets. It reserves the
+  payer's whole balance as read at build time.
+- `"coins"`: at least one ref is a coin object.
 
 ### `GetObjectError` (type)
 
@@ -2322,174 +2434,70 @@ declined), `"unavailable"` (the device, wallet or remote signer could not be
 reached). Absent for every other failure. A program branches on this, never
 on `cause`.
 
-### `Simulation` (const)
+### `Simulation` (class)
 
 ```ts
-declare const Simulation: Schema
-// decodes to:
-// {
-//     readonly digest: Digest;
-//     readonly effects: {
-//         readonly version: number;
-//         readonly status: {
-//             readonly success: boolean;
-//         };
-//         readonly gasUsed: {
-//             readonly computationCost: Mist;
-//             readonly storageCost: Mist;
-//             readonly storageRebate: Mist;
-//             readonly nonRefundableStorageFee: Mist;
-//         };
-//         readonly transactionDigest: Digest;
-//         readonly gasObject: {
-//             readonly objectId: ObjectId;
-//             readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
-//             readonly inputVersion: Version | null;
-//             readonly inputDigest: string | null;
-//             readonly inputOwner: {
-//                 readonly $kind: "AddressOwner";
-//                 readonly AddressOwner: SuiAddress;
-//             } | {
-//                 readonly $kind: "ObjectOwner";
-//                 readonly ObjectOwner: ObjectId;
-//             } | {
-//                 readonly $kind: "Shared";
-//                 readonly Shared: {
-//                     readonly initialSharedVersion: Version;
-//                 };
-//             } | {
-//                 readonly $kind: "Immutable";
-//                 readonly Immutable: true;
-//             } | {
-//                 readonly $kind: "ConsensusAddressOwner";
-//                 readonly ConsensusAddressOwner: {
-//                     readonly startVersion: Version;
-//                     readonly owner: SuiAddress;
-//                 };
-//             } | {
-//                 readonly $kind: "Unknown";
-//             } | null;
-//             readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
-//             readonly outputVersion: Version | null;
-//             readonly outputDigest: string | null;
-//             readonly outputOwner: {
-//                 readonly $kind: "AddressOwner";
-//                 readonly AddressOwner: SuiAddress;
-//             } | {
-//                 readonly $kind: "ObjectOwner";
-//                 readonly ObjectOwner: ObjectId;
-//             } | {
-//                 readonly $kind: "Shared";
-//                 readonly Shared: {
-//                     readonly initialSharedVersion: Version;
-//                 };
-//             } | {
-//                 readonly $kind: "Immutable";
-//                 readonly Immutable: true;
-//             } | {
-//                 readonly $kind: "ConsensusAddressOwner";
-//                 readonly ConsensusAddressOwner: {
-//                     readonly startVersion: Version;
-//                     readonly owner: SuiAddress;
-//                 };
-//             } | {
-//                 readonly $kind: "Unknown";
-//             } | null;
-//             readonly idOperation: "Unknown" | "None" | "Created" | "Deleted";
-//         } | null;
-//         readonly eventsDigest: string | null;
-//         readonly dependencies: readonly string[];
-//         readonly lamportVersion: Version | null;
-//         readonly changedObjects: readonly {
-//             readonly objectId: ObjectId;
-//             readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
-//             readonly inputVersion: Version | null;
-//             readonly inputDigest: string | null;
-//             readonly inputOwner: {
-//                 readonly $kind: "AddressOwner";
-//                 readonly AddressOwner: SuiAddress;
-//             } | {
-//                 readonly $kind: "ObjectOwner";
-//                 readonly ObjectOwner: ObjectId;
-//             } | {
-//                 readonly $kind: "Shared";
-//                 readonly Shared: {
-//                     readonly initialSharedVersion: Version;
-//                 };
-//             } | {
-//                 readonly $kind: "Immutable";
-//                 readonly Immutable: true;
-//             } | {
-//                 readonly $kind: "ConsensusAddressOwner";
-//                 readonly ConsensusAddressOwner: {
-//                     readonly startVersion: Version;
-//                     readonly owner: SuiAddress;
-//                 };
-//             } | {
-//                 readonly $kind: "Unknown";
-//             } | null;
-//             readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
-//             readonly outputVersion: Version | null;
-//             readonly outputDigest: string | null;
-//             readonly outputOwner: {
-//                 readonly $kind: "AddressOwner";
-//                 readonly AddressOwner: SuiAddress;
-//             } | {
-//                 readonly $kind: "ObjectOwner";
-//                 readonly ObjectOwner: ObjectId;
-//             } | {
-//                 readonly $kind: "Shared";
-//                 readonly Shared: {
-//                     readonly initialSharedVersion: Version;
-//                 };
-//             } | {
-//                 readonly $kind: "Immutable";
-//                 readonly Immutable: true;
-//             } | {
-//                 readonly $kind: "ConsensusAddressOwner";
-//                 readonly ConsensusAddressOwner: {
-//                     readonly startVersion: Version;
-//                     readonly owner: SuiAddress;
-//                 };
-//             } | {
-//                 readonly $kind: "Unknown";
-//             } | null;
-//             readonly idOperation: "Unknown" | "None" | "Created" | "Deleted";
-//         }[];
-//         readonly unchangedConsensusObjects: readonly {
-//             readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
-//             readonly objectId: ObjectId;
-//             readonly version: Version | null;
-//             readonly digest: string | null;
-//         }[];
-//         readonly auxiliaryDataDigest: string | null;
-//     };
-//     readonly events: readonly {
-//         readonly sender: SuiAddress;
-//         readonly bcs: Uint8Array<ArrayBufferLike>;
-//         readonly packageId: ObjectId;
-//         readonly module: string;
-//         readonly eventType: string;
-//         readonly json?: unknown;
-//     }[];
-//     readonly balanceChanges: readonly {
-//         readonly coinType: CoinType;
-//         readonly address: SuiAddress;
-//         readonly amount: bigint;
-//     }[];
-//     readonly objectTypes: {
-//         readonly [x: string]: string;
-//     };
-//     readonly commandResults: readonly {
-//         readonly returnValues: readonly {
-//             readonly bcs: Uint8Array<ArrayBufferLike>;
-//         }[];
-//         readonly mutatedReferences: readonly {
-//             readonly bcs: Uint8Array<ArrayBufferLike>;
-//         }[];
-//     }[];
-//     readonly gasPaymentMocked: boolean;
-// }
+export declare class Simulation extends Simulation_base {
+    readonly digest: Digest;
+    readonly effects: TransactionEffects;
+    readonly events: ReadonlyArray<Event>;
+    readonly balanceChanges: ReadonlyArray<BalanceChange>;
+    readonly objectTypes: { readonly [x: string]: string; };
+    readonly commandResults: ReadonlyArray<CommandResult>;
+    readonly gasPaymentMocked: boolean;
+    /** `Executed.created`, over the simulated effects. Never fails. @since 0.5.0 */
+    created(type?: string): ReadonlyArray<ChangedRef>;
+    /** `Executed.createdWhere`, over the simulated effects. Never fails. @since 0.5.0 */
+    createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef>;
+    /** `Executed.mutated`, over the simulated effects. Never fails. @since 0.5.0 */
+    mutated(type?: string): ReadonlyArray<ChangedRef>;
+    /** `Executed.deleted` (deleted or wrapped), over the simulated effects. Never fails. @since 0.5.0 */
+    deleted(): ReadonlyArray<ChangedRef>;
+    /** `Executed.wrapped`, over the simulated effects. Never fails. @since 0.5.0 */
+    wrapped(): ReadonlyArray<ChangedRef>;
+    /** `Executed.transferred`: objects whose owner changed. Never fails. @since 0.5.0 */
+    transferred(type?: string): ReadonlyArray<TransferredRef>;
+    /** `Executed.packagesPublished`, over the simulated effects. Never fails. @since 0.5.0 */
+    packagesPublished(): ReadonlyArray<ChangedRef>;
+    /** `Executed.balanceChange`: the net delta for one address and coin type. Never fails. @since 0.5.0 */
+    balanceChange(address: SuiAddress, coinType: CoinType | string): bigint;
+    /** Computation plus storage less the storage rebate, in MIST. Can be negative. Never fails. @since 0.5.0 */
+    get gasUsedTotal(): bigint;
+    /**
+     * `Executed.expectCreated`, over the simulated effects.
+     *
+     * Fails with: `UnexpectedEffects` when the simulation created no object of
+     * that type, or more than one.
+     *
+     * @since 0.5.0
+     */
+    expectCreated(type: string): Effect.Effect<ChangedRef, UnexpectedEffects>;
+    /**
+     * `Executed.eventsOf`, over the simulated events.
+     *
+     * Fails with: `DecodeError`.
+     *
+     * @since 0.5.0
+     */
+    eventsOf<T>(codec: Schema.Codec<T, Uint8Array>, eventType?: string): Effect.Effect<ReadonlyArray<T>, DecodeError>;
+    /**
+     * `Executed.expectEvent`, over the simulated events.
+     *
+     * Fails with: `UnexpectedEffects`, `DecodeError`.
+     *
+     * @since 0.5.0
+     */
+    expectEvent<T>(codec: Schema.Codec<T, Uint8Array>, eventType?: string): Effect.Effect<T, UnexpectedEffects | DecodeError>;
+    /**
+     * `Executed.expectPublished`, over the simulated effects: the package a
+     * publish would create, and its `UpgradeCap`.
+     *
+     * Fails with: `UnexpectedEffects`.
+     *
+     * @since 0.5.0
+     */
+    expectPublished(): Effect.Effect<Published, UnexpectedEffects>;
+}
 ```
 
 The result of a successful simulation, with the fixed include set `Sui` asks
@@ -2500,6 +2508,15 @@ simulated transaction had no gas payment, so the node ran it on a mocked gas
 coin — gas costs and logic are exercised, but anything drawn from `tx.gas`
 was funded by the mock, not the sender. `false` when gas was paid with real
 coins or from the sender's address balance.
+
+**A `Schema.Class` since 0.5.0** (a `Schema.Struct` before), so it carries
+`Executed`'s accessors — `created`, `createdWhere`, `mutated`,
+`deleted`, `wrapped`, `transferred`, `packagesPublished`, `balanceChange`,
+`gasUsedTotal`, `expectCreated`, `eventsOf`, `expectEvent`,
+`expectPublished` — through **the same implementation**, so a preview and
+the receipt it predicts read the same way. The fields are unchanged. Values
+come from `Sui.simulate` or a decode (`Schema.decodeUnknownEffect(Simulation)`);
+one assembled by hand is `new Simulation({ ... })`.
 
 ### `SimulationFailed` (class)
 
@@ -3830,6 +3847,21 @@ export declare class TransactionNotFound extends TransactionNotFound_base {
 
 No transaction with this digest is known to the node.
 
+### `TransferredRef` (interface)
+
+```ts
+export interface TransferredRef extends ChangedRef {
+    /** The owner the object had going in. */
+    readonly inputOwner: Owner;
+    /** The owner it has afterwards. */
+    readonly owner: Owner;
+}
+```
+
+A changed object whose **owner changed**: what `Executed.transferred`
+and `Simulation.transferred` return. The output side's ref, with the
+owner it had going in as `inputOwner` and the one it has now as `owner`.
+
 ### `TransportError` (class)
 
 ```ts
@@ -4058,7 +4090,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-75 exported symbols.
+79 exported symbols.
 
 ### `Built` (const)
 
@@ -4148,6 +4180,41 @@ How one fold transaction pays for gas.
 - `"auto"`: any other coin type. The payment is left to the resolver, which
   pays from the SUI balance when it covers the budget and from SUI coins
   otherwise.
+
+### `FoldMovement` (interface)
+
+```ts
+export interface FoldMovement {
+    readonly owner: SuiAddress;
+    readonly coinType: CoinType;
+    /** The batch's coins this fold consumes, at the versions and balances the plan read. */
+    readonly consumed: ReadonlyArray<Coin>;
+    /** The batch's coins the effects do **not** consume. Empty for a fold that does what it says. */
+    readonly missing: ReadonlyArray<Coin>;
+    /** The total of `consumed`, in the coin type's smallest unit. */
+    readonly fromCoins: bigint;
+    /**
+     * What the owner's address balance of this coin type gains: `netChange +
+     * fromCoins`. For a SUI batch paying for itself, the coins less the net gas
+     * (more than the coins when the storage rebates exceed the gas).
+     */
+    readonly toAddressBalance: bigint;
+    /** The owner's net balance change for the coin type, coins and balance together. */
+    readonly netChange: bigint;
+    /**
+     * Whether `toAddressBalance` is exact: every coin of the batch is consumed,
+     * and the owner ends up with no coin object of this type created or
+     * mutated, so nothing but the address balance can hold the difference.
+     */
+    readonly exact: boolean;
+}
+```
+
+What one fold moves, read off its simulation (or its execution):
+`consumed`, the batch's coins the effects delete, with the balances the plan
+read them at; `fromCoins`, their total; `toAddressBalance`, what the owner's
+address balance of the coin type gains; and `netChange`, the owner's net
+balance change, which is all `balanceChanges` reports.
 
 ### `FoldPlan` (interface)
 
@@ -4621,6 +4688,28 @@ Whose transaction it is. Gas spent by whoever pays it is never an outflow.
 A `Built` is a `Parties` as it is: `sender`, and `gasOwner` only when someone
 else pays.
 
+### `Prepared` (interface)
+
+```ts
+export interface Prepared {
+    readonly built: Built;
+    readonly simulation: Simulation;
+    readonly verified?: Verified;
+}
+```
+
+Built bytes and what the lifecycle learned about them before anything is
+signed: the simulation of exactly those bytes, and the verified intent when
+one was declared. What `prepare` answers and what `Tx.run`'s
+`approve` is shown.
+
+`built.gas` is the gas the bytes carry (budget, price, payer, payment and
+where it comes from) and `built.gasOwner` the sponsor, when there is one;
+`simulation` has `Executed`'s accessors (`created`, `transferred`,
+`balanceChange`, ...), and `simulation.gasUsedTotal` is the gas it is
+expected to cost. `verified` is present exactly when an intent was given,
+and is the `Built` to sign when it is.
+
 ### `ReconcileInput` (type)
 
 ```ts
@@ -5064,6 +5153,15 @@ declare const Tx: {
     readonly build: (input: Transaction | Recipe, opts: {
         readonly sender: SuiAddress;
         readonly gasOwner?: SuiAddress;
+        /**
+         * The last epoch the transaction may be valid in: a signer's session
+         * bound (`Signer.maxEpoch`). The default expiration's `maxEpoch` is capped
+         * at it, and a bound already below the current epoch fails the build
+         * before anything resolves.
+         *
+         * @since 0.5.0
+         */
+        readonly maxEpoch?: bigint;
     }) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
     readonly sign: (built: Built, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
     readonly cosign: (signed: Signed, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
@@ -5095,21 +5193,42 @@ declare const Tx: {
         readonly coinType?: CoinType;
         readonly maxCoinsPerTransaction?: number;
     }) => Effect.Effect<FoldPlan, TransportError, Sui>;
-    readonly fold: (batch: import("./Fold.ts").FoldBatch) => Recipe;
-    readonly foldCoins: (opts: {
+    readonly fold: (batch: FoldBatch) => Recipe;
+    readonly foldCoins: <E = never>(opts: {
         readonly signer: Signer;
         /** One coin type to fold; every coin type the signer holds coins of when omitted. */
         readonly coinType?: CoinType;
         /** At most this many coins per transaction: 1 to 500, 500 by default. */
         readonly maxCoinsPerTransaction?: number;
-    }) => Effect.Effect<FoldResult, RunError, Sui>;
+        /**
+         * A plan from `Tx.planFold`, run as given rather than re-planned.
+         *
+         * @since 0.5.0
+         */
+        readonly plan?: FoldPlan;
+        /**
+         * `Tx.run`'s `approve`, per batch, with the batch it is about to fold.
+         *
+         * @since 0.5.0
+         */
+        readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>;
+    }) => Effect.Effect<FoldResult, RunError | E, Sui>;
+    readonly foldMovement: (batch: FoldBatch, effects: Simulation | Executed) => import("./Fold.ts").FoldMovement;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
     readonly verify: (built: Built, intent: Intent) => Effect.Effect<Verified, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
+    readonly prepare: (input: Transaction | Recipe | Built, opts: {
+        readonly sender: SuiAddress;
+        readonly gasOwner?: SuiAddress;
+        /** What the transaction is declared to do; `verified` is present when given. */
+        readonly intent?: Intent;
+        /** A session bound for what is built here (`Signer.maxEpoch`); see `Tx.build`. Ignored for a `Built`. */
+        readonly maxEpoch?: bigint;
+    }) => Effect.Effect<Prepared, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
     readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
     readonly resubmit: (input: SubmissionUnknown | Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly recorded: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never>;
-    readonly run: (recipe: Transaction | Recipe, opts: {
+    readonly run: <E = never>(recipe: Transaction | Recipe, opts: {
         readonly signer: Signer;
         readonly gasOwner?: SuiAddress;
         /**
@@ -5148,7 +5267,22 @@ declare const Tx: {
          * @since 0.5.0
          */
         readonly intent?: Intent;
-    }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>;
+        /**
+         * Shown the `Prepared` transaction — the built bytes with their gas,
+         * the simulation of exactly those bytes, the verified intent — **after**
+         * `preflight` and the intent checks and **before the first signature**.
+         * Succeeding approves; failing refuses with the caller's own error (a
+         * wallet's `UserRejected`), which `Tx.run` fails with, nothing signed and
+         * nothing journalled. It runs where signing runs: under the sender lock
+         * when the bytes pin something, after it is released when they do not,
+         * so a person taking their time never holds an address-balance account's
+         * lock. Giving it always costs the simulate it is shown (the build's own,
+         * when the build made one of exactly these bytes).
+         *
+         * @since 0.5.0
+         */
+        readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
+    }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError | E, Sui>;
     readonly reconcileAll: (opts?: {
         /**
          * Re-send, as identical bytes, every entry that is still
@@ -5176,8 +5310,9 @@ declare const Tx: {
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
 `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
 `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
-`Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.reconcile`,
-`Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+`Tx.foldCoins`, `Tx.foldMovement`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`,
+`Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
+`Tx.reconcileAll`.
 
 ### `UNRESOLVED_TAGS` (const)
 
@@ -5225,6 +5360,17 @@ declare const Verified: Schema
 //     readonly bytes: Uint8Array<ArrayBufferLike>;
 //     readonly digest: Digest;
 //     readonly sender: SuiAddress;
+//     readonly gas: {
+//         readonly budget: Mist;
+//         readonly price: Mist;
+//         readonly owner: SuiAddress;
+//         readonly payment: readonly {
+//             readonly objectId: ObjectId;
+//             readonly version: Version;
+//             readonly digest: string;
+//         }[];
+//         readonly source: "addressBalance" | "coinReservation" | "coins";
+//     };
 //     readonly intent: {
 //         readonly summary: string;
 //         readonly author: "user" | "task" | "dapp";
@@ -5288,6 +5434,7 @@ declare const Verified: Schema
 //         };
 //     } | undefined;
 //     readonly chain?: string | undefined;
+//     readonly simulation?: SimulationClass | undefined;
 // } & Brand<"Verified">
 ```
 
@@ -5353,6 +5500,15 @@ const signed = yield* Tx.cosign(withSender, sponsor)
 declare const build: (input: Transaction | Recipe, opts: {
     readonly sender: SuiAddress;
     readonly gasOwner?: SuiAddress;
+    /**
+     * The last epoch the transaction may be valid in: a signer's session
+     * bound (`Signer.maxEpoch`). The default expiration's `maxEpoch` is capped
+     * at it, and a bound already below the current epoch fails the build
+     * before anything resolves.
+     *
+     * @since 0.5.0
+     */
+    readonly maxEpoch?: bigint;
 }) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>
 ```
 
@@ -5428,9 +5584,21 @@ does not show and execution fails on, charging gas.
 
 `Built.gasOwner` is read out of the bytes: it is present whenever the bytes
 name a gas owner other than the sender, whether `opts.gasOwner` or the
-recipe set it.
+recipe set it. So is `Built.gas` (0.5.0): budget, price, payer, payment refs
+and their `source` — `"addressBalance"`, `"coinReservation"` or `"coins"`,
+the `sui.gas_payment` attribute. `Built.simulation` (0.5.0) is the explicit
+simulate above when it ran, which is a simulation of exactly the returned
+bytes; when the SDK's resolver simulated instead (always on gRPC) it
+simulated the transaction before its budget was set, and there is none.
 
-**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the node refused to resolve the transaction, a zero-gas requirement was not met, the payer's address balance cannot cover the budget and withdrawals, coins were chosen under `gasPayment: "requireAddressBalance"`, or an address-balance payment lacks an epoch-bounded expiration or is used with `tx.gas`), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
+**`opts.maxEpoch` keeps the window inside a session** (0.5.0): the default
+expiration's `maxEpoch` is the current epoch plus one or the bound,
+whichever is lower, and a bound below the current epoch fails before
+anything resolves. `Tx.run` passes the signer's (and sponsor's)
+`Signer.maxEpoch` here. A recipe's own expiration is the recipe's choice
+and is not changed.
+
+**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the session bound `opts.maxEpoch` is below the current epoch — its `cause` is the `SigningError { reason: "expired" }` `Tx.run` reports instead, the node refused to resolve the transaction, a zero-gas requirement was not met, the payer's address balance cannot cover the budget and withdrawals, coins were chosen under `gasPayment: "requireAddressBalance"`, or an address-balance payment lacks an epoch-bounded expiration or is used with `tx.gas`), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
 
 ### `chainOf` (const)
 
@@ -5546,13 +5714,25 @@ coin that moved since fails the build rather than folding something else.
 ### `foldCoins` (const)
 
 ```ts
-declare const foldCoins: (opts: {
+declare const foldCoins: <E = never>(opts: {
     readonly signer: Signer;
     /** One coin type to fold; every coin type the signer holds coins of when omitted. */
     readonly coinType?: CoinType;
     /** At most this many coins per transaction: 1 to 500, 500 by default. */
     readonly maxCoinsPerTransaction?: number;
-}) => Effect.Effect<FoldResult, RunError, Sui>
+    /**
+     * A plan from `Tx.planFold`, run as given rather than re-planned.
+     *
+     * @since 0.5.0
+     */
+    readonly plan?: FoldPlan;
+    /**
+     * `Tx.run`'s `approve`, per batch, with the batch it is about to fold.
+     *
+     * @since 0.5.0
+     */
+    readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>;
+}) => Effect.Effect<FoldResult, RunError | E, Sui>
 ```
 
 Folds the signer's coin objects into its address balance: `planFold`
@@ -5569,7 +5749,39 @@ stay executed. Calling it again re-plans from what is left, so it is safe to
 repeat. Dust that cannot pay for its own fold is in `plan.skipped`, and an
 owner with no coins answers an empty plan with nothing executed.
 
-**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` — exactly `run`'s, for the batch that failed.**
+**A previewed plan is run as given** (0.5.0). Pass the `plan` a person was
+shown and it is not re-planned — `coinType` and `maxCoinsPerTransaction` are
+then ignored — so what runs is exactly what was previewed; a coin in it that
+has moved since fails that batch's build with `BuildError`, as any pinned
+input does. A plan for another owner is a `BuildError` before anything
+runs. `approve` is `Tx.run`'s, once per batch, shown the batch beside the
+prepared transaction: `foldMovement` of the two is what the fold
+moves from coins into the balance, which the simulation's balance changes
+alone do not show.
+
+**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` — exactly `run`'s, for the batch that failed — and `E`, whatever `approve` fails with.**
+
+### `foldMovement` (const)
+
+```ts
+declare const foldMovement: (batch: FoldBatch, effects: Simulation | Executed) => FoldMovement
+```
+
+The coin → address-balance movement of one fold, which its balance changes
+do not show: a node nets them per address, so a fold of 1,000 SUI of coins
+reports only the gas (`+3,939,506` MIST on localnet, protocol 139, for five
+faucet coins whose storage rebate beat the gas), and the coins' balances are
+not in the effects at all — the coins are simply deleted, and the deposit is
+an accumulator write with no amount on it. So the movement is computed from
+what is known exactly: the batch's coins were pinned at the versions the plan
+read (`tx.objectRef`), so their balances are the plan's; the effects say
+which of them were consumed; and the owner's net balance change is the rest.
+
+For `simulation` pass `prepared.simulation` (`Tx.prepare(Tx.fold(batch),
+{ sender })`, or what `Tx.foldCoins`' `approve` is shown), or the
+`Executed` the fold produced.
+
+**Never fails.**
 
 ### `fromBytes` (const)
 
@@ -5593,10 +5805,15 @@ chain (the default `ValidDuring` does) must name that one; bytes whose
 expiration names none (`Epoch`, `None`) cannot be checked, and are taken to
 be for this chain.
 
-Unlike `Tx.build`, nothing is simulated: run `sui.simulate(built.bytes)` (or
-a `SubmitConfig.preflight`) before co-signing bytes you did not build.
+`gas` is read out of the bytes too (budget, price, payer, payment and its
+source); there is never a `simulation`.
 
-**Fails with: `BuildError` (the bytes are not a full transaction this SDK can read, name no sender, or are bound to another chain).**
+Unlike `Tx.build`, nothing is simulated: `Tx.prepare(built, { sender })`
+simulates the bytes (with `preflight` and an intent) and shows them to an
+`approve` step, or run `sui.simulate(built.bytes)` before co-signing bytes
+you did not build.
+
+**Fails with: `BuildError` (the bytes are not a full transaction this SDK can read, name no sender or no gas data, or are bound to another chain).**
 
 ### `fromConfig` (const)
 
@@ -6031,10 +6248,61 @@ after the earlier batches covers that estimate, and is `skipped` otherwise.
 Other coin types fold with `gas: "auto"`, after every SUI batch, so the SUI
 just folded pays for them.
 
-Preview a batch with `Tx.build(Tx.fold(batch), { sender })` and then
-`Sui.simulate` of the bytes, with nothing signed.
+Preview a batch with `Tx.prepare(Tx.fold(batch), { sender })`, nothing
+signed, and read what it moves with `foldMovement`; pass the plan
+you previewed to `Tx.foldCoins({ plan, approve })` to run exactly it.
 
 **Fails with: `TransportError`.**
+
+### `prepare` (const)
+
+```ts
+declare const prepare: (input: Transaction | Recipe | Built, opts: {
+    readonly sender: SuiAddress;
+    readonly gasOwner?: SuiAddress;
+    /** What the transaction is declared to do; `verified` is present when given. */
+    readonly intent?: Intent;
+    /** A session bound for what is built here (`Signer.maxEpoch`); see `Tx.build`. Ignored for a `Built`. */
+    readonly maxEpoch?: bigint;
+}) => Effect.Effect<Prepared, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>
+```
+
+Build (or take) a transaction, simulate exactly its bytes, run
+`SubmitConfig.preflight` and, given an intent, `Tx.verify`'s checks — and
+sign nothing. The front half of `Tx.run`, for previews, dry runs, sign-only
+flows and transactions a dapp hands over; the answer is a `Prepared`
+to show a person, then `Tx.sign` (`prepared.verified ?? prepared.built`)
+and `Tx.submit`, `Tx.submitVia`, or another party's co-signature.
+
+**A `Built` is not rebuilt.** Bytes from `Tx.fromBytes` — a dapp's request,
+a sponsor's reply — are what is simulated and what will be signed;
+`opts.sender` must be the sender the bytes name and `opts.gasOwner`, when
+given, their payer, or it fails with `PolicyDenied` (`prepare.sender`,
+`prepare.gasOwner`) before anything is asked of the node. A recipe or a
+`Transaction` goes through `Tx.build` with `sender`, `gasOwner` and
+`maxEpoch`, and when the build already simulated exactly the bytes it
+returned (`built.simulation`), that simulation is the one used.
+
+**One simulate.** On gRPC the build's resolver simulates a pre-budget
+transaction, so a prepare costs that plus one simulate of the final bytes;
+off gRPC with a preset budget the build's own simulate is reused and the
+prepare costs one in all.
+
+**No sender lock**, unlike `Tx.run`: the answer is a value that may wait for
+a person, a second device or a sponsor for as long as it likes, and a lock
+held across that would stall every other transaction from the account. The
+cost is the one `Tx.build` already documents — two prepares from one sender
+can resolve the same gas coin or owned object, and the second to land fails
+— so a flow that signs straight after approval uses `Tx.run({ approve })`,
+which runs this same front half under the lock exactly when the bytes pin.
+
+**`Gate.requireIntent` does not apply**: it binds `Tx.run`, the call that
+signs. A prepare without an intent is how a wallet first sees a dapp's
+effects, to render them (`Intent.fromSimulation`) and ask; give the intent
+then — here, to `Tx.verify`, or to `Tx.run` — and `verified` is what gets
+signed.
+
+**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied` (the gas ceiling, `preflight`, the intent's rules, `prepare.sender`, `prepare.gasOwner`), `TransportError`.**
 
 ### `reconcile` (const)
 
@@ -6247,7 +6515,7 @@ reconciling a bare digest), there is nothing to send and this is `reconcile`.
 ### `run` (const)
 
 ```ts
-declare const run: (recipe: Transaction | Recipe, opts: {
+declare const run: <E = never>(recipe: Transaction | Recipe, opts: {
     readonly signer: Signer;
     readonly gasOwner?: SuiAddress;
     /**
@@ -6286,7 +6554,22 @@ declare const run: (recipe: Transaction | Recipe, opts: {
      * @since 0.5.0
      */
     readonly intent?: Intent;
-}) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>
+    /**
+     * Shown the `Prepared` transaction — the built bytes with their gas,
+     * the simulation of exactly those bytes, the verified intent — **after**
+     * `preflight` and the intent checks and **before the first signature**.
+     * Succeeding approves; failing refuses with the caller's own error (a
+     * wallet's `UserRejected`), which `Tx.run` fails with, nothing signed and
+     * nothing journalled. It runs where signing runs: under the sender lock
+     * when the bytes pin something, after it is released when they do not,
+     * so a person taking their time never holds an address-balance account's
+     * lock. Giving it always costs the simulate it is shown (the build's own,
+     * when the build made one of exactly these bytes).
+     *
+     * @since 0.5.0
+     */
+    readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
+}) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError | E, Sui>
 ```
 
 Build, preflight, sign and submit, under the sender lock wherever two runs
@@ -6378,7 +6661,21 @@ hand. Pass `onSigned` instead: it runs inside the sender lock, after the last
 signature and before `Tx.submit`'s first `executeTransaction`, and failing it
 fails the run with nothing sent.
 
-**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`).**
+**`approve` is the person in the loop** (0.5.0). After `preflight` and the
+intent, before the first signature, `approve` is shown the `Prepared`
+transaction — the same thing `prepare` answers — and refuses by
+failing with its own error, which is then `Tx.run`'s: nothing is signed,
+`onSigned` does not run and nothing is journalled. It runs under the lock
+exactly when signing does. A sponsored run approves too: `built.gasOwner`
+and `built.gas.owner` name the sponsor.
+
+**The session bound** (0.5.0). A signer with a `maxEpoch` (a zkLogin
+session) — and a sponsor with one — bounds the window the build sets:
+`Tx.build`'s `maxEpoch` is the earlier of the two, and a bound already below
+the current epoch fails with `SigningError { reason: "expired" }` before
+anything resolves.
+
+**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`), and `E` — whatever `approve` fails with.**
 
 ### `sendFunds` (const)
 
@@ -7495,7 +7792,8 @@ export interface FakeChange {
     /**
      * The owner going **in**, for a transaction that moved the object: a transfer
      * is `inputOwner` the sender and `owner` the recipient, which is what
-     * `checkClaims` reads. Defaults to `owner`, an object that stayed put.
+     * `checkClaims` and `transferred()` (on `Simulation` and `Executed`) read.
+     * Defaults to `owner`, an object that stayed put.
      *
      * @since 0.5.0
      */
@@ -7605,6 +7903,21 @@ export interface FakeObject {
      * node that will not say, which is evidence of nothing.
      */
     readonly previousTransaction?: string;
+    /**
+     * The node's JSON rendering of the content, served when the caller includes
+     * `json` (`null` when this is left out, as a node with nothing to render
+     * answers).
+     *
+     * @since 0.5.0
+     */
+    readonly json?: Record<string, unknown>;
+    /**
+     * The Display output, served when the caller includes `display` (`null` when
+     * this is left out: the type has no Display template).
+     *
+     * @since 0.5.0
+     */
+    readonly display?: SuiClientTypes.Display;
 }
 ```
 

@@ -14,7 +14,9 @@
 import type { Transaction } from "@mysten/sui/transactions"
 import { normalizeStructTag } from "@mysten/sui/utils"
 import { Effect, Stream } from "effect"
+import { typeMatches } from "../domain/bcs.ts"
 import type { TransportError } from "../domain/errors.ts"
+import type { Executed, Simulation } from "../domain/executed.ts"
 import type { Coin, SuiAddress } from "../domain/schemas.ts"
 import { CoinType } from "../domain/schemas.ts"
 import type { Recipe } from "./Sui.ts"
@@ -133,8 +135,9 @@ const sumOf = (coins: ReadonlyArray<Coin>): bigint => coins.reduce((total, coin)
  * Other coin types fold with `gas: "auto"`, after every SUI batch, so the SUI
  * just folded pays for them.
  *
- * Preview a batch with `Tx.build(Tx.fold(batch), { sender })` and then
- * `Sui.simulate` of the bytes, with nothing signed.
+ * Preview a batch with `Tx.prepare(Tx.fold(batch), { sender })`, nothing
+ * signed, and read what it moves with {@link foldMovement}; pass the plan
+ * you previewed to `Tx.foldCoins({ plan, approve })` to run exactly it.
  *
  * Fails with: `TransportError`.
  *
@@ -298,4 +301,98 @@ export const sendFunds = (opts: {
       tx.pure.address(opts.recipient)
     ]
   })
+}
+
+/**
+ * What one fold moves, read off its simulation (or its execution):
+ * `consumed`, the batch's coins the effects delete, with the balances the plan
+ * read them at; `fromCoins`, their total; `toAddressBalance`, what the owner's
+ * address balance of the coin type gains; and `netChange`, the owner's net
+ * balance change, which is all `balanceChanges` reports.
+ *
+ * @since 0.5.0
+ */
+export interface FoldMovement {
+  readonly owner: SuiAddress
+  readonly coinType: CoinType
+  /** The batch's coins this fold consumes, at the versions and balances the plan read. */
+  readonly consumed: ReadonlyArray<Coin>
+  /** The batch's coins the effects do **not** consume. Empty for a fold that does what it says. */
+  readonly missing: ReadonlyArray<Coin>
+  /** The total of `consumed`, in the coin type's smallest unit. */
+  readonly fromCoins: bigint
+  /**
+   * What the owner's address balance of this coin type gains: `netChange +
+   * fromCoins`. For a SUI batch paying for itself, the coins less the net gas
+   * (more than the coins when the storage rebates exceed the gas).
+   */
+  readonly toAddressBalance: bigint
+  /** The owner's net balance change for the coin type, coins and balance together. */
+  readonly netChange: bigint
+  /**
+   * Whether `toAddressBalance` is exact: every coin of the batch is consumed,
+   * and the owner ends up with no coin object of this type created or
+   * mutated, so nothing but the address balance can hold the difference.
+   */
+  readonly exact: boolean
+}
+
+/**
+ * The coin → address-balance movement of one fold, which its balance changes
+ * do not show: a node nets them per address, so a fold of 1,000 SUI of coins
+ * reports only the gas (`+3,939,506` MIST on localnet, protocol 139, for five
+ * faucet coins whose storage rebate beat the gas), and the coins' balances are
+ * not in the effects at all — the coins are simply deleted, and the deposit is
+ * an accumulator write with no amount on it. So the movement is computed from
+ * what is known exactly: the batch's coins were pinned at the versions the plan
+ * read (`tx.objectRef`), so their balances are the plan's; the effects say
+ * which of them were consumed; and the owner's net balance change is the rest.
+ *
+ * For `simulation` pass `prepared.simulation` (`Tx.prepare(Tx.fold(batch),
+ * { sender })`, or what `Tx.foldCoins`' `approve` is shown), or the
+ * `Executed` the fold produced. Never fails.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { Tx, type Signer } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const signer: Signer
+ *
+ * const program = Effect.gen(function*() {
+ *   const plan = yield* Tx.planFold({ owner: signer.address })
+ *   return yield* Tx.foldCoins({
+ *     signer,
+ *     plan,
+ *     approve: (prepared, batch) => {
+ *       const moved = Tx.foldMovement(batch, prepared.simulation)
+ *       return Effect.log(`${moved.consumed.length} coins, +${moved.toAddressBalance} into the balance`)
+ *     }
+ *   })
+ * })
+ * ```
+ */
+export const foldMovement = (batch: FoldBatch, effects: Simulation | Executed): FoldMovement => {
+  const gone = new Set(effects.deleted().map((ref) => ref.id as string))
+  const consumed = batch.coins.filter((coin) => gone.has(coin.objectId))
+  const missing = batch.coins.filter((coin) => !gone.has(coin.objectId))
+  const fromCoins = sumOf(consumed)
+  const netChange = effects.balanceChange(batch.owner, batch.coinType)
+  const coinOfType = `0x2::coin::Coin<${batch.coinType}>`
+  const ownsCoin = (ref: { readonly type?: string; readonly owner?: { readonly $kind: string; readonly AddressOwner?: string } }) =>
+    ref.type !== undefined && typeMatches(coinOfType, ref.type) &&
+    ref.owner?.$kind === "AddressOwner" && ref.owner.AddressOwner === batch.owner
+  const kept = [...effects.created(), ...effects.mutated()].some(ownsCoin)
+  return {
+    owner: batch.owner,
+    coinType: batch.coinType,
+    consumed,
+    missing,
+    fromCoins,
+    toAddressBalance: netChange + fromCoins,
+    netChange,
+    exact: missing.length === 0 && !kept
+  }
 }

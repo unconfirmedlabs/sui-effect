@@ -47,7 +47,6 @@ export {
 export {
   Balance,
   BalanceChange,
-  Built,
   ChangedObject,
   CleverError,
   Coin,
@@ -80,7 +79,6 @@ export {
   Owner,
   Signature,
   SignedTransaction,
-  Simulation,
   StructTag,
   SuiAddress,
   type SuiObject,
@@ -98,8 +96,13 @@ export {
   objectRefOf,
   type Published,
   type SdkObjectRef,
-  sdkRefOf
+  sdkRefOf,
+  Simulation,
+  type TransferredRef
 } from "./domain/executed.ts"
+
+/** A built transaction and what the build learned about it (0.5.0: its own module). */
+export { Built, BuiltGas, GasPaymentRef, GasPaymentSource } from "./domain/built.ts"
 
 /** The opinionated tier. */
 export {

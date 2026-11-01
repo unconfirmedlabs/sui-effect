@@ -8,7 +8,8 @@ import { HttpClient, HttpClientResponse } from "effect/http"
 import { TransportError } from "../src/domain/errors.ts"
 import type { Screening } from "../src/domain/intent.ts"
 import { checkClaims, describeEffects, Intent, Verified } from "../src/domain/intent.ts"
-import { CoinType, Digest, Mist, ObjectId, type Simulation, SuiAddress } from "../src/domain/schemas.ts"
+import { Simulation } from "../src/domain/executed.ts"
+import { CoinType, Digest, Mist, ObjectId, SuiAddress } from "../src/domain/schemas.ts"
 import type { GateService, ScreenRequest } from "../src/services/Gate.ts"
 import { Gate } from "../src/services/Gate.ts"
 import { layerJev } from "../src/services/GateJev.ts"
@@ -465,7 +466,7 @@ const paymentOf = (bytes: Uint8Array) => TransactionDataBuilder.fromBytes(bytes)
 /** A bare simulation with only balance changes, for the pure checks. */
 const fakeSimulation = (
   changes: ReadonlyArray<{ readonly coinType: string; readonly address: string; readonly amount: bigint }>
-): Simulation => ({
+): Simulation => new Simulation({
   digest: Digest.make("11111111111111111111111111111111"),
   effects: {
     version: 2,

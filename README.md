@@ -265,6 +265,27 @@ the run with nothing sent; its error is `JournalError`, which is already in
 `Tx.run`'s union and already means "the record could not be written and nothing
 has gone out".
 
+**Prepare, approve, then sign** (0.5.0). `Tx.prepare(recipeOrBuilt, { sender, intent? })`
+is `Tx.run`'s front half without the signature: it builds (or, for bytes from
+`Tx.fromBytes`, takes them as they are), simulates exactly those bytes, runs
+`preflight` and the intent, and answers `{ built, simulation, verified? }` —
+`built.gas` for the fee line (budget, price, payer, and whether it is paid from
+the address balance, a coin reservation or coins), `simulation.created()`,
+`transferred()`, `balanceChange(...)` for the rest, the same accessors an
+`Executed` has. A wallet that signs straight after asking passes
+`approve` to `Tx.run` instead: it is shown the same value after the checks and
+before the first signature, refuses by failing with its own error (nothing
+signed, nothing journalled), and runs under the sender lock only when the bytes
+pin something. A signer with a session bound (`Signer.maxEpoch`) keeps the
+build's window inside it.
+
+```ts
+const executed = yield* Tx.run(recipe, {
+  signer,
+  approve: (prepared) => askThePerson(prepared) // Effect<void, UserRejected>
+})
+```
+
 **`Tx.submitVia(signed, send)` is the lifecycle when someone else submits.** A
 relay or a sponsorship service that holds the only key allowed to talk to the
 node gets the bytes from you; this keeps everything around that. It journals
@@ -435,7 +456,11 @@ payment takes at most 256), SUI first, and `skipped`, SUI dust worth less than
 the cost of folding it. `Tx.fold(batch)` is one batch's recipe, and
 `Tx.foldCoins({ signer })` plans for `signer.address` and runs every batch
 through `Tx.run`, answering `{ plan, executed }`; it stops at the first batch
-that fails, and calling it again re-plans from what is left.
+that fails, and calling it again re-plans from what is left. Given the `plan` a
+person previewed (0.5.0), it runs that plan as is and calls `approve(prepared,
+batch)` per batch; `Tx.foldMovement(batch, prepared.simulation)` is what the
+fold moves from coins into the balance, which its balance changes — the net
+gas only — do not show.
 
 **SUI pays for its own fold**, so a coin-only account needs nothing first: the
 batch is the gas payment and `0x2::coin::send_funds<SUI>` deposits the whole

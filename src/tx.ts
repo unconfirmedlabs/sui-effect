@@ -62,7 +62,7 @@ export {
   Verified
 } from "./domain/intent.ts"
 
-/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, verify, reconcile, resubmit, run, foldCoins. */
+/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, verify, prepare, reconcile, resubmit, run, foldCoins. */
 export {
   attach,
   build,
@@ -72,6 +72,8 @@ export {
   type Built,
   foldCoins,
   type FoldResult,
+  type Prepared,
+  prepare,
   Reconciled,
   type ReconcileInput,
   type RunError,
@@ -93,7 +95,16 @@ export {
 } from "./services/Tx.ts"
 
 /** Folding coins into the address balance, and sending into one. */
-export { fold, type FoldBatch, type FoldGas, type FoldPlan, planFold, sendFunds } from "./services/Fold.ts"
+export {
+  fold,
+  type FoldBatch,
+  type FoldGas,
+  foldMovement,
+  type FoldMovement,
+  type FoldPlan,
+  planFold,
+  sendFunds
+} from "./services/Fold.ts"
 
 /** The expiration union and the bounds `Tx.reconcile` reasons about. */
 export {
