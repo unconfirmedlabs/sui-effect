@@ -413,3 +413,38 @@ describe("Keystore: iteration bounds agree between seal and open (0.5.0)", () =>
     await verifies(result.signer, result.address)
   })
 })
+
+describe("Keystore: derived key material is zeroed (0.5.0)", () => {
+  test("the AES key half of the PBKDF2 output is zeroed once the key is imported", async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, "crypto")
+    const real = globalThis.crypto
+    const aesKeyData: Array<Uint8Array> = []
+    const subtle = {
+      importKey: (...args: Parameters<SubtleCrypto["importKey"]>) => {
+        const [format, data, algorithm] = args
+        if (format === "raw" && algorithm === "AES-GCM" && data instanceof Uint8Array) aesKeyData.push(data)
+        return real.subtle.importKey(...args)
+      },
+      deriveBits: real.subtle.deriveBits.bind(real.subtle),
+      digest: real.subtle.digest.bind(real.subtle),
+      decrypt: real.subtle.decrypt.bind(real.subtle),
+      encrypt: real.subtle.encrypt.bind(real.subtle)
+    }
+    Object.defineProperty(globalThis, "crypto", {
+      value: { subtle, getRandomValues: real.getRandomValues.bind(real) },
+      configurable: true,
+      writable: true
+    })
+    try {
+      await run(Effect.gen(function*() {
+        const keystore = yield* Keystore
+        const account = yield* keystore.importSecretKey(new Uint8Array(32).fill(9), password)
+        yield* keystore.unlock(account.address, password)
+      }))
+    } finally {
+      if (original !== undefined) Object.defineProperty(globalThis, "crypto", original)
+    }
+    expect(aesKeyData).toHaveLength(2)
+    for (const data of aesKeyData) expect(data.every((byte) => byte === 0)).toBe(true)
+  })
+})

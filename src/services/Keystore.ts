@@ -353,7 +353,9 @@ const derive = (
         bits = new Uint8Array(
           await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations, hash: "SHA-256" }, base, 512)
         )
-        const key = await crypto.subtle.importKey("raw", bits.slice(0, 32), "AES-GCM", false, ["encrypt", "decrypt"])
+        // A view, not a copy: `importKey` copies the key data, and `bits` is
+        // zeroed below, so no copy of the AES key half outlives this call.
+        const key = await crypto.subtle.importKey("raw", bits.subarray(0, 32), "AES-GCM", false, ["encrypt", "decrypt"])
         const checkInput = new Uint8Array(CHECK_DOMAIN.length + 32)
         checkInput.set(utf8(CHECK_DOMAIN))
         checkInput.set(bits.subarray(32), CHECK_DOMAIN.length)
