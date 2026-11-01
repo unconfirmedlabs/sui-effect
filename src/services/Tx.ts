@@ -1083,15 +1083,7 @@ export const build = Effect.fn("Tx.build")(function*(
   const data = dataOfBytes(bytes)
   const budget = Option.getOrUndefined(Option.map(data, gasBudgetOf))
   if (budget !== undefined) yield* Effect.annotateCurrentSpan({ "sui.gas_budget": Number(budget) })
-  if (budget !== undefined && budget > config.maxGasBudget) {
-    // A configured limit refusing the transaction before it is signed is what
-    // `PolicyDenied` means; a `BuildError` whose cause was a bare `2988000n`
-    // told a sponsor nothing it could act on.
-    return yield* new PolicyDenied({
-      rule: "maxGasBudget",
-      message: `the gas budget ${budget} MIST exceeds SubmitConfig.maxGasBudget ${config.maxGasBudget} MIST`
-    })
-  }
+  yield* gasCeiling(budget, config)
 
   const gasOwner = Option.match(data, {
     // Bytes this version cannot read keep what the caller said.
@@ -1206,6 +1198,30 @@ export const build = Effect.fn("Tx.build")(function*(
     ...(simulation === undefined ? {} : { simulation })
   }
 })
+
+/**
+ * `SubmitConfig.maxGasBudget` over a budget the bytes carry. A configured
+ * limit refusing the transaction before it is signed is what `PolicyDenied`
+ * means; a `BuildError` whose cause was a bare `2988000n` told a sponsor
+ * nothing it could act on. Applied by `Tx.build` and, for bytes it did not
+ * build, by `Tx.prepare` and `Tx.verify`: the intent checks treat gas as
+ * bounded by this ceiling. Internal.
+ *
+ * Fails with: `PolicyDenied` (`maxGasBudget`).
+ */
+const gasCeiling = (budget: bigint | undefined, config: SubmitConfigService): Effect.Effect<void, PolicyDenied> =>
+  budget !== undefined && budget > config.maxGasBudget
+    ? Effect.fail(
+      new PolicyDenied({
+        rule: "maxGasBudget",
+        message: `the gas budget ${budget} MIST exceeds SubmitConfig.maxGasBudget ${config.maxGasBudget} MIST`
+      })
+    )
+    : Effect.void
+
+/** {@link gasCeiling} over the budget `bytes` carry; bytes with none, or unreadable, pass. */
+const gasCeilingOfBytes = (bytes: Uint8Array, config: SubmitConfigService): Effect.Effect<void, PolicyDenied> =>
+  gasCeiling(Option.getOrUndefined(Option.flatMap(dataOfBytes(bytes), (data) => Option.fromUndefinedOr(gasBudgetOf(data)))), config)
 
 /**
  * The simulations `Tx.build` made of exactly the bytes it returned, by
@@ -3234,6 +3250,9 @@ const prepareBuilt = Effect.fnUntraced(function*(
   intent: Intent | undefined
 ): Effect.fn.Return<Prepared, PolicyDenied | SimulationFailed | BuildError | TransportError, Sui> {
   const config = yield* SubmitConfig
+  // Before the simulate: bytes from elsewhere were never through `Tx.build`'s
+  // ceiling, and the claims below do not count gas.
+  yield* gasCeilingOfBytes(built.bytes, config)
   const simulation = yield* simulateBuilt(built)
   if (config.preflight !== undefined) yield* config.preflight(simulation)
   const verified = intent === undefined ? undefined : yield* verifyAgainst(built, intent, simulation)
@@ -3411,8 +3430,12 @@ export const prepare = Effect.fn("Tx.prepare")(function*(
  * randomness can behave differently when the bytes land. The claims bound what
  * was simulated, not what will execute.
  *
+ * Gas is not counted because it is bounded: bytes whose budget is over
+ * `SubmitConfig.maxGasBudget` are refused (`maxGasBudget`) before the
+ * simulate, as `Tx.build` refuses them, whoever built them.
+ *
  * Every refusal is a `PolicyDenied` whose `rule` says which check:
- * `intent.invalid`, `intent.outflow`, `intent.recipient`, `intent.object`,
+ * `maxGasBudget`, `intent.invalid`, `intent.outflow`, `intent.recipient`, `intent.object`,
  * `gate.unavailable`, `intent.injection`, `intent.vague`, `intent.effect`,
  * `intent.claim`.
  *
@@ -3447,6 +3470,7 @@ export const verify = Effect.fn("Tx.verify")(function*(
   intent: Intent
 ): Effect.fn.Return<Verified, PolicyDenied | SimulationFailed | BuildError | TransportError, Sui> {
   yield* Effect.annotateCurrentSpan({ "sui.digest": built.digest })
+  yield* gasCeilingOfBytes(built.bytes, yield* SubmitConfig)
   return yield* verifyAgainst(built, intent, yield* simulateBuilt(built))
 })
 

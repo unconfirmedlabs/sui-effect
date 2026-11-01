@@ -8,8 +8,10 @@ import type { Transaction } from "@mysten/sui/transactions"
 import { Effect, Layer } from "effect"
 import { TestClock } from "effect/testing"
 import { PolicyDenied } from "../src/domain/errors.ts"
-import { CoinType, SuiAddress } from "../src/domain/schemas.ts"
+import { CoinType, Mist, SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
+import { SubmitConfig } from "../src/services/SubmitConfig.ts"
+import { verifySponsored } from "../src/tx.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
 import type { Sui } from "../src/services/Sui.ts"
 import { FakeOutcome, type FakeScript, type SuiCoreFake } from "../src/services/SuiCoreFake.ts"
@@ -140,5 +142,54 @@ describe("Tx.foldCoins refuses a plan whose batch names another owner", () => {
     )
     expect(error).toBeInstanceOf(BuildError)
     expect(executes).toBe(0)
+  })
+})
+
+describe("handed-over bytes: the gas ceiling and the sponsorship check read the bytes", () => {
+  const script: FakeScript = {
+    chainId: CHAIN_ID,
+    objects: [],
+    coins: [],
+    balances: [funded(SENDER), funded(other.address)],
+    simulate: [FakeOutcome.succeed()],
+    execute: [FakeOutcome.succeed()]
+  }
+  /** Bytes somebody else built with a 5,000,000 MIST budget. */
+  const handedOver = Effect.flatMap(
+    Tx.build(send(1n), { sender: SENDER }),
+    (built) => Tx.fromBytes(built.bytes)
+  )
+  const ceiling = SubmitConfig.with({ maxGasBudget: Mist.make(1_000_000n) })
+
+  test("Tx.prepare of a Built over SubmitConfig.maxGasBudget is refused before it is simulated", async () => {
+    const error = await run(
+      Effect.flatMap(handedOver, (built) => Effect.flip(ceiling(Tx.prepare(built, { sender: SENDER })))),
+      script
+    )
+    expect(error).toBeInstanceOf(PolicyDenied)
+    expect((error as PolicyDenied).rule).toBe("maxGasBudget")
+  })
+
+  test("Tx.verify of a Built over SubmitConfig.maxGasBudget is refused", async () => {
+    const error = await run(
+      Effect.flatMap(handedOver, (built) =>
+        Effect.flip(ceiling(Tx.verify(built, {
+          summary: "Send one MIST.",
+          author: "dapp",
+          claims: { outflows: [{ coinType: CoinType.SUI, max: 1n }], recipients: [THIEF], objects: [] }
+        })))),
+      script
+    )
+    expect((error as PolicyDenied).rule).toBe("maxGasBudget")
+  })
+
+  test("verifySponsored refuses bytes the sender pays for, whatever the Built's gasOwner field says", async () => {
+    const error = await run(
+      Effect.flatMap(handedOver, (built) =>
+        Effect.flip(verifySponsored({ ...built, gasOwner: other.address }, { sender: SENDER }))),
+      script
+    )
+    expect(error).toBeInstanceOf(PolicyDenied)
+    expect((error as PolicyDenied).rule).toBe("sponsored.gasOwner")
   })
 })

@@ -17,6 +17,14 @@ const kindOf = (build: () => TransactionDataBuilder): Uint8Array | undefined => 
   }
 }
 
+const dataOf = (bytes: Uint8Array): TransactionDataBuilder | undefined => {
+  try {
+    return TransactionDataBuilder.fromBytes(bytes)
+  } catch {
+    return undefined
+  }
+}
+
 const sameBytes = (left: Uint8Array, right: Uint8Array): boolean =>
   left.length === right.length && left.every((byte, index) => byte === right[index])
 
@@ -53,13 +61,23 @@ export const verifySponsored = Effect.fn("Tx.verifySponsored")(function*(
   }
 ): Effect.fn.Return<Built, PolicyDenied> {
   const sender = normalizeSuiAddress(expect.sender)
-  if (normalizeSuiAddress(built.sender) !== sender) {
+  // Read out of the bytes, never off the value: `built.sender` and
+  // `built.gasOwner` are fields, and a value spread or decoded from somewhere
+  // else can name a sponsor the bytes do not, leaving the sender paying.
+  const data = dataOf(built.bytes)
+  const named = data === undefined || typeof data.sender !== "string" || data.sender.length === 0
+    ? undefined
+    : normalizeSuiAddress(data.sender)
+  if (named !== sender) {
     return yield* new PolicyDenied({
       rule: "sponsored.sender",
-      message: `the sponsored bytes name sender ${built.sender}, not ${sender}`
+      message: named === undefined
+        ? "the sponsored bytes are not a transaction this SDK can read"
+        : `the sponsored bytes name sender ${named}, not ${sender}`
     })
   }
-  const gasOwner = built.gasOwner === undefined ? undefined : normalizeSuiAddress(built.gasOwner)
+  const owner = data?.gasData.owner
+  const gasOwner = typeof owner === "string" && owner.length > 0 ? normalizeSuiAddress(owner) : undefined
   if (gasOwner === undefined || gasOwner === sender) {
     return yield* new PolicyDenied({
       rule: "sponsored.gasOwner",
