@@ -247,6 +247,9 @@ export const wipeHeldKey = (held: HeldKey): void => {
 
 const decodeSignature = Schema.decodeUnknownEffect(Signature)
 
+/** The rejection a locked signer's sign thunk answers, told apart from the SDK's own. */
+const LOCKED: unique symbol = Symbol("sui-effect/locked")
+
 const lockedError = () =>
   new SigningError({
     cause: "this signer is locked: its secret was dropped; open the account again for a new signer",
@@ -264,24 +267,28 @@ export const lockable = (held: HeldKey): LockableSigner => {
   const withKey = (
     sign: (keypair: Keypair) => Promise<{ readonly signature: string }>
   ): Effect.Effect<Signature, SigningError> =>
-    Effect.suspend(() => {
-      const key = current
-      if (key === undefined) return Effect.fail(lockedError())
-      return Effect.tryPromise({
-        // The SDK signs synchronously inside this call, before its first
-        // `await`; a `lock` (an `Effect.sync`) cannot land mid-signature.
-        try: () => sign(key.keypair),
-        catch: (cause) => new SigningError({ cause })
-      }).pipe(
-        Effect.flatMap((result) =>
-          decodeSignature(result.signature).pipe(
-            Effect.mapError((issue) =>
-              new SigningError({ cause: `the signer returned a signature this version cannot read: ${issue.message}` })
-            )
+    Effect.tryPromise({
+      // `current` is read and the SDK call started in this one synchronous
+      // thunk, so no fiber (no `lock`) can run between them. Every SDK keypair
+      // computes its signature synchronously inside the call, before its first
+      // `await` (`signWithIntent` hashes, then evaluates `this.sign(digest)`,
+      // whose body is one synchronous noble call), so a `lock` lands either
+      // before this thunk, and the answer is `locked`, or after the signature
+      // by the real key already exists.
+      try: () => {
+        const key = current
+        return key === undefined ? Promise.reject(LOCKED) : sign(key.keypair)
+      },
+      catch: (cause) => (cause === LOCKED ? lockedError() : new SigningError({ cause }))
+    }).pipe(
+      Effect.flatMap((result) =>
+        decodeSignature(result.signature).pipe(
+          Effect.mapError((issue) =>
+            new SigningError({ cause: `the signer returned a signature this version cannot read: ${issue.message}` })
           )
         )
       )
-    })
+    )
   return {
     address,
     scheme,

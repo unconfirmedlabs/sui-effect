@@ -6,7 +6,7 @@ import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
 import { verifyPersonalMessageSignature } from "@mysten/sui/verify"
 import { validateMnemonic } from "@scure/bip39"
 import { wordlist } from "@scure/bip39/wordlists/english.js"
-import { Effect, Exit, Redacted } from "effect"
+import { Effect, Exit, Fiber, Redacted, Scheduler } from "effect"
 import { SigningError, SuiError } from "../src/domain/errors.ts"
 import { KeyError } from "../src/domain/keys.ts"
 import { SuiAddress } from "../src/domain/schemas.ts"
@@ -228,6 +228,34 @@ describe("LockableSigner", () => {
       // The SDK's own buffer (reached the same structural way the wipe does).
       const inner = Reflect.get(Reflect.get(held.keypair, "keypair"), "secretKey") as Uint8Array
       expect(inner.every((byte) => byte === 0)).toBe(true)
+    })
+  }
+
+  for (const scheme of ["ED25519", "Secp256k1", "Secp256r1"] as const) {
+    test(`a ${scheme} lock racing a signature answers the real key's signature or locked, nothing else`, async () => {
+      const seed = new Uint8Array(32).fill(9)
+      const expected = holdKey(scheme, seed).keypair.toSuiAddress()
+      // Every interleaving the scheduler can produce: yield before the lock 0..n times.
+      for (const yields of [0, 1, 2, 3, 4, 5, 6, 8]) {
+        const exit = await Effect.runPromise(Effect.gen(function*() {
+          const signer = yield* Signer.fromSecretKey(Uint8Array.from(seed), { scheme })
+          const fiber = yield* Effect.forkChild(Effect.exit(signer.signPersonalMessage(message)))
+          for (let i = 0; i < yields; i++) yield* Effect.yieldNow
+          yield* signer.lock
+          return yield* Fiber.join(fiber)
+        }).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 5)))
+        if (Exit.isSuccess(exit)) {
+          const publicKey = await verifyPersonalMessageSignature(message, exit.value)
+          expect(publicKey.toSuiAddress()).toBe(expected)
+        } else {
+          const reason = exit.cause.reasons[0]
+          expect(reason?._tag).toBe("Fail")
+          if (reason?._tag === "Fail") {
+            expect(reason.error).toBeInstanceOf(SigningError)
+            expect(reason.error.reason).toBe("locked")
+          }
+        }
+      }
     })
   }
 
