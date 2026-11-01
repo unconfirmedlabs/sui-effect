@@ -81,6 +81,38 @@ export const pay = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
   )
 ```
 
+Fold coin objects into the address balance, once per coin-funded account:
+
+```ts
+// Fold an account's coin objects into its address balance once, so later transactions pay gas
+// from the balance and pin nothing. SUI pays for its own fold: a coin-only account (a localnet
+// faucet's) needs no balance first. Safe to repeat: each call re-plans from what is left.
+import { Effect } from "effect"
+import { Sui } from "@unconfirmed/sui-effect"
+import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+// Reads only: what a fold would do, each batch built and simulated, nothing signed.
+export const previewFold = (signer: Signer) =>
+  Effect.gen(function*() {
+    const sui = yield* Sui
+    const plan = yield* Tx.planFold({ owner: signer.address })
+    for (const batch of plan.batches) {
+      const built = yield* Tx.build(Tx.fold(batch), { sender: signer.address })
+      yield* sui.simulate(built.bytes)
+    }
+    return plan
+  })
+
+export const foldAll = (signer: Signer) =>
+  Tx.foldCoins({ signer }).pipe(
+    Effect.map(({ executed, plan }) => ({
+      digests: executed.map((run) => run.digest),
+      // SUI dust worth less than the gas of folding it, with no balance to pay for it either.
+      dust: plan.skipped.length
+    }))
+  )
+```
+
 The explicit lifecycle, for a sponsored transaction, and the coin-paid alternative:
 
 ```ts
@@ -411,7 +443,7 @@ test("a counter the fake serves decodes, and a missing one is None", async () =>
 ## Gas and the address balance
 
 - **Gas comes from the payer's SUI address balance by default** (`SubmitConfig.gasPayment: "preferAddressBalance"`): the resolver pays from it when it covers the budget and the transaction does not use `tx.gas`, and from coins otherwise. The `Tx.build` span attribute `sui.gas_payment` names the choice (`addressBalance`, `coinReservation`, `coins`). `"requireAddressBalance"` makes coins a `BuildError`.
-- **Bytes that pin nothing do not hold the sender lock past their build.** Under `lockSender: "whenPinned"` (the default) `Tx.run` locks every build, and keeps the lock through submit only when the bytes pin an owned input or a gas coin. Lock-free runs can together overdraw a balance (the overdrawing one is `ExecutionFailed`, `InsufficientFundsForWithdraw`, no gas charged): a spend-to-zero flow sets `lockSender: "always"`.
+- **Bytes that pin nothing do not hold the sender lock past their build.** Under `lockSender: "whenPinned"` (the default) `Tx.run` locks every build, and keeps the lock through submit only when the bytes pin an owned input, a gas coin or a coin reservation (what a `tx.gas` user paying from a balance gets: it reserves the whole balance, so such a run also waits for the lock-free runs in flight before it builds). Lock-free runs can together overdraw a balance, budgets counted in full (refused at submission when the shortfall is already there; otherwise the overdrawing one is `ExecutionFailed`, `InsufficientFundsForWithdraw`, no gas charged): a spend-to-zero flow sets `lockSender: "always"`.
 - **Fold coins into the balance** with `Tx.foldCoins({ signer })`: `Tx.planFold` (reads only) then one `Tx.run(Tx.fold(batch))` per batch, SUI first. SUI pays for its own fold, so a coin-only account needs nothing first. Preview a batch with `Tx.build(Tx.fold(batch), { sender })` and `sui.simulate(built.bytes)`. The localnet faucet (V2) pays coins, so fold first; the devnet/testnet faucet (V3) pays the balance.
 - **Transfer into a balance** with `Tx.sendFunds({ coinType?, amount, recipient })` (`balance::send_funds`; keep `useGasCoin` at its default `true`, `false` under `Tx.sponsored`). In your own recipes prefer `tx.coin({ balance })` / `tx.balance(...)` to `tx.splitCoins(tx.gas, ...)`, which pays gas with a coin.
 - Address-balance gas is checked before signing: an explicit empty payment needs the budget plus the payer's SUI withdrawals in the balance, and with no owned input a `ValidDuring` expiration (the default), and must not use `tx.gas` (its coin is empty: the simulate passes, execution fails and charges gas); each miss is a `BuildError`. A sponsored recipe uses `tx.coin({ balance, useGasCoin: false })` / `Tx.sendFunds({ ..., useGasCoin: false })`, never `tx.splitCoins(tx.gas, ...)`.
@@ -432,7 +464,7 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 | `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, and the gas ceiling as `rule: "maxGasBudget"`); the journal write before the first send |
 | `GraphQLUnavailable` / `ExtensionNotReady` | `not_applied` | 4 | No usable GraphQL endpoint; a synchronous Promise-face member called before its runtime existed |
 | `NotApplied` | `not_applied` | 4 | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
-| `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged |
+| `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged (none for `InsufficientFundsForWithdraw`, an overdrawn balance) |
 | `UnexpectedEffects` | `applied` | 5 | It ran; the effects lack what the caller expected (`expectCreated`) |
 | `SubmissionUnknown` | `unknown` | 3 | Bytes may have been sent; the outcome is unknown. Carries the signed bytes |
 | anything else, with no `outcome` field | `unknown` | 1 | Unclassified; declare `outcome` on every extension error |
@@ -467,7 +499,7 @@ layer option (30 s; `SUI_RPC_TIMEOUT` for `layerConfig`).
 | `validFor` | unset | An extra wall-clock bound; no Sui network accepts one yet |
 | `maxGasBudget` | 50 SUI | The ceiling above which `Tx.build` fails with `PolicyDenied { rule: "maxGasBudget" }` |
 | `preflight` | unset | `(simulation) => Effect<void, PolicyDenied>`, run before signing |
-| `lockSender` | `"whenPinned"` | When `Tx.run` holds the sender lock: every build, and through submit only when the bytes pin an owned input or gas coin (`"always"`: build through submit, the pre-0.4.0 rule; `"never"`). `true` / `false` mean `"always"` / `"never"` |
+| `lockSender` | `"whenPinned"` | When `Tx.run` holds the sender lock: every build, and through submit only when the bytes pin an owned input, a gas coin or a coin reservation (`"always"`: build through submit, the pre-0.4.0 rule; `"never"`). `true` / `false` mean `"always"` / `"never"` |
 | `gasPayment` | `"preferAddressBalance"` | How an unset gas payment is chosen: the address balance when it covers the budget, else coins (`"requireAddressBalance"`: the balance or `BuildError`) |
 | `resubmit` | exponential from 250 ms, capped at 30 s, jittered | How `Tx.submit` re-sends the identical bytes |
 | `resubmitAttempts` | `5` | Sends in total, the first included |
@@ -510,7 +542,7 @@ process-wide.
 4. Once bytes may have been sent no `TransportError` escapes; it becomes `SubmissionUnknown`. The one exception is a gRPC `INVALID_ARGUMENT` on the first send: the node refused, nothing ran, and the journal entry is settled as `NotApplied { evidence: "refused" }`. A `Tx.resubmit` never takes a refusal that way: an earlier send of the same bytes may have landed.
 5. `JournalError` escapes only from the `Signed` write, before anything is sent.
 6. `NotApplied { inputConsumed }` is built only on a **different** transaction's effects reporting the exact pinned `inputVersion`; an input that merely moved on is not evidence. Positive evidence vetoes expiry: a pinned object naming the transaction's own digest is never answered `NotApplied { expired }`, and neither is a miss on a gRPC node that has pruned into the validity window (JSON-RPC and GraphQL cannot report pruning: set `expiryEvidence: "never"` behind pruning nodes there).
-7. A sponsored `Tx.run` needs `sponsor` whenever the gas owner is not the sender — `opts.gasOwner`, or one the recipe set itself (`Tx.sponsored`), which `Tx.run` reads from the recipe before locking. The gas owner's lock is taken only when gas is paid with its coins; an address-balance payment (`Tx.sponsored`) locks the sender alone, so one sponsor pays for many senders at once. Under the default `lockSender: "whenPinned"` the locks cover every build, and the submission only when the bytes pin an owned input or a gas coin.
+7. A sponsored `Tx.run` needs `sponsor` whenever the gas owner is not the sender — `opts.gasOwner`, or one the recipe set itself (`Tx.sponsored`), which `Tx.run` reads from the recipe before locking. The gas owner's lock is taken only when gas is paid with its coins; an address-balance payment (`Tx.sponsored`) locks the sender alone, so one sponsor pays for many senders at once. Under the default `lockSender: "whenPinned"` the locks cover every build, and the submission only when the bytes pin an owned input, a gas coin or a coin reservation.
 8. Every SDK call forwards the Effect's `AbortSignal`, so `Effect.timeout` and interruption cancel the request.
 9. One Move type rule everywhere: a bare expected tag matches every instantiation of the generic; a parameterized one is compared in full.
 10. A test that runs `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default journal is process-wide; `layerTest` is the production `Sui`, so fixtures use `localnet`.
@@ -4376,12 +4408,22 @@ When `Tx.run` holds the sender lock.
 
 - `"whenPinned"` (the default): for **every build**, and on through signing,
   `onSigned` and submission **only when the built bytes pin a versioned
-  object** — an owned or receiving input, or a gas coin. Bytes that pin
-  nothing (gas from an address balance; pure, shared and `FundsWithdrawal`
-  inputs) release it before signing, so address-balance transactions from
-  one sender are sent and awaited concurrently.
+  object or carry a gas payment** — an owned or receiving input, a gas coin,
+  or a coin reservation. A coin reservation is what a recipe that uses
+  `tx.gas` gets when its payer has an address balance, and it reserves the
+  payer's **whole** SUI balance as of the build: a spend landing before it is
+  sent makes the node refuse it. So it holds the lock, and a run that uses
+  `tx.gas` first waits, before it builds, for the lock-free runs in flight on
+  its payer. Bytes that pin nothing (an empty payment, gas drawn from the
+  address balance at execution; pure, shared and `FundsWithdrawal` inputs)
+  release it before signing, so address-balance transactions from one sender
+  are sent and awaited concurrently.
 - `"always"`: from build through submit on every run, the rule before 0.4.0.
 - `"never"`: no lock at all.
+
+A config provided directly rather than through `SubmitConfig.with` may still
+hold the pre-0.4.0 boolean or another value: `Tx.run` reads `true` as
+`"always"`, `false` as `"never"`, and anything else as `"always"`.
 
 ### `ReconcileInput` (type)
 
@@ -5097,8 +5139,9 @@ Folds the signer's coin objects into its address balance: `planFold`
 for `signer.address`, then one `run` of `fold` per batch, in
 order — SUI first, paying for its own fold, so a fresh account whose SUI is
 all coins needs no address balance to start. Afterwards gas comes from the
-balance, and transactions that pin nothing else run without holding the
-sender lock past their build.
+balance, and transactions that pin nothing else and do not use `tx.gas` run
+without holding the sender lock past their build (one that uses `tx.gas` is
+paid with a reservation of the whole balance, which holds it).
 
 Each batch pins its coins, so it runs under the sender lock. It stops at the
 first batch that fails, with that failure; the batches before it executed and
@@ -5825,14 +5868,35 @@ from one address that overlap can pin the same one at the same version and
 one of them will fail on chain. Under `SubmitConfig.lockSender: "whenPinned"`
 (the default) `Tx.run` holds the sender lock for **every build**, and on
 through signing and submission **only when the built bytes pin** an owned or
-receiving input or a gas coin. Bytes that pin nothing — gas from an address
-balance, inputs that are pure values, shared objects or withdrawals — are
-signed and sent with the lock released, so address-balance transactions from
-one sender run concurrently, serialized only for the length of a build. The
-span attribute `sui.sender_lock` says which happened (`"held"`, `"build"`).
-`"always"` holds the lock from build through submit on every run (the rule
-before 0.4.0), `"never"` takes none. This is the whole reason to prefer
-`Tx.run` over calling the steps separately.
+receiving input or carry any gas payment — a gas coin **or a coin
+reservation**. Bytes that pin nothing — an empty payment (gas from an address
+balance, drawn at execution), inputs that are pure values, shared objects or
+withdrawals — are signed and sent with the lock released, so address-balance
+transactions from one sender run concurrently, serialized only for the length
+of a build. The span attribute `sui.sender_lock` says which happened
+(`"held"`, `"build"`; `"none"` under `"never"`). `"always"` holds the lock
+from build through submit on every run (the rule before 0.4.0), `"never"`
+takes none. This is the whole reason to prefer `Tx.run` over calling the
+steps separately.
+
+**A coin reservation reserves the payer's whole SUI address balance as of the
+build.** That is what the resolver gives a recipe that uses `tx.gas` when its
+payer has an address balance (on an account with no SUI coins, the payment is
+the reservation alone). Any spend from that balance landing between the build
+and the send makes the node refuse it at submit (`INVALID_ARGUMENT`, "Invalid
+withdraw reservation", which escapes as `TransportError`), and one in flight
+beside it makes one of them execute as `InsufficientFundsForWithdraw`. So such
+a run holds the lock through submission, and a run whose recipe uses `tx.gas`
+first waits — holding its locks, before it builds — until no lock-free run is
+in flight on its payer (the gas owner when it is someone else, else the
+sender). A lock-free run counts as in flight on its sender and its gas owner
+from just before it releases the lock until it settles, fails or is
+interrupted. Residual: a reservation that appears only after the build — an
+SDK intent such as `tx.coin({ balance })` that fell back to splitting
+`tx.gas` — holds the lock but did not wait, and a sponsored address-balance
+run (which takes only its sender's lock) can still start drawing on its
+sponsor's balance while that sponsor's own `tx.gas` run builds. A flow that
+must never see either uses `lockSender: "always"`.
 
 Lock-free runs can together withdraw more than one balance holds; the node
 then executes the one that overdraws as a failure (`InsufficientFundsForWithdraw`,
@@ -5951,8 +6015,11 @@ passing `gasOwner` to `Tx.run`/`Tx.build` without `Tx.sponsored` (the gas
 owner's coins are then selected under its sender lock). `Tx.foldCoins` with
 the sponsor's signer deposits its coins.
 
-A sponsored transaction with no owned input pins nothing, so `Tx.run` sends
-it without holding either party's lock past the build.
+A sponsored transaction with no owned input pins nothing — its payment is
+empty, so it carries no coin and no coin reservation — and `Tx.run` sends it
+without holding either party's lock past the build. It is in flight on both
+parties until it settles, so the sponsor's own `tx.gas` runs wait for it
+before they build (one that starts building first is not stopped by it).
 
 **Never fails; the recipe it returns throws only if the recipe it wraps does, which `Tx.build` reports as `BuildError`.**
 

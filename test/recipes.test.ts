@@ -16,6 +16,7 @@ import { KeyValueStore } from "effect/persistence"
 import { TestClock } from "effect/testing"
 import { pay } from "../examples/recipes/build-and-submit.ts"
 import { durableJournal, payOnce } from "../examples/recipes/durable-journal-script.ts"
+import { foldAll, previewFold } from "../examples/recipes/fold-coins.ts"
 import { postedIndices, thePost } from "../examples/recipes/events.ts"
 import { Versions, versions } from "../examples/recipes/extension.ts"
 import { indexPosts } from "../examples/recipes/indexer.ts"
@@ -26,7 +27,7 @@ import { readCounter } from "../examples/recipes/read-object.ts"
 import { payOrResend, startup } from "../examples/recipes/resubmit.ts"
 import { sponsorBytes } from "../examples/recipes/sponsored-stateless.ts"
 import { coinPaidIncrement, sponsoredIncrement } from "../examples/recipes/sponsored.ts"
-import { type EventEntry, ObjectId, SuiAddress } from "../src/index.ts"
+import { type EventEntry, ObjectId, Sui, SuiAddress } from "../src/index.ts"
 import { makeKeyValueStore } from "../src/journal.ts"
 import { Script } from "../src/services/Script.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
@@ -106,6 +107,26 @@ describe("docs/llms-head.md recipes", () => {
     )
     expect(error._tag).toBe("PolicyDenied")
     if (error._tag === "PolicyDenied") expect(error.rule).toBe("maxGasBudget")
+  })
+
+  test("fold-coins: the preview signs nothing, then the fold leaves no SUI coin", async () => {
+    const outcome = await run(
+      Effect.gen(function*() {
+        const plan = yield* previewFold(signer)
+        const previewed = (yield* SuiTest.calls("executeTransaction")).length
+        const folded = yield* foldAll(signer)
+        const coins = (yield* Stream.runCollect((yield* Sui).streamCoins(signer.address))).length
+        return { plan, previewed, folded, coins, balance: yield* SuiTest.addressBalance(signer.address) }
+      }).pipe(
+        SuiTest.provide(layerTest({ ...script, simulate: [FakeOutcome.succeed()], execute: [FakeOutcome.succeed()] }))
+      )
+    )
+    expect(outcome.plan.batches.map((batch) => batch.gas)).toEqual(["foldedCoins"])
+    expect(outcome.previewed).toBe(0)
+    expect(outcome.folded.digests).toHaveLength(1)
+    expect(outcome.folded.dust).toBe(0)
+    expect(outcome.coins).toBe(0)
+    expect(outcome.balance).toBeGreaterThan(0n)
   })
 
   test("sponsored: build, sign, cosign, submit with two signatures", async () => {
