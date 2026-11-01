@@ -620,7 +620,8 @@ The full entries follow under "API".
 - `ServiceInfo` — What a node says about itself: the chain, where its ledger head is, and — the part a reconciler or an indexer needs — how far back its history reaches.
 - `Signature` — A serialized signature, as every SDK signer returns it: the base64 of the flag, signature and public key bytes.
 - `SignedTransaction` — The signed bytes of a transaction, kept so an uncertain submission can be reconciled or re-submitted later without rebuilding.
-- `SigningError` — A signer refused or failed to produce a signature.
+- `SigningError`
+- `SigningFailureReason` — Why a signer refused, when it knows: `"expired"` (a session-bound credential — a zkLogin proof — whose `maxEpoch` has passed or would pass before the bytes could land), `"locked"` (the secret was dropped by `lock` / `dispose` and must be unlocked again), `"rejected"` (the person, or the wallet acting for them, declined), `"unavailable"` (the device, wallet or remote signer could not be reached).
 - `Simulation` — The result of a successful simulation, with the fixed include set `Sui` asks for: effects, events, balance changes, object types and command results.
 - `SimulationFailed` — Simulation reported an execution failure.
 - `SimulationLookupError` — The failures of a simulation.
@@ -807,7 +808,7 @@ The full entries follow under "API".
 ## `@unconfirmed/sui-effect`
 
 
-102 exported symbols.
+103 exported symbols.
 
 ### `Balance` (const)
 
@@ -2300,12 +2301,26 @@ The expiration the transaction was built with rides along, because it is what
 ```ts
 export declare class SigningError extends SigningError_base {
     readonly cause: unknown;
+    readonly reason?: "expired" | "locked" | "rejected" | "unavailable" | undefined;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
 ```
 
-A signer refused or failed to produce a signature.
+### `SigningFailureReason` (const)
+
+```ts
+declare const SigningFailureReason: Schema
+// decodes to: "expired" | "locked" | "rejected" | "unavailable"
+```
+
+Why a signer refused, when it knows: `"expired"` (a session-bound credential —
+a zkLogin proof — whose `maxEpoch` has passed or would pass before the bytes
+could land), `"locked"` (the secret was dropped by `lock` / `dispose` and must
+be unlocked again), `"rejected"` (the person, or the wallet acting for them,
+declined), `"unavailable"` (the device, wallet or remote signer could not be
+reached). Absent for every other failure. A program branches on this, never
+on `cause`.
 
 ### `Simulation` (const)
 
@@ -4794,6 +4809,15 @@ export interface Signer {
      * Fails with: `SigningError`.
      */
     readonly signPersonalMessage: (bytes: Uint8Array) => Effect.Effect<Signature, SigningError>;
+    /**
+     * The last epoch this credential can sign for, when it is session-bound (a
+     * zkLogin proof's `maxEpoch`). Absent for a credential that does not expire.
+     * `Tx.run` keeps the built bytes' validity window inside it, and a signer
+     * whose bound has passed fails with `SigningError { reason: "expired" }`.
+     *
+     * @since 0.5.0
+     */
+    readonly maxEpoch?: bigint;
 }
 ```
 

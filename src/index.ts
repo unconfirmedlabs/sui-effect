@@ -34,6 +34,7 @@ export {
   type OutcomePhase,
   PolicyDenied,
   SigningError,
+  SigningFailureReason,
   SimulationFailed,
   SubmissionUnknown,
   SuiError,

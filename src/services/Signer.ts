@@ -54,6 +54,15 @@ export interface Signer {
    * Fails with: `SigningError`.
    */
   readonly signPersonalMessage: (bytes: Uint8Array) => Effect.Effect<Signature, SigningError>
+  /**
+   * The last epoch this credential can sign for, when it is session-bound (a
+   * zkLogin proof's `maxEpoch`). Absent for a credential that does not expire.
+   * `Tx.run` keeps the built bytes' validity window inside it, and a signer
+   * whose bound has passed fails with `SigningError { reason: "expired" }`.
+   *
+   * @since 0.5.0
+   */
+  readonly maxEpoch?: bigint
 }
 
 const decodeSignature = Schema.decodeUnknownEffect(Signature)
