@@ -38,7 +38,7 @@ import {
 import type { Built } from "../domain/built.ts"
 import { type BuiltGas, BuiltGas as BuiltGasSchema, GasPaymentRef as GasPaymentRefSchema } from "../domain/built.ts"
 import { EXECUTE_INCLUDE, Executed, fromTransactionResult, type Simulation, withSender } from "../domain/executed.ts"
-import type { Intent, Verdict } from "../domain/intent.ts"
+import type { Intent, Parties, Verdict } from "../domain/intent.ts"
 import { checkClaims, describeClaims, describeEffects, Intent as IntentSchema, Verified } from "../domain/intent.ts"
 import * as Metrics from "../domain/metrics.ts"
 import { isUnresolved, JournalEntry } from "../domain/journal-entry.ts"
@@ -3059,6 +3059,40 @@ export const requireIntentOf = Effect.fnUntraced(function*(
 })
 
 /**
+ * The sender and gas owner `built.bytes` name, after checking that the value's
+ * own `digest`, `sender` and `gasOwner` are the bytes'. Internal to
+ * {@link verifyAgainst}.
+ *
+ * Fails with: `PolicyDenied` (`intent.invalid`).
+ */
+const partiesOfBytes = (built: Built): Effect.Effect<Parties, PolicyDenied> =>
+  Effect.suspend((): Effect.Effect<Parties, PolicyDenied> => {
+    const deny = (message: string) => Effect.fail(new PolicyDenied({ rule: "intent.invalid", message }))
+    const data = dataOfBytes(built.bytes)
+    if (Option.isNone(data) || typeof data.value.sender !== "string" || data.value.sender.length === 0) {
+      return deny("these bytes are not a transaction this SDK can read, so nothing says whose they are")
+    }
+    const sender = normalizeSuiAddress(data.value.sender)
+    const owner = data.value.gasData.owner
+    const payer = typeof owner === "string" && owner.length > 0 ? normalizeSuiAddress(owner) : sender
+    const digest = Option.liftThrowable(TransactionDataBuilder.getDigestFromBytes)(built.bytes)
+    if (
+      Option.isNone(digest) || digest.value !== built.digest ||
+      normalizeSuiAddress(built.sender) !== sender ||
+      (built.gasOwner === undefined ? sender : normalizeSuiAddress(built.gasOwner)) !== payer
+    ) {
+      return deny(
+        "this Built's digest, sender or gas owner is not what its bytes say; take bytes from somewhere" +
+          " else through Tx.fromBytes"
+      )
+    }
+    return Effect.succeed({
+      sender: SuiAddress.make(sender),
+      ...(payer === sender ? {} : { gasOwner: SuiAddress.make(payer) })
+    })
+  })
+
+/**
  * {@link verify} over a simulation the caller already has: the claims, in
  * code, then the screen, when the gate in force has one.
  *
@@ -3078,10 +3112,14 @@ const verifyAgainst = Effect.fn("Tx.verifyAgainst")(function*(
       new PolicyDenied({ rule: "intent.invalid", message: `the intent is not valid: ${issue.message}` })
     )
   )
-  const parties = {
-    sender: built.sender,
-    ...(built.gasOwner === undefined ? {} : { gasOwner: built.gasOwner })
-  }
+  // Whose transaction it is comes from the bytes, never from the value's
+  // fields: a `Built` decoded from a queue or a dapp's JSON can name any
+  // sender, and the claims checked against the wrong one check nothing (the
+  // real sender's loss, or a gas the real sender never paid netted out of it).
+  // A value whose digest, sender or gas owner disagrees with its bytes is
+  // refused rather than corrected, because `Verified` carries those fields on
+  // to `Tx.sign` and the journal.
+  const parties = yield* partiesOfBytes(built)
   const verified = (verdict: Verdict) =>
     Effect.try({
       try: () => Verified.make({ ...built, intent: declared, verdict }),
@@ -3147,7 +3185,12 @@ const simulateBuilt = Effect.fnUntraced(function*(
   built: Built
 ): Effect.fn.Return<Simulation, SimulationFailed | BuildError | TransportError, Sui> {
   const own = built.simulation
-  if (own !== undefined && BUILD_SIMULATIONS.has(own) && own.digest === built.digest) {
+  // The digest is recomputed from the bytes: `built.digest` is a field, and a
+  // value spread from a real build with other bytes keeps it.
+  if (
+    own !== undefined && BUILD_SIMULATIONS.has(own) &&
+    own.digest === Option.getOrUndefined(Option.liftThrowable(TransactionDataBuilder.getDigestFromBytes)(built.bytes))
+  ) {
     yield* Effect.annotateCurrentSpan({ "sui.simulation": "reused" })
     return own
   }
@@ -3351,6 +3394,13 @@ export const prepare = Effect.fn("Tx.prepare")(function*(
  * probabilities into a refusal. With no screen configured the claims check
  * stands alone and the verdict is `Unscreened`. `SubmitConfig.preflight` is
  * not run here; `Tx.run` runs it on the same simulate.
+ *
+ * **Whose transaction it is comes from the bytes.** The sender and gas owner
+ * the claims are checked for are the ones `built.bytes` name, and a value whose
+ * `digest`, `sender` or `gasOwner` field disagrees with its bytes (spread from
+ * another build, decoded from a queue) is refused as `intent.invalid`; a
+ * `built.simulation` is reused only when `Tx.build` made it in this process
+ * for the digest of these bytes.
  *
  * The answer is structurally a `Built`, so it goes straight to `Tx.sign`. The
  * explicit lifecycle is not gated: `Tx.sign` takes any `Built`, so a caller
