@@ -3005,6 +3005,32 @@ const firstBelow = (
 const validIntent = Schema.decodeUnknownEffect(Schema.toType(IntentSchema))
 
 /**
+ * Refuses a signer that is already locked before anything is built: a
+ * `LockableSigner` (`Signer.fromMnemonic`, `Keystore.unlock`) whose
+ * `locked` answers `true` can only fail at `Tx.sign`, after a build and a
+ * simulate that cost reads for nothing. Read structurally, so any signer
+ * value with a `locked: Effect<boolean>` member is checked. Internal.
+ *
+ * Fails with: `SigningError` (`reason: "locked"`).
+ */
+export const requireUnlocked = (
+  signers: ReadonlyArray<Signer | undefined>
+): Effect.Effect<void, SigningError> =>
+  Effect.forEach(signers, (signer) => {
+    const locked: unknown = signer === undefined ? undefined : Reflect.get(signer, "locked")
+    if (!Effect.isEffect(locked)) return Effect.void
+    return Effect.flatMap(locked as Effect.Effect<unknown>, (isLocked) =>
+      isLocked === true
+        ? Effect.fail(
+          new SigningError({
+            reason: "locked",
+            cause: `the signer for ${signer!.address} is locked: its secret was dropped; open the account again`
+          })
+        )
+        : Effect.void)
+  }, { discard: true })
+
+/**
  * `Gate.requireIntent`, as `Tx.run` (and `Enoki.run`) applies it before
  * anything is built: a gate that requires an intent signs nothing that
  * declares none. Internal.
@@ -3469,6 +3495,11 @@ export const verify = Effect.fn("Tx.verify")(function*(
  * the current epoch fails with `SigningError { reason: "expired" }` before
  * anything resolves.
  *
+ * **A locked signer is refused first** (0.5.0). A `LockableSigner`
+ * (`Signer.fromMnemonic`, `Keystore.unlock`) — signer or sponsor — whose
+ * `locked` answers `true` fails the run with `SigningError { reason:
+ * "locked" }` before anything is built or simulated.
+ *
  * Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`,
  * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`,
  * `TransportError` (from the build reads; once bytes are sent, transport
@@ -3582,6 +3613,8 @@ export const run = Effect.fn("Tx.run")(function*<E = never>(
   if (payer !== undefined) {
     yield* assertSponsor(payer, opts.sponsor)
   }
+  // Nor can a signer that is already locked: refused before any read.
+  yield* requireUnlocked([opts.signer, opts.sponsor])
 
   // The session bound: the earlier of the signer's and the sponsor's, so the
   // window the build sets cannot outlive either signature.

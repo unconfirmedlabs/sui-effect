@@ -34,6 +34,7 @@ import {
   prepare,
   type Prepared,
   requireIntentOf,
+  requireUnlocked,
   sign,
   type Signed,
   submitVia,
@@ -376,7 +377,9 @@ export const execute = Effect.fn("Enoki.execute")(function*(
  * transaction that pins nothing of the sender's (pure values, shared objects,
  * withdrawals) is approved, signed and executed with the lock released, and
  * a person taking their time never holds it. `"always"` holds it throughout,
- * `"never"` takes none. `Gate.requireIntent` applies, as it does to `Tx.run`.
+ * `"never"` takes none. `Gate.requireIntent` applies, as it does to `Tx.run`,
+ * and so does its early refusal of a locked signer (`SigningError { reason:
+ * "locked" }` before Enoki is asked anything).
  *
  * `options.signer` is the sender: an Enoki zkLogin session
  * (`Enoki.fromFlow`, `Enoki.fromWallet`, `Signer.zkLogin`) or any other
@@ -441,6 +444,7 @@ export const run = Effect.fn("Enoki.run")(function*<E = never>(
   const sender = options.signer.address
   yield* Effect.annotateCurrentSpan({ "sui.sender": sender })
   yield* requireIntentOf(options.intent)
+  yield* requireUnlocked([options.signer])
   const approve = options.approve
   return yield* lockedRun({
     sui,

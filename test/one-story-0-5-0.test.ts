@@ -17,7 +17,7 @@ import { SuiAddress } from "../src/domain/schemas.ts"
 import { Enoki, type EnokiClient } from "../src/enoki.ts"
 import { Gate } from "../src/services/Gate.ts"
 import { Journal } from "../src/services/Journal.ts"
-import { fromKeypair, remote } from "../src/services/Signer.ts"
+import { fromKeypair, fromSecretKey, remote } from "../src/services/Signer.ts"
 import { verifySponsored } from "../src/services/Sponsored.ts"
 import { SubmitConfig } from "../src/services/SubmitConfig.ts"
 import type { Sui } from "../src/services/Sui.ts"
@@ -251,5 +251,32 @@ describe("a sponsor backend of one's own", () => {
     expect(value.signed.signatures).toHaveLength(2)
     expect(value.executed.digest).toBe(value.signed.digest)
     expect(value.simulates).toBe(1)
+  })
+})
+
+describe("a locked signer is refused before anything is built", () => {
+  const reads = Effect.map(SuiTest.calls(), (calls) =>
+    calls.filter((call) => call.method === "simulateTransaction" || call.method === "getCurrentSystemState").length)
+
+  test("Tx.run, as the signer or the sponsor, and Enoki.run: SigningError { locked }, no simulate", async () => {
+    const enoki = fakeEnoki()
+    const { value } = await run(Effect.gen(function*() {
+      const locked = yield* fromSecretKey(new Uint8Array(32).fill(61))
+      yield* locked.lock
+      const lockedSponsor = yield* fromSecretKey(sponsorKey.getSecretKey())
+      yield* lockedSponsor.lock
+      const asSigner = yield* Effect.flip(Tx.run(ping, { signer: locked }))
+      const asSponsor = yield* Effect.flip(
+        Tx.run(Tx.sponsored({ sender: SENDER, gasOwner: SPONSOR })(ping), { signer, sponsor: lockedSponsor })
+      )
+      const viaEnoki = yield* Effect.flip(Enoki.run(enoki, ping, { signer: locked }))
+      return { errors: [asSigner, asSponsor, viaEnoki], reads: yield* reads }
+    }))
+    for (const error of value.errors) {
+      expect(error._tag).toBe("SigningError")
+      expect((error as { reason?: string }).reason).toBe("locked")
+    }
+    expect(value.reads).toBe(0)
+    expect(enoki.created).toHaveLength(0)
   })
 })
