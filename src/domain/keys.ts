@@ -61,6 +61,15 @@ export class KeyError extends Schema.TaggedError<KeyError>()("KeyError", {
 }) {
   /** Nothing was derived or sent. */
   readonly outcome: Outcome = "not_applied"
+  /**
+   * `Script.exitCode`'s answer: 2, like a `ConfigError`. Every reason is input
+   * (or a platform) a person has to fix; retrying the same call cannot succeed.
+   *
+   * @since 0.5.0
+   */
+  get exitCode(): number {
+    return 2
+  }
 }
 
 /**
@@ -114,4 +123,16 @@ export class KeystoreError extends Schema.TaggedError<KeystoreError>()("Keystore
 }) {
   /** Nothing was sent. */
   readonly outcome: Outcome = "not_applied"
+  /**
+   * `Script.exitCode`'s answer: 2, like a `ConfigError`, for every reason a
+   * person has to fix (a wrong password, a missing or existing account, a
+   * corrupt or newer record, no WebCrypto); `undefined` for `"storage"`, a
+   * store failure that may pass on retry, which therefore exits 4 like any
+   * other `not_applied` failure.
+   *
+   * @since 0.5.0
+   */
+  get exitCode(): number | undefined {
+    return this.reason === "storage" ? undefined : 2
+  }
 }

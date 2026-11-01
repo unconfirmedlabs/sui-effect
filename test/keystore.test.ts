@@ -344,3 +344,19 @@ describe("Keystore: lifecycle", () => {
     }
   })
 })
+
+describe("exit codes for key and keystore refusals (0.5.0)", () => {
+  test("input a person must fix exits 2; a store failure exits 4", async () => {
+    const { Script } = await import("../src/services/Script.ts")
+    const { KeyError } = await import("../src/domain/keys.ts")
+    const code = (error: unknown) => Script.exitCode(Exit.fail(error))
+    expect(code(new KeyError({ reason: "invalidMnemonic", message: "word 3 is not in the list" }))).toBe(2)
+    for (const reason of ["wrongPassword", "invalidPassword", "notFound", "exists", "noMnemonic", "corrupt", "unsupported", "unavailable"] as const) {
+      expect(code(new KeystoreError({ reason, message: reason }))).toBe(2)
+    }
+    expect(code(new KeystoreError({ reason: "storage", message: "the store failed" }))).toBe(4)
+    // The getter stays out of the encoding and does not change the outcome.
+    expect(SuiError.outcome(new KeystoreError({ reason: "wrongPassword", message: "no" }))).toBe("not_applied")
+    expect(Object.keys(SuiError.toJson(new KeystoreError({ reason: "wrongPassword", message: "no" })))).not.toContain("exitCode")
+  })
+})

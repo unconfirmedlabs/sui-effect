@@ -159,14 +159,16 @@ code or stored data; read "Migrating from 0.4.x" first.
   hex or bytes, copied); `Signer.generateMnemonic` (`crypto.getRandomValues`);
   `Signer.scoped`; `LockableSigner` (`lock`, one-way, then `SigningError {
   reason: "locked" }`; `locked`); `KeyError` (root export; declared
-  `not_applied`; names a bad word's position, never the word).
+  `not_applied`; `Script.exitCode` 2; names a bad word's position, never the
+  word).
 - **`@unconfirmed/sui-effect/keystore`**: `Keystore` (`layer`, `layerTest`,
   `make`) — `list`, `account`, `generate`, `importMnemonic`, `importSecretKey`,
   `unlock`, `remove`, `changePassword`, `exportMnemonic`, `exportSecretKey` —
   sealing one `SealedKey` record (version 1) per address over `KeyValueStore`:
   PBKDF2-SHA256 at 600 000 iterations, AES-256-GCM, the address, scheme, source
   and path as AAD, and a key-check value that tells a wrong password from an
-  edited record. `KeystoreError` (declared `not_applied`). `Keystore.sealer(
+  edited record. `KeystoreError` (declared `not_applied`; `Script.exitCode` 2 for
+  every reason but `"storage"`, which exits 4). `Keystore.sealer(
   password, { iterations? })` (also flat as `sealer`) is the `SecretSealer` for
   `ZkLogin.save`/`load` in the same format (`SealedSecret`). Needs WebCrypto.
 - **`@unconfirmed/sui-effect/storage`**: `layerIndexedDb`, `layerAsyncStorage`,
