@@ -1,10 +1,10 @@
 /**
  * `sui-effect/journal`: the durable submission journal.
  *
- * Separate from `sui-effect/tx` because it is the only part of the package
- * that imports `effect/persistence` (`KeyValueStore`, still unstable
- * upstream), and an application that does not need durability should not take
- * that dependency.
+ * Separate from `sui-effect/tx` because it imports `effect/persistence`
+ * (`KeyValueStore`, still unstable upstream), and an application that does not
+ * need durability should not take that dependency. The stores it runs on in a
+ * browser, React Native or an extension are in `sui-effect/storage`.
  *
  * Building the layer does no network work. Settling what a previous run left
  * behind is `Tx.reconcileAll`, which the application calls when it is ready.
@@ -56,8 +56,9 @@ export { make as makeKeyValueStore } from "./services/JournalKeyValueStore.ts"
 /**
  * Deletes the settled entries (`Executed`, `Failed`, `NotApplied`) recorded
  * before a cutoff from the durable journal's `KeyValueStore`, and answers how
- * many it deleted; unresolved entries are never deleted. It keeps the scan
- * `listUnresolved` does over every entry short in a long-lived service.
+ * many it deleted; unresolved entries are never deleted. `listUnresolved`
+ * skips settled entries by their marker, but `keys` still enumerates them, so
+ * this is what keeps a long-lived service's store short.
  *
  * Fails with: `JournalError`.
  */
