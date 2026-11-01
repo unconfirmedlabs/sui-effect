@@ -138,6 +138,18 @@ const sessionFailure = (cause: unknown): SigningError => {
     : new SigningError({ reason: "unavailable", cause })
 }
 
+/**
+ * A session's `maxEpoch` as an epoch: a non-negative safe integer, or the
+ * session is unusable (`SigningError { reason: "unavailable" }`) — `BigInt`
+ * of `1.5` or `NaN` throws, which was a defect.
+ */
+const epochOfSession = (value: number): Effect.Effect<bigint, SigningError> =>
+  Number.isSafeInteger(value) && value >= 0
+    ? Effect.succeed(BigInt(value))
+    : Effect.fail(
+      new SigningError({ reason: "unavailable", cause: `the Enoki session names maxEpoch ${String(value)}, not an epoch` })
+    )
+
 const bounded = (
   inner: Pick<Signer, "address" | "scheme" | "signTransaction" | "signPersonalMessage">,
   bound: { readonly maxEpoch: bigint; readonly expiresAt?: number }
@@ -176,7 +188,8 @@ export const fromFlow = Effect.fn("Enoki.fromFlow")(function*(
   if (session === null) {
     return yield* new SigningError({ reason: "unavailable", cause: "nobody is signed in to this EnokiFlow" })
   }
-  const bound = { maxEpoch: BigInt(session.maxEpoch), expiresAt: session.expiresAt }
+  const maxEpoch = yield* epochOfSession(session.maxEpoch)
+  const bound = { maxEpoch, expiresAt: session.expiresAt }
   yield* checkSessionBound(bound, undefined)
   return bounded({
     address: SuiAddress.make(normalizeSuiAddress(keypair.toSuiAddress())),
@@ -232,8 +245,9 @@ export const fromWallet = Effect.fn("Enoki.fromWallet")(function*(options: {
   if (record === null || typeof record !== "object" || typeof record.maxEpoch !== "number") {
     return yield* new SigningError({ reason: "unavailable", cause: "nobody is signed in to this Enoki wallet" })
   }
+  const maxEpoch = yield* epochOfSession(record.maxEpoch)
   const bound = {
-    maxEpoch: BigInt(record.maxEpoch),
+    maxEpoch,
     ...(typeof record.expiresAt === "number" ? { expiresAt: record.expiresAt } : {})
   }
   yield* checkSessionBound(bound, undefined)

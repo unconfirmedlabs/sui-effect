@@ -123,24 +123,47 @@ const loadPasskey = (): Effect.Effect<PasskeyModule, SigningError> =>
       new SigningError({ reason: "unavailable", cause: `passkeys are not available here: ${String(cause)}` })
   })
 
-const fromPasskeyKeypair = (keypair: SdkSigner): Signer => ({
-  address: SuiAddress.make(normalizeSuiAddress(keypair.toSuiAddress())),
-  scheme: "Passkey",
-  signTransaction: Effect.fn("Signer.passkey.signTransaction")(function*(bytes: Uint8Array) {
-    const signed = yield* Effect.tryPromise({
-      try: () => keypair.signTransaction(bytes),
-      catch: failureOf("the passkey did not sign")
+/**
+ * A passkey signer, which checks every signature against its own address
+ * before answering it: with no `credentialId` the platform lets the person
+ * pick any passkey registered for the site, and the SDK's `PasskeyKeypair`
+ * returns whatever the authenticator signed with. A signature by another
+ * credential is a `SigningError` here, not a refusal at submit.
+ */
+const fromPasskeyKeypair = (keypair: SdkSigner): Signer => {
+  const address = SuiAddress.make(normalizeSuiAddress(keypair.toSuiAddress()))
+  const checked = (signature: string, verify: (signature: string) => Promise<unknown>) =>
+    Effect.tryPromise({
+      try: () => verify(signature),
+      catch: (cause) =>
+        new SigningError({
+          cause: `the passkey answered a signature that is not ${address}'s over these bytes (another credential` +
+            ` was chosen?): ${String(cause)}`
+        })
     })
-    return yield* signatureOfString(signed.signature)
-  }),
-  signPersonalMessage: Effect.fn("Signer.passkey.signPersonalMessage")(function*(bytes: Uint8Array) {
-    const signed = yield* Effect.tryPromise({
-      try: () => keypair.signPersonalMessage(bytes),
-      catch: failureOf("the passkey did not sign")
+  return {
+    address,
+    scheme: "Passkey",
+    signTransaction: Effect.fn("Signer.passkey.signTransaction")(function*(bytes: Uint8Array) {
+      const signed = yield* Effect.tryPromise({
+        try: () => keypair.signTransaction(bytes),
+        catch: failureOf("the passkey did not sign")
+      })
+      const signature = yield* signatureOfString(signed.signature)
+      yield* checked(signature, (candidate) => verifyTransactionSignature(bytes, candidate, { address }))
+      return signature
+    }),
+    signPersonalMessage: Effect.fn("Signer.passkey.signPersonalMessage")(function*(bytes: Uint8Array) {
+      const signed = yield* Effect.tryPromise({
+        try: () => keypair.signPersonalMessage(bytes),
+        catch: failureOf("the passkey did not sign")
+      })
+      const signature = yield* signatureOfString(signed.signature)
+      yield* checked(signature, (candidate) => verifyPersonalMessageSignature(bytes, candidate, { address }))
+      return signature
     })
-    return yield* signatureOfString(signed.signature)
-  })
-})
+  }
+}
 
 /**
  * A `Signer` over an existing passkey: the SDK's `PasskeyKeypair` with the
@@ -291,31 +314,28 @@ const schemeOfAccount = (account: StandardWalletAccount): SignatureScheme | unde
 }
 
 /**
- * Checks a wallet's signature locally when that needs no node: every scheme
- * but zkLogin and multisig, whose checks need a client (`Tx.attach` makes
- * those). A signature by another key is refused here rather than by the node.
+ * Checks a wallet's signature locally when that needs no node: for an account
+ * whose scheme is anything but zkLogin or multisig, whose checks need a client
+ * (`Tx.attach` makes those). The scheme is the **account's**, never the flag
+ * byte the wallet put on its answer: a wallet answering a signature flagged
+ * zkLogin, or a string that is not base64, for an Ed25519 account is refused
+ * here rather than by the node.
  */
 const checkSignatureOf = (
   verify: (signature: string) => Promise<unknown>,
   signature: string,
-  account: string
+  account: string,
+  scheme: SignatureScheme
 ): Effect.Effect<void, SigningError> => {
-  const flag = (() => {
-    try {
-      return fromBase64(signature)[0]
-    } catch {
-      return undefined
-    }
-  })()
-  const scheme = flag === undefined ? undefined : (SIGNATURE_FLAG_TO_SCHEME as Record<number, string>)[flag]
-  if (scheme === undefined || scheme === "ZkLogin" || scheme === "MultiSig") return Effect.void
-  return Effect.tryPromise({
-    try: () => verify(signature),
-    catch: (cause) =>
-      new SigningError({
-        cause: `the wallet's signature is not a valid signature by ${account} over these bytes: ${String(cause)}`
-      })
-  }).pipe(Effect.asVoid)
+  if (scheme === "ZkLogin" || scheme === "MultiSig") return Effect.void
+  const refuse = (why: string) =>
+    new SigningError({ cause: `the wallet's signature is not a valid signature by ${account} over these bytes: ${why}` })
+  const flag = bytesOf(signature)?.[0]
+  const flagged = flag === undefined ? undefined : (SIGNATURE_FLAG_TO_SCHEME as Record<number, string>)[flag]
+  if (flagged !== scheme) {
+    return Effect.fail(refuse(`it is flagged ${flagged ?? "as nothing this SDK knows"}, and the account is ${scheme}`))
+  }
+  return Effect.tryPromise({ try: () => verify(signature), catch: (cause) => refuse(String(cause)) }).pipe(Effect.asVoid)
 }
 
 const sameBytes = (left: Uint8Array, right: Uint8Array): boolean =>
@@ -436,7 +456,8 @@ export const wallet = Effect.fn("Signer.wallet")(function*(options: {
       yield* checkSignatureOf(
         (candidate) => verifyTransactionSignature(bytes, candidate, { address }),
         signature,
-        address
+        address,
+        scheme
       )
       return signature
     }),
@@ -458,7 +479,8 @@ export const wallet = Effect.fn("Signer.wallet")(function*(options: {
       yield* checkSignatureOf(
         (candidate) => verifyPersonalMessageSignature(bytes, candidate, { address }),
         signature,
-        address
+        address,
+        scheme
       )
       return signature
     })
