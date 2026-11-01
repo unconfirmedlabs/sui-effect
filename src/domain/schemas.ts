@@ -331,10 +331,74 @@ const CoinTypeSchema = structTagLike(
   "Expected a fully qualified Move coin type"
 ).pipe(Schema.brand("CoinType"))
 
+/** What {@link CoinType.Strict} takes: `0x<hex>::module::Name`, type arguments allowed. */
+const STRICT_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*(<.+>)?$/
+
+/** The coin **object** type, `0x2::coin::Coin<…>`, in any address spelling. */
+const COIN_OBJECT_TYPE = /^0x0*2::coin::Coin</
+
+/**
+ * {@link CoinType} for user input — a CLI argument, a form field, a token a
+ * person picked — with every refusal a decode failure (`SchemaError` in the
+ * error channel), never a throw.
+ *
+ * It takes exactly `0x<address>::<module>::<Name>`, type arguments allowed,
+ * and refuses what `CoinType` would let through or reject only by accident: a
+ * bare symbol (`"SUI"`, `"USDC"` — a symbol is not a coin type, and nothing on
+ * chain maps one to a type), surrounding whitespace, a package named without
+ * `0x` or by an MVR name, and the coin **object** type
+ * `0x2::coin::Coin<0x2::sui::SUI>` (a coin type is the type argument). The
+ * address may be the short form (`0x2::sui::SUI`), which is how every coin type
+ * is written; the decoded value is padded and carries the same `CoinType`
+ * brand.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Schema } from "effect"
+ * import { CoinType } from "@unconfirmed/sui-effect"
+ *
+ * const coinType = Schema.decodeUnknownEffect(CoinType.Strict)(process.argv[2])
+ * ```
+ */
+const CoinTypeStrict = Schema.String.annotate({
+  identifier: "CoinType",
+  description: "A fully qualified Move coin type, 0x<address>::<module>::<Name>"
+}).pipe(
+  Schema.check(
+    Schema.makeFilter((value: string) =>
+      COIN_OBJECT_TYPE.test(value)
+        ? "Expected a coin type, not the coin object type: give the type inside 0x2::coin::Coin<…>"
+        : STRICT_COIN_TYPE.test(value)
+        ? undefined
+        : "Expected a fully qualified Move coin type such as 0x2::sui::SUI (0x<address>::<module>::<Name>);" +
+          " a symbol is not a coin type"
+    )
+  )
+).annotate({
+  identifier: "CoinType",
+  description: "A fully qualified Move coin type, 0x<address>::<module>::<Name>"
+}).pipe(
+  Schema.decode({
+    decode: SchemaGetter.transform(normalizeStructTagSafe),
+    encode: SchemaGetter.passthrough()
+  }),
+  Schema.check(
+    Schema.makeFilter((value: string) =>
+      isValidStructTag(value) ? undefined : "Expected a fully qualified Move coin type"
+    )
+  ),
+  Schema.brand("CoinType")
+)
+
 /**
  * A branded, normalized {@link CoinType} from any spelling. Throws a
  * `SchemaError` on a string that is not a struct tag, because it is
- * `Schema.decodeSync`.
+ * `Schema.decodeSync` — so it is for literals and configuration a caller
+ * controls. A coin type a person typed goes through
+ * `Schema.decodeUnknownEffect(CoinType.Strict)`, which puts the refusal in the
+ * error channel (a `SchemaError`, exit 2 under `Script`) instead of a defect.
  *
  * @since 0.4.0
  *
@@ -351,10 +415,12 @@ const normalizeCoinTypeValue: (input: string) => typeof CoinTypeSchema.Type = Sc
 
 /**
  * A coin type in normalized form: the schema, plus `CoinType.normalize` for any
- * spelling and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
+ * spelling, `CoinType.Strict` for user input and `CoinType.SUI`, the
+ * normalized `0x2::sui::SUI`.
  */
 export const CoinType = Object.assign(CoinTypeSchema, {
   normalize: normalizeCoinTypeValue,
+  Strict: CoinTypeStrict,
   /**
    * SUI's coin type, `0x000…002::sui::SUI`, normalized and branded.
    *
@@ -390,6 +456,28 @@ export const Mist = Schema.BigIntFromString.pipe(
   Schema.brand("Mist")
 )
 export type Mist = typeof Mist.Type
+
+/**
+ * An amount of some coin in its smallest unit — MIST for SUI, the coin's own
+ * base unit for every other coin — as a plain non-negative `bigint`, encoded
+ * as the decimal string every SDK response uses. Which unit it is depends on
+ * the coin type beside it, so it carries no brand: {@link Mist} is for amounts
+ * that are always SUI (gas), and a SUI balance is `Mist.make(amount)` away.
+ *
+ * @since 0.5.0
+ */
+export const CoinAmount = Schema.BigIntFromString.pipe(
+  Schema.check(Schema.isGreaterThanOrEqualToBigInt(0n))
+).annotate({
+  identifier: "CoinAmount",
+  description: "An amount of a coin in its smallest unit, encoded as a decimal string"
+}).pipe(
+  Schema.annotateEncoded({
+    identifier: "CoinAmount",
+    description: "An amount of a coin in its smallest unit, encoded as a decimal string"
+  })
+)
+export type CoinAmount = typeof CoinAmount.Type
 
 /** A Move object version. Encoded as the decimal string the SDK returns. */
 export const Version = Schema.BigIntFromString.pipe(
@@ -473,12 +561,17 @@ type ObjectRefType = typeof ObjectRef.Type
  */
 export interface ObjectRef extends ObjectRefType {}
 
-/** A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`. */
+/**
+ * A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`. The
+ * amounts are {@link CoinAmount}s in the coin's own smallest unit — MIST only
+ * when `coinType` is SUI (they were branded `Mist` for every coin before
+ * 0.5.0).
+ */
 export const Balance = Schema.Struct({
   coinType: CoinType,
-  balance: Mist,
-  coinBalance: Mist,
-  addressBalance: Mist
+  balance: CoinAmount,
+  coinBalance: CoinAmount,
+  addressBalance: CoinAmount
 }).annotate({
   identifier: "Balance",
   description: "A coin balance for one coin type"
@@ -505,7 +598,8 @@ export const Coin = Schema.Struct({
   digest: Schema.String,
   owner: Owner,
   type: StructTag,
-  balance: Mist
+  /** In the coin's own smallest unit: MIST only for a SUI coin (`Mist` for every coin before 0.5.0). */
+  balance: CoinAmount
 }).annotate({
   identifier: "Coin",
   description: "A coin object"

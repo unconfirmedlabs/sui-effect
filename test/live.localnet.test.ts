@@ -338,4 +338,39 @@ describe.skipIf(!LOCALNET)("localnet, with SUI_LOCALNET=1", () => {
     },
     5 * MINUTE
   )
+
+  test(
+    "streamTransactions({ affectedAddress }) lists an incoming transfer a sender filter cannot see",
+    async () => {
+      const payer = await funded()
+      const receiver = await Effect.runPromise(ephemeral)
+      const executed = await local(Tx.run((tx) => {
+        tx.transferObjects([tx.splitCoins(tx.gas, [1_000_000n])[0]!], receiver.address)
+      }, { signer: payer }))
+      // The ledger's transaction index follows checkpoints, so wait for it.
+      const listed = await local(Effect.gen(function*() {
+        const sui = yield* Sui
+        return yield* Effect.retry(
+          Effect.flatMap(
+            Stream.runCollect(Stream.take(
+              sui.streamTransactions({ affectedAddress: receiver.address }, { order: "descending" }),
+              5
+            )),
+            (items) => {
+              const digests = [...items].map((item) => item._tag === "Success" ? item.success.digest : item.failure.digest)
+              return digests.includes(executed.digest) ? Effect.succeed(digests) : Effect.fail("not indexed yet" as const)
+            }
+          ),
+          { schedule: Schedule.spaced("500 millis"), times: 40 }
+        )
+      }))
+      expect(listed).toContain(executed.digest)
+      const sent = await local(Effect.gen(function*() {
+        const sui = yield* Sui
+        return [...(yield* Stream.runCollect(sui.streamTransactions({ sender: receiver.address })))]
+      }))
+      expect(sent).toHaveLength(0)
+    },
+    2 * MINUTE
+  )
 })

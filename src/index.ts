@@ -51,6 +51,7 @@ export {
   ChangedObject,
   CleverError,
   Coin,
+  CoinAmount,
   CoinMetadata,
   CoinType,
   CommandResult,
@@ -103,6 +104,7 @@ export {
 
 /** The opinionated tier. */
 export {
+  type AffectedAddressFilter,
   type BatchItemError,
   type DecodedDynamicField,
   type EventFilter,
