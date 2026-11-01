@@ -33,6 +33,13 @@ const DIGESTS = Object.keys(STORE_FROM_RC112)
   .filter((key) => key.startsWith("entry:"))
   .map((key) => Digest.make(key.slice("entry:".length)))
 
+/** The terminal entries of the fixture: the ones a 0.5.0 rewrite marks settled. */
+const SETTLED_DIGESTS = [
+  "CiDwVBFgWV9E5MvXWoLgnEgn2hK7rJikbvfWavzAQzA",
+  "GcdayuLaLyrdmUu324nahyv33G5poQdLUEZ1nEytDeW",
+  "QRSsyMWN1yHT9ir42bgNZUNZ4PdEhcSWCrL2AryKpyC"
+]
+
 const run = <A>(effect: Effect.Effect<A, unknown, KeyValueStore.KeyValueStore>): Promise<A> =>
   Effect.runPromise(effect.pipe(Effect.provide(KeyValueStore.layerMemory)))
 
@@ -68,8 +75,11 @@ describe("a journal written on effect rc.112", () => {
         for (const entry of decoded) yield* target.put(entry)
         const out: Record<string, string | undefined> = {}
         for (const key of ENTRY_KEYS) out[key] = yield* fresh.get(key)
-        // A rewrite produces the entry keys and nothing else: no index.
-        expect([...(yield* fresh.keys)].sort()).toEqual([...ENTRY_KEYS].sort())
+        // A rewrite produces the entry keys and a settled marker for each
+        // terminal one (0.5.0), and no index.
+        expect([...(yield* fresh.keys)].sort()).toEqual(
+          [...ENTRY_KEYS, ...SETTLED_DIGESTS.map((digest) => `settled:${digest}`)].sort()
+        )
         return out
       })
     )

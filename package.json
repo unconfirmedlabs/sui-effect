@@ -25,6 +25,10 @@
       "types": "./dist/keystore.d.ts",
       "import": "./dist/keystore.js"
     },
+    "./storage": {
+      "types": "./dist/storage.d.ts",
+      "import": "./dist/storage.js"
+    },
     "./extension": {
       "types": "./dist/extension.d.ts",
       "import": "./dist/extension.js"

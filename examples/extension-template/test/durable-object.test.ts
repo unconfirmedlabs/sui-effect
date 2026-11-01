@@ -45,7 +45,8 @@ describe("the Durable Object KeyValueStore adapter", () => {
     expect(result.before.map((entry) => entry.digest)).toEqual([DIGEST])
     expect(result.after).toHaveLength(0)
     expect(Option.isSome(result.entry) && result.entry.value._tag).toBe("Executed")
-    expect([...storage.map.keys()]).toEqual([`entry:${DIGEST}`])
+    // The entry, and the settled marker a terminal entry carries (0.5.0).
+    expect([...storage.map.keys()].sort()).toEqual([`entry:${DIGEST}`, `settled:${DIGEST}`])
   })
 
   test("a rejected storage call is a KeyValueStoreError, not a defect", async () => {
