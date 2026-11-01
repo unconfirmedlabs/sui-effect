@@ -14,7 +14,8 @@ import { fromKeypair } from "../src/services/Signer.ts"
 import type { Sui } from "../src/services/Sui.ts"
 import { FakeOutcome, type FakeScript, type SuiCoreFake } from "../src/services/SuiCoreFake.ts"
 import { Tx } from "../src/services/Tx.ts"
-import { layerTest } from "../src/testing.ts"
+import { fakeCoin, layerTest, SuiTest } from "../src/testing.ts"
+import { BuildError } from "../src/domain/errors.ts"
 
 const CHAIN_ID = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
 const PADDED = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
@@ -113,5 +114,31 @@ describe("Tx.verify reads the bytes, never a forged Built's fields", () => {
       script
     )
     expect((result as PolicyDenied).rule).toBe("intent.invalid")
+  })
+})
+
+describe("Tx.foldCoins refuses a plan whose batch names another owner", () => {
+  const coin = fakeCoin({ objectId: PADDED("c001"), owner: SENDER, balance: 5_000_000_000n })
+  const script: FakeScript = {
+    chainId: CHAIN_ID,
+    objects: [],
+    coins: [coin],
+    balances: [{ owner: SENDER, coinType: SUI, balance: "5000000000", coinBalance: "5000000000", addressBalance: "0" }],
+    simulate: [FakeOutcome.succeed()],
+    execute: [FakeOutcome.succeed()]
+  }
+
+  test("plan.owner is the signer, a batch's owner is not: nothing is built", async () => {
+    const { error, executes } = await run(
+      Effect.gen(function*() {
+        const plan = yield* Tx.planFold({ owner: SENDER })
+        const forged = { ...plan, batches: plan.batches.map((batch) => ({ ...batch, owner: THIEF })) }
+        const error = yield* Effect.flip(Tx.foldCoins({ signer, plan: forged }))
+        return { error, executes: (yield* SuiTest.calls("executeTransaction")).length }
+      }),
+      script
+    )
+    expect(error).toBeInstanceOf(BuildError)
+    expect(executes).toBe(0)
   })
 })

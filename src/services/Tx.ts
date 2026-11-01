@@ -4042,8 +4042,8 @@ const foldIntentOf = (batch: FoldBatch): Intent => ({
  * shown and it is not re-planned — `coinType` and `maxCoinsPerTransaction` are
  * then ignored — so what runs is exactly what was previewed; a coin in it that
  * has moved since fails that batch's build with `BuildError`, as any pinned
- * input does. A plan for another owner is a `BuildError` before anything
- * runs. `approve` is `Tx.run`'s, once per batch, shown the batch beside the
+ * input does. A plan for another owner — the plan's or any batch's — is a
+ * `BuildError` before anything runs. `approve` is `Tx.run`'s, once per batch, shown the batch beside the
  * prepared transaction: {@link foldMovement} of the two is what the fold
  * moves from coins into the balance, which the simulation's balance changes
  * alone do not show.
@@ -4086,10 +4086,18 @@ export const foldCoins = Effect.fn("Tx.foldCoins")(function*<E = never>(opts: {
   readonly intent?: Intent
 }): Effect.fn.Return<FoldResult, RunError | E, Sui> {
   const gate = yield* Gate
-  if (opts.plan !== undefined && normalizeSuiAddress(opts.plan.owner) !== normalizeSuiAddress(opts.signer.address)) {
+  // Every batch, not only the plan: `fold(batch)` deposits into
+  // `batch.owner`, so a plan that names the signer with a batch that names
+  // someone else would send the signer's coins to that address balance.
+  const signerAddress = normalizeSuiAddress(opts.signer.address)
+  const foreign = opts.plan === undefined
+    ? undefined
+    : [opts.plan.owner, ...opts.plan.batches.map((batch) => batch.owner)]
+      .find((owner) => normalizeSuiAddress(owner) !== signerAddress)
+  if (foreign !== undefined) {
     return yield* new BuildError({
-      message: `this fold plan is for ${opts.plan.owner}'s coins, and the signer is ${opts.signer.address}`,
-      cause: opts.plan.owner
+      message: `this fold plan is for ${foreign}'s coins, and the signer is ${opts.signer.address}`,
+      cause: foreign
     })
   }
   const plan = opts.plan ?? (yield* planFold({
