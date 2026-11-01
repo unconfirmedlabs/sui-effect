@@ -41,7 +41,8 @@ const ENTRY = "entry:"
  * holds a terminal entry, and its value is that entry's tag. It is a
  * **negative** index — it names what a listing may skip, never what it must
  * read — so a missing marker costs one extra read and a marker can only hide
- * an entry if it is wrong, which the write order below rules out.
+ * an entry if it is wrong, which the write order below rules out but for
+ * one crash window (see {@link make}).
  */
 const SETTLED = "settled:"
 
@@ -101,24 +102,41 @@ const listKeys = (kv: KeyValueStore.KeyValueStore) =>
   })
 
 /**
- * Writes the marker for a settled entry a listing just read without one (a
- * store 0.4 wrote, or a crash between a terminal entry and its marker), then
- * reads the entry again and takes the marker back if it is no longer settled.
- * The second read is what keeps a concurrent `put` of an unresolved entry for
- * the same digest visible: that put clears the marker after its own write, so
- * either it sees this marker and removes it, or this re-read sees its entry.
+ * Writes the settled marker for `entry`, then reads the entry again and takes
+ * the marker back unless that read **confirms** a terminal entry — it found
+ * an unresolved one, found none, or failed. The re-read is what keeps a
+ * concurrent `put` of an unresolved entry for the same digest (another tab,
+ * another extension context, another process) visible: that put clears the
+ * marker after its own write, so either it sees this marker and removes it,
+ * or this re-read sees its entry. Used by a terminal `put` and by a listing
+ * that found a settled entry with no marker.
  *
- * Best effort: a marker is an optimization, so a failure here fails nothing.
+ * What it cannot cover: a process that dies after the marker write and
+ * before the re-read (or whose `remove` fails), while an unresolved `put` of
+ * the same digest from another writer landed wholly between the entry write
+ * and the marker write. Closing that needs a compare-and-set the
+ * `KeyValueStore` interface does not have.
+ *
+ * Fails with: `JournalError` (the marker write, or the `remove`).
  */
-const heal = (kv: KeyValueStore.KeyValueStore, entry: JournalEntry) =>
+const settleMarker = (kv: KeyValueStore.KeyValueStore, entry: JournalEntry) =>
   Effect.gen(function*() {
     const key = `${SETTLED}${entry.digest}`
     yield* kv.set(key, entry._tag).pipe(Effect.mapError(journalError))
-    const again = yield* readEntry(kv, entry.digest)
-    if (Option.isNone(again) || isUnresolved(again.value)) {
-      yield* kv.remove(key).pipe(Effect.mapError(journalError))
-    }
-  }).pipe(Effect.ignore)
+    const confirmed = yield* readEntry(kv, entry.digest).pipe(
+      Effect.map((again) => Option.isSome(again) && !isUnresolved(again.value)),
+      Effect.orElseSucceed(() => false)
+    )
+    if (!confirmed) yield* kv.remove(key).pipe(Effect.mapError(journalError))
+  })
+
+/**
+ * {@link settleMarker} for a settled entry a listing just read without a
+ * marker (a store 0.4 wrote, or a crash between a terminal entry and its
+ * marker). Best effort: a marker is an optimization, so a failure here fails
+ * nothing.
+ */
+const heal = (kv: KeyValueStore.KeyValueStore, entry: JournalEntry) => settleMarker(kv, entry).pipe(Effect.ignore)
 
 /**
  * The entries that may be unresolved: every entry key without a settled
@@ -160,8 +178,11 @@ const readUnmarked = (kv: KeyValueStore.KeyValueStore) =>
  *   entry, and clears the marker again (each clear a `has`, and a `remove`
  *   only when it exists). A crash after the first clear leaves an unmarked
  *   terminal entry, which the next listing reads once and marks.
- * - a terminal `put` writes the entry, then the marker. A crash between them
- *   leaves an unmarked terminal entry, read once and marked.
+ * - a terminal `put` writes the entry, then the marker, then reads the entry
+ *   back and removes the marker unless the read confirms a terminal entry —
+ *   so an unresolved `put` of the same digest from another writer that lands
+ *   between the two writes stays listed. A crash between the entry and the
+ *   marker leaves an unmarked terminal entry, read once and marked.
  * - a listing that reads an unmarked terminal entry marks it, reads the entry
  *   again and takes the marker back if the entry is no longer terminal — the
  *   other half of the second clear above, so a listing racing a fresh `Signed`
@@ -170,14 +191,23 @@ const readUnmarked = (kv: KeyValueStore.KeyValueStore) =>
  *
  * Nothing is read-modify-written: two fibers, two layer instances, two
  * processes over one store do not lose each other's entries. Two writers that
- * put the **same** digest at once still race, and the last `set` wins; the
- * lifecycle never does that, because one submission is one fiber.
+ * put the **same** digest at once still race for the entry, and the last
+ * `set` wins; that happens when another context's `Tx.reconcileAll` writes
+ * `Unknown` (or re-sends) for a `Signed` entry this one is settling. A marker
+ * is never left over an unresolved entry by that race, **except** when the
+ * settling process dies (or its `remove` fails) between its marker write and
+ * its re-read while the other writer's whole `put` landed just before the
+ * marker write: then the entry is hidden from listings (never from `get`)
+ * until it is written again. Closing that needs a compare-and-set.
  *
  * **A store 0.4 wrote needs no migration.** It has entries and no markers, and
  * an unmarked entry is always read, so the first listing is the 0.4 scan and
  * marks every settled entry it finds; the second reads only the unresolved
- * ones. Rolling back to 0.4 is safe: 0.4 reads only `entry:` keys and ignores
- * the markers. **Running a 0.4 writer beside this one is not**, in one case: a
+ * ones. Rolling back to 0.4 is safe for 0.4: it reads only `entry:` keys and
+ * ignores the markers. **Rolling forward again is not, after 0.4 wrote**: a
+ * 0.4 process that put an unresolved entry over a digest 0.5 had settled left
+ * 0.5's marker in place, so delete every `settled:` key (or drain the journal
+ * with `Tx.reconcileAll` on 0.4) before a 0.5 process lists the store again. **Running a 0.4 writer beside this one is not**, in one case: a
  * 0.4 process that writes an unresolved entry over a digest this journal had
  * settled leaves the marker in place, and the entry is hidden from
  * `listUnresolved` (not from `get`). The lifecycle re-signs a settled digest
@@ -217,7 +247,7 @@ export const make = (
         yield* clearMarker(kv, entry.digest)
       } else {
         yield* set
-        yield* kv.set(`${SETTLED}${entry.digest}`, entry._tag).pipe(Effect.mapError(journalError))
+        yield* settleMarker(kv, entry)
       }
     }),
     get: Effect.fn("Journal.get")(function*(digest: Digest) {

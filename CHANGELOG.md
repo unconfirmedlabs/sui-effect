@@ -58,7 +58,11 @@ code or stored data; read "Migrating from 0.4.x" first.
   one** can hide an entry — a 0.4 process that writes an unresolved entry over
   a digest 0.5 had settled (the same bytes submitted again) leaves the marker,
   and `listUnresolved` skips it (`get` still finds it). Rolling back to 0.4 is
-  safe: 0.4 reads only `entry:` keys.
+  safe for 0.4 (it reads only `entry:` keys); **rolling forward again after 0.4
+  wrote** hides such an entry the same way, so delete the `settled:` keys first.
+  Two contexts over one store (a tab's `Tx.reconcileAll` beside another's
+  submission) can hide an entry only if the settling one dies between its
+  marker write and its re-read (DESIGN §8).
 - **A visibility wait that times out logs at debug, not warning** (wallet
   finding 6). Effect's default logger writes to stdout at minimum level `Info`,
   so the warning landed in the middle of a `--json` CLI's output on a run whose
@@ -294,7 +298,8 @@ opt-in).
 5. Durable journals need no migration. Stop every 0.4 writer before a 0.5
    process writes the same store (or drain it with `Tx.reconcileAll()` and keep
    0.4 read-only); code that lists the store's raw keys filters on the
-   `entry:` prefix. Rolling back to 0.4 needs nothing.
+   `entry:` prefix. Rolling back to 0.4 needs nothing; rolling forward again
+   after 0.4 wrote to the store needs its `settled:` keys deleted first.
 6. A program that wants the visibility-timeout line sets
    `References.MinimumLogLevel` to `Debug`, or reads the `sui.visibility` span
    attribute or the `sui_effect_tx_visibility_wait` metric's `result`.
