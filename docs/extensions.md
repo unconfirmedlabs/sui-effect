@@ -2296,7 +2296,7 @@ Effect, no mutable module-level state, no `run*` outside an entrypoint.
   "@mysten/bcs": "^2.1.3",
   "@mysten/sui": "^2.28",
   "effect": ">=4.1.1 <4.2",
-  "@unconfirmed/sui-effect": ">=0.4.0 <0.5.0"
+  "@unconfirmed/sui-effect": ">=0.5.0 <0.6.0"
 },
 "peerDependenciesMeta": {
   "@unconfirmed/sui-effect": {
@@ -2372,8 +2372,8 @@ change — the dependency needs a form that does not exist on the registry.
 
 ```bash
 cd /path/to/sui-effect && bun run build && npm pack
-mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-0.4.0.tgz vendor/
-cd /path/to/your-package && bun add -d ./vendor/unconfirmed-sui-effect-0.4.0.tgz
+mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-0.5.0.tgz vendor/
+cd /path/to/your-package && bun add -d ./vendor/unconfirmed-sui-effect-0.5.0.tgz
 ```
 
 It is also the only form that proves anything: an isolated consumer of the
@@ -2417,7 +2417,7 @@ flight — fails the install. The escape is
 
 Put both halves of the swap on the release checklist:
 
-1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.4.0 <0.5.0"`, which is what the template ships for 0.4.x — a range rather than a caret, written out so the one minor it spans is explicit: a 0.x minor may break, and 0.4.0 did, see `CHANGELOG.md`);
+1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.5.0 <0.6.0"`, which is what the template ships for 0.5.x — a range rather than a caret, written out so the one minor it spans is explicit: a 0.x minor may break, and 0.4.0 and 0.5.0 both did, see `CHANGELOG.md`);
 2. **delete the `peerDependenciesMeta` entry.** Left in, it turns a genuinely
    missing peer into a silent `undefined` at import time;
 3. re-run the isolated-consumer check against the published package.
