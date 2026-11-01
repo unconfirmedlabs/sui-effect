@@ -660,6 +660,7 @@ The full entries follow under "API".
 ### `@unconfirmed/sui-effect/tx`
 
 - `Built` — re-exported from `@unconfirmed/sui-effect`.
+- `ClaimViolation` — One way the simulated effects stepped outside the claims.
 - `ExpirationPolicy` — How `Tx.build` sets an expiration when the recipe left one unset.
 - `ExpiryEvidencePolicy` — Whether `Tx.reconcile` is allowed to conclude that an expiration window closed on a transaction the node does not know.
 - `FoldBatch` — One fold transaction's worth of coins: what `fold` turns into a recipe.
@@ -667,14 +668,24 @@ The full entries follow under "API".
 - `FoldPlan` — What `planFold` answers: the transactions that fold an owner's coins, in the order they must run, and the SUI dust that cannot pay for its own fold.
 - `FoldResult` — What `foldCoins` did: the plan it ran, and one `Executed` per batch, in order.
 - `GasPaymentPolicy` — How `Tx.build` treats a gas payment the recipe left unset.
+- `Gate` — The intent policy and its screen.
+- `GateService` — Every decision `Tx.verify` and `Tx.run` read from context about intents.
+- `Intent` — A declared intent: one sentence for the screen, exact claims for the code.
+- `IntentAuthor` — Who wrote the intent.
+- `IntentClaims` — What the transaction is allowed to do to the sender, deny by default: a coin that is not listed may not decrease, an address that is not listed may not receive anything, and an object that is not listed may not leave.
 - `Journal` — The submission journal.
 - `JournalEntry` — One line of the submission journal.
 - `JournalService` — Reading and writing the submission journal.
 - `LockSenderPolicy` — When `Tx.run` holds the sender lock.
+- `OutflowClaim` — The most of one coin the sender may lose, in base units, gas excluded.
+- `Parties` — Whose transaction it is.
 - `ReconcileInput` — What `Tx.reconcile` can be asked about.
 - `Reconciled` — What one entry of `Tx.reconcileAll` settled to, as a tagged union.
 - `RemoteSigner` — What `remote` needs to know about a credential it does not hold.
 - `RunError` — Everything `run` can fail with, as one name: `SubmitError` plus what building, preflighting and signing can produce.
+- `ScreenRequest` — What a screen is shown: the sentence, and both things it is compared with.
+- `ScreenedLine` — One rendered line and the probability that the declared summary covers it.
+- `Screening` — What a semantic screen answered: probabilities, never a decision.
 - `Signature` — re-exported from `@unconfirmed/sui-effect`.
 - `SignatureScheme`
 - `Signed` — The schema of `Signed`.
@@ -686,14 +697,19 @@ The full entries follow under "API".
 - `SubmitViaError` — Everything `submitVia` can fail with, before the sender's own errors.
 - `SubmitViaReply` — What a third party answers when it has submitted your bytes.
 - `TransactionExpiration` — re-exported from `@unconfirmed/sui-effect`.
-- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 - `UNRESOLVED_TAGS` — The tags whose entries still need an answer from the network.
+- `Verdict` — How far a transaction was checked.
+- `Verified` — A `Built` whose simulated effects stayed inside a declared `Intent`.
 - `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
 - `VerifyOptions` — The options both verifiers take.
 - `attach` — Attaches a signature somebody else made — a sender's wallet, a remote sponsor, an HSM — to built or already signed bytes, after checking it.
 - `build` — Builds a transaction into signable bytes.
 - `chainOf` — re-exported from `@unconfirmed/sui-effect`.
+- `checkClaims` — Compares the simulated effects with the claims, exactly and in code.
 - `cosign` — Adds one more signature to already signed bytes, for a sponsored or multi-party transaction.
+- `describeClaims` — The claims as sentences, for the edge between the summary and the claims: a harmless sentence must not sit in front of permissions it has no use for.
+- `describeEffects` — The simulated effects as sentences a semantic screen can read: addresses become labels, types lose their package ids, and only SUI carries a number.
 - `ephemeral` — A fresh Ed25519 credential that exists only for this process.
 - `fold` — The recipe for one fold transaction: merge the batch's coins and deposit them into the owner's address balance with `0x2::coin::send_funds<T>`.
 - `foldCoins` — Folds the signer's coin objects into its address balance: `planFold` for `signer.address`, then one `run` of `fold` per batch, in order — SUI first, paying for its own fold, so a fresh account whose SUI is all coins needs no address balance to start.
@@ -717,6 +733,7 @@ The full entries follow under "API".
 - `sponsored` — Turns a recipe into a sponsored one: the sender owns the transaction, the gas owner pays, and gas comes from the sponsor's address balance rather than from coin objects, so the two parties never have to agree on a gas coin and can sign in either order.
 - `submit` — Sends signed bytes, and does not stop caring until it knows what happened.
 - `submitVia` — Submits through **someone else** — a relay, a sponsorship service, a backend that holds the only key allowed to talk to the node — and keeps the journal and the evidence rules that `Tx.submit` would have kept.
+- `verify` — Checks built bytes against a declared intent, before anything is signed.
 
 ### `@unconfirmed/sui-effect/journal`
 
@@ -726,6 +743,16 @@ The full entries follow under "API".
 - `layerKeyValueStore` — The durable journal as a layer.
 - `makeKeyValueStore` — A journal backed by a `KeyValueStore`.
 - `pruneSettled` — Deletes every **settled** entry (`Executed`, `Failed`, `NotApplied`) whose answer was recorded strictly before `before`, and answers how many it deleted.
+
+### `@unconfirmed/sui-effect/gate`
+
+- `Gate` — re-exported from `@unconfirmed/sui-effect/tx`.
+- `GateService` — re-exported from `@unconfirmed/sui-effect/tx`.
+- `JevOptions` — How to reach Jev.
+- `ScreenRequest` — re-exported from `@unconfirmed/sui-effect/tx`.
+- `layerJev` — The `Gate` already in force, with Jev as its screen and `overrides` applied.
+- `layerJevConfig` — `layerJev` from the environment: `TYPESAFE_API_KEY` (required, redacted), `TYPESAFE_MODEL` and `TYPESAFE_BASE_URL` (optional).
+- `makeJev` — The screen itself, over an `HttpClient` you already have.
 
 ### `@unconfirmed/sui-effect/extension`
 
@@ -4016,11 +4043,22 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-58 exported symbols.
+75 exported symbols.
 
 ### `Built` (const)
 
 Re-exported from `@unconfirmed/sui-effect`.
+
+### `ClaimViolation` (interface)
+
+```ts
+export interface ClaimViolation {
+    readonly rule: "outflow" | "recipient" | "object";
+    readonly message: string;
+}
+```
+
+One way the simulated effects stepped outside the claims.
 
 ### `ExpirationPolicy` (type)
 
@@ -4147,6 +4185,126 @@ How `Tx.build` treats a gas payment the recipe left unset.
   `Tx.foldCoins`.
 
 A payment the recipe set itself is the recipe's choice under either policy.
+
+### `Gate` (const)
+
+```ts
+declare const Gate: Context.Reference<GateService> & {
+    defaults: GateService;
+    layer: (overrides: Partial<GateService>) => Layer.Layer<never>;
+    with: (overrides: Partial<GateService>) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+}
+```
+
+The intent policy and its screen.
+
+Because this is a `Context.Reference`, `Tx.verify` keeps `R = Sui`: with
+nothing provided the claims are checked and the verdict is `Unscreened`.
+`Gate.layer(overrides)` spreads `defaults`; `Gate.with(overrides)`
+merges over the gate in force.
+
+### `GateService` (interface)
+
+```ts
+export interface GateService {
+    /**
+     * The semantic screen. It answers in probabilities and decides nothing.
+     *
+     * Fails with: `TransportError`, which is what `GateService.onUnavailable`
+     * is about.
+     */
+    readonly screen?: (request: ScreenRequest) => Effect.Effect<Screening, TransportError>;
+    /**
+     * Whether `Tx.run` refuses a transaction that declares no intent, with
+     * `PolicyDenied { rule: "intent.required" }`, before it builds anything.
+     * Off by default; on is the setting for a wallet an agent drives. It binds
+     * `Tx.run` only: the explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.submit`)
+     * is not gated, and a caller assembling it calls `Tx.verify` itself.
+     */
+    readonly requireIntent: boolean;
+    /**
+     * What a screen that could not answer means. `"deny"` refuses the transaction
+     * with `PolicyDenied { rule: "gate.unavailable" }`: a gate that was configured
+     * and is down is not a gate that passed. `"unscreened"` lets the claims check
+     * stand alone and records why on the verdict.
+     */
+    readonly onUnavailable: "deny" | "unscreened";
+    /** An effect line the summary covers with less probability than this is refused. */
+    readonly minEffectInScope: number;
+    /** A claim line the summary has less use for than this is refused. */
+    readonly minClaimInScope: number;
+    /** A summary less specific than this (0 to 2) covers nothing and is refused. */
+    readonly minSpecificity: number;
+    /** A summary more likely than this to be addressing the screen is refused. */
+    readonly maxInjection: number;
+}
+```
+
+Every decision `Tx.verify` and `Tx.run` read from context about intents.
+
+### `Intent` (const)
+
+```ts
+declare const Intent: Schema
+// decodes to:
+// {
+//     readonly summary: string;
+//     readonly author: "user" | "task" | "dapp";
+//     readonly claims: {
+//         readonly outflows: readonly {
+//             readonly coinType: CoinType;
+//             readonly max: bigint;
+//         }[];
+//         readonly recipients: readonly SuiAddress[];
+//         readonly objects: readonly ObjectId[];
+//     };
+// }
+```
+
+A declared intent: one sentence for the screen, exact claims for the code.
+
+`Intent.fromSimulation(simulation: Simulation, parties: Parties, opts: {
+summary: string; author: IntentAuthor }): Intent` renders a simulation as
+the exact claims it implies: every coin the sender loses at exactly the
+amount lost (net of gas), every address other than the sender that receives
+a coin or an object, every non-coin object that leaves the sender. So
+`checkClaims(Intent.fromSimulation(s, p, opts), s, p)` is empty. It is how a
+wallet shows a dapp's bytes as claims a person can approve, then holds what
+it signs to them with `Tx.verify`; `parties` may be the `Built` itself.
+
+**Never fails; the summary is checked by `Tx.verify` (`intent.invalid`).**
+
+### `IntentAuthor` (const)
+
+```ts
+declare const IntentAuthor: Schema
+// decodes to: "user" | "task" | "dapp"
+```
+
+Who wrote the intent. Provenance for the audit record, and nothing else: the
+checks are the same for all three, because none of them can be verified from
+here.
+
+`"user"` is a person describing their own transaction. `"task"` is the scope
+a person gave an agent **before** the agent built anything, which is the only
+form that constrains a prompt-injected agent; an agent describing its own PTB
+after the fact is `"dapp"` in all but name. `"dapp"` is a third party's
+description of a transaction it built, which is a claim to check and never
+evidence.
+
+### `IntentClaims` (const)
+
+```ts
+declare const IntentClaims: Schema
+// decodes to: { readonly outflows: readonly { readonly coinType: CoinType; readonly max: bigint; }[]; readonly recipients: readonly SuiAddress[]; readonly objects: readonly ObjectId[]; }
+```
+
+What the transaction is allowed to do to the sender, deny by default: a coin
+that is not listed may not decrease, an address that is not listed may not
+receive anything, and an object that is not listed may not leave.
+
+Gas is not an outflow. It is bounded by `SubmitConfig.maxGasBudget`, and
+counting it would make every claim a guess about the reference gas price.
 
 ### `Journal` (const)
 
@@ -4425,6 +4583,29 @@ A config provided directly rather than through `SubmitConfig.with` may still
 hold the pre-0.4.0 boolean or another value: `Tx.run` reads `true` as
 `"always"`, `false` as `"never"`, and anything else as `"always"`.
 
+### `OutflowClaim` (const)
+
+```ts
+declare const OutflowClaim: Schema
+// decodes to: { readonly coinType: CoinType; readonly max: bigint; }
+```
+
+The most of one coin the sender may lose, in base units, gas excluded.
+
+### `Parties` (interface)
+
+```ts
+export interface Parties {
+    readonly sender: SuiAddress;
+    readonly gasOwner?: SuiAddress | undefined;
+}
+```
+
+Whose transaction it is. Gas spent by whoever pays it is never an outflow.
+
+A `Built` is a `Parties` as it is: `sender`, and `gasOwner` only when someone
+else pays.
+
 ### `ReconcileInput` (type)
 
 ```ts
@@ -4489,6 +4670,51 @@ export type RunError = BuildError | SimulationFailed | PolicyDenied | SigningErr
 
 Everything `run` can fail with, as one name: `SubmitError` plus
 what building, preflighting and signing can produce.
+
+### `ScreenRequest` (interface)
+
+```ts
+export interface ScreenRequest {
+    readonly intent: Intent;
+    /** `describeEffects` of the simulation. Never empty. */
+    readonly effects: ReadonlyArray<string>;
+    /** `describeClaims` of the intent. Empty when it claims nothing. */
+    readonly claims: ReadonlyArray<string>;
+}
+```
+
+What a screen is shown: the sentence, and both things it is compared with.
+
+### `ScreenedLine` (const)
+
+```ts
+declare const ScreenedLine: Schema
+// decodes to: { readonly text: string; readonly inScope: number; }
+```
+
+One rendered line and the probability that the declared summary covers it.
+
+### `Screening` (const)
+
+```ts
+declare const Screening: Schema
+// decodes to:
+// {
+//     readonly effects: readonly {
+//         readonly text: string;
+//         readonly inScope: number;
+//     }[];
+//     readonly claims: readonly {
+//         readonly text: string;
+//         readonly inScope: number;
+//     }[];
+//     readonly specificity: number;
+//     readonly injection: number;
+// }
+```
+
+What a semantic screen answered: probabilities, never a decision. The
+decision is `Gate`'s thresholds, applied in code by `Tx.verify`.
 
 ### `Signature` (const)
 
@@ -4855,6 +5081,7 @@ declare const Tx: {
     }) => Effect.Effect<FoldResult, RunError, Sui>;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
+    readonly verify: (built: Built, intent: Intent) => Effect.Effect<Verified, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
     readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
     readonly resubmit: (input: SubmissionUnknown | Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly recorded: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never>;
@@ -4888,6 +5115,15 @@ declare const Tx: {
          * @since 0.1.2
          */
         readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+        /**
+         * What this transaction is declared to do. When present, the built bytes
+         * go through `verify` before anything is signed, sharing its
+         * simulate with `SubmitConfig.preflight`. `Gate.requireIntent` makes it
+         * mandatory.
+         *
+         * @since 0.5.0
+         */
+        readonly intent?: Intent;
     }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>;
     readonly reconcileAll: (opts?: {
         /**
@@ -4916,7 +5152,7 @@ declare const Tx: {
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
 `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
 `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
-`Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
+`Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.reconcile`,
 `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 
 ### `UNRESOLVED_TAGS` (const)
@@ -4926,6 +5162,114 @@ declare const UNRESOLVED_TAGS: readonly ["Signed", "Unknown"]
 ```
 
 The tags whose entries still need an answer from the network.
+
+### `Verdict` (const)
+
+```ts
+declare const Verdict: Schema
+// decodes to:
+// {
+//     readonly _tag: "Screened";
+//     readonly screening: {
+//         readonly effects: readonly {
+//             readonly text: string;
+//             readonly inScope: number;
+//         }[];
+//         readonly claims: readonly {
+//             readonly text: string;
+//             readonly inScope: number;
+//         }[];
+//         readonly specificity: number;
+//         readonly injection: number;
+//     };
+// } | {
+//     readonly _tag: "Unscreened";
+//     readonly reason: string;
+// }
+```
+
+How far a transaction was checked. The claims always held, or there would be
+a `PolicyDenied` instead of a verdict; what varies is whether anything read
+the sentence. `Unscreened` is never silent: it is on the record with a reason.
+
+### `Verified` (const)
+
+```ts
+declare const Verified: Schema
+// decodes to:
+// {
+//     readonly bytes: Uint8Array<ArrayBufferLike>;
+//     readonly digest: Digest;
+//     readonly sender: SuiAddress;
+//     readonly intent: {
+//         readonly summary: string;
+//         readonly author: "user" | "task" | "dapp";
+//         readonly claims: {
+//             readonly outflows: readonly {
+//                 readonly coinType: CoinType;
+//                 readonly max: bigint;
+//             }[];
+//             readonly recipients: readonly SuiAddress[];
+//             readonly objects: readonly ObjectId[];
+//         };
+//     };
+//     readonly verdict: {
+//         readonly _tag: "Screened";
+//         readonly screening: {
+//             readonly effects: readonly {
+//                 readonly text: string;
+//                 readonly inScope: number;
+//             }[];
+//             readonly claims: readonly {
+//                 readonly text: string;
+//                 readonly inScope: number;
+//             }[];
+//             readonly specificity: number;
+//             readonly injection: number;
+//         };
+//     } | {
+//         readonly _tag: "Unscreened";
+//         readonly reason: string;
+//     };
+//     readonly gasOwner?: SuiAddress | undefined;
+//     readonly expiration?: {
+//         readonly $kind: "None";
+//         readonly None: true;
+//     } | {
+//         readonly $kind: "Epoch";
+//         readonly Epoch: bigint;
+//     } | {
+//         readonly $kind: "ValidDuring";
+//         readonly ValidDuring: {
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | {
+//         readonly $kind: "Validity";
+//         readonly Validity: {
+//             readonly allowedProposers: {
+//                 readonly epoch: bigint;
+//                 readonly proposers: readonly number[];
+//             } | null;
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | undefined;
+//     readonly chain?: string | undefined;
+// } & Brand<"Verified">
+```
+
+A `Built` whose simulated effects stayed inside a declared
+`Intent`. Structurally a `Built`, so `Tx.sign` takes it as it is; the
+brand is what says `Tx.verify` produced it.
 
 ### `Verify` (const)
 
@@ -5068,6 +5412,31 @@ recipe set it.
 
 Re-exported from `@unconfirmed/sui-effect`.
 
+### `checkClaims` (const)
+
+```ts
+declare const checkClaims: (intent: Intent, simulation: Simulation, parties: Parties) => ReadonlyArray<ClaimViolation>
+```
+
+Compares the simulated effects with the claims, exactly and in code.
+
+Deny by default: a coin the sender loses needs an outflow claim that covers
+the amount (net of gas), an address that gains a coin or an object needs to
+be a claimed recipient, and a non-coin object that leaves the sender —
+transferred, shared, wrapped or deleted — needs to be a claimed object.
+
+**Gas is gas wherever it is paid from.** A node's balance changes cover coin
+objects and address balances alike, so the payer's SUI delta carries the
+gas whether the payment was a gas coin or the payer's address balance (an
+empty payment), and it is taken back out either way. Anything else that
+leaves the sender's address balance — a `balance::send_funds` of a
+`tx.balance()` withdrawal — is an outflow like any coin transfer, and its
+receiver a recipient. Accumulator writes are bookkeeping and never an object.
+
+An empty answer means the claims held.
+
+**Never fails.**
+
 ### `cosign` (const)
 
 ```ts
@@ -5082,6 +5451,33 @@ As in `sign`, the co-signer's address must be the sender or the gas
 owner named in the bytes.
 
 **Fails with: `SigningError`.**
+
+### `describeClaims` (const)
+
+```ts
+declare const describeClaims: (intent: Intent) => ReadonlyArray<string>
+```
+
+The claims as sentences, for the edge between the summary and the claims: a
+harmless sentence must not sit in front of permissions it has no use for.
+
+Answers with no lines when the intent claims nothing.
+
+**Never fails.**
+
+### `describeEffects` (const)
+
+```ts
+declare const describeEffects: (simulation: Simulation, parties: Parties) => ReadonlyArray<string>
+```
+
+The simulated effects as sentences a semantic screen can read: addresses
+become labels, types lose their package ids, and only SUI carries a number.
+What it cannot say reliably it does not say.
+
+Always answers with at least one line.
+
+**Never fails.**
 
 ### `ephemeral` (const)
 
@@ -5857,6 +6253,15 @@ declare const run: (recipe: Transaction | Recipe, opts: {
      * @since 0.1.2
      */
     readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+    /**
+     * What this transaction is declared to do. When present, the built bytes
+     * go through `verify` before anything is signed, sharing its
+     * simulate with `SubmitConfig.preflight`. `Gate.requireIntent` makes it
+     * mandatory.
+     *
+     * @since 0.5.0
+     */
+    readonly intent?: Intent;
 }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>
 ```
 
@@ -5915,6 +6320,13 @@ is not taken and one sponsor serves many senders at once.
 When `SubmitConfig.preflight` is set it costs one extra simulate, and is
 where spend limits and target policies refuse a transaction before anything
 is signed.
+
+**`intent` puts the bytes through `verify` before anything is
+signed**, on the same simulate `preflight` uses — one extra simulate for
+either or both, run after the build exactly where signing runs (under the
+lock when the bytes pin). `Gate.requireIntent` makes it mandatory: a run
+that declares none fails with `PolicyDenied { rule: "intent.required" }`
+before the recipe is even applied.
 
 **A sponsored run needs both signatures.** A transaction whose gas owner is
 not its sender is signed by *both* parties; one signature is bytes a
@@ -6111,6 +6523,40 @@ whatever the service returns. What this owns is everything around it:
 
 **Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown` (carrying the signed bytes, with the sender's failure as its `cause`), `JournalError` (only from the write before `send`), and `E` — whatever `send` fails with — when that error declares `outcome: "not_applied"`.**
 
+### `verify` (const)
+
+```ts
+declare const verify: (built: Built, intent: Intent) => Effect.Effect<Verified, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>
+```
+
+Checks built bytes against a declared intent, before anything is signed.
+
+One simulate of exactly `built.bytes`, then two checkers. The claims are
+compared with the simulated effects exactly, in code, deny by default (gas
+is never an outflow, whether a gas coin or the payer's address balance paid
+it; an address-balance withdrawal sent to someone is). Then `Gate.screen`,
+when the gate in force has one, reads the summary against the effects and
+the claims rendered as words, and `Gate`'s thresholds turn its
+probabilities into a refusal. With no screen configured the claims check
+stands alone and the verdict is `Unscreened`. `SubmitConfig.preflight` is
+not run here; `Tx.run` runs it on the same simulate.
+
+The answer is structurally a `Built`, so it goes straight to `Tx.sign`. The
+explicit lifecycle is not gated: `Tx.sign` takes any `Built`, so a caller
+assembling `build`/`sign`/`submit` by hand calls this itself.
+
+**What it does not prove.** A simulation is one execution against the state
+the node had; a package that branches on a shared object, the clock or
+randomness can behave differently when the bytes land. The claims bound what
+was simulated, not what will execute.
+
+Every refusal is a `PolicyDenied` whose `rule` says which check:
+`intent.invalid`, `intent.outflow`, `intent.recipient`, `intent.object`,
+`gate.unavailable`, `intent.injection`, `intent.vague`, `intent.effect`,
+`intent.claim`.
+
+**Fails with: `PolicyDenied`, `SimulationFailed`, `BuildError`, `TransportError`.**
+
 ## `@unconfirmed/sui-effect/journal`
 
 
@@ -6220,6 +6666,79 @@ It reads the same `KeyValueStore` the journal layer was built over; pass the
 same `prefix`. The dead `index` key a 0.3 journal kept is not touched.
 
 **Fails with: `JournalError`, when the store cannot be listed, read or written, or holds an entry that does not decode (nothing is deleted on the strength of an entry it could not read).**
+
+## `@unconfirmed/sui-effect/gate`
+
+
+7 exported symbols.
+
+### `Gate` (const)
+
+Re-exported from `@unconfirmed/sui-effect/tx`.
+
+### `GateService` (interface)
+
+Re-exported from `@unconfirmed/sui-effect/tx`.
+
+### `JevOptions` (interface)
+
+```ts
+export interface JevOptions {
+    readonly apiKey: Redacted.Redacted<string>;
+    /** Defaults to `"jev-latest"`. Pin a version to keep thresholds meaningful. */
+    readonly model?: string;
+    /** Defaults to `https://api.typesafe.ai`. */
+    readonly baseUrl?: string;
+    /** The bound on one screen, retries included. Defaults to 10 seconds. */
+    readonly timeout?: Duration.Input;
+}
+```
+
+How to reach Jev.
+
+### `ScreenRequest` (interface)
+
+Re-exported from `@unconfirmed/sui-effect/tx`.
+
+### `layerJev` (const)
+
+```ts
+declare const layerJev: (options: JevOptions, overrides?: Partial<Omit<GateService, "screen">>) => Layer.Layer<never, never, HttpClient.HttpClient>
+```
+
+The `Gate` already in force, with Jev as its screen and `overrides` applied.
+
+Requires an `HttpClient`: `FetchHttpClient.layer` from
+`effect/http` needs no platform package.
+
+**Never fails.**
+
+### `layerJevConfig` (const)
+
+```ts
+declare const layerJevConfig: (overrides?: Partial<Omit<GateService, "screen">>) => Layer.Layer<never, Config.ConfigError, HttpClient.HttpClient>
+```
+
+`layerJev` from the environment: `TYPESAFE_API_KEY` (required,
+redacted), `TYPESAFE_MODEL` and `TYPESAFE_BASE_URL` (optional).
+
+**Fails with: `ConfigError` when the key is absent.**
+
+### `makeJev` (const)
+
+```ts
+declare const makeJev: (options: JevOptions) => Effect.Effect<NonNullable<GateService["screen"]>, never, HttpClient.HttpClient>
+```
+
+The screen itself, over an `HttpClient` you already have.
+
+One `POST /v1/systemone` per screen, retried on 429, 5xx and a dropped
+connection inside `timeout`. An answer that is missing a question it was
+asked is a non-retryable `TransportError`, never a default.
+
+The screen fails with: `TransportError`.
+
+**Never fails to build.**
 
 ## `@unconfirmed/sui-effect/extension`
 
@@ -6949,6 +7468,14 @@ export interface FakeChange {
      */
     readonly inputVersion?: bigint;
     readonly owner?: SuiClientTypes.ObjectOwner;
+    /**
+     * The owner going **in**, for a transaction that moved the object: a transfer
+     * is `inputOwner` the sender and `owner` the recipient, which is what
+     * `checkClaims` reads. Defaults to `owner`, an object that stayed put.
+     *
+     * @since 0.5.0
+     */
+    readonly inputOwner?: SuiClientTypes.ObjectOwner;
     /** `PackageWrite` marks a published package; `AccumulatorWriteV1` an accumulator write. */
     readonly outputState?: SuiClientTypes.ChangedObject["outputState"];
     /**

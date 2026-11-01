@@ -42,7 +42,27 @@ export { Journal, type JournalService } from "./services/Journal.ts"
 /** The lifecycle as a serializable union, for what the journal holds. */
 export { isUnresolved, JournalEntry, UNRESOLVED_TAGS } from "./domain/journal-entry.ts"
 
-/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, reconcile, resubmit, run, foldCoins. */
+/** The intent policy and its optional screen; `@unconfirmed/sui-effect/gate` provides Jev. */
+export { Gate, type GateService, type ScreenRequest } from "./services/Gate.ts"
+
+/** A declared intent, the record of having checked it, and the pure checks. */
+export {
+  checkClaims,
+  type ClaimViolation,
+  describeClaims,
+  describeEffects,
+  Intent,
+  IntentAuthor,
+  IntentClaims,
+  OutflowClaim,
+  type Parties,
+  ScreenedLine,
+  Screening,
+  Verdict,
+  Verified
+} from "./domain/intent.ts"
+
+/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, verify, reconcile, resubmit, run, foldCoins. */
 export {
   attach,
   build,
@@ -68,7 +88,8 @@ export {
   type SubmitViaError,
   type SubmitViaReply,
   submitVia,
-  Tx
+  Tx,
+  verify
 } from "./services/Tx.ts"
 
 /** Folding coins into the address balance, and sending into one. */

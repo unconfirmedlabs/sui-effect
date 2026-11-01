@@ -36,6 +36,8 @@ import {
   TransportError
 } from "../domain/errors.ts"
 import { EXECUTE_INCLUDE, Executed, fromTransactionResult } from "../domain/executed.ts"
+import type { Intent, Verdict } from "../domain/intent.ts"
+import { checkClaims, describeClaims, describeEffects, Intent as IntentSchema, Verified } from "../domain/intent.ts"
 import * as Metrics from "../domain/metrics.ts"
 import { isUnresolved, JournalEntry } from "../domain/journal-entry.ts"
 import {
@@ -50,11 +52,13 @@ import {
   ObjectId,
   Signature,
   SignedTransaction,
+  type Simulation,
   SuiAddress,
   TransactionExpiration,
   U32_MAX,
   Version
 } from "../domain/schemas.ts"
+import { Gate } from "./Gate.ts"
 import { Journal } from "./Journal.ts"
 import { defaultReadPolicy } from "./SuiCore.ts"
 import { verifyTransactionSignature } from "./Verify.ts"
@@ -2869,6 +2873,223 @@ const assertSponsor = (
   return Effect.succeed(sponsor)
 }
 
+/** The first line a screen scored under `minimum`, if any did. */
+const firstBelow = (
+  lines: ReadonlyArray<{ readonly text: string; readonly inScope: number }>,
+  minimum: number
+) => lines.find((line) => line.inScope < minimum)
+
+/** The intent exactly as its schema admits it, or `intent.invalid`. */
+const validIntent = Schema.decodeUnknownEffect(Schema.toType(IntentSchema))
+
+/**
+ * `Gate.requireIntent`, as `Tx.run` applies it before anything is built: a
+ * gate that requires an intent signs nothing that declares none.
+ *
+ * Fails with: `PolicyDenied` (`intent.required`).
+ */
+const requireIntentOf = Effect.fnUntraced(function*(
+  intent: Intent | undefined
+): Effect.fn.Return<void, PolicyDenied> {
+  const gate = yield* Gate
+  if (gate.requireIntent && intent === undefined) {
+    return yield* new PolicyDenied({
+      rule: "intent.required",
+      message: "this gate signs nothing that does not declare an intent"
+    })
+  }
+})
+
+/**
+ * {@link verify} over a simulation the caller already has: the claims, in
+ * code, then the screen, when the gate in force has one.
+ *
+ * Fails with: `PolicyDenied`.
+ */
+const verifyAgainst = Effect.fn("Tx.verifyAgainst")(function*(
+  built: Built,
+  intent: Intent,
+  simulation: Simulation
+): Effect.fn.Return<Verified, PolicyDenied> {
+  const gate = yield* Gate
+  const deny = (rule: string, message: string) => Effect.fail(new PolicyDenied({ rule, message }))
+  // Checked first, so an intent the schema refuses is `intent.invalid`
+  // whatever the effects are, and nothing below reads a malformed one.
+  const declared = yield* validIntent(intent).pipe(
+    Effect.mapError((issue) =>
+      new PolicyDenied({ rule: "intent.invalid", message: `the intent is not valid: ${issue.message}` })
+    )
+  )
+  const parties = {
+    sender: built.sender,
+    ...(built.gasOwner === undefined ? {} : { gasOwner: built.gasOwner })
+  }
+  const verified = (verdict: Verdict) =>
+    Effect.try({
+      try: () => Verified.make({ ...built, intent: declared, verdict }),
+      catch: (cause) =>
+        new PolicyDenied({ rule: "intent.invalid", message: `the intent is not valid: ${String(cause)}` })
+    })
+
+  const violations = checkClaims(declared, simulation, parties)
+  const violation = violations[0]
+  if (violation !== undefined) {
+    return yield* deny(
+      `intent.${violation.rule}`,
+      violations.map((each) => each.message).join("; ")
+    )
+  }
+
+  const screen = gate.screen
+  if (screen === undefined) {
+    return yield* verified({ _tag: "Unscreened", reason: "no screen is configured" })
+  }
+  const answer = yield* Effect.result(screen({
+    intent: declared,
+    effects: describeEffects(simulation, parties),
+    claims: describeClaims(declared)
+  }))
+  if (answer._tag === "Failure") {
+    const reason = SuiError.describe(answer.failure)
+    return yield* gate.onUnavailable === "deny"
+      ? deny("gate.unavailable", `the screen did not answer: ${reason}`)
+      : verified({ _tag: "Unscreened", reason })
+  }
+
+  const screening = answer.success
+  // Injection first: a summary that talks to the screen taints every other
+  // answer it gave, so none of them is read.
+  if (screening.injection > gate.maxInjection) {
+    return yield* deny("intent.injection", "the summary addresses whoever is screening it")
+  }
+  if (screening.specificity < gate.minSpecificity) {
+    return yield* deny("intent.vague", "the summary names nothing concrete, so it covers nothing")
+  }
+  const effect = firstBelow(screening.effects, gate.minEffectInScope)
+  if (effect !== undefined) {
+    return yield* deny("intent.effect", `outside the declared intent: ${effect.text}`)
+  }
+  const claim = firstBelow(screening.claims, gate.minClaimInScope)
+  if (claim !== undefined) {
+    return yield* deny("intent.claim", `the declared intent has no use for: ${claim.text}`)
+  }
+  return yield* verified({ _tag: "Screened", screening })
+})
+
+/**
+ * The one simulate of exactly `built.bytes` that everything before signing
+ * shares. The single place a later change reuses a simulation the build
+ * already made of these bytes.
+ *
+ * Fails with: `SimulationFailed`, `BuildError`, `TransportError`.
+ */
+const simulateBuilt = Effect.fnUntraced(function*(
+  built: Built
+): Effect.fn.Return<Simulation, SimulationFailed | BuildError | TransportError, Sui> {
+  const sui = yield* Sui
+  return yield* sui.simulate(built.bytes)
+})
+
+/**
+ * What the front half of a run learned about built bytes before anything is
+ * signed: the simulation, when one ran, and the verified intent, when there
+ * was one to verify.
+ */
+interface FrontHalf {
+  readonly built: Built
+  readonly simulation: Simulation | undefined
+  readonly verified: Verified | undefined
+}
+
+/**
+ * The front half of `Tx.run` after the build: **one** simulate of exactly
+ * these bytes, shared by `SubmitConfig.preflight` and the intent check, then
+ * `preflight(simulation)`, then {@link verifyAgainst} when there is an
+ * intent. The simulate runs when `opts.simulate` asks for it or when either
+ * consumer exists, and not otherwise, so a run with neither costs no extra
+ * simulate. Nothing here signs, takes a lock or sends: the caller decides
+ * where it runs (`Tx.run` runs it exactly where signing runs, under the lock
+ * when the bytes pin).
+ *
+ * Fails with: `SimulationFailed`, `BuildError`, `TransportError` (the
+ * simulate), `PolicyDenied` (preflight, the claims, the screen).
+ */
+const frontHalf = Effect.fnUntraced(function*(
+  built: Built,
+  opts: { readonly intent?: Intent | undefined; readonly simulate?: boolean | undefined }
+): Effect.fn.Return<FrontHalf, PolicyDenied | SimulationFailed | BuildError | TransportError, Sui> {
+  const config = yield* SubmitConfig
+  const preflight = config.preflight
+  if (opts.simulate !== true && preflight === undefined && opts.intent === undefined) {
+    return { built, simulation: undefined, verified: undefined }
+  }
+  const simulation = yield* simulateBuilt(built)
+  if (preflight !== undefined) yield* preflight(simulation)
+  const verified = opts.intent === undefined ? undefined : yield* verifyAgainst(built, opts.intent, simulation)
+  return { built, simulation, verified }
+})
+
+/**
+ * Checks built bytes against a declared intent, before anything is signed.
+ *
+ * One simulate of exactly `built.bytes`, then two checkers. The claims are
+ * compared with the simulated effects exactly, in code, deny by default (gas
+ * is never an outflow, whether a gas coin or the payer's address balance paid
+ * it; an address-balance withdrawal sent to someone is). Then `Gate.screen`,
+ * when the gate in force has one, reads the summary against the effects and
+ * the claims rendered as words, and `Gate`'s thresholds turn its
+ * probabilities into a refusal. With no screen configured the claims check
+ * stands alone and the verdict is `Unscreened`. `SubmitConfig.preflight` is
+ * not run here; `Tx.run` runs it on the same simulate.
+ *
+ * The answer is structurally a `Built`, so it goes straight to `Tx.sign`. The
+ * explicit lifecycle is not gated: `Tx.sign` takes any `Built`, so a caller
+ * assembling `build`/`sign`/`submit` by hand calls this itself.
+ *
+ * **What it does not prove.** A simulation is one execution against the state
+ * the node had; a package that branches on a shared object, the clock or
+ * randomness can behave differently when the bytes land. The claims bound what
+ * was simulated, not what will execute.
+ *
+ * Every refusal is a `PolicyDenied` whose `rule` says which check:
+ * `intent.invalid`, `intent.outflow`, `intent.recipient`, `intent.object`,
+ * `gate.unavailable`, `intent.injection`, `intent.vague`, `intent.effect`,
+ * `intent.claim`.
+ *
+ * Fails with: `PolicyDenied`, `SimulationFailed`, `BuildError`, `TransportError`.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { CoinType, type SuiAddress } from "@unconfirmed/sui-effect"
+ * import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const signer: Signer
+ * declare const cold: SuiAddress
+ *
+ * const program = Effect.gen(function*() {
+ *   const built = yield* Tx.build(Tx.sendFunds({ amount: 250_000_000_000n, recipient: cold }), {
+ *     sender: signer.address
+ *   })
+ *   const verified = yield* Tx.verify(built, {
+ *     summary: "Send 250 SUI to my cold wallet.",
+ *     author: "user",
+ *     claims: { outflows: [{ coinType: CoinType.SUI, max: 250_000_000_000n }], recipients: [cold], objects: [] }
+ *   })
+ *   return yield* Tx.submit(yield* Tx.sign(verified, signer))
+ * })
+ * ```
+ */
+export const verify = Effect.fn("Tx.verify")(function*(
+  built: Built,
+  intent: Intent
+): Effect.fn.Return<Verified, PolicyDenied | SimulationFailed | BuildError | TransportError, Sui> {
+  yield* Effect.annotateCurrentSpan({ "sui.digest": built.digest })
+  return yield* verifyAgainst(built, intent, yield* simulateBuilt(built))
+})
+
 /**
  * Build, preflight, sign and submit, under the sender lock wherever two runs
  * could race.
@@ -2925,6 +3146,13 @@ const assertSponsor = (
  * When `SubmitConfig.preflight` is set it costs one extra simulate, and is
  * where spend limits and target policies refuse a transaction before anything
  * is signed.
+ *
+ * **`intent` puts the bytes through {@link verify} before anything is
+ * signed**, on the same simulate `preflight` uses — one extra simulate for
+ * either or both, run after the build exactly where signing runs (under the
+ * lock when the bytes pin). `Gate.requireIntent` makes it mandatory: a run
+ * that declares none fails with `PolicyDenied { rule: "intent.required" }`
+ * before the recipe is even applied.
  *
  * **A sponsored run needs both signatures.** A transaction whose gas owner is
  * not its sender is signed by *both* parties; one signature is bytes a
@@ -2989,6 +3217,15 @@ export const run = Effect.fn("Tx.run")(function*(
      * @since 0.1.2
      */
     readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>
+    /**
+     * What this transaction is declared to do. When present, the built bytes
+     * go through {@link verify} before anything is signed, sharing its
+     * simulate with `SubmitConfig.preflight`. `Gate.requireIntent` makes it
+     * mandatory.
+     *
+     * @since 0.5.0
+     */
+    readonly intent?: Intent
   }
 ): Effect.fn.Return<
   Executed,
@@ -3006,6 +3243,9 @@ export const run = Effect.fn("Tx.run")(function*(
   const sui = yield* Sui
   const config = yield* SubmitConfig
   const sender = opts.signer.address
+  // Before the recipe is applied: a gate that requires an intent has nothing
+  // to build for a run that declares none.
+  yield* requireIntentOf(opts.intent)
   // Applied before any lock is chosen, so what the recipe set — its own gas
   // owner, an address-balance payment — decides which locks the run needs.
   const tx = yield* toTransaction(recipe)
@@ -3045,11 +3285,9 @@ export const run = Effect.fn("Tx.run")(function*(
   // lock when the bytes pin nothing and pay from an empty payment.
   const finish = (built: Built) =>
     Effect.gen(function*() {
-      const preflight = config.preflight
-      if (preflight !== undefined) {
-        const simulation = yield* sui.simulate(built.bytes)
-        yield* preflight(simulation)
-      }
+      // One simulate for preflight and the intent, here and nowhere else, so
+      // it runs exactly where signing does.
+      yield* frontHalf(built, { intent: opts.intent })
       let signed = yield* sign(built, opts.signer)
       // Read back out of the bytes, so a recipe that set its own gas owner —
       // which `Tx.sponsored` does — is covered as well as the option.
@@ -3350,7 +3588,7 @@ export const foldCoins = Effect.fn("Tx.foldCoins")(function*(opts: {
  * The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
  * `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
  * `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
- * `Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
+ * `Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.reconcile`,
  * `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
  */
 export const Tx = {
@@ -3367,6 +3605,7 @@ export const Tx = {
   foldCoins,
   submit,
   submitVia,
+  verify,
   reconcile,
   resubmit,
   recorded,

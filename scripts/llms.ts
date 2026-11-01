@@ -21,6 +21,7 @@ const SUBPATHS: ReadonlyArray<{ readonly name: string; readonly file: string }> 
   { name: "@unconfirmed/sui-effect", file: "dist/index.d.ts" },
   { name: "@unconfirmed/sui-effect/tx", file: "dist/tx.d.ts" },
   { name: "@unconfirmed/sui-effect/journal", file: "dist/journal.d.ts" },
+  { name: "@unconfirmed/sui-effect/gate", file: "dist/gate.d.ts" },
   { name: "@unconfirmed/sui-effect/extension", file: "dist/extension.d.ts" },
   { name: "@unconfirmed/sui-effect/script", file: "dist/script.d.ts" },
   { name: "@unconfirmed/sui-effect/testing", file: "dist/testing.d.ts" }
@@ -64,6 +65,7 @@ const SUBPATH_OF_SOURCE: ReadonlyArray<readonly [string, string]> = [
   ["src/index.ts", "@unconfirmed/sui-effect"],
   ["src/tx.ts", "@unconfirmed/sui-effect/tx"],
   ["src/journal.ts", "@unconfirmed/sui-effect/journal"],
+  ["src/gate.ts", "@unconfirmed/sui-effect/gate"],
   ["src/extension.ts", "@unconfirmed/sui-effect/extension"],
   ["src/script.ts", "@unconfirmed/sui-effect/script"],
   ["src/testing.ts", "@unconfirmed/sui-effect/testing"]

@@ -78,6 +78,7 @@ with no handling lines anywhere.
 | [The transaction lifecycle](#the-transaction-lifecycle) | `@unconfirmed/sui-effect/tx` | `Tx.run`, or `build` / `sign` / `cosign` / `submit` / `reconcile` by hand; `fromBytes` / `attach` for a sponsor; `resubmit`; `Signer` values; `Verify` |
 | [`SubmitConfig`](#submitconfig) | `@unconfirmed/sui-effect/tx` | Every lifecycle decision, with defaults, overridable per effect or per layer |
 | [Fold your coins](#fold-your-coins) | `@unconfirmed/sui-effect/tx` | Move coin objects into the address balance, which pays gas by default; `Tx.sendFunds` |
+| [Declared intents](#declared-intents) | `@unconfirmed/sui-effect/tx`, `/gate` | `Intent` claims checked against the simulation in code; `Tx.verify`; an optional semantic screen (`Gate`, Jev) |
 | [The journal](#the-journal) | `@unconfirmed/sui-effect/journal` | The record of signed bytes; in memory by default, durable over a `KeyValueStore` |
 | [Errors](#errors) | `@unconfirmed/sui-effect` | One flat tagged error per failure, `SuiError.outcome` and the exit codes |
 | [Scripts](#scripts) | `@unconfirmed/sui-effect/script` | `Script.run`: config from the environment, signals, stderr diagnostics, exit codes |
@@ -147,8 +148,8 @@ SUI type.
 
 `Tx` is the lifecycle as functions — `build`, `sign`, `cosign`, `fromBytes`,
 `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`,
-`fold`, `foldCoins`, `submit`, `submitVia`, `reconcile`, `resubmit`, `recorded`,
-`run`, `reconcileAll` — each with a closed error union and `R = Sui`. Gas comes
+`fold`, `foldCoins`, `submit`, `submitVia`, `verify`, `reconcile`, `resubmit`,
+`recorded`, `run`, `reconcileAll` — each with a closed error union and `R = Sui`. Gas comes
 from the payer's SUI **address balance** by default, and from coins only when
 the balance cannot cover it ([Fold your coins](#fold-your-coins)). `Tx.run`
 holds the sender lock for every build, and through submit only when the bytes
@@ -474,6 +475,95 @@ transactions then fail with `BuildError` naming `Tx.foldCoins` instead of
 quietly paying with coins. And a flow that spends its balance down to zero sets
 `lockSender: "always"`, because lock-free runs from one sender can together
 overdraw it (`SubmitConfig`, above).
+
+## Declared intents
+
+A transaction can say what it is for, and `Tx.run` will refuse to sign one that
+does more. An `Intent` is one sentence plus exact claims:
+
+```ts
+import { Effect } from "effect"
+import { CoinType, type SuiAddress } from "@unconfirmed/sui-effect"
+import { type Intent, type Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+declare const signer: Signer
+declare const coldWallet: SuiAddress
+
+const intent: Intent = {
+  summary: "Send 250 SUI to my cold wallet.",
+  author: "user",
+  claims: {
+    outflows: [{ coinType: CoinType.SUI, max: 250_000_000_000n }],
+    recipients: [coldWallet],
+    objects: []
+  }
+}
+
+const sent = Tx.run(Tx.sendFunds({ amount: 250_000_000_000n, recipient: coldWallet }), { signer, intent })
+```
+
+The claims are compared with the simulated effects **in code**, deny by default:
+a coin that is not claimed may not decrease, an address that is not claimed may
+not receive anything, and an object that is not claimed may not leave the
+sender. Gas is never an outflow, whether a gas coin or the address balance paid
+it; anything else drawn from the address balance is. Every refusal is a
+`PolicyDenied` whose `rule` says which check (`intent.outflow`,
+`intent.recipient`, `intent.object`, ...), before anything is signed. `Tx.run`
+runs the check on the same simulate as `SubmitConfig.preflight`, where it signs:
+under the sender lock only when the bytes pin something.
+
+`Tx.verify(built, intent)` is the same check for the explicit lifecycle and
+answers a `Verified`, which `Tx.sign` takes as it is; the explicit lifecycle is
+not gated otherwise. For bytes somebody else built — a dapp's —
+`Intent.fromSimulation(simulation, built, { summary, author: "dapp" })` is the
+exact claims the simulation implies, to show a person and then verify:
+
+```ts
+import { Effect } from "effect"
+import { Sui } from "@unconfirmed/sui-effect"
+import { Intent, Tx } from "@unconfirmed/sui-effect/tx"
+
+declare const dappBytes: Uint8Array
+declare const dappSays: string
+
+const review = Effect.gen(function*() {
+  const sui = yield* Sui
+  const built = yield* Tx.fromBytes(dappBytes)
+  const claims = Intent.fromSimulation(yield* sui.simulate(built.bytes), built, {
+    summary: dappSays,
+    author: "dapp"
+  })
+  // ...show `claims` and ask...
+  return yield* Tx.verify(built, claims)
+})
+```
+
+The sentence is read by a **screen**, when one is configured.
+`@unconfirmed/sui-effect/gate` provides one that asks
+[Jev](https://docs.typesafe.ai), TypeSafe's System One model, whether each
+simulated effect and each claim — rendered as words, never as hex or base units
+— is something the sentence describes:
+
+```ts
+import { Layer } from "effect"
+import { FetchHttpClient } from "effect/http"
+import { layerJevConfig } from "@unconfirmed/sui-effect/gate"
+
+// TYPESAFE_API_KEY from the environment. `requireIntent` is the setting for a
+// wallet an agent drives: `Tx.run` signs nothing that declares no intent.
+const gate = layerJevConfig({ requireIntent: true }).pipe(Layer.provide(FetchHttpClient.layer))
+```
+
+The screen answers in probabilities and decides nothing; the thresholds that
+turn them into `intent.effect`, `intent.claim`, `intent.vague` and
+`intent.injection` are fields of `Gate`, in code. A screen that is down denies
+(`gate.unavailable`) unless `onUnavailable: "unscreened"`, and an unscreened
+verdict always says so. `Gate.with` merges over the gate in force, so it never
+drops a layer's screen.
+
+What it does not prove: a simulation is one execution against the state the
+node had, so a package that branches on a shared object can still behave
+differently when the bytes land.
 
 ## The journal
 

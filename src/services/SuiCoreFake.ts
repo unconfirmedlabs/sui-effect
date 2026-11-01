@@ -141,6 +141,14 @@ export interface FakeChange {
    */
   readonly inputVersion?: bigint
   readonly owner?: SuiClientTypes.ObjectOwner
+  /**
+   * The owner going **in**, for a transaction that moved the object: a transfer
+   * is `inputOwner` the sender and `owner` the recipient, which is what
+   * `checkClaims` reads. Defaults to `owner`, an object that stayed put.
+   *
+   * @since 0.5.0
+   */
+  readonly inputOwner?: SuiClientTypes.ObjectOwner
   /** `PackageWrite` marks a published package; `AccumulatorWriteV1` an accumulator write. */
   readonly outputState?: SuiClientTypes.ChangedObject["outputState"]
   /**
@@ -720,7 +728,9 @@ const changedObject = (
     ? null
     : (change.inputVersion ?? (change.version ?? 2n) - 1n).toString(),
   inputDigest: kind === "created" ? null : fakeDigest(11),
-  inputOwner: kind === "created" ? null : (change.owner ?? addressOwner("0x1")),
+  inputOwner: kind === "created"
+    ? null
+    : (change.inputOwner ?? change.owner ?? addressOwner("0x1")),
   outputState:
     change.outputState ?? (kind === "deleted" ? "DoesNotExist" : "ObjectWrite"),
   outputVersion: kind === "deleted" ? null : (change.version ?? 2n).toString(),

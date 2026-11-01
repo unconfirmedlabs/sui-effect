@@ -17,6 +17,10 @@
       "types": "./dist/journal.d.ts",
       "import": "./dist/journal.js"
     },
+    "./gate": {
+      "types": "./dist/gate.d.ts",
+      "import": "./dist/gate.js"
+    },
     "./extension": {
       "types": "./dist/extension.d.ts",
       "import": "./dist/extension.js"
