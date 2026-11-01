@@ -18,6 +18,12 @@
  *   const signed = yield* Tx.sign(built, signer)
  *   return yield* Enoki.execute(enokiClient, signed)
  * })
+ *
+ * // Or the whole run, with Tx.run's front half (prepare, intent, approve) and lock rule:
+ * const run = Effect.gen(function*() {
+ *   const signer = yield* Enoki.fromFlow(flow, { network: "testnet" })
+ *   return yield* Enoki.run(enokiClient, recipe, { signer, network: "testnet", approve })
+ * })
  * ```
  *
  * @since 0.5.0

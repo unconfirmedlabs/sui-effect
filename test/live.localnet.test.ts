@@ -527,7 +527,11 @@ describe.skipIf(!LOCALNET)("localnet, with SUI_LOCALNET=1", () => {
         expect(await coinCount(signer.address, coinType)).toBe(0)
         expect(got.addressBalance).toBe(result.received)
         // A read of it names its sender (0.5.0): read from the transaction's BCS.
-        const read = await local(Effect.flatMap(Sui, (sui) => sui.getTransaction(result.executed.digest)))
+        // Retried: under load the node can answer execute before it serves the read.
+        const read = await local(Effect.retry(
+          Effect.flatMap(Sui, (sui) => sui.getTransaction(result.executed.digest)),
+          { schedule: Schedule.spaced("500 millis"), times: 40 }
+        ))
         expect(read.sender).toBe(signer.address)
         return result
       }

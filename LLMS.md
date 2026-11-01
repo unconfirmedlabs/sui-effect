@@ -704,6 +704,8 @@ The full entries follow under "API".
 - `ScreenedLine` — One rendered line and the probability that the declared summary covers it.
 - `Screening` — What a semantic screen answered: probabilities, never a decision.
 - `SecretSealer` — Seals and unseals a secret for storage.
+- `SendAllResult` — What `sendAll` did: the sweep it ran and the `Executed` it produced.
+- `SendAllSweep` — What one `sendAll` sweep takes: the coins and the address balance of one coin type, as read just before the build, and how the transaction pays for gas.
 - `Signature` — re-exported from `@unconfirmed/sui-effect`.
 - `SignatureScheme`
 - `Signed` — The schema of `Signed`.
@@ -717,7 +719,7 @@ The full entries follow under "API".
 - `SubmitViaError` — Everything `submitVia` can fail with, before the sender's own errors.
 - `SubmitViaReply` — What a third party answers when it has submitted your bytes.
 - `TransactionExpiration` — re-exported from `@unconfirmed/sui-effect`.
-- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.foldMovement`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.foldMovement`, `Tx.sendAll`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 - `UNRESOLVED_TAGS` — The tags whose entries still need an answer from the network.
 - `Verdict` — How far a transaction was checked.
 - `Verified` — A `Built` whose simulated effects stayed inside a declared `Intent`.
@@ -757,6 +759,7 @@ The full entries follow under "API".
 - `remote` — `Signer.remote`, also exported bare. Builds a signer around something that signs elsewhere: a KMS, a wallet, a hardware device, another process.
 - `resubmit` — `Tx.resubmit`, also exported bare. Re-sends signed bytes whose outcome is unknown — the **identical** bytes, never a rebuild — and settles them the way `submit` does.
 - `run` — `Tx.run`, also exported bare. Build, preflight, sign and submit, under the sender lock wherever two runs could race.
+- `sendAll` — `Tx.sendAll`, also exported bare. Sends **everything** the signer holds of one coin type — every coin object and the whole address balance — into `recipient`'s address balance, in one `run`, and leaves the sender **nothing** of it: no coin, no balance, no dust.
 - `sendFunds` — Sends `amount` of a coin type into `recipient`'s **address balance**: `0x2::balance::send_funds<T>(tx.balance({ type, balance: amount }), recipient)`, the canonical transfer on an address-balance account.
 - `sign` — `Tx.sign`, also exported bare. Signs built bytes.
 - `sponsored` — `Tx.sponsored`, also exported bare. Turns a recipe into a sponsored one: the sender owns the transaction, the gas owner pays, and gas comes from the sponsor's address balance rather than from coin objects, so the two parties never have to agree on a gas coin and can sign in either order.
@@ -800,6 +803,8 @@ The full entries follow under "API".
 - `LockableSigner` — re-exported from `@unconfirmed/sui-effect/tx`.
 - `MIN_LAYER_ITERATIONS` — The fewest iterations `Keystore.layer` accepts for a new seal.
 - `SealedKey` — One sealed account as stored, version 1.
+- `SealedSecret` — One secret sealed by `sealer`, as the string `seal` answers: the keystore's KDF and cipher parameters and its key-check value, version 1.
+- `sealer` — A `SecretSealer` (what `ZkLogin.save` and `ZkLogin.load` take) in the keystore's format: PBKDF2-HMAC-SHA256 over `password` (600 000 iterations by default, 16-byte random salt, 512 bits: the AES key and the key-check value), AES-256-GCM with a fresh 12-byte IV per seal, and as AAD `sui-effect/keystore/sealer/v1`, a newline, then the caller's `aad` — for a zkLogin session, its address — so a blob copied under another account's entry does not unseal.
 
 ### `@unconfirmed/sui-effect/storage`
 
@@ -820,13 +825,14 @@ The full entries follow under "API".
 
 ### `@unconfirmed/sui-effect/enoki`
 
-- `Enoki` — The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`, `Enoki.sponsor`, `Enoki.execute`.
+- `Enoki` — The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`, `Enoki.sponsor`, `Enoki.execute`, `Enoki.run`.
 - `EnokiClient` — The two `EnokiClient` methods sponsorship uses, as `@mysten/enoki` 1.3.2 declares them (the input of `createSponsoredTransaction` narrowed to the `sender` form, plus `jwt`).
 - `EnokiError` — Enoki refused a request: an HTTP 4xx from the Enoki API, or a refusal the caller's `refused` predicate recognised.
 - `EnokiFlow` — The two `EnokiFlow` methods `fromFlow` uses.
 - `execute` — `Enoki.execute`, also exported bare. Executes a sponsored transaction through Enoki's `executeSponsoredTransaction`, **through the journal**: this is `Tx.submitVia(signed, send)`, so the `Signed` entry is written before Enoki is called, Enoki is called once, and its answer — a bare digest, never effects — is settled by asking the chain for the digest of the bytes that were signed.
 - `fromFlow` — `Enoki.fromFlow`, also exported bare. The signed-in `EnokiFlow` session as a `Signer`: `scheme: "ZkLogin"`, `maxEpoch` and the expiry checks of `Signer.zkLogin`, signing with the flow's own `EnokiKeypair` (`getKeypair`, which asks Enoki for the proof the first time and caches it in the flow's store).
 - `fromWallet` — `Enoki.fromWallet`, also exported bare. An Enoki wallet (from `registerEnokiWallets`) as a `Signer`: `Signer.wallet` over its Wallet Standard features, plus the session bound its `enoki:getSession` feature reports, so the signer carries `maxEpoch` and refuses after it like `Signer.zkLogin`.
+- `run` — `Enoki.run`, also exported bare. The whole Enoki-sponsored run, with the same front half as `Tx.run`: `sponsor` → `Tx.prepare(built, { sender, intent })` (one simulate of exactly Enoki's bytes, `SubmitConfig.preflight`, the intent's claims and screen) → `approve(prepared)` → `Tx.sign` (`prepared.verified` when there is an intent) → `onSigned` → `execute`, through the journal.
 - `sponsor` — `Enoki.sponsor`, also exported bare. Asks Enoki to sponsor a transaction, and answers its sponsored bytes as a `Built` that has been checked: `Tx.fromBytes` (the chain), Enoki's digest is the digest of its bytes, and `verifySponsored` (on `/tx`) — the sender is `options.sender`, the gas owner is someone else, and the transaction kind is **exactly** the kind that was sent.
 
 ### `@unconfirmed/sui-effect/extension`
@@ -4251,7 +4257,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-96 exported symbols.
+99 exported symbols.
 
 ### `Built` (const)
 
@@ -5099,15 +5105,66 @@ export interface SecretSealer {
 }
 ```
 
-Seals and unseals a secret for storage. **sui-effect ships no sealer**: the
-keystore that owns the wrapping key (WebCrypto AES-GCM under a key the
-platform keeps, a passphrase-derived key, the OS keychain) implements this.
+Seals and unseals a secret for storage. The keystore that owns the wrapping
+key implements this: `Keystore.sealer(password)` on
+`@unconfirmed/sui-effect/keystore` is one (PBKDF2 and AES-GCM, the
+keystore's format), and WebCrypto under a key the platform keeps or the OS
+keychain are others.
 
 `aad` is additional authenticated data the sealer must bind the blob to —
 here, the UTF-8 bytes of the session's address — so a sealed key copied
 under another account's entry does not unseal. A sealer that returns its
 input unchanged stores the ephemeral key in plain text; that is a decision
 the caller makes by writing one, never a default.
+
+### `SendAllResult` (interface)
+
+```ts
+export interface SendAllResult {
+    readonly sweep: SendAllSweep;
+    readonly executed: Executed;
+    readonly received: bigint;
+}
+```
+
+What `sendAll` did: the sweep it ran and the `Executed` it produced.
+`received` is what the recipient's balance of the coin type gained, read
+off the effects: for SUI, the sweep less the net gas (more than the sweep
+when the deleted coins' storage rebate beats the gas); for any other type,
+exactly `sweep.amount`.
+
+### `SendAllSweep` (interface)
+
+```ts
+export interface SendAllSweep {
+    readonly owner: SuiAddress;
+    readonly recipient: SuiAddress;
+    /** The coin type, normalized. */
+    readonly coinType: CoinType;
+    /** The coin objects swept, largest first, at the versions read. */
+    readonly coins: ReadonlyArray<Coin>;
+    /** The owner's address balance of the coin type as read: all of it is swept. */
+    readonly addressBalance: bigint;
+    /** `coins` plus `addressBalance`, before gas. */
+    readonly amount: bigint;
+    readonly gas: "coinReservation" | "coins" | "auto";
+}
+```
+
+What one `sendAll` sweep takes: the coins and the address balance of
+one coin type, as read just before the build, and how the transaction pays
+for gas. What `Tx.sendAll`'s `approve` is shown beside the prepared
+transaction, and what its answer reports.
+
+- `"coinReservation"` (SUI): gas is a reservation of the **whole** SUI
+  address balance, the coins are merged into that gas coin, and the gas
+  coin is deposited — what is left after gas is the recipient's.
+- `"coins"` (SUI): the coins are the gas payment (the first 256; the rest
+  are merged into the gas coin), the address balance is redeemed into a
+  coin and merged into it, and the gas coin is deposited.
+- `"auto"` (any other coin type): the coins are merged and deposited, the
+  balance is withdrawn and deposited, and SUI pays the gas, from wherever
+  the resolver finds it.
 
 ### `Signature` (const)
 
@@ -5556,6 +5613,23 @@ declare const Tx: {
         readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>;
     }) => Effect.Effect<FoldResult, RunError | E, Sui>;
     readonly foldMovement: (batch: FoldBatch, effects: Simulation | Executed) => import("./Fold.ts").FoldMovement;
+    readonly sendAll: <E = never>(opts: {
+        readonly signer: Signer;
+        readonly recipient: SuiAddress;
+        /** The coin type to sweep. Default SUI. */
+        readonly coinType?: CoinType;
+        /** What the sweep is declared to do; see `Tx.run`. */
+        readonly intent?: Intent;
+        /** `Tx.run`'s `approve`, with the sweep it is about to send. */
+        readonly approve?: (prepared: Prepared, sweep: SendAllSweep) => Effect.Effect<void, E>;
+        /** `Tx.run`'s `onSigned`. */
+        readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+    }) => Effect.Effect<SendAllResult, RunError | E, Sui>;
+    readonly verifySponsored: (built: Built, expect: {
+        readonly sender: string;
+        readonly gasOwner?: string;
+        readonly transactionKind?: Uint8Array;
+    }) => Effect.Effect<Built, PolicyDenied, never>;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
     readonly verify: (built: Built, intent: Intent) => Effect.Effect<Verified, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
@@ -5652,7 +5726,7 @@ declare const Tx: {
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
 `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
 `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
-`Tx.foldCoins`, `Tx.foldMovement`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`,
+`Tx.foldCoins`, `Tx.foldMovement`, `Tx.sendAll`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`,
 `Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
 `Tx.reconcileAll`.
 
@@ -7270,7 +7344,64 @@ session) — and a sponsor with one — bounds the window the build sets:
 the current epoch fails with `SigningError { reason: "expired" }` before
 anything resolves.
 
+**A locked signer is refused first** (0.5.0). A `LockableSigner`
+(`Signer.fromMnemonic`, `Keystore.unlock`) — signer or sponsor — whose
+`locked` answers `true` fails the run with `SigningError { reason:
+"locked" }` before anything is built or simulated.
+
 **Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`), and `E` — whatever `approve` fails with.**
+
+### `sendAll` (const)
+
+```ts
+declare const sendAll: <E = never>(opts: {
+    readonly signer: Signer;
+    readonly recipient: SuiAddress;
+    /** The coin type to sweep. Default SUI. */
+    readonly coinType?: CoinType;
+    /** What the sweep is declared to do; see `Tx.run`. */
+    readonly intent?: Intent;
+    /** `Tx.run`'s `approve`, with the sweep it is about to send. */
+    readonly approve?: (prepared: Prepared, sweep: SendAllSweep) => Effect.Effect<void, E>;
+    /** `Tx.run`'s `onSigned`. */
+    readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+}) => Effect.Effect<SendAllResult, RunError | E, Sui>
+```
+
+Sends **everything** the signer holds of one coin type — every coin object
+and the whole address balance — into `recipient`'s address balance, in one
+`run`, and leaves the sender **nothing** of it: no coin, no balance,
+no dust.
+
+**SUI pays for its own sweep out of the sweep.** The gas coin is made to be
+everything — a coin reservation of the whole address balance with every
+coin merged into it, or, when the coins hold more, the coins as the gas
+payment with the balance redeemed and merged in — and
+`0x2::coin::send_funds<SUI>(GasCoin, recipient)` deposits it; gas is
+charged against that coin, so the recipient gets the rest and the sender
+keeps 0 (localnet, protocol 139: a coin-only, a balance-only and a mixed
+account all end at 0 coins and 0 balance). There is no budget to guess and
+no refund left behind, which is what a send of `balance − budget` from the
+address balance leaves (the unused budget comes back to the sender). **Any
+other coin type** sends every coin (`coin::send_funds`) and the whole
+balance (`balance::send_funds` of a `FundsWithdrawal`), and gas comes from
+the signer's SUI as usual, so the signer needs some.
+
+**What can remain**: anything that arrives after the read — a deposit into
+the balance, a coin — stays with the sender; a spend from the balance that
+lands after the read makes the withdrawal too large, and the sweep executes
+as a failure (`ExecutionFailed`, `InsufficientFundsForWithdraw`) or is
+refused at submit, moving nothing. A SUI sweep paid from a reservation holds
+the sender lock through submission and waits for lock-free runs in flight
+first, like every `tx.gas` run. More than 500 coin objects do not fit
+one transaction: `BuildError`, and `Tx.foldCoins` first.
+A SUI account worth less than about twice a budget cannot pay for its own
+sweep: that build fails.
+
+`intent`, `approve` (shown the sweep beside the prepared transaction) and
+`onSigned` are `Tx.run`'s.
+
+**Fails with: `BuildError` (nothing to send, the signer is the recipient, too many coins, or the build), `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` — `run`'s — and `E`, whatever `approve` fails with.**
 
 ### `sendFunds` (const)
 
@@ -7717,7 +7848,7 @@ The screen fails with: `TransportError`.
 ## `@unconfirmed/sui-effect/keystore`
 
 
-14 exported symbols.
+16 exported symbols.
 
 ### `DEFAULT_ITERATIONS` (const)
 
@@ -7760,6 +7891,10 @@ export declare class Keystore extends Keystore_base {
      * builds its own layer. No floor on `iterations`. Never fails.
      */
     static readonly make: (options?: KeystoreOptions) => Effect.Effect<KeystoreService, never, KeyValueStore.KeyValueStore>;
+    /** See `sealer`: a `SecretSealer` (for `ZkLogin.save`/`load`) in the keystore's format. */
+    static readonly sealer: (password: Redacted.Redacted<string>, options?: {
+        readonly iterations?: number;
+    }) => SecretSealer;
     /**
      * The keystore over the `KeyValueStore` in context. Builds without reading
      * anything.
@@ -7998,6 +8133,57 @@ base64; `createdAt` is epoch milliseconds from the Effect `Clock`.
 
 Only `label` is outside the AAD, so it is the one field that may be edited
 in place; every other edit makes the record `corrupt`.
+
+### `SealedSecret` (const)
+
+```ts
+declare const SealedSecret: Schema
+// decodes to:
+// {
+//     readonly version: 1;
+//     readonly kdf: {
+//         readonly name: "PBKDF2-SHA256";
+//         readonly iterations: number;
+//         readonly salt: string;
+//     };
+//     readonly cipher: {
+//         readonly name: "AES-256-GCM";
+//         readonly iv: string;
+//     };
+//     readonly check: string;
+//     readonly ciphertext: string;
+// }
+```
+
+One secret sealed by `sealer`, as the string `seal` answers: the
+keystore's KDF and cipher parameters and its key-check value, version 1.
+Every byte field is standard base64.
+
+### `sealer` (const)
+
+```ts
+declare const sealer: (password: Redacted.Redacted<string>, options?: {
+    readonly iterations?: number;
+}) => SecretSealer
+```
+
+A `SecretSealer` (what `ZkLogin.save` and `ZkLogin.load` take) in the
+keystore's format: PBKDF2-HMAC-SHA256 over `password` (600 000 iterations
+by default, 16-byte random salt, 512 bits: the AES key and the key-check
+value), AES-256-GCM with a fresh 12-byte IV per seal, and as AAD
+`sui-effect/keystore/sealer/v1`, a newline, then the caller's `aad` — for
+a zkLogin session, its address — so a blob copied under another account's
+entry does not unseal. The blob is `SealedSecret` as JSON.
+
+The password is held by the sealer for as long as the sealer lives: make
+one when the person unlocks and drop it when they lock. Each `seal` and
+`unseal` costs one PBKDF2 derivation.
+
+**Throws** a `RangeError` when `options.iterations` is not an integer of at
+least `MIN_LAYER_ITERATIONS`, `Keystore.layer`'s floor. Its members
+fail with: `SigningError` — `reason: "locked"` for a wrong password,
+`reason: "unavailable"` without WebCrypto, and no reason for an empty
+password, an empty secret or a blob that was edited, moved or is not one.
 
 ## `@unconfirmed/sui-effect/storage`
 
@@ -8242,7 +8428,7 @@ it returns; it does not group two writes either.
 ## `@unconfirmed/sui-effect/enoki`
 
 
-8 exported symbols.
+9 exported symbols.
 
 ### `Enoki` (const)
 
@@ -8267,11 +8453,26 @@ declare const Enoki: {
     readonly execute: (client: EnokiClient, signed: Signed, options?: {
         readonly refused?: (cause: unknown) => boolean;
     } | undefined) => Effect.Effect<Executed, SubmitViaError | EnokiError, Sui>;
+    readonly run: <E = never>(client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
+        readonly signer: Signer;
+        readonly network?: "mainnet" | "testnet" | "devnet";
+        readonly jwt?: string;
+        readonly allowedAddresses?: ReadonlyArray<string>;
+        readonly allowedMoveCallTargets?: ReadonlyArray<string>;
+        /** What the transaction is declared to do; see `Tx.run`. */
+        readonly intent?: Intent;
+        /** Shown the prepared, sponsored transaction before the sender signs; failing refuses. */
+        readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
+        /** `Tx.run`'s `onSigned`: after the sender's signature, before Enoki is called. */
+        readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+        /** `execute`'s `refused`. */
+        readonly refused?: (cause: unknown) => boolean;
+    }) => Effect.Effect<Executed, TransportError | SimulationFailed | SigningError | BuildError | PolicyDenied | SubmitViaError | EnokiError | E, Sui>;
 }
 ```
 
 The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`,
-`Enoki.sponsor`, `Enoki.execute`.
+`Enoki.sponsor`, `Enoki.execute`, `Enoki.run`.
 
 ### `EnokiClient` (interface)
 
@@ -8410,6 +8611,53 @@ over its Wallet Standard features, plus the session bound its
 refuses after it like `Signer.zkLogin`.
 
 **Fails with: `SigningError` — everything `Signer.wallet` fails with, `reason: "unavailable"` when the wallet has no `enoki:getSession` or nobody is signed in, and `reason: "expired"` when the session has expired.**
+
+### `run` (const)
+
+```ts
+declare const run: <E = never>(client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
+    readonly signer: Signer;
+    readonly network?: "mainnet" | "testnet" | "devnet";
+    readonly jwt?: string;
+    readonly allowedAddresses?: ReadonlyArray<string>;
+    readonly allowedMoveCallTargets?: ReadonlyArray<string>;
+    /** What the transaction is declared to do; see `Tx.run`. */
+    readonly intent?: Intent;
+    /** Shown the prepared, sponsored transaction before the sender signs; failing refuses. */
+    readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
+    /** `Tx.run`'s `onSigned`: after the sender's signature, before Enoki is called. */
+    readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+    /** `execute`'s `refused`. */
+    readonly refused?: (cause: unknown) => boolean;
+}) => Effect.Effect<Executed, TransportError | SimulationFailed | SigningError | BuildError | PolicyDenied | SubmitViaError | EnokiError | E, Sui>
+```
+
+The whole Enoki-sponsored run, with the same front half as `Tx.run`:
+`sponsor` → `Tx.prepare(built, { sender, intent })` (one simulate of
+exactly Enoki's bytes, `SubmitConfig.preflight`, the intent's claims and
+screen) → `approve(prepared)` → `Tx.sign` (`prepared.verified` when there
+is an intent) → `onSigned` → `execute`, through the journal.
+
+**The sender lock follows `Tx.run`'s rule for the sender's own pins.**
+Under `SubmitConfig.lockSender: "whenPinned"` (the default) the sponsor
+request — which resolves the sender's object inputs — runs under the
+sender's lock, and the lock is held on through approval, signing and
+execution only when Enoki's bytes pin an owned or receiving input. The gas
+coins are Enoki's and are not the sender's to race, so a sponsored
+transaction that pins nothing of the sender's (pure values, shared objects,
+withdrawals) is approved, signed and executed with the lock released, and
+a person taking their time never holds it. `"always"` holds it throughout,
+`"never"` takes none. `Gate.requireIntent` applies, as it does to `Tx.run`,
+and so does its early refusal of a locked signer (`SigningError { reason:
+"locked" }` before Enoki is asked anything).
+
+`options.signer` is the sender: an Enoki zkLogin session
+(`Enoki.fromFlow`, `Enoki.fromWallet`, `Signer.zkLogin`) or any other
+signer Enoki sponsors. `options.jwt`, `allowedAddresses` and
+`allowedMoveCallTargets` are `sponsor`'s; `refused` is
+`execute`'s.
+
+**Fails with: `EnokiError` (a refusal: the sponsor request answered 4xx, or the execute call failed in a way `refused` recognises), `TransportError` (Enoki could not be reached for the sponsor request, or the simulate), `BuildError`, `PolicyDenied` (`enoki.digest`, `sponsored.*`, `prepare.sender`, `intent.*`, `preflight`), `SimulationFailed`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, and `E` — whatever `approve` fails with.**
 
 ### `sponsor` (const)
 

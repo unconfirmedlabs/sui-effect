@@ -261,9 +261,11 @@ export const zkLogin = Effect.fn("Signer.zkLogin")(function*(
 })
 
 /**
- * Seals and unseals a secret for storage. **sui-effect ships no sealer**: the
- * keystore that owns the wrapping key (WebCrypto AES-GCM under a key the
- * platform keeps, a passphrase-derived key, the OS keychain) implements this.
+ * Seals and unseals a secret for storage. The keystore that owns the wrapping
+ * key implements this: `Keystore.sealer(password)` on
+ * `@unconfirmed/sui-effect/keystore` is one (PBKDF2 and AES-GCM, the
+ * keystore's format), and WebCrypto under a key the platform keeps or the OS
+ * keychain are others.
  *
  * `aad` is additional authenticated data the sealer must bind the blob to —
  * here, the UTF-8 bytes of the session's address — so a sealed key copied
