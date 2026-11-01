@@ -44,7 +44,7 @@ import {
   TransactionNotFound,
   TransportError
 } from "../domain/errors.ts"
-import { EXECUTE_INCLUDE, Executed, fromTransactionResult } from "../domain/executed.ts"
+import { EXECUTE_INCLUDE, Executed, fromTransactionResult, Simulation } from "../domain/executed.ts"
 import * as Metrics from "../domain/metrics.ts"
 import {
   Balance,
@@ -62,7 +62,6 @@ import {
   normalizeStructTagSafe,
   ObjectEnvelope,
   ObjectId,
-  Simulation,
   StructTag,
   SuiAddress,
   type SuiObject

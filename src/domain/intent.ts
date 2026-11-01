@@ -18,8 +18,17 @@
 import { normalizeStructTag, normalizeSuiAddress } from "@mysten/sui/utils"
 import { Schema } from "effect"
 import { typeMatches } from "./bcs.ts"
-import type { ChangedObject, Owner, Simulation } from "./schemas.ts"
-import { Built, CoinType, ObjectId, SuiAddress } from "./schemas.ts"
+import { Built } from "./built.ts"
+import type { Simulation as SimulationClass } from "./executed.ts"
+import type { ChangedObject, Owner } from "./schemas.ts"
+import { CoinType, ObjectId, SuiAddress } from "./schemas.ts"
+
+/**
+ * What the pure checks read off a simulation: its fields, not its accessors,
+ * so a `Simulation` passes and so does any value with the same data (one
+ * assembled in a test, or spread from a `Simulation` with a field changed).
+ */
+type Simulation = Pick<SimulationClass, "effects" | "balanceChanges" | "objectTypes" | "gasPaymentMocked">
 
 /**
  * Who wrote the intent. Provenance for the audit record, and nothing else: the

@@ -2,19 +2,17 @@ import { expect, test } from "bun:test"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import type { Effect } from "effect"
 import { Schema } from "effect"
-import type {
-  Built,
-  ObjectRef,
-  Simulation
-} from "../src/domain/schemas.ts"
+import type { Built } from "../src/domain/built.ts"
+import { Built as BuiltSchema } from "../src/domain/built.ts"
+import type { Simulation } from "../src/domain/executed.ts"
+import { Simulation as SimulationSchema } from "../src/domain/executed.ts"
+import type { ObjectRef } from "../src/domain/schemas.ts"
 import {
-  Built as BuiltSchema,
   Coin,
   CoinMetadata,
   EventEntry,
   ObjectRef as ObjectRefSchema,
-  SignedTransaction,
-  Simulation as SimulationSchema
+  SignedTransaction
 } from "../src/domain/schemas.ts"
 import type { SuiCoreService } from "../src/services/SuiCore.ts"
 import type { Signed } from "../src/services/Tx.ts"

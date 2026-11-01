@@ -7,7 +7,8 @@
  */
 import { Context, Duration, Effect, Layer, Random, Schedule } from "effect"
 import type { PolicyDenied } from "../domain/errors.ts"
-import type { Mist, Simulation } from "../domain/schemas.ts"
+import type { Simulation } from "../domain/executed.ts"
+import type { Mist } from "../domain/schemas.ts"
 import { U32_MAX } from "../domain/schemas.ts"
 
 /** How `Tx.build` sets an expiration when the recipe left one unset. */

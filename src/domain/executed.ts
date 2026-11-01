@@ -5,20 +5,22 @@
  * Every accessor returns {@link ChangedRef}s — the object's id plus whatever
  * else the effects actually carried — and ignores accumulator writes
  * (`outputState: "AccumulatorWriteV1"`), which are balance bookkeeping rather
- * than objects. Use {@link objectRefOf} to turn one into the full `ObjectRef`
+ * than objects. `Simulation` (0.5.0) lives here too and shares every accessor
+ * with `Executed`, through one implementation. Use {@link objectRefOf} to turn one into the full `ObjectRef`
  * the transaction builder wants, which succeeds exactly when the node reported
  * every field it needs.
  *
  * @since 0.1.0
  */
 import type { SuiClientTypes } from "@mysten/sui/client"
-import { fromBase64 } from "@mysten/sui/utils"
+import { fromBase64, isValidSuiAddress, normalizeSuiAddress } from "@mysten/sui/utils"
 import { Effect, Predicate, Schema } from "effect"
 import { DecodeError, decodePayload, ExecutionFailed, UnexpectedEffects } from "./errors.ts"
 import {
   BalanceChange,
   ChangedObject,
   type Coin,
+  CommandResult,
   CoinType,
   Digest,
   Event,
@@ -109,6 +111,279 @@ export interface SdkObjectRef {
 }
 
 /**
+ * A changed object whose **owner changed**: what {@link Executed.transferred}
+ * and {@link Simulation.transferred} return. The output side's ref, with the
+ * owner it had going in as `inputOwner` and the one it has now as `owner`.
+ *
+ * @since 0.5.0
+ */
+export interface TransferredRef extends ChangedRef {
+  /** The owner the object had going in. */
+  readonly inputOwner: Owner
+  /** The owner it has afterwards. */
+  readonly owner: Owner
+}
+
+/**
+ * What the shared accessors read: the fields `Executed` and `Simulation` have
+ * in common. Internal; both classes delegate every accessor to the functions
+ * below, so the two can never disagree about what "created" means.
+ */
+interface ChangeSource {
+  readonly digest: Digest
+  readonly effects: TransactionEffects
+  readonly events: ReadonlyArray<Event>
+  readonly balanceChanges: ReadonlyArray<BalanceChange>
+  readonly objectTypes: { readonly [objectId: string]: string }
+}
+
+/**
+ * The type of a changed object, from the `objectTypes` join. A published
+ * package reports the literal `package` rather than a struct tag, so the
+ * decode goes through {@link ObjectType}.
+ */
+const typeOf = (source: ChangeSource, objectId: ObjectId): ObjectType | undefined => {
+  const type = source.objectTypes[objectId]
+  if (type === undefined) return undefined
+  const decoded = decodeObjectType(type)
+  return decoded._tag === "Some" ? decoded.value : undefined
+}
+
+/**
+ * Everything the effects actually say about one changed object. Nothing is
+ * invented: a field the node did not report stays `undefined`, so a caller
+ * that needs a full builder reference can tell the difference between
+ * "version 0" and "the node did not say".
+ */
+const refOf = (source: ChangeSource, change: ChangedObject, side: "input" | "output"): ChangedRef => {
+  const version = side === "output" ? change.outputVersion : change.inputVersion
+  const digest = side === "output" ? change.outputDigest : change.inputDigest
+  const owner = side === "output" ? change.outputOwner : change.inputOwner
+  const type = typeOf(source, change.objectId)
+  return {
+    id: change.objectId,
+    ...(type === undefined ? {} : { type }),
+    ...(version === null ? {} : { version }),
+    ...(digest === null ? {} : { digest }),
+    ...(owner === null ? {} : { owner })
+  }
+}
+
+/**
+ * The changes that pass `predicate`, as refs read off one side, **never an
+ * accumulator write**: an `AccumulatorWriteV1` output is an address balance
+ * moving (the node's bookkeeping object for `balance::send_funds`, a gas
+ * charge from a balance, a fold's deposit). It has no owner on either side,
+ * no type in the `objectTypes` join and no version a builder could use, and
+ * nobody holds it; the amount it moved is in `balanceChanges`.
+ */
+const select = (
+  source: ChangeSource,
+  predicate: (change: ChangedObject) => boolean,
+  side: "input" | "output",
+  filter?: (ref: ChangedRef) => boolean
+): ReadonlyArray<ChangedRef> => {
+  const refs: Array<ChangedRef> = []
+  for (const change of source.effects.changedObjects) {
+    if (isAccumulatorWrite(change)) continue
+    if (!predicate(change)) continue
+    const ref = refOf(source, change, side)
+    if (filter !== undefined && !filter(ref)) continue
+    refs.push(ref)
+  }
+  return refs
+}
+
+const byType = (type?: string): ((ref: ChangedRef) => boolean) | undefined =>
+  type === undefined ? undefined : (ref) => ref.type !== undefined && typeMatches(type, ref.type)
+
+/**
+ * Whether this change wrote an object, treating `Unknown` as "the envelope
+ * did not say".
+ *
+ * A node always reports the output state; a reduced envelope from a relay or
+ * a sponsor often reports nothing but the id and the id operation, and
+ * {@link Executed.fromPartial} leaves what it was not told as `Unknown`
+ * rather than inventing `ObjectWrite`. Reading `Unknown` as "not an object
+ * write" would make `created()` silently empty for exactly those envelopes.
+ */
+const wroteAnObject = (change: ChangedObject): boolean =>
+  change.outputState === "ObjectWrite" || change.outputState === "Unknown"
+
+const isDeleted = (change: ChangedObject): boolean => change.idOperation === "Deleted"
+
+const isWrapped = (change: ChangedObject): boolean =>
+  change.idOperation === "None" && change.inputState === "Exists" && change.outputState === "DoesNotExist"
+
+/**
+ * Who an owner is, for comparing two of them: the kind and the party, never
+ * the versions (`Shared.initialSharedVersion` never changes, and a
+ * `ConsensusAddressOwner`'s `startVersion` moves without the owner changing).
+ * `undefined` for `Unknown`, which cannot be compared with anything.
+ */
+const ownerKey = (owner: Owner): string | undefined => {
+  switch (owner.$kind) {
+    case "AddressOwner":
+      return `address:${owner.AddressOwner}`
+    case "ObjectOwner":
+      return `object:${owner.ObjectOwner}`
+    case "Shared":
+      return "shared"
+    case "Immutable":
+      return "immutable"
+    case "ConsensusAddressOwner":
+      return `consensus:${owner.ConsensusAddressOwner.owner}`
+    case "Unknown":
+      return undefined
+  }
+}
+
+/**
+ * An object that existed before and after, kept its id, and changed owner. Both
+ * owners must be known: a reduced envelope that left either out says nothing.
+ */
+const isTransferred = (change: ChangedObject): boolean => {
+  if (change.idOperation !== "None" || change.inputState !== "Exists" || !wroteAnObject(change)) return false
+  if (change.inputOwner === null || change.outputOwner === null) return false
+  const before = ownerKey(change.inputOwner)
+  const after = ownerKey(change.outputOwner)
+  return before !== undefined && after !== undefined && before !== after
+}
+
+const createdWhereOf = (source: ChangeSource, predicate: (ref: ChangedRef) => boolean) =>
+  select(source, (change) => change.idOperation === "Created" && wroteAnObject(change), "output", predicate)
+
+const createdOf = (source: ChangeSource, type?: string) => createdWhereOf(source, byType(type) ?? (() => true))
+
+const mutatedOf = (source: ChangeSource, type?: string) =>
+  select(
+    source,
+    (change) =>
+      change.idOperation === "None" &&
+      wroteAnObject(change) &&
+      (change.inputState === "Exists" || change.inputState === "Unknown"),
+    "output",
+    byType(type)
+  )
+
+const deletedOf = (source: ChangeSource) =>
+  select(source, (change) => isDeleted(change) || isWrapped(change), "input")
+
+const wrappedOf = (source: ChangeSource) => select(source, isWrapped, "input")
+
+const transferredOf = (source: ChangeSource, type?: string): ReadonlyArray<TransferredRef> => {
+  const refs: Array<TransferredRef> = []
+  const filter = byType(type)
+  for (const change of source.effects.changedObjects) {
+    if (isAccumulatorWrite(change) || !isTransferred(change)) continue
+    if (change.inputOwner === null || change.outputOwner === null) continue
+    const ref = { ...refOf(source, change, "output"), inputOwner: change.inputOwner, owner: change.outputOwner }
+    if (filter !== undefined && !filter(ref)) continue
+    refs.push(ref)
+  }
+  return refs
+}
+
+const packagesPublishedOf = (source: ChangeSource): ReadonlyArray<ChangedRef> => {
+  const refs: Array<ChangedRef> = []
+  for (const change of source.effects.changedObjects) {
+    if (change.outputState !== "PackageWrite" || change.idOperation !== "Created") continue
+    const ref = refOf(source, change, "output")
+    // gRPC reports the literal `package` as a published package's type, and
+    // some nodes omit it from `objectTypes` entirely; a `PackageWrite` is a
+    // package either way.
+    refs.push(ref.type === undefined ? { ...ref, type: "package" } : ref)
+  }
+  return refs
+}
+
+const balanceChangeOf = (source: ChangeSource, address: SuiAddress, coinType: CoinType | string): bigint => {
+  let total = 0n
+  for (const change of source.balanceChanges) {
+    if (change.address === address && typeMatches(coinType, change.coinType)) total += change.amount
+  }
+  return total
+}
+
+const gasUsedTotalOf = (source: ChangeSource): bigint => {
+  const gas = source.effects.gasUsed
+  return gas.computationCost + gas.storageCost - gas.storageRebate
+}
+
+const expectCreatedOf = (source: ChangeSource, type: string): Effect.Effect<ChangedRef, UnexpectedEffects> => {
+  const created = createdOf(source, type)
+  const only = created[0]
+  if (created.length === 1 && only !== undefined) return Effect.succeed(only)
+  return Effect.fail(
+    new UnexpectedEffects({ digest: source.digest, expected: type, found: created.map((ref) => ref.id) })
+  )
+}
+
+const eventsOfType = (source: ChangeSource, type: string): ReadonlyArray<Event> =>
+  source.events.filter((event) => typeMatches(type, event.eventType))
+
+const eventsOfOf = <T>(
+  source: ChangeSource,
+  codec: Schema.Codec<T, Uint8Array>,
+  eventType?: string
+): Effect.Effect<ReadonlyArray<T>, DecodeError> =>
+  Effect.flatMap(
+    selectingType(codec, eventType),
+    (wanted) =>
+      Effect.forEach(
+        eventsOfType(source, wanted),
+        (event) => decodeContent(codec, event.bcs, { expectedType: wanted, actualType: event.eventType })
+      )
+  )
+
+const expectEventOf = <T>(
+  source: ChangeSource,
+  codec: Schema.Codec<T, Uint8Array>,
+  eventType?: string
+): Effect.Effect<T, UnexpectedEffects | DecodeError> =>
+  Effect.flatMap(selectingType(codec, eventType), (wanted): Effect.Effect<T, UnexpectedEffects | DecodeError> => {
+    const matching = eventsOfType(source, wanted)
+    const only = matching[0]
+    if (matching.length !== 1 || only === undefined) {
+      return Effect.fail(
+        new UnexpectedEffects({
+          digest: source.digest,
+          expected: `exactly one event ${wanted}`,
+          found: matching.map((event) => event.packageId)
+        })
+      )
+    }
+    return decodeContent(codec, only.bcs, { expectedType: wanted, actualType: only.eventType })
+  })
+
+const expectPublishedOf = (source: ChangeSource): Effect.Effect<Published, UnexpectedEffects> => {
+  const packages = packagesPublishedOf(source)
+  const pkg = packages[0]
+  if (packages.length !== 1 || pkg === undefined) {
+    return Effect.fail(
+      new UnexpectedEffects({
+        digest: source.digest,
+        expected: "exactly one published package",
+        found: packages.map((ref) => ref.id)
+      })
+    )
+  }
+  const created = createdOf(source, UPGRADE_CAP_TYPE)
+  const caps = created.length > 0 ? created : mutatedOf(source, UPGRADE_CAP_TYPE)
+  const cap = caps[0]
+  if (caps.length !== 1 || cap === undefined) {
+    return Effect.fail(
+      new UnexpectedEffects({
+        digest: source.digest,
+        expected: `exactly one ${UPGRADE_CAP_TYPE}`,
+        found: caps.map((ref) => ref.id)
+      })
+    )
+  }
+  return Effect.succeed({ packageId: pkg.id, package: pkg, upgradeCap: cap })
+}
+
+/**
  * A transaction the network executed, built from the fixed execute include set:
  * effects, events, balance changes and object types.
  *
@@ -126,7 +401,10 @@ export interface SdkObjectRef {
  *
  * The data fields are `digest`, `effects`, `events`, `balanceChanges`,
  * `objectTypes` (object id to Move type), `checkpoint` (`null` until the node
- * says) and `timestampMs` (`null` likewise).
+ * says), `timestampMs` (`null` likewise) and `sender` (0.5.0).
+ *
+ * The accessors are **one implementation shared with {@link Simulation}**, so
+ * a preview reads a simulation exactly the way a receipt reads an execution.
  */
 export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   digest: Digest,
@@ -135,68 +413,26 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   balanceChanges: Schema.Array(BalanceChange),
   objectTypes: Schema.Record(Schema.String, Schema.String),
   checkpoint: Schema.NullOr(Schema.BigIntFromString),
-  timestampMs: Schema.NullOr(Schema.Finite)
+  timestampMs: Schema.NullOr(Schema.Finite),
+  /**
+   * The transaction's sender. `Tx.submit`, `Tx.submitVia`, `Tx.resubmit`,
+   * `Tx.reconcile` (given the signed bytes) and `Tx.run` always fill it from
+   * the bytes they sent; a read fills it when the node returned the
+   * transaction data (`include: { transaction: true }`), and
+   * {@link Executed.fromPartial} when the envelope names one. Absent only when
+   * nothing said.
+   *
+   * @since 0.5.0
+   */
+  sender: Schema.optionalKey(SuiAddress)
 }) {
-  /**
-   * The type of a changed object, from the `objectTypes` join. A published
-   * package reports the literal `package` rather than a struct tag, so the
-   * decode goes through {@link ObjectType}.
-   */
-  private typeOf(objectId: ObjectId): ObjectType | undefined {
-    const type = this.objectTypes[objectId]
-    if (type === undefined) return undefined
-    const decoded = decodeObjectType(type)
-    return decoded._tag === "Some" ? decoded.value : undefined
-  }
-
-  /**
-   * Everything the effects actually say about one changed object. Nothing is
-   * invented: a field the node did not report stays `undefined`, so a caller
-   * that needs a full builder reference can tell the difference between
-   * "version 0" and "the node did not say".
-   */
-  private refOf(change: ChangedObject, side: "input" | "output"): ChangedRef {
-    const version = side === "output" ? change.outputVersion : change.inputVersion
-    const digest = side === "output" ? change.outputDigest : change.inputDigest
-    const owner = side === "output" ? change.outputOwner : change.inputOwner
-    const type = this.typeOf(change.objectId)
-    return {
-      id: change.objectId,
-      ...(type === undefined ? {} : { type }),
-      ...(version === null ? {} : { version }),
-      ...(digest === null ? {} : { digest }),
-      ...(owner === null ? {} : { owner })
-    }
-  }
-
-  private select(
-    predicate: (change: ChangedObject) => boolean,
-    side: "input" | "output",
-    filter?: (ref: ChangedRef) => boolean
-  ): ReadonlyArray<ChangedRef> {
-    const refs: Array<ChangedRef> = []
-    for (const change of this.effects.changedObjects) {
-      if (isAccumulatorWrite(change)) continue
-      if (!predicate(change)) continue
-      const ref = this.refOf(change, side)
-      if (filter !== undefined && !filter(ref)) continue
-      refs.push(ref)
-    }
-    return refs
-  }
-
-  private static byType(type?: string): ((ref: ChangedRef) => boolean) | undefined {
-    if (type === undefined) return undefined
-    return (ref) => ref.type !== undefined && typeMatches(type, ref.type)
-  }
-
   /**
    * Objects this transaction created, optionally filtered by Move type through
    * `typeMatches`: a bare tag matches every instantiation of the generic, a
    * parameterized one is compared in full after normalization. Never fails.
    */
   created(type?: string): ReadonlyArray<ChangedRef> {
-    return this.createdWhere(Executed.byType(type) ?? (() => true))
+    return createdOf(this, type)
   }
 
   /**
@@ -208,23 +444,16 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * Never fails.
    */
   createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef> {
-    return this.select(
-      (change) => change.idOperation === "Created" && Executed.wroteAnObject(change),
-      "output",
-      predicate
-    )
+    return createdWhereOf(this, predicate)
   }
 
-  /** Objects this transaction mutated in place, optionally filtered by type. Never fails. */
+  /**
+   * Objects this transaction mutated in place, optionally filtered by type.
+   * An object that changed owner is mutated too, and is also in
+   * {@link transferred}. Never fails.
+   */
   mutated(type?: string): ReadonlyArray<ChangedRef> {
-    return this.select(
-      (change) =>
-        change.idOperation === "None" &&
-        Executed.wroteAnObject(change) &&
-        (change.inputState === "Exists" || change.inputState === "Unknown"),
-      "output",
-      Executed.byType(type)
-    )
+    return mutatedOf(this, type)
   }
 
   /**
@@ -243,10 +472,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * Never fails.
    */
   deleted(): ReadonlyArray<ChangedRef> {
-    return this.select(
-      (change) => Executed.isDeleted(change) || Executed.isWrapped(change),
-      "input"
-    )
+    return deletedOf(this)
   }
 
   /**
@@ -256,30 +482,27 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * Never fails.
    */
   wrapped(): ReadonlyArray<ChangedRef> {
-    return this.select(Executed.isWrapped, "input")
+    return wrappedOf(this)
   }
 
   /**
-   * Whether this change wrote an object, treating `Unknown` as "the envelope
-   * did not say".
+   * Objects whose **owner changed**, optionally filtered by type: they existed
+   * going in, still exist with the same id, and their input owner and output
+   * owner differ. Owners are compared by kind and party — an address, an
+   * object (a dynamic object field's parent), shared, immutable, a consensus
+   * address — never by version, so a transfer to someone else, a freeze, a
+   * move under a dynamic object field and a move between `AddressOwner` and
+   * `ConsensusAddressOwner` all count, while a consensus object whose
+   * `startVersion` moved does not. A created object is not transferred (its
+   * owner is on {@link created}'s ref), and neither is a deleted or wrapped
+   * one. Either owner unknown — a reduced envelope that left it out, or the
+   * `Unknown` variant — is not evidence of a change and is left out. Each ref
+   * is the output side, with `inputOwner` the owner going in. Never fails.
    *
-   * A node always reports the output state; a reduced envelope from a relay or
-   * a sponsor often reports nothing but the id and the id operation, and
-   * {@link Executed.fromPartial} leaves what it was not told as `Unknown`
-   * rather than inventing `ObjectWrite`. Reading `Unknown` as "not an object
-   * write" would make `created()` silently empty for exactly those envelopes.
+   * @since 0.5.0
    */
-  private static wroteAnObject(change: ChangedObject): boolean {
-    return change.outputState === "ObjectWrite" || change.outputState === "Unknown"
-  }
-
-  private static isDeleted(change: ChangedObject): boolean {
-    return change.idOperation === "Deleted"
-  }
-
-  private static isWrapped(change: ChangedObject): boolean {
-    return change.idOperation === "None" && change.inputState === "Exists" &&
-      change.outputState === "DoesNotExist"
+  transferred(type?: string): ReadonlyArray<TransferredRef> {
+    return transferredOf(this, type)
   }
 
   /**
@@ -290,37 +513,24 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * Never fails.
    */
   packagesPublished(): ReadonlyArray<ChangedRef> {
-    const refs: Array<ChangedRef> = []
-    for (const change of this.effects.changedObjects) {
-      if (change.outputState !== "PackageWrite" || change.idOperation !== "Created") continue
-      const ref = this.refOf(change, "output")
-      // gRPC reports the literal `package` as a published package's type, and
-      // some nodes omit it from `objectTypes` entirely; a `PackageWrite` is a
-      // package either way.
-      refs.push(ref.type === undefined ? { ...ref, type: "package" } : ref)
-    }
-    return refs
+    return packagesPublishedOf(this)
   }
 
   /**
    * The net balance change for one address and coin type, in the coin's base
    * unit (MIST for SUI). `coinType` is any spelling — `"0x2::sui::SUI"`,
-   * `CoinType.SUI` — compared under the one Move type rule. Never fails.
+   * `CoinType.SUI` — compared under the one Move type rule. It covers coin
+   * objects and the address balance alike, netted per address: a fold that
+   * moves 1,000 SUI of coins into its owner's address balance reports only
+   * the gas it cost (`Tx.foldMovement` reports the movement). Never fails.
    */
   balanceChange(address: SuiAddress, coinType: CoinType | string): bigint {
-    let total = 0n
-    for (const change of this.balanceChanges) {
-      if (change.address === address && typeMatches(coinType, change.coinType)) {
-        total += change.amount
-      }
-    }
-    return total
+    return balanceChangeOf(this, address, coinType)
   }
 
   /** Computation plus storage less the storage rebate, in MIST. Can be negative. Never fails. */
   get gasUsedTotal(): bigint {
-    const gas = this.effects.gasUsed
-    return gas.computationCost + gas.storageCost - gas.storageRebate
+    return gasUsedTotalOf(this)
   }
 
   /**
@@ -329,7 +539,9 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    *
    * This is what `Tx.submit` uses, exported so a caller holding a result from
    * somewhere else — `client.core.executeTransaction`, a sponsor's SDK call —
-   * can get the accessors without re-implementing the decode.
+   * can get the accessors without re-implementing the decode. `sender` is
+   * filled when the result carries the transaction data (it was read with
+   * `transaction: true` as well).
    *
    * Fails with: `ExecutionFailed` (the transaction applied and failed),
    * `DecodeError` (the response does not carry the include set).
@@ -359,7 +571,8 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    *   {@link createdWhere}, still list every created id.
    * - `balanceChanges` and `events` default to `[]`, `checkpoint` and
    *   `timestampMs` to `null`, `gasUsed` to zeros, and `effects.status` to
-   *   success.
+   *   success. `sender` (or `transaction.sender`) is kept when it is an
+   *   address.
    * - **JSON spellings are accepted** where the SDK's types are not JSON:
    *   `bcs` as base64 or as an array of byte values as well as a
    *   `Uint8Array`, and every `u64` (versions, balances, gas, `checkpoint`)
@@ -382,16 +595,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * that type, or more than one.
    */
   expectCreated(type: string): Effect.Effect<ChangedRef, UnexpectedEffects> {
-    const created = this.created(type)
-    const only = created[0]
-    if (created.length === 1 && only !== undefined) return Effect.succeed(only)
-    return Effect.fail(
-      new UnexpectedEffects({
-        digest: this.digest,
-        expected: type,
-        found: created.map((ref) => ref.id)
-      })
-    )
+    return expectCreatedOf(this, type)
   }
 
   /**
@@ -436,14 +640,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
     codec: Schema.Codec<T, Uint8Array>,
     eventType?: string
   ): Effect.Effect<ReadonlyArray<T>, DecodeError> {
-    return Effect.flatMap(
-      selectingType(codec, eventType),
-      (wanted) =>
-        Effect.forEach(
-          this.eventsOfType(wanted),
-          (event) => decodeContent(codec, event.bcs, { expectedType: wanted, actualType: event.eventType })
-        )
-    )
+    return eventsOfOf(this, codec, eventType)
   }
 
   /**
@@ -464,24 +661,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
     codec: Schema.Codec<T, Uint8Array>,
     eventType?: string
   ): Effect.Effect<T, UnexpectedEffects | DecodeError> {
-    return Effect.flatMap(selectingType(codec, eventType), (wanted): Effect.Effect<T, UnexpectedEffects | DecodeError> => {
-      const matching = this.eventsOfType(wanted)
-      const only = matching[0]
-      if (matching.length !== 1 || only === undefined) {
-        return Effect.fail(
-          new UnexpectedEffects({
-            digest: this.digest,
-            expected: `exactly one event ${wanted}`,
-            found: matching.map((event) => event.packageId)
-          })
-        )
-      }
-      return decodeContent(codec, only.bcs, { expectedType: wanted, actualType: only.eventType })
-    })
-  }
-
-  private eventsOfType(type: string): ReadonlyArray<Event> {
-    return this.events.filter((event) => typeMatches(type, event.eventType))
+    return expectEventOf(this, codec, eventType)
   }
 
   /**
@@ -517,30 +697,133 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * ```
    */
   expectPublished(): Effect.Effect<Published, UnexpectedEffects> {
-    const packages = this.packagesPublished()
-    const pkg = packages[0]
-    if (packages.length !== 1 || pkg === undefined) {
-      return Effect.fail(
-        new UnexpectedEffects({
-          digest: this.digest,
-          expected: "exactly one published package",
-          found: packages.map((ref) => ref.id)
-        })
-      )
-    }
-    const created = this.created(UPGRADE_CAP_TYPE)
-    const caps = created.length > 0 ? created : this.mutated(UPGRADE_CAP_TYPE)
-    const cap = caps[0]
-    if (caps.length !== 1 || cap === undefined) {
-      return Effect.fail(
-        new UnexpectedEffects({
-          digest: this.digest,
-          expected: `exactly one ${UPGRADE_CAP_TYPE}`,
-          found: caps.map((ref) => ref.id)
-        })
-      )
-    }
-    return Effect.succeed({ packageId: pkg.id, package: pkg, upgradeCap: cap })
+    return expectPublishedOf(this)
+  }
+}
+
+/**
+ * The result of a successful simulation, with the fixed include set `Sui` asks
+ * for: effects, events, balance changes, object types and command results.
+ *
+ * `gasPaymentMocked` mirrors the SDK field of the same name: `true` when the
+ * simulated transaction had no gas payment, so the node ran it on a mocked gas
+ * coin — gas costs and logic are exercised, but anything drawn from `tx.gas`
+ * was funded by the mock, not the sender. `false` when gas was paid with real
+ * coins or from the sender's address balance.
+ *
+ * **A `Schema.Class` since 0.5.0** (a `Schema.Struct` before), so it carries
+ * {@link Executed}'s accessors — `created`, `createdWhere`, `mutated`,
+ * `deleted`, `wrapped`, `transferred`, `packagesPublished`, `balanceChange`,
+ * `gasUsedTotal`, `expectCreated`, `eventsOf`, `expectEvent`,
+ * `expectPublished` — through **the same implementation**, so a preview and
+ * the receipt it predicts read the same way. The fields are unchanged. Values
+ * come from `Sui.simulate` or a decode (`Schema.decodeUnknownEffect(Simulation)`);
+ * one assembled by hand is `new Simulation({ ... })`.
+ */
+export class Simulation extends Schema.Class<Simulation>("sui-effect/Simulation")({
+  digest: Digest,
+  effects: TransactionEffects,
+  events: Schema.Array(Event),
+  balanceChanges: Schema.Array(BalanceChange),
+  objectTypes: Schema.Record(Schema.String, Schema.String),
+  commandResults: Schema.Array(CommandResult),
+  gasPaymentMocked: Schema.Boolean
+}) {
+  /** {@link Executed.created}, over the simulated effects. Never fails. @since 0.5.0 */
+  created(type?: string): ReadonlyArray<ChangedRef> {
+    return createdOf(this, type)
+  }
+
+  /** {@link Executed.createdWhere}, over the simulated effects. Never fails. @since 0.5.0 */
+  createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef> {
+    return createdWhereOf(this, predicate)
+  }
+
+  /** {@link Executed.mutated}, over the simulated effects. Never fails. @since 0.5.0 */
+  mutated(type?: string): ReadonlyArray<ChangedRef> {
+    return mutatedOf(this, type)
+  }
+
+  /** {@link Executed.deleted} (deleted or wrapped), over the simulated effects. Never fails. @since 0.5.0 */
+  deleted(): ReadonlyArray<ChangedRef> {
+    return deletedOf(this)
+  }
+
+  /** {@link Executed.wrapped}, over the simulated effects. Never fails. @since 0.5.0 */
+  wrapped(): ReadonlyArray<ChangedRef> {
+    return wrappedOf(this)
+  }
+
+  /** {@link Executed.transferred}: objects whose owner changed. Never fails. @since 0.5.0 */
+  transferred(type?: string): ReadonlyArray<TransferredRef> {
+    return transferredOf(this, type)
+  }
+
+  /** {@link Executed.packagesPublished}, over the simulated effects. Never fails. @since 0.5.0 */
+  packagesPublished(): ReadonlyArray<ChangedRef> {
+    return packagesPublishedOf(this)
+  }
+
+  /** {@link Executed.balanceChange}: the net delta for one address and coin type. Never fails. @since 0.5.0 */
+  balanceChange(address: SuiAddress, coinType: CoinType | string): bigint {
+    return balanceChangeOf(this, address, coinType)
+  }
+
+  /** Computation plus storage less the storage rebate, in MIST. Can be negative. Never fails. @since 0.5.0 */
+  get gasUsedTotal(): bigint {
+    return gasUsedTotalOf(this)
+  }
+
+  /**
+   * {@link Executed.expectCreated}, over the simulated effects.
+   *
+   * Fails with: `UnexpectedEffects` when the simulation created no object of
+   * that type, or more than one.
+   *
+   * @since 0.5.0
+   */
+  expectCreated(type: string): Effect.Effect<ChangedRef, UnexpectedEffects> {
+    return expectCreatedOf(this, type)
+  }
+
+  /**
+   * {@link Executed.eventsOf}, over the simulated events.
+   *
+   * Fails with: `DecodeError`.
+   *
+   * @since 0.5.0
+   */
+  eventsOf<T>(
+    codec: Schema.Codec<T, Uint8Array>,
+    eventType?: string
+  ): Effect.Effect<ReadonlyArray<T>, DecodeError> {
+    return eventsOfOf(this, codec, eventType)
+  }
+
+  /**
+   * {@link Executed.expectEvent}, over the simulated events.
+   *
+   * Fails with: `UnexpectedEffects`, `DecodeError`.
+   *
+   * @since 0.5.0
+   */
+  expectEvent<T>(
+    codec: Schema.Codec<T, Uint8Array>,
+    eventType?: string
+  ): Effect.Effect<T, UnexpectedEffects | DecodeError> {
+    return expectEventOf(this, codec, eventType)
+  }
+
+  /**
+   * {@link Executed.expectPublished}, over the simulated effects: the package a
+   * publish would create, and its `UpgradeCap`.
+   *
+   * Fails with: `UnexpectedEffects`.
+   *
+   * @since 0.5.0
+   */
+  expectPublished(): Effect.Effect<Published, UnexpectedEffects> {
+    return expectPublishedOf(this)
   }
 }
 
@@ -612,6 +895,11 @@ export const fromTransactionResult = Effect.fnUntraced(
     result: SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
   ): Effect.fn.Return<Executed, ExecutionFailed | DecodeError> {
     const transaction = result.$kind === "Transaction" ? result.Transaction : result.FailedTransaction
+    // Present only when the caller also asked for `transaction: true`; the
+    // execute include set does not, so `Tx` fills it from the signed bytes.
+    const sender = senderOf(
+      (transaction as unknown as { readonly transaction?: { readonly sender?: unknown } | null }).transaction?.sender
+    )
     const encoded = {
       digest: transaction.digest,
       effects: transaction.effects,
@@ -619,7 +907,8 @@ export const fromTransactionResult = Effect.fnUntraced(
       balanceChanges: transaction.balanceChanges,
       objectTypes: transaction.objectTypes,
       checkpoint: transaction.checkpoint,
-      timestampMs: transaction.timestampMs
+      timestampMs: transaction.timestampMs,
+      ...(sender === undefined ? {} : { sender })
     }
     const executed = yield* decodeExecuted(encoded).pipe(
       Effect.mapError((error) => new DecodeError({ kind: "shape", ...decodePayload(error) }))
@@ -637,6 +926,18 @@ export const fromTransactionResult = Effect.fnUntraced(
     return executed
   }
 )
+
+/** A sender someone reported, as the padded address, or `undefined` when it is not an address. */
+const senderOf = (value: unknown): string | undefined =>
+  typeof value === "string" && isValidSuiAddress(normalizeSuiAddress(value)) ? normalizeSuiAddress(value) : undefined
+
+/**
+ * `executed` with `sender` filled in from the bytes that were sent, when the
+ * node's answer did not carry it. Internal: what `Tx` applies to everything it
+ * returns for a `Signed`. Never fails.
+ */
+export const withSender = (executed: Executed, sender: SuiAddress): Executed =>
+  executed.sender !== undefined ? executed : new Executed({ ...executed, sender }, { disableChecks: true })
 
 /** The zero gas summary a reduced envelope gets when it reports no gas at all. */
 const NO_GAS = {
@@ -754,6 +1055,10 @@ const fromPartial = (envelope: unknown): Effect.Effect<Executed, DecodeError> =>
     events: asArray(field(envelope, "events")).map(partialEvent),
     balanceChanges: asArray(field(envelope, "balanceChanges")).map(partialBalanceChange),
     objectTypes: field(envelope, "objectTypes") ?? {},
+    ...(() => {
+      const sender = senderOf(field(envelope, "sender") ?? field(field(envelope, "transaction"), "sender"))
+      return sender === undefined ? {} : { sender }
+    })(),
     checkpoint: u64OrNull(field(envelope, "checkpoint")),
     timestampMs: (() => {
       const value = field(envelope, "timestampMs")

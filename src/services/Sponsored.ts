@@ -7,7 +7,7 @@ import { TransactionDataBuilder } from "@mysten/sui/transactions"
 import { normalizeSuiAddress } from "@mysten/sui/utils"
 import { Effect } from "effect"
 import { PolicyDenied } from "../domain/errors.ts"
-import type { Built } from "../domain/schemas.ts"
+import type { Built } from "../domain/built.ts"
 
 const kindOf = (build: () => TransactionDataBuilder): Uint8Array | undefined => {
   try {

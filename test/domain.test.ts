@@ -24,9 +24,9 @@ import {
   SuiErrorSchema,
   UnexpectedEffects
 } from "../src/domain/errors.ts"
+import { Built } from "../src/domain/built.ts"
 import {
   Balance,
-  Built,
   CoinType,
   Digest,
   Network,
@@ -763,6 +763,13 @@ describe("optionalKey on library-owned shapes (BR1)", () => {
       digest: Digest.make(DIGEST),
       bytes: new Uint8Array([1]),
       sender: SuiAddress.make(ADDRESS),
+      gas: {
+        budget: Mist.make(1n),
+        price: Mist.make(1n),
+        owner: SuiAddress.make(ADDRESS),
+        payment: [],
+        source: "addressBalance"
+      },
       chain: undefined
     }
     expect(built.digest).toBe(Digest.make(DIGEST))

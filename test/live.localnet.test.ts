@@ -25,6 +25,7 @@ import { describe, expect, test } from "bun:test"
 import { requestSuiFromFaucetV2 } from "@mysten/sui/faucet"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
 import { Effect, Layer, Schedule, Stream } from "effect"
+import type { Prepared } from "../src/services/Tx.ts"
 import { CoinType } from "../src/domain/schemas.ts"
 import type { SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
@@ -49,6 +50,34 @@ const layer = Layer.mergeAll(
 
 const local = <A, E>(effect: Effect.Effect<A, E, Sui | SuiCore>): Promise<A> =>
   Effect.runPromise(Effect.provide(effect, layer, { local: true }))
+
+/**
+ * `local` over a `SuiCore` that counts its `simulateTransaction` calls: the
+ * explicit simulates, which is what a run costs beyond the gRPC resolver's own
+ * (that one goes straight to the node from the SDK's build plugin).
+ */
+const counted = async <A, E>(effect: Effect.Effect<A, E, Sui | SuiCore>): Promise<{ value: A; simulates: number }> => {
+  let simulates = 0
+  const core = Layer.effect(
+    SuiCore,
+    Effect.gen(function*() {
+      const inner = yield* SuiCore
+      return {
+        ...inner,
+        simulateTransaction: ((options: Parameters<typeof inner.simulateTransaction>[0]) => {
+          simulates += 1
+          return inner.simulateTransaction(options)
+        }) as typeof inner.simulateTransaction
+      }
+    })
+  ).pipe(Layer.provide(SuiCore.layerGrpc({ network: "localnet", baseUrl: BASE_URL })))
+  const value = await Effect.runPromise(
+    Effect.provide(effect, Layer.mergeAll(Sui.layerNoDeps.pipe(Layer.provideMerge(core)), Journal.layerMemory), {
+      local: true
+    })
+  )
+  return { value, simulates }
+}
 
 /** A fresh key with the faucet's coins on it, once they are readable. */
 const funded = async (): Promise<Signer> => {
@@ -372,5 +401,110 @@ describe.skipIf(!LOCALNET)("localnet, with SUI_LOCALNET=1", () => {
       expect(sent).toHaveLength(0)
     },
     2 * MINUTE
+  )
+
+  test(
+    "Tx.run({ intent, approve }) on address-balance gas: one simulate, approved before signing, inside the session",
+    async () => {
+      const signer = await funded()
+      await local(Tx.foldCoins({ signer }))
+      const recipient = (await Effect.runPromise(ephemeral)).address
+      const epoch = await local(Effect.gen(function*() {
+        const { systemState } = yield* (yield* SuiCore).getCurrentSystemState()
+        return BigInt(systemState.epoch)
+      }))
+      let seen: Prepared | undefined
+      const { value: executed, simulates } = await counted(Tx.run(Tx.sendFunds({ amount: 1_000_000_000n, recipient }), {
+        // A one-epoch session: the window is capped at it, and a node accepts that.
+        signer: { ...signer, maxEpoch: epoch },
+        intent: {
+          summary: "Send 1 SUI to a fresh account.",
+          author: "user",
+          claims: { outflows: [{ coinType: CoinType.SUI, max: 1_000_000_000n }], recipients: [recipient], objects: [] }
+        },
+        approve: (prepared) => Effect.sync(() => (seen = prepared))
+      }))
+      expect(executed.effects.status.success).toBe(true)
+      expect(executed.sender).toBe(signer.address)
+      expect(seen).toBeDefined()
+      const prepared = seen!
+      expect(prepared.built.gas.source).toBe("addressBalance")
+      expect(prepared.built.gas.payment).toEqual([])
+      expect(prepared.built.gas.owner).toBe(signer.address)
+      // gRPC: the resolver simulated a pre-budget transaction, so the build kept none.
+      expect(prepared.built.simulation).toBeUndefined()
+      expect(prepared.verified?.verdict._tag).toBe("Unscreened")
+      expect(prepared.simulation.balanceChange(recipient, CoinType.SUI)).toBe(1_000_000_000n)
+      expect(executed.balanceChange(recipient, CoinType.SUI)).toBe(1_000_000_000n)
+      expect(prepared.built.expiration?.$kind === "ValidDuring" ? prepared.built.expiration.ValidDuring.maxEpoch : null)
+        .toBe(epoch)
+      // Preflight, the intent and approve share one simulate of the final bytes.
+      expect(simulates).toBe(1)
+      console.error(
+        `run({ intent, approve }): ${simulates} explicit simulate, gas ${prepared.built.gas.source},` +
+          ` budget ${prepared.built.gas.budget}, net gas ${prepared.simulation.gasUsedTotal}, window ${epoch}..${epoch}`
+      )
+    },
+    5 * MINUTE
+  )
+
+  test(
+    "Tx.prepare → preview → Tx.sign → Tx.submit, and the same for bytes handed over",
+    async () => {
+      const signer = await funded()
+      await local(Tx.foldCoins({ signer }))
+      const recipient = (await Effect.runPromise(ephemeral)).address
+      const { value, simulates } = await counted(Effect.gen(function*() {
+        const prepared = yield* Tx.prepare(Tx.sendFunds({ amount: 2_000n, recipient }), { sender: signer.address })
+        const executed = yield* Tx.submit(yield* Tx.sign(prepared.built, signer))
+        // A dapp's bytes: not rebuilt, simulated as they are.
+        const handed = yield* Tx.build(Tx.sendFunds({ amount: 3_000n, recipient }), { sender: signer.address })
+        const again = yield* Tx.prepare(yield* Tx.fromBytes(handed.bytes), { sender: signer.address })
+        const second = yield* Tx.submit(yield* Tx.sign(again.built, signer))
+        return { prepared, executed, again, handed, second }
+      }))
+      expect(value.executed.digest).toBe(value.prepared.built.digest)
+      expect(value.executed.sender).toBe(signer.address)
+      expect(value.prepared.simulation.balanceChange(recipient, CoinType.SUI))
+        .toBe(value.executed.balanceChange(recipient, CoinType.SUI))
+      expect(value.again.built.digest).toBe(value.handed.digest)
+      expect(value.again.built.gas).toEqual(value.handed.gas)
+      expect(value.second.effects.status.success).toBe(true)
+      // One per prepare.
+      expect(simulates).toBe(2)
+      expect((await balanceOf(recipient)).addressBalance).toBe(5_000n)
+    },
+    5 * MINUTE
+  )
+
+  test(
+    "a previewed fold runs as planned, and approve sees the coins move into the balance",
+    async () => {
+      const signer = await funded()
+      const before = await balanceOf(signer.address)
+      const plan = await local(Tx.planFold({ owner: signer.address }))
+      const movements: Array<ReturnType<typeof Tx.foldMovement>> = []
+      const result = await local(Tx.foldCoins({
+        signer,
+        plan,
+        approve: (prepared, batch) => Effect.sync(() => movements.push(Tx.foldMovement(batch, prepared.simulation)))
+      }))
+      const after = await balanceOf(signer.address)
+      expect(result.plan).toBe(plan)
+      expect(movements.length).toBe(plan.batches.length)
+      const moved = movements[0]!
+      expect(moved.exact).toBe(true)
+      expect(moved.consumed.length).toBe(plan.batches[0]!.coins.length)
+      expect(moved.fromCoins).toBe(before.coinBalance)
+      // What balanceChanges alone shows: the net gas, a rebate here.
+      expect(moved.netChange).toBe(moved.toAddressBalance - moved.fromCoins)
+      expect(after.addressBalance - before.addressBalance).toBe(moved.toAddressBalance)
+      expect(Tx.foldMovement(plan.batches[0]!, result.executed[0]!)).toEqual(moved)
+      console.error(
+        `fold preview: ${moved.consumed.length} coins, ${moved.fromCoins} MIST from coins,` +
+          ` +${moved.toAddressBalance} MIST into the balance, net change ${moved.netChange}`
+      )
+    },
+    5 * MINUTE
   )
 })

@@ -120,6 +120,21 @@ export interface FakeObject {
    * node that will not say, which is evidence of nothing.
    */
   readonly previousTransaction?: string
+  /**
+   * The node's JSON rendering of the content, served when the caller includes
+   * `json` (`null` when this is left out, as a node with nothing to render
+   * answers).
+   *
+   * @since 0.5.0
+   */
+  readonly json?: Record<string, unknown>
+  /**
+   * The Display output, served when the caller includes `display` (`null` when
+   * this is left out: the type has no Display template).
+   *
+   * @since 0.5.0
+   */
+  readonly display?: SuiClientTypes.Display
 }
 
 /** A created, mutated or deleted object in a scripted execution. */
@@ -144,7 +159,8 @@ export interface FakeChange {
   /**
    * The owner going **in**, for a transaction that moved the object: a transfer
    * is `inputOwner` the sender and `owner` the recipient, which is what
-   * `checkClaims` reads. Defaults to `owner`, an object that stayed put.
+   * `checkClaims` and `transferred()` (on `Simulation` and `Executed`) read.
+   * Defaults to `owner`, an object that stayed put.
    *
    * @since 0.5.0
    */
@@ -727,8 +743,10 @@ const toSdkObject = (
       ? object.previousTransaction ?? null
       : undefined,
     objectBcs: undefined,
-    json: undefined,
-    display: undefined
+    // Served when asked for, as a node does: `undefined` only when the include
+    // set did not request them.
+    json: include?.json === true ? object.json ?? null : undefined,
+    display: include?.display === true ? object.display ?? null : undefined
   }) as SuiClientTypes.Object<{ content: true }>
 
 const changedObject = (

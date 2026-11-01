@@ -1161,44 +1161,6 @@ export const NotAppliedEvidence = Schema.Literals(["expired", "inputConsumed", "
 export type NotAppliedEvidence = typeof NotAppliedEvidence.Type
 
 /**
- * A transaction built into bytes and ready to sign, with the expiration the
- * builder settled on recorded so `Tx.reconcile` can decide, later and without
- * the builder, whether the transaction can still land.
- *
- * Every field but `chain` is read back out of `bytes`. Bytes that arrived from
- * somewhere else — a sponsor handed a sender's transaction — become a `Built`
- * through `Tx.fromBytes`, never by hand: a hand-built value that leaves out
- * `expiration` or `chain` silently disables the expiry rule and the chain guard
- * `Tx.reconcile` depends on.
- */
-export const Built = Schema.Struct({
-  digest: Digest,
-  bytes: Schema.Uint8ArrayFromBase64,
-  sender: SuiAddress,
-  /**
-   * The address that pays for gas, present only when it is not the sender.
-   * Read out of the bytes, so a gas owner a recipe set itself (`Tx.sponsored`
-   * does) is recorded as well as one passed to `Tx.build`.
-   */
-  gasOwner: Schema.optionalKey(SuiAddress),
-  expiration: Schema.optionalKey(TransactionExpiration),
-  /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
-  chain: Schema.optionalKey(Schema.String)
-}).annotate({
-  identifier: "Built",
-  description: "A transaction built into bytes and ready to sign"
-})
-type BuiltType = typeof Built.Type
-/**
- * The decoded shape of {@link Built}.
- *
- * Declared as an interface rather than as `typeof Built.Type` so the name
- * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
- * into its structure. Structurally identical to the type alias it replaces.
- */
-export interface Built extends BuiltType {}
-
-/**
  * The last epoch in which a transaction can still be applied, or `undefined`
  * when its expiration sets no such bound (`None`, or a `ValidDuring` with no
  * `maxEpoch`).
@@ -1337,37 +1299,9 @@ export const CommandResult = Schema.Struct({
 })
 export type CommandResult = typeof CommandResult.Type
 
-/**
- * The result of a successful simulation, with the fixed include set `Sui` asks
- * for: effects, events, balance changes, object types and command results.
- *
- * `gasPaymentMocked` mirrors the SDK field of the same name: `true` when the
- * simulated transaction had no gas payment, so the node ran it on a mocked gas
- * coin — gas costs and logic are exercised, but anything drawn from `tx.gas`
- * was funded by the mock, not the sender. `false` when gas was paid with real
- * coins or from the sender's address balance.
- */
-export const Simulation = Schema.Struct({
-  digest: Digest,
-  effects: TransactionEffects,
-  events: Schema.Array(Event),
-  balanceChanges: Schema.Array(BalanceChange),
-  objectTypes: Schema.Record(Schema.String, Schema.String),
-  commandResults: Schema.Array(CommandResult),
-  gasPaymentMocked: Schema.Boolean
-}).annotate({
-  identifier: "Simulation",
-  description: "The result of a successful simulation"
-})
-type SimulationType = typeof Simulation.Type
-/**
- * The decoded shape of {@link Simulation}.
- *
- * Declared as an interface rather than as `typeof Simulation.Type` so the name
- * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
- * into its structure. Structurally identical to the type alias it replaces.
- */
-export interface Simulation extends SimulationType {}
+// `Built` lives in `built.ts` and `Simulation` in `executed.ts` since 0.5.0:
+// `Simulation` carries `Executed`'s accessors, which need `bcs.ts`, and `Built`
+// carries a `Simulation`. Both are still exported from the package root.
 
 /**
  * Decodes the SDK's `ExecutionError` into an {@link ExecutionReason}, falling
