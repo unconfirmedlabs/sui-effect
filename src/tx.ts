@@ -73,7 +73,7 @@ export {
   Verified
 } from "./domain/intent.ts"
 
-/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, verify, prepare, reconcile, resubmit, run, foldCoins. */
+/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, verify, prepare, reconcile, resubmit, run, foldCoins, sendAll. */
 export {
   attach,
   build,
@@ -94,6 +94,8 @@ export {
   reconcileAll,
   resubmit,
   run,
+  type SendAllResult,
+  sendAll,
   sign,
   Signed,
   sponsored,
@@ -114,6 +116,7 @@ export {
   type FoldMovement,
   type FoldPlan,
   planFold,
+  type SendAllSweep,
   sendFunds
 } from "./services/Fold.ts"
 

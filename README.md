@@ -148,9 +148,10 @@ SUI type.
 ## The transaction lifecycle
 
 `Tx` is the lifecycle as functions — `build`, `sign`, `cosign`, `fromBytes`,
-`attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`,
-`fold`, `foldCoins`, `submit`, `submitVia`, `verify`, `reconcile`, `resubmit`,
-`recorded`, `run`, `reconcileAll` — each with a closed error union and `R = Sui`. Gas comes
+`attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `sendAll`,
+`planFold`, `fold`, `foldCoins`, `submit`, `submitVia`, `verify`,
+`verifySponsored`, `prepare`, `reconcile`, `resubmit`, `recorded`, `run`,
+`reconcileAll` — each with a closed error union and `R = Sui`. Gas comes
 from the payer's SUI **address balance** by default, and from coins only when
 the balance cannot cover it ([Fold your coins](#fold-your-coins)). `Tx.run`
 holds the sender lock for every build, and through submit only when the bytes
@@ -493,6 +494,21 @@ const sent = yield* Tx.run(Tx.sendFunds({ amount: 1_000_000_000n, recipient }), 
 const paid = yield* Tx.run((tx) => {
   tx.transferObjects([tx.coin({ balance: 1_000_000_000n })], recipient)
 }, { signer })
+```
+
+**Send everything.** `Tx.sendAll({ signer, recipient, coinType?, intent?,
+approve? })` sweeps one coin type — every coin object and the whole address
+balance — into the recipient's balance in one `Tx.run`, and leaves the sender
+**0**. For SUI the gas coin is made to be everything (a reservation of the
+whole balance with the coins merged in, or the coins with the balance redeemed
+into them) and is deposited, so gas comes out of the sweep and no unused-budget
+refund is left behind; any other type sends its coins and its balance and pays
+gas from SUI. Proved on localnet for coin-only, balance-only and mixed SUI
+accounts and for a second coin type. What arrives after the read stays; more
+than 500 coin objects need `Tx.foldCoins` first.
+
+```ts
+const { sweep, received } = yield* Tx.sendAll({ signer, recipient: newWallet })
 ```
 
 A wallet that wants the balance enforced sets
@@ -859,10 +875,12 @@ unresolved entry of the journal it is given, another process's included in a
 shared store, and any one of them turns a would-be 2, 4 or 130 into 3; it cannot
 count what applied, so a multi-command CLI passes `applied` (the transactions it
 saw execute) and gets the "applied → 5" rule too. Provide
-**`Script.layerStderrLogger()`** around the program: library log lines — the
-"did not become visible within `visibilityTimeout`" warning above all — go
-through Effect's logger, whose default writes to **stdout**, and would break a
-`--json` document. `Script.run` installs it for you.
+**`Script.layerStderrLogger()`** around the program: library log lines — a
+tail's retry warnings, a journal write that failed — go through Effect's
+logger, whose default writes to **stdout**, and would break a `--json`
+document. (The "did not become visible within `visibilityTimeout`" line is
+debug level since 0.5.0, so a default program never prints it; it is the
+`sui.visibility` span attribute.) `Script.run` installs it for you.
 `Script.run` lists, and counts, only the entries its own program wrote.
 `Script.layerNoDeps`, `layerWithSigner` and `layerReadOnlyNoDeps` take the
 network from the `SuiCore` underneath, not from `SUI_NETWORK`, so they build

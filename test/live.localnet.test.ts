@@ -507,4 +507,101 @@ describe.skipIf(!LOCALNET)("localnet, with SUI_LOCALNET=1", () => {
     },
     5 * MINUTE
   )
+
+  test(
+    "Tx.sendAll leaves 0: SUI in coins, in a balance and in both, and a second coin type",
+    async () => {
+      const sweepTo = async (signer: Signer, coinType?: CoinType) => {
+        const recipient = (await Effect.runPromise(ephemeral)).address
+        const before = await balanceOf(signer.address, coinType)
+        const result = await local(Tx.sendAll({ signer, recipient, ...(coinType === undefined ? {} : { coinType }) }))
+        expect(result.executed.effects.status.success).toBe(true)
+        const after = await balanceOf(signer.address, coinType)
+        const got = await balanceOf(recipient, coinType)
+        console.error(
+          `sendAll ${coinType === undefined ? "SUI" : "FCOIN"} (${result.sweep.gas}): before ${before.coinBalance} in coins +` +
+            ` ${before.addressBalance} in the balance; after ${after.coinBalance} + ${after.addressBalance};` +
+            ` recipient +${got.addressBalance} (received ${result.received})`
+        )
+        expect(after).toEqual({ coinBalance: 0n, addressBalance: 0n })
+        expect(await coinCount(signer.address, coinType)).toBe(0)
+        expect(got.addressBalance).toBe(result.received)
+        // A read of it names its sender (0.5.0): read from the transaction's BCS.
+        // Retried: under load the node can answer execute before it serves the read.
+        const read = await local(Effect.retry(
+          Effect.flatMap(Sui, (sui) => sui.getTransaction(result.executed.digest)),
+          { schedule: Schedule.spaced("500 millis"), times: 40 }
+        ))
+        expect(read.sender).toBe(signer.address)
+        return result
+      }
+
+      // Coins only: the faucet's five coins are the gas payment.
+      const coins = await sweepTo(await funded())
+      expect(coins.sweep.gas).toBe("coins")
+
+      // A balance only: a reservation of all of it is the gas coin.
+      const folded = await funded()
+      await local(Tx.foldCoins({ signer: folded }))
+      const balance = await sweepTo(folded)
+      expect(balance.sweep.gas).toBe("coinReservation")
+      expect(balance.sweep.coins).toHaveLength(0)
+
+      // Both, more in coins: the balance is redeemed into the coin payment. A
+      // send to oneself from a coin-only account splits it off the gas coin.
+      const mixed = await funded()
+      await local(Tx.run(Tx.sendFunds({ amount: 1_000_000_000n, recipient: mixed.address }), { signer: mixed }))
+      const both = await balanceOf(mixed.address)
+      expect(both.addressBalance).toBe(1_000_000_000n)
+      expect(both.coinBalance).toBeGreaterThan(both.addressBalance)
+      expect((await sweepTo(mixed)).sweep.gas).toBe("coins")
+
+      // Both, more in the balance: the coins are merged into the reservation.
+      const refilled = await funded()
+      await local(Tx.foldCoins({ signer: refilled }))
+      await requestSuiFromFaucetV2({ host: FAUCET, recipient: refilled.address })
+      await local(Effect.retry(
+        Effect.flatMap(Effect.flatMap(Sui, (sui) => sui.getBalance(refilled.address)), (value) =>
+          value.coinBalance > 0n ? Effect.void : Effect.fail("not visible yet" as const)),
+        { schedule: Schedule.spaced("250 millis"), times: 40 }
+      ))
+      const merged = await sweepTo(refilled)
+      expect(merged.sweep.gas).toBe("coinReservation")
+      expect(merged.sweep.coins.length).toBeGreaterThan(0)
+
+      // Another coin type: coins and balance, gas from SUI.
+      const minter = await funded()
+      const published = await local(Tx.run((tx) => {
+        const [cap] = tx.publish({ modules: [FCOIN_MODULE], dependencies: ["0x1", "0x2"] })
+        tx.transferObjects([cap!], minter.address)
+      }, { signer: minter }))
+      const packageId = published.effects.changedObjects.find((change) => change.outputState === "PackageWrite")!
+        .objectId
+      const fcoin = CoinType.normalize(`${packageId}::fcoin::FCOIN`)
+      const capId = published.effects.changedObjects.find((change) =>
+        change.idOperation === "Created" && change.outputState !== "PackageWrite" &&
+        (published.objectTypes?.[change.objectId] ?? "").includes("TreasuryCap")
+      )!.objectId
+      await local(Tx.run((tx) => {
+        for (const amount of [5_000n, 7_000n]) {
+          tx.transferObjects([
+            tx.moveCall({ target: "0x2::coin::mint", typeArguments: [fcoin], arguments: [tx.object(capId), tx.pure.u64(amount)] })
+          ], minter.address)
+        }
+        tx.moveCall({
+          target: "0x2::coin::send_funds",
+          typeArguments: [fcoin],
+          arguments: [
+            tx.moveCall({ target: "0x2::coin::mint", typeArguments: [fcoin], arguments: [tx.object(capId), tx.pure.u64(3_000n)] }),
+            tx.pure.address(minter.address)
+          ]
+        })
+      }, { signer: minter }))
+      const other = await sweepTo(minter, fcoin)
+      expect(other.sweep.gas).toBe("auto")
+      expect(other.sweep.amount).toBe(15_000n)
+      expect(other.received).toBe(15_000n)
+    },
+    5 * MINUTE
+  )
 })

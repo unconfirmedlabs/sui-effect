@@ -6,6 +6,8 @@
  * address and metadata bound as additional data (DESIGN §19). `unlock` answers
  * a `LockableSigner`, the same value `Signer.fromMnemonic` and
  * `Signer.fromSecretKey` answer; `Signer.scoped` locks it when a scope closes.
+ * `Keystore.sealer(password)` is the same format as the `SecretSealer` that
+ * `ZkLogin.save` and `ZkLogin.load` take, for a zkLogin session's ephemeral key.
  *
  * Separate from `sui-effect/tx` because it imports `effect/persistence`, and
  * because it needs WebCrypto (`crypto.subtle`, `crypto.getRandomValues`):
@@ -42,7 +44,9 @@ export {
   type KeystoreOptions,
   type KeystoreService,
   MIN_LAYER_ITERATIONS,
-  SealedKey
+  SealedKey,
+  SealedSecret,
+  sealer
 } from "./services/Keystore.ts"
 
 /** The keystore's failure, and the key failure its imports can end in. */

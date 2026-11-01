@@ -12,6 +12,7 @@
  *
  * @since 0.1.0
  */
+import { bcs as suiBcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { fromBase64, isValidSuiAddress, normalizeSuiAddress } from "@mysten/sui/utils"
 import { Effect, Predicate, Schema } from "effect"
@@ -874,6 +875,19 @@ export const EXECUTE_INCLUDE = {
   objectTypes: true
 } as const
 
+/**
+ * The include set the `Sui` tier's transaction **reads** ask for:
+ * {@link EXECUTE_INCLUDE} plus `bcs`, the transaction's own BCS bytes, which
+ * is where the sender is read from (`fromTransactionResult`). Not
+ * `transaction: true`: on gRPC the SDK parses that into commands and
+ * **throws** for every transaction that is not programmable (a consensus
+ * commit prologue, an epoch change), which would fail an unfiltered listing,
+ * and it costs about three times as much (localnet, protocol 139: +776 BCS
+ * bytes against +2,184 bytes of parsed data for a `send_funds`, +1,245
+ * against +7,320 for a 50-way split, on 8 KB and 53 KB answers). Internal.
+ */
+export const READ_INCLUDE = { ...EXECUTE_INCLUDE, bcs: true } as const
+
 const decodeExecutedAst = Schema.decodeUnknownEffect(Executed)
 
 /**
@@ -895,11 +909,14 @@ export const fromTransactionResult = Effect.fnUntraced(
     result: SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
   ): Effect.fn.Return<Executed, ExecutionFailed | DecodeError> {
     const transaction = result.$kind === "Transaction" ? result.Transaction : result.FailedTransaction
-    // Present only when the caller also asked for `transaction: true`; the
-    // execute include set does not, so `Tx` fills it from the signed bytes.
-    const sender = senderOf(
-      (transaction as unknown as { readonly transaction?: { readonly sender?: unknown } | null }).transaction?.sender
-    )
+    // Present only when the caller also asked for `transaction: true` or
+    // `bcs: true` (the `Sui` tier's reads ask for `bcs`); the execute include
+    // set asks for neither, so `Tx` fills it from the signed bytes.
+    const extra = transaction as unknown as {
+      readonly transaction?: { readonly sender?: unknown } | null
+      readonly bcs?: unknown
+    }
+    const sender = senderOf(extra.transaction?.sender) ?? senderOfBcs(extra.bcs)
     const encoded = {
       digest: transaction.digest,
       effects: transaction.effects,
@@ -930,6 +947,20 @@ export const fromTransactionResult = Effect.fnUntraced(
 /** A sender someone reported, as the padded address, or `undefined` when it is not an address. */
 const senderOf = (value: unknown): string | undefined =>
   typeof value === "string" && isValidSuiAddress(normalizeSuiAddress(value)) ? normalizeSuiAddress(value) : undefined
+
+/**
+ * The sender a transaction's BCS bytes name, or `undefined` when there are no
+ * bytes or this SDK cannot parse them (a system transaction kind newer than
+ * its BCS schema, whose sender is `0x0` anyway). Never fails.
+ */
+const senderOfBcs = (bytes: unknown): string | undefined => {
+  if (!(bytes instanceof Uint8Array) || bytes.length === 0) return undefined
+  try {
+    return senderOf(suiBcs.TransactionData.parse(bytes).V1?.sender)
+  } catch {
+    return undefined
+  }
+}
 
 /**
  * `executed` with `sender` filled in from the bytes that were sent, when the

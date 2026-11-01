@@ -126,7 +126,7 @@ describe("Sui.streamTransactions({ affectedAddress })", () => {
     )
   })
 
-  test("reads each listed digest with the execute include set", async () => {
+  test("reads each listed digest with the read include set (execute's plus bcs)", async () => {
     const calls = await run(
       Effect.gen(function*() {
         const sui = yield* Sui
@@ -153,7 +153,9 @@ describe("Sui.streamTransactions({ affectedAddress })", () => {
       effects: true,
       events: true,
       balanceChanges: true,
-      objectTypes: true
+      objectTypes: true,
+      // 0.5.0: the transaction's BCS bytes, which is where `Executed.sender` is read from.
+      bcs: true
     })
   })
 
