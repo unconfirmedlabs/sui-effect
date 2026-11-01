@@ -80,6 +80,7 @@ with no handling lines anywhere.
 | [Fold your coins](#fold-your-coins) | `@unconfirmed/sui-effect/tx` | Move coin objects into the address balance, which pays gas by default; `Tx.sendFunds` |
 | [Declared intents](#declared-intents) | `@unconfirmed/sui-effect/tx`, `/gate` | `Intent` claims checked against the simulation in code; `Tx.verify`; an optional semantic screen (`Gate`, Jev) |
 | [The journal](#the-journal) | `@unconfirmed/sui-effect/journal` | The record of signed bytes; in memory by default, durable over a `KeyValueStore` |
+| [Storage](#storage) | `@unconfirmed/sui-effect/storage` | `KeyValueStore` layers for IndexedDB, React Native (AsyncStorage, MMKV) and `chrome.storage` |
 | [Errors](#errors) | `@unconfirmed/sui-effect` | One flat tagged error per failure, `SuiError.outcome` and the exit codes |
 | [Scripts](#scripts) | `@unconfirmed/sui-effect/script` | `Script.run`: config from the environment, signals, stderr diagnostics, exit codes |
 | [Extensions](#extensions) | `@unconfirmed/sui-effect/extension` | A downstream SDK as an Effect service with a derived Promise face |
@@ -593,10 +594,15 @@ entries; `"ignore"` builds and leaves them for `Tx.reconcileAll()`, the
 explicit startup call. Each entry is one key, and the journal lists them through
 `KeyValueStore.keys` — which every store has had to implement since effect 4.1 —
 so a custom store must implement `keys`, and several processes writing one
-prefix do not lose each other's entries. Listing is a scan, so a service that
-runs for months calls `pruneSettled(before)`, which deletes settled entries
-recorded before the cutoff and never an unresolved one. `makeKeyValueStore(store)`
-is the same journal as a plain `JournalService`.
+prefix do not lose each other's entries. A settled entry carries a
+`settled:<digest>` marker beside it (0.5.0), so a listing reads only the
+entries without one: one `keys` and one read per unresolved entry, however many
+settled ones the store keeps. A store 0.4 wrote has no markers and needs no
+migration — its first listing is the old scan and marks what it finds settled.
+`keys` still enumerates every entry, so a service that runs for months calls
+`pruneSettled(before)`, which deletes settled entries recorded before the
+cutoff and never an unresolved one. `makeKeyValueStore(store)` is the same
+journal as a plain `JournalService`.
 
 **A script with a durable journal** gives it to `Script.run` in
 `options.layer` (`Layer.merge(Script.layer, journal)`; the option accepts any
@@ -614,7 +620,38 @@ entry 0.4 wrote is invisible to a 0.3 `listUnresolved`, `Tx.reconcileAll` and
 cannot decode `NotApplied { evidence: "refused" }`, which 0.4 writes. Before
 rolling back, or while 0.3 and 0.4 processes share a store, drain it with
 `Tx.reconcileAll()` on 0.4 (or settle the entries by hand) and delete the
-`"refused"` entries.
+`"refused"` entries. Rolling back from 0.5 to 0.4 is safe (0.4 ignores the
+markers); running a 0.4 **writer** beside 0.5 is not, because a 0.4 process
+that re-signs a digest 0.5 had settled leaves its marker in place and hides the
+entry from `listUnresolved` — stop the 0.4 writers first.
+
+## Storage
+
+`@unconfirmed/sui-effect/storage` is a `KeyValueStore` layer for each platform a
+wallet runs on, so the durable journal (and anything else written over
+`KeyValueStore`) runs there unchanged. Every platform object is reached
+structurally: no DOM, React Native or `chrome` types, and no dependency.
+
+```ts
+import { Layer } from "effect"
+import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
+import { layerIndexedDb } from "@unconfirmed/sui-effect/storage"
+
+const journal = layerKeyValueStore({ onUnresolved: "ignore" }).pipe(
+  Layer.provide(layerIndexedDb({ databaseName: "my-wallet" }))
+)
+```
+
+| Layer | Over | Notes |
+|---|---|---|
+| `layerIndexedDb({ indexedDB?, databaseName?, storeName?, durability? })` | `globalThis.indexedDB` | Pages, workers, extension pages and MV3 service workers. One transaction per operation; writes resolve on commit, `"strict"` durability by default. |
+| `layerAsyncStorage(storage)` | `@react-native-async-storage/async-storage` | Strings; bytes as base64. |
+| `layerMmkv(mmkv)` | `react-native-mmkv` (2.x–4.x) | Synchronous. |
+| `layerChromeStorage(area)` | `chrome.storage.local` (promise form) | 10 MB without `"unlimitedStorage"`; `getKeys` when the browser has it. |
+
+`localStorage` is effect's own `KeyValueStore.layerStorage(() => localStorage)`:
+synchronous, about 5 MB, absent from workers and service workers — small data
+in a page only, not a journal.
 
 ## Extensions
 
@@ -659,6 +696,7 @@ and `journal` (e.g. a durable one) — and settles that journal at startup with
 And `SuiGraphQL` is sui-effect's tag over the SDK's `SuiGraphQLClient` — one
 client shared by every extension that reads GraphQL; sui-effect wraps no GraphQL
 API of its own.
+
 
 ## Errors
 

@@ -755,6 +755,23 @@ The full entries follow under "API".
 - `layerJevConfig` — `layerJev` from the environment: `TYPESAFE_API_KEY` (required, redacted), `TYPESAFE_MODEL` and `TYPESAFE_BASE_URL` (optional).
 - `makeJev` — The screen itself, over an `HttpClient` you already have.
 
+### `@unconfirmed/sui-effect/storage`
+
+- `AsyncStorageLike` — The part of `@react-native-async-storage/async-storage` (or anything shaped like it) this adapter calls.
+- `ChromeStorageAreaLike` — The part of a `chrome.storage` `StorageArea` this adapter calls, in its promise form.
+- `IndexedDbDatabase` — The part of an `IDBDatabase` this adapter calls.
+- `IndexedDbFactory` — The part of an `IDBFactory` (`globalThis.indexedDB`) this adapter calls.
+- `IndexedDbObjectStore` — The part of an `IDBObjectStore` this adapter calls.
+- `IndexedDbOpenRequest` — The part of an `IDBOpenDBRequest` this adapter reads.
+- `IndexedDbOptions` — Options for `layerIndexedDb`.
+- `IndexedDbRequest` — The part of an `IDBRequest` this adapter reads.
+- `IndexedDbTransaction` — The part of an `IDBTransaction` this adapter calls.
+- `MmkvLike` — The part of a `react-native-mmkv` instance this adapter calls: `delete` (2.x/3.x) or `remove` (4.x).
+- `layerAsyncStorage` — A `KeyValueStore` over an AsyncStorage-shaped store.
+- `layerChromeStorage` — A `KeyValueStore` over a `chrome.storage` area.
+- `layerIndexedDb` — A `KeyValueStore` backed by IndexedDB.
+- `layerMmkv` — A `KeyValueStore` over an MMKV-shaped synchronous store.
+
 ### `@unconfirmed/sui-effect/extension`
 
 - `ExtensionFace` — What every registration carries besides the service's own members, under `$`-prefixed names so an extension is free to call a member `ready` or `dispose` itself.
@@ -6633,36 +6650,60 @@ declare const makeKeyValueStore: (store: KeyValueStore.KeyValueStore, options?: 
 
 A journal backed by a `KeyValueStore`.
 
-Each entry is one key, `entry:<digest>`, holding the entry as JSON, and a
-`put` is one `set` of that key. A terminal entry (`Executed`, `Failed`,
-`NotApplied`) overwrites the unresolved one and stays, so a later `get`
-still finds the answer.
+Each entry is one key, `entry:<digest>`, holding the entry as JSON. A
+terminal entry (`Executed`, `Failed`, `NotApplied`) overwrites the
+unresolved one and stays, so a later `get` still finds the answer.
 
-There is no index and no lock. `listUnresolved` enumerates the store with
-`KeyValueStore.keys`, so the only thing a `put` writes is the entry itself:
-no read-modify-write, nothing for two writers — two fibers, two layer
-instances, two processes over one store — to lose between them, and no
-crash between two writes to order around. Two writers that put the **same**
-digest at once still race, and the last `set` wins; the lifecycle never does
-that, because one submission is one fiber.
+**A settled marker beside each terminal entry.** `settled:<digest>` (value:
+the tag) exists only while the entry under that digest is terminal, and
+`listUnresolved` reads every entry key **except** the marked ones: one
+`keys` and one `get` per unresolved entry, however many settled ones the
+store keeps. The marker is a negative index — it says what may be skipped,
+never what must be read — so the write order is chosen to make a crash cost
+a spurious read and never a missing entry:
 
-**The cost is a scan.** `listUnresolved` reads every entry under the prefix,
-terminal ones included (`keys` is O(n) in the prefix, and each entry is one
-`get`, eight at a time). A journal that keeps every settled entry forever
-makes startup recovery slower without bound; `pruneSettled` is how a
-long-lived service keeps it short.
+- an unresolved `put` (`Signed`, `Unknown`) clears the marker, writes the
+  entry, and clears the marker again (each clear a `has`, and a `remove`
+  only when it exists). A crash after the first clear leaves an unmarked
+  terminal entry, which the next listing reads once and marks.
+- a terminal `put` writes the entry, then the marker. A crash between them
+  leaves an unmarked terminal entry, read once and marked.
+- a listing that reads an unmarked terminal entry marks it, reads the entry
+  again and takes the marker back if the entry is no longer terminal — the
+  other half of the second clear above, so a listing racing a fresh `Signed`
+  for the same digest cannot leave it hidden. Marker writes during a listing
+  are best effort and never fail it.
 
-A store written by 0.3 or earlier also holds an `index` key, and reading
-such a store needs no migration: the key is dead data here — never read,
-never rewritten, never an error — left in place and no longer maintained.
-**Rolling back to 0.3 is therefore not safe as is.** 0.3 lists unresolved
-entries only through that index, so a `Signed` or `Unknown` entry this
-journal wrote is invisible to a 0.3 `listUnresolved`, `Tx.reconcileAll` and
-`onUnresolved: "fail"` (only `Tx.recorded(digest)` finds it), and a 0.3
-reader cannot decode a `NotApplied { evidence: "refused" }` entry at all.
-Before rolling back, or while 0.3 and 0.4 processes share a store, drain it
-with `Tx.reconcileAll()` on 0.4 (or settle the entries by hand) and delete
-the `"refused"` entries.
+Nothing is read-modify-written: two fibers, two layer instances, two
+processes over one store do not lose each other's entries. Two writers that
+put the **same** digest at once still race, and the last `set` wins; the
+lifecycle never does that, because one submission is one fiber.
+
+**A store 0.4 wrote needs no migration.** It has entries and no markers, and
+an unmarked entry is always read, so the first listing is the 0.4 scan and
+marks every settled entry it finds; the second reads only the unresolved
+ones. Rolling back to 0.4 is safe: 0.4 reads only `entry:` keys and ignores
+the markers. **Running a 0.4 writer beside this one is not**, in one case: a
+0.4 process that writes an unresolved entry over a digest this journal had
+settled leaves the marker in place, and the entry is hidden from
+`listUnresolved` (not from `get`). The lifecycle re-signs a settled digest
+only when the same bytes are submitted again; drain with `Tx.reconcileAll`
+and stop the 0.4 writers before mixing versions.
+
+A store written by 0.3 or earlier also holds an `index` key: dead data here
+— never read, never rewritten, never an error. **Rolling back to 0.3 is not
+safe as is.** 0.3 lists unresolved entries only through that index, so a
+`Signed` or `Unknown` entry this journal wrote is invisible to a 0.3
+`listUnresolved`, `Tx.reconcileAll` and `onUnresolved: "fail"` (only
+`Tx.recorded(digest)` finds it), and a 0.3 reader cannot decode a
+`NotApplied { evidence: "refused" }` entry at all. Before rolling back, or
+while 0.3 and later processes share a store, drain it with
+`Tx.reconcileAll()` (or settle the entries by hand) and delete the
+`"refused"` entries.
+
+`keys` is still O(n) in the prefix on every store, and some stores pay for
+it in values (`chrome.storage` without `getKeys`); `pruneSettled` is
+how a long-lived service keeps n short.
 
 Every member fails with `JournalError` and nothing else.
 
@@ -6678,8 +6719,12 @@ Deletes every **settled** entry (`Executed`, `Failed`, `NotApplied`) whose
 answer was recorded strictly before `before`, and answers how many it
 deleted. `Signed` and `Unknown` entries are never deleted, however old.
 
-This is what keeps `make`'s scan short in a service that runs for
-months. After it, `Journal.get` and `Tx.recorded` answer `None` for a pruned
+`listUnresolved` reads only unmarked entries, but `keys` still enumerates
+every one, and some stores pay for that in values; this is what keeps the
+store short in a service that runs for months. It reads every entry itself
+(it deletes nothing on the strength of a marker alone), removes each pruned
+entry's marker before the entry, and removes markers whose entry is gone.
+After it, `Journal.get` and `Tx.recorded` answer `None` for a pruned
 digest, so choose `before` older than anything you still look up by digest —
 and older than any bytes you might still hand to `Tx.submit` again, because a
 resubmission puts a fresh `Signed` entry that a concurrent prune of the same
@@ -6763,6 +6808,246 @@ asked is a non-retryable `TransportError`, never a default.
 The screen fails with: `TransportError`.
 
 **Never fails to build.**
+
+## `@unconfirmed/sui-effect/storage`
+
+
+14 exported symbols.
+
+### `AsyncStorageLike` (interface)
+
+```ts
+export interface AsyncStorageLike {
+    getItem(key: string): Promise<string | null | undefined>;
+    setItem(key: string, value: string): Promise<unknown>;
+    removeItem(key: string): Promise<unknown>;
+    getAllKeys(): Promise<ReadonlyArray<string>>;
+    clear?(): Promise<unknown>;
+}
+```
+
+The part of `@react-native-async-storage/async-storage` (or anything shaped
+like it) this adapter calls. `clear` is optional; without it, `clear` removes
+every key one by one.
+
+### `ChromeStorageAreaLike` (interface)
+
+```ts
+export interface ChromeStorageAreaLike {
+    get(keys: string | ReadonlyArray<string> | null): Promise<Readonly<Record<string, unknown>>>;
+    set(items: Readonly<Record<string, unknown>>): Promise<unknown>;
+    remove(keys: string | ReadonlyArray<string>): Promise<unknown>;
+    clear(): Promise<unknown>;
+    getKeys?(): Promise<ReadonlyArray<string>>;
+}
+```
+
+The part of a `chrome.storage` `StorageArea` this adapter calls, in its
+promise form. `getKeys` (Chrome 130+) is used when present; without it,
+`keys` is `get(null)`, which reads every value in the area.
+
+### `IndexedDbDatabase` (interface)
+
+```ts
+export interface IndexedDbDatabase {
+    readonly version: number;
+    readonly objectStoreNames: {
+        contains(name: string): boolean;
+    };
+    createObjectStore(name: string): unknown;
+    transaction(storeName: string, mode: "readonly" | "readwrite", options?: {
+        readonly durability?: "default" | "strict" | "relaxed";
+    }): IndexedDbTransaction;
+    close(): void;
+    onversionchange: ((event: never) => void) | null;
+    onclose: ((event: never) => void) | null;
+}
+```
+
+The part of an `IDBDatabase` this adapter calls.
+
+### `IndexedDbFactory` (interface)
+
+```ts
+export interface IndexedDbFactory {
+    open(name: string, version?: number): IndexedDbOpenRequest;
+}
+```
+
+The part of an `IDBFactory` (`globalThis.indexedDB`) this adapter calls.
+
+### `IndexedDbObjectStore` (interface)
+
+```ts
+export interface IndexedDbObjectStore {
+    get(key: string): IndexedDbRequest<unknown>;
+    put(value: unknown, key: string): IndexedDbRequest<unknown>;
+    delete(key: string): IndexedDbRequest<unknown>;
+    clear(): IndexedDbRequest<unknown>;
+    count(): IndexedDbRequest<number>;
+    getAllKeys(): IndexedDbRequest<ReadonlyArray<unknown>>;
+}
+```
+
+The part of an `IDBObjectStore` this adapter calls.
+
+### `IndexedDbOpenRequest` (interface)
+
+```ts
+export interface IndexedDbOpenRequest extends IndexedDbRequest<IndexedDbDatabase> {
+    onupgradeneeded: ((event: never) => void) | null;
+    onblocked: ((event: never) => void) | null;
+}
+```
+
+The part of an `IDBOpenDBRequest` this adapter reads.
+
+### `IndexedDbOptions` (interface)
+
+```ts
+export interface IndexedDbOptions {
+    /** The factory to open the database with. Defaults to `globalThis.indexedDB`. */
+    readonly indexedDB?: IndexedDbFactory;
+    /** The database name. Defaults to `"sui-effect"`. */
+    readonly databaseName?: string;
+    /** The object store name. Defaults to `"keyvalue"`. */
+    readonly storeName?: string;
+    /**
+     * The durability hint every write transaction carries. Defaults to
+     * `"strict"`: the journal's `Signed` entry is written before any bytes are
+     * sent, and a write that a power loss can undo is not a journal. Browsers
+     * that do not know the hint ignore it.
+     */
+    readonly durability?: "default" | "strict" | "relaxed";
+}
+```
+
+Options for `layerIndexedDb`.
+
+### `IndexedDbRequest` (interface)
+
+```ts
+export interface IndexedDbRequest<T> {
+    readonly result: T;
+    readonly error: unknown;
+    onsuccess: ((event: never) => void) | null;
+    onerror: ((event: never) => void) | null;
+}
+```
+
+The part of an `IDBRequest` this adapter reads.
+
+### `IndexedDbTransaction` (interface)
+
+```ts
+export interface IndexedDbTransaction {
+    readonly error: unknown;
+    objectStore(name: string): IndexedDbObjectStore;
+    abort(): void;
+    oncomplete: ((event: never) => void) | null;
+    onerror: ((event: never) => void) | null;
+    onabort: ((event: never) => void) | null;
+}
+```
+
+The part of an `IDBTransaction` this adapter calls.
+
+### `MmkvLike` (type)
+
+```ts
+export type MmkvLike = (MmkvBase & {
+    delete(key: string): void;
+}) | (MmkvBase & {
+    remove(key: string): unknown;
+});
+```
+
+The part of a `react-native-mmkv` instance this adapter calls: `delete`
+(2.x/3.x) or `remove` (4.x).
+
+### `layerAsyncStorage` (const)
+
+```ts
+declare const layerAsyncStorage: (storage: AsyncStorageLike) => Layer.Layer<KeyValueStore.KeyValueStore>
+```
+
+A `KeyValueStore` over an AsyncStorage-shaped store.
+
+Every operation is one call (`clearPrefix` is `getAllKeys` and a
+`removeItem` per match; `size` is `getAllKeys`). AsyncStorage has no
+transactions, so a `set` that resolved is as durable as AsyncStorage makes
+it, and nothing groups two calls. Android's default backend caps the whole
+store (6 MB by default) and each value (about 2 MB); a journal or keystore is
+far below either.
+
+**Never fails to build; every operation fails with `KeyValueStoreError`.**
+
+### `layerChromeStorage` (const)
+
+```ts
+declare const layerChromeStorage: (area: ChromeStorageAreaLike) => Layer.Layer<KeyValueStore.KeyValueStore>
+```
+
+A `KeyValueStore` over a `chrome.storage` area.
+
+The area holds JSON values; this store writes only strings (a `Uint8Array`
+as base64, through `KeyValueStore.makeStringOnly`) and fails `get` with
+`KeyValueStoreError` on a key that holds anything else, which only another
+writer to the same area can have put there. Every operation is one call;
+`clearPrefix` is one `keys` and one `remove` of the matches.
+
+`chrome.storage.local` is the area that survives the browser restarting; it
+holds 10 MB unless the extension asks for `"unlimitedStorage"`, and it is
+reachable from the MV3 service worker, where `localStorage` is not. Unlike
+IndexedDB it is shared by every context of the extension and gives no
+transactions. `chrome.storage.session` is memory only and lost when the
+browser closes: not a journal.
+
+**Never fails to build; every operation fails with `KeyValueStoreError`.**
+
+### `layerIndexedDb` (const)
+
+```ts
+declare const layerIndexedDb: (options?: IndexedDbOptions) => Layer.Layer<KeyValueStore.KeyValueStore>
+```
+
+A `KeyValueStore` backed by IndexedDB.
+
+Strings and `Uint8Array`s are stored as themselves (IndexedDB clones both),
+so `getUint8Array` returns stored bytes unchanged and `get` returns them as
+base64; a stored string read with `getUint8Array` is its UTF-8 encoding —
+the semantics of `KeyValueStore.layerMemory`.
+
+The database is opened on first use, not when the layer is built, so
+building never fails; an IndexedDB that cannot be opened (absent, blocked,
+refused in a private window) fails each operation with
+`KeyValueStoreError`, `method` naming the operation. The object store is
+created when missing, by reopening at the next version. A `versionchange`
+from another tab closes this connection and the next operation reopens it;
+the layer's scope closes it for good.
+
+Each operation is one transaction, and a write resolves when its
+transaction **completes** (not when its request succeeds), so a write this
+store reported done is committed. Interrupting an operation aborts its
+transaction. `clearPrefix` reads every key and deletes the matching ones in
+the same transaction: IndexedDB's key ranges need `IDBKeyRange`, which is
+not structural.
+
+**Never fails to build; every operation fails with `KeyValueStoreError`.**
+
+### `layerMmkv` (const)
+
+```ts
+declare const layerMmkv: (mmkv: MmkvLike) => Layer.Layer<KeyValueStore.KeyValueStore>
+```
+
+A `KeyValueStore` over an MMKV-shaped synchronous store.
+
+Every operation is one synchronous call, wrapped in `Effect.try`. MMKV
+writes through a memory map, so a `set` survives the app being killed once
+it returns; it does not group two writes either.
+
+**Never fails to build; every operation fails with `KeyValueStoreError`.**
 
 ## `@unconfirmed/sui-effect/extension`
 
