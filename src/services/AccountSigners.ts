@@ -97,19 +97,21 @@ interface PasskeyKeypairLike extends SdkSigner {
 }
 
 /**
- * The passkey subpath, by variable so the import is lazy and the declaration
- * does not have to resolve: it is the same `PasskeyKeypair` on 2.30 and 2.38,
- * but it pulls in `@noble/curves`' P-256 and nothing that never signs with a
- * passkey should load that.
+ * The passkey subpath is imported on first use, by a **literal** specifier:
+ * a bundler (esbuild, Rollup/Vite, Metro) follows only a literal `import()`,
+ * and one by variable was left as a bare runtime import that a browser, React
+ * Native or an extension cannot resolve, so every passkey failed as
+ * `unavailable` in a bundled app. The subpath exists in every `@mysten/sui`
+ * the peer range admits (2.28 on). It saves little: `/tx` already loads
+ * `@mysten/sui/verify`, which pulls in the passkey public key and P-256.
  */
-const PASSKEY_MODULE = "@mysten/sui/keypairs/passkey"
-
 let passkeyModule: Promise<PasskeyModule> | undefined
 
 const loadPasskey = (): Effect.Effect<PasskeyModule, SigningError> =>
   Effect.tryPromise({
     try: () => {
-      passkeyModule ??= import(PASSKEY_MODULE).then((module: PasskeyModule) => {
+      passkeyModule ??= import("@mysten/sui/keypairs/passkey").then((loaded) => {
+        const module = loaded as unknown as PasskeyModule
         if (typeof module?.PasskeyKeypair !== "function") {
           throw new Error("this @mysten/sui has no PasskeyKeypair")
         }
