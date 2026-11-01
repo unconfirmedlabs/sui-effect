@@ -4,6 +4,10 @@
   "workspaces": {
     "": {
       "name": "sui-effect",
+      "dependencies": {
+        "@scure/bip32": "^2.3.0",
+        "@scure/bip39": "^2.3.0",
+      },
       "devDependencies": {
         "@effect/language-service": "0.87.5",
         "@effect/platform-bun": "4.1.1",

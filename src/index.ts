@@ -43,6 +43,9 @@ export {
   UnexpectedEffects
 } from "./domain/errors.ts"
 
+/** A phrase, secret key or derivation path that was refused (`Signer.fromMnemonic`, `Signer.fromSecretKey`). */
+export { KeyError, KeyErrorReason } from "./domain/keys.ts"
+
 /** Branded schemas and the transport-neutral object model. */
 export {
   Balance,

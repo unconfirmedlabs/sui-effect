@@ -22,13 +22,14 @@ Three audiences, each with a stated entry point:
 | `@unconfirmed/sui-effect/tx` | `Signer`, `Tx.*`, `SubmitConfig`, `Journal`, `JournalEntry`, `Intent`, `Verified`, `Gate` |
 | `@unconfirmed/sui-effect/journal` | durable `Journal` layer over `KeyValueStore` (`effect/persistence`) |
 | `@unconfirmed/sui-effect/gate` | the Jev screen for `Tx.verify`, over `HttpClient` (`effect/http`); section 17 (0.5.0) |
+| `@unconfirmed/sui-effect/keystore` | `Keystore`: sealed keys at rest over `KeyValueStore` (`effect/persistence`), WebCrypto; section 19 (0.5.0) |
 | `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService` (Effect service to `$extend` registration), authoring conventions and helpers |
 | `@unconfirmed/sui-effect/script` | `Script` service, `Script.run`, exit-code mapping |
 | `@unconfirmed/sui-effect/testing` | `SuiCoreFake.layer(script)`, `layerTest(script)` (the real `Sui` over the fake), fixtures, schema round-trip helpers, extension test harness |
 
 Everything the package uses to implement itself and everything the tests reach for lives in `src/internal.ts` (`mapSdkError`, `DefectMarker`, `makeFromClient`, `readSchedule`, the include sets, `fromTransactionResult`, `fromSimulationResult`, `makeSuiObject`, `executionReasonOf`, `digestOf`, `SuiErrorSchema`, and the BCS bridge's `typeMatches` / `expectedTypeOf`; `decodeContent` is public as `SuiSchema.decode`, because an extension that holds bytes — a stream of envelopes, a dynamic field value, an event payload — otherwise hand-rolls a worse `DecodeError`). It is deliberately absent from the package `exports` map, so `src/index.ts` is exactly the public API.
 
-Peer dependencies: `effect` `>=4.1.1 <4.2` (the stable 4.1.x line; 4.1.1 is the floor because 4.1 made `KeyValueStore.keys` part of every store, which the durable journal lists through), with a CI matrix of one (`4.1.1`) documented in the README; `@mysten/sui ^2.28` (first version whose BCS and gRPC support round-trips `ValidDuring` and `Validity` expirations). The core module imports only `effect` and `effect/encoding/*`; the two other modules, `effect/persistence` and `effect/http` (both `@stability unstable` upstream), appear only behind `@unconfirmed/sui-effect/journal` and `@unconfirmed/sui-effect/gate` respectively. No platform package dependency anywhere; tests and examples use `@effect/platform-bun`.
+Peer dependencies: `effect` `>=4.1.1 <4.2` (the stable 4.1.x line; 4.1.1 is the floor because 4.1 made `KeyValueStore.keys` part of every store, which the durable journal lists through), with a CI matrix of one (`4.1.1`) documented in the README; `@mysten/sui ^2.28` (first version whose BCS and gRPC support round-trips `ValidDuring` and `Validity` expirations). The core module imports only `effect` and `effect/encoding/*`; the two other modules, `effect/persistence` and `effect/http` (both `@stability unstable` upstream), appear only behind `@unconfirmed/sui-effect/journal` and `@unconfirmed/sui-effect/keystore` (`effect/persistence`) and `@unconfirmed/sui-effect/gate` (`effect/http`). Direct dependencies: `@scure/bip39` and `@scure/bip32`, both `^2.3.0` — exactly the range every `@mysten/sui` from 2.28 to 2.38 declares, so a consumer resolves one copy — for the checksum-validated mnemonic signer (§19). No platform package dependency anywhere; tests and examples use `@effect/platform-bun`.
 
 The `effect` peer admits `>=4.1.1 <4.2` and no release candidate. rc.113 renamed three `Config` constructors this package calls (`Config.nonEmptyString` to `Config.NonEmptyString`, `Config.string` to `Config.String`, `Config.redacted` to `Config.Redacted`; call sites in `src/services/Script.ts`, `Signer.ts`, `SuiCore.ts` and `SuiGraphQL.ts`), `SchemaTransformation.transformOrFail` became `transformEffect`, and rc.118 moved `effect/unstable/persistence` to `effect/persistence` and `Encoding.encodeBase64` to `effect/encoding/Base64`. The source uses only the 4.x spellings, so it does not run on a release candidate; widening the range downward means supporting both spellings and proving the wider range in CI.
 
@@ -147,9 +148,15 @@ Signer.fromKeypair(kp)                                                        //
 Signer.fromConfig(name = "SUI_PRIVATE_KEY"): Effect<Signer, ConfigError>     // Config.Redacted + decodeSuiPrivateKey + scheme dispatch (ML-DSA-65 imported on demand)
 Signer.ephemeral: Effect<Signer>
 Signer.remote(f): Signer                                                      // KMS or wallet
+Signer.fromMnemonic(phrase, { scheme?, account?, path? }): Effect<LockableSigner, KeyError>   // BIP-39 checked first (0.5.0, §19)
+Signer.fromSecretKey(secret, { scheme? }): Effect<LockableSigner, KeyError>  // suiprivkey1…, hex seed or bytes, copied (0.5.0)
+Signer.generateMnemonic(words?): Effect<Redacted<string>, KeyError>          // crypto.getRandomValues, not Random
+Signer.derivationPath(scheme, account?): string
+Signer.scoped(acquire): Effect<LockableSigner, E, R | Scope>                  // lock on scope close
+interface LockableSigner extends Signer { lock: Effect<void>; locked: Effect<boolean> }
 ```
 
-A `Signer` never exposes secret material. `SignatureScheme` is the SDK's own type, re-exported, so it is exactly as wide as the installed SDK.
+A `Signer` never exposes secret material. Keys the process itself holds — a recovery phrase, an imported key, a keystore account — are a `LockableSigner`, which is still a plain value; its `lock` drops the secret, and §19 says what that does and does not guarantee. `SignatureScheme` is the SDK's own type, re-exported, so it is exactly as wide as the installed SDK.
 
 Checking a signature someone else made is `Verify` (on `/tx`, `R = Sui`): `verifyTransactionSignature(bytes, signature, { address? })` and `verifyPersonalMessageSignature(message, signature, { address? })`, the SDK's `@mysten/sui/verify` with the client taken from `sui.core`, answering the public key. An invalid signature is `SigningError`; a zkLogin or multisig check that could not reach the node is `TransportError`, never a verdict. onara's sender check before it co-signs is the first one with `address: sender`.
 
@@ -499,3 +506,54 @@ Every refusal is `PolicyDenied`, so `Tx.run`'s union is unchanged and the outcom
 **What this does not prove.** A simulation is one execution against the state the node had. A package that branches on a shared object, the clock or randomness can behave differently when the bytes land; the claims bound what was simulated, not what will execute. And **the explicit lifecycle is not gated**: `Tx.sign` takes any `Built`, so `requireIntent` binds `Tx.run` only, and a caller assembling `build`/`sign`/`submit` by hand calls `Tx.verify` itself.
 
 Deferred: a gate **attestation** (the gate's own signature over digest, intent and effects, which is what a co-signing service or a Move vault would check), verified coin metadata so non-SUI amounts can be shown to the screen, a registry of known packages and coin types for impersonation checks, and screening `signPersonalMessage`.
+
+## 19. Keys at rest (0.5.0)
+
+A wallet holds keys, and the SDK leaves four gaps a wallet falls into: `deriveKeypair` checks neither the BIP-39 word list nor the checksum, so a phrase with one word wrong derives a valid account nobody ever funded; `Secp256k1Keypair` and `Secp256r1Keypair` keep a **reference** to the bytes they are built from, so the caller can neither zero its buffer nor reuse it; `getSecretKey()` answers an immutable string; and there is no format for a key at rest nor a way to drop one from memory.
+
+```ts
+Signer.fromMnemonic(phrase: Redacted<string> | string, { scheme?: KeyScheme; account?: number; path?: string }): Effect<LockableSigner, KeyError>
+Signer.fromSecretKey(secret: Redacted<string> | string | Uint8Array, { scheme?: KeyScheme }): Effect<LockableSigner, KeyError>
+Signer.generateMnemonic(words?: 12 | 15 | 18 | 21 | 24): Effect<Redacted<string>, KeyError>
+Signer.derivationPath(scheme: KeyScheme, account = 0): string               // throws RangeError outside [0, 2^31)
+Signer.scoped(acquire: Effect<LockableSigner, E, R>): Effect<LockableSigner, E, R | Scope>
+type KeyScheme = "ED25519" | "Secp256k1" | "Secp256r1"
+KeyError { reason: "invalidMnemonic" | "invalidSecretKey" | "invalidPath" | "unsupportedScheme" | "unavailable"; message }   // outcome not_applied
+
+Keystore (Context.Service, @unconfirmed/sui-effect/keystore; Keystore.layer(options?), Keystore.layerTest, Keystore.make)
+  list: Effect<ReadonlyArray<KeystoreAccount>, KeystoreError>                 // no password, no secret
+  account(address), remove(address)
+  generate(password, { words?, scheme?, account?, path?, label? }): Effect<{ account, mnemonic: Redacted<string> }, KeyError | KeystoreError>
+  importMnemonic(phrase, password, { scheme?, account?, path?, label? }): Effect<KeystoreAccount, KeyError | KeystoreError>
+  importSecretKey(secret, password, { scheme?, label? }): Effect<KeystoreAccount, KeyError | KeystoreError>
+  unlock(address, password): Effect<LockableSigner, KeystoreError>
+  changePassword(address, old, new), exportMnemonic(address, password), exportSecretKey(address, password)   // exports answer Redacted
+KeystoreError { reason: "wrongPassword" | "invalidPassword" | "notFound" | "exists" | "noMnemonic" | "corrupt" | "unsupported" | "unavailable" | "storage"; message; address?; cause? }   // outcome not_applied
+```
+
+**Mnemonics.** A phrase is normalized (NFKD, trimmed, lowercased, single-spaced) and must have 12, 15, 18, 21 or 24 words, every one in the BIP-39 English list, and a valid checksum, before anything is derived (`@scure/bip39`'s check; the SDK's `deriveKeypair` skips it). No BIP-39 passphrase, as every Sui wallet. The paths are the standard Sui ones: `m/44'/784'/{a}'/0'/0'` (Ed25519, SLIP-0010, every level hardened), `m/54'/784'/{a}'/0/0` (Secp256k1) and `m/74'/784'/{a}'/0/0` (Secp256r1), BIP-32 over the secp256k1 HD curve for both ECDSA schemes as the SDK does; an explicit path must pass the SDK's `isValidHardenedPath` / `isValidBIP32Path` **with its own scheme's purpose** (the SDK's BIP-32 check admits 54 and 74 for either) and every level below 2^31. Derivation is the SDK's for Ed25519 (`deriveKeypairFromSeed`) and `@scure/bip32`'s `HDKey` for the ECDSA schemes, over a seed this module computed; `test/keys.test.ts` holds all three to the SDK's `deriveKeypair` and to known addresses. A failure names a bad word's **position**, never the word. `generateMnemonic` takes entropy from `crypto.getRandomValues`, not Effect's `Random`, for the reason `Signer.ephemeral` does: `Random` is seedable and reproducible by design.
+
+**Ownership.** Every keypair is built over a buffer this module allocated and nobody else holds (`holdKey` copies). An ECDSA keypair signs with that very buffer; an Ed25519 keypair copies it once more in its constructor. Every intermediate this module owns — decoded Bech32 or hex bytes, the 64-byte BIP-39 seed, the HD nodes (`wipePrivateData`), the entropy of a fresh phrase, PBKDF2 output, plaintext — is zeroed once it is used. `getSecretKey()` is never called outside `Keystore.exportSecretKey`, whose answer is a string by necessity. `Signer.fromConfig` builds over a copy too and zeroes what it decoded.
+
+**Lock.** `LockableSigner.lock` is one-way disposal: it zeroes the buffer the signer owns, zeroes the SDK keypair's own secret buffer (reached structurally through its TypeScript-private `keypair.secretKey`; best effort, proved on the installed SDK by `test/keys.test.ts`), and drops the keypair from the closure. Afterwards both members fail with `SigningError { reason: "locked" }`. There is no unlock: open the account again. The SDK signs synchronously inside its call, so a lock (an `Effect.sync`) cannot land mid-signature.
+
+**The sealed format, version 1** (`SealedKey`, one JSON record per account under `{prefix}{address}`, prefix `sui-effect/keystore/` by default):
+
+```ts
+{ version: 1, address, scheme, source: "mnemonic" | "secretKey", path?, label?, createdAt /* epoch ms, Clock */,
+  kdf: { name: "PBKDF2-SHA256", iterations, salt /* 16 bytes */ },
+  cipher: { name: "AES-256-GCM", iv /* 12 bytes */ },
+  check /* 32 bytes */, ciphertext /* plaintext + 16-byte tag */ }      // byte fields standard base64
+```
+
+- **KDF**: PBKDF2-HMAC-SHA256, **600 000 iterations** by default — OWASP's 2023 figure for PBKDF2-SHA256 — and 512 bits out. Bits 0–255 are the AES key, imported non-extractable; bits 256–511, domain-separated and hashed with SHA-256, are `check`, which tells a wrong password (`wrongPassword`) from an edited record (`corrupt`) at no saving to an attacker, who must run the full KDF to test either. `Keystore.layer` refuses fewer than 100 000 iterations (a `RangeError` at construction); `Keystore.layerTest` seals with 1 000 and is for tests only. A stored record outside `[1 000, 10 000 000]` is `corrupt`: a downgrade, or a denial of service. **Why PBKDF2 rather than scrypt or Argon2**: it is the one password KDF WebCrypto provides, so it runs natively and off the main thread in every browser and extension with no dependency; scrypt would be `@noble/hashes` in JavaScript on the UI thread (seconds per unlock on a phone for parameters worth having), and Argon2 needs WebAssembly. Its weakness — no memory hardness against GPUs — is what the iteration count and a real password answer; `kdf.name` is versioned so a stronger KDF can be added without a format break.
+- **Cipher**: AES-256-GCM, a fresh random 12-byte IV per seal (a fresh salt too, so no key is ever reused), 128-bit tag.
+- **AAD**: `sui-effect/keystore/v1`, the address, the scheme, the source and the path, newline-separated. A record copied onto another address does not open (the stored address must also equal the key it is stored under), and editing any of those fields makes the tag fail. Only `label` is outside the AAD, so it can be renamed in place.
+- **Plaintext**: the 32-byte secret key, then — for a mnemonic account — the normalized phrase in UTF-8. Unlocking reads only the first 32 bytes, so the phrase never becomes a string unless `exportMnemonic` asks for it; the unlocked key is checked against the record's address and scheme.
+- **Versioning**: the reader decodes `version` alone first. A newer version is `unsupported` (written by a newer release; not corrupt), anything else that does not decode is `corrupt`.
+
+Each record is sealed under its own password and salt, so `changePassword` is per address (a wallet with one password calls it for each account). Writes in one process are serialized; across processes over one store the last write wins per address, and no write touches another address's key. `list` needs no password and reads no secret.
+
+**Platforms.** The keystore needs WebCrypto: `crypto.subtle` (PBKDF2, AES-GCM, SHA-256) and `crypto.getRandomValues`. Browsers, extensions, Bun and Node ≥ 22 have both; React Native has neither without a polyfill, and without them every seal or open fails with `KeystoreError { reason: "unavailable" }`, never a defect. `Signer.fromMnemonic` and `Signer.fromSecretKey` need no WebCrypto (`@scure`/`@noble` are pure JavaScript); `Signer.generateMnemonic` needs `getRandomValues` and fails with `KeyError { reason: "unavailable" }` without it.
+
+**Threat model.** The keystore protects keys **at rest** against someone who can read the store (a synced profile, a backup, another extension, a stolen disk): without the password a record costs one PBKDF2 per guess, and a record moved or edited is refused rather than misread. It does not protect against code running in the same JavaScript realm, which can read the password as it is typed and the key while it is unlocked, nor against a weak password. **Lock is a best effort in a garbage-collected runtime**: it zeroes every buffer this package owns and the SDK's own copy, and drops every reference, but it cannot reach copies it never owned — strings (a phrase or Bech32 key the caller passed as a string, the phrase `generateMnemonic` and `exportMnemonic` answer, the password inside a `Redacted`), intermediates inside `@noble`/`@scure` and the SDK (an Ed25519 SLIP-0010 node, scalar arithmetic), or memory the engine copied while moving objects. What lock does guarantee is that the signer can no longer sign, and that nothing in this package keeps the key reachable. A `Redacted` the caller passed in is read and left to the caller to `Redacted.wipeUnsafe`. Secrets never appear in an error message, a span attribute or a log line.

@@ -10,7 +10,7 @@
  * @since 0.1.0
  */
 
-/** The credential value type and its five constructors. */
+/** The credential value type and its constructors. */
 export {
   ephemeral,
   fromConfig,
@@ -20,6 +20,17 @@ export {
   type RemoteSigner,
   Signer,
   type SignatureScheme
+} from "./services/Signer.ts"
+
+/** Keys the process holds: a checked mnemonic, an imported secret key, and the signer that can drop them. */
+export {
+  type FromMnemonicOptions,
+  fromMnemonic,
+  type FromSecretKeyOptions,
+  fromSecretKey,
+  type KeyScheme,
+  type LockableSigner,
+  type MnemonicLength
 } from "./services/Signer.ts"
 
 /** Signature verification: the Effect face of `@mysten/sui/verify`. */

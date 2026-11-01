@@ -589,6 +589,8 @@ The full entries follow under "API".
 - `HasOutcome` — An extension error may declare its own `outcome`, and `SuiError.outcome` and `Script.run` honour it before anything else.
 - `JournalError` — The submission journal could not be read or written.
 - `KNOWN_CHAIN_IDS` — The genesis checkpoint digest of each public network whose chain identifier is fixed and known.
+- `KeyError` — A recovery phrase, a secret key or a derivation path was refused.
+- `KeyErrorReason` — Why a phrase, a secret key or a path was refused.
 - `KnownNetwork` — The four networks with a built-in default gRPC endpoint.
 - `ListOptions` — Where a ledger listing starts and which way it reads.
 - `ListOrder` — The ledger order a listing is read in.
@@ -668,6 +670,8 @@ The full entries follow under "API".
 - `FoldGas` — How one fold transaction pays for gas.
 - `FoldPlan` — What `planFold` answers: the transactions that fold an owner's coins, in the order they must run, and the SUI dust that cannot pay for its own fold.
 - `FoldResult` — What `foldCoins` did: the plan it ran, and one `Executed` per batch, in order.
+- `FromMnemonicOptions` — Options of `Signer.fromMnemonic`.
+- `FromSecretKeyOptions` — Options of `Signer.fromSecretKey`.
 - `GasPaymentPolicy` — How `Tx.build` treats a gas payment the recipe left unset.
 - `Gate` — The intent policy and its screen.
 - `GateService` — Every decision `Tx.verify` and `Tx.run` read from context about intents.
@@ -677,7 +681,10 @@ The full entries follow under "API".
 - `Journal` — The submission journal.
 - `JournalEntry` — One line of the submission journal.
 - `JournalService` — Reading and writing the submission journal.
+- `KeyScheme` — The schemes a key at rest can be: the three a BIP-39 phrase derives on the standard Sui paths.
 - `LockSenderPolicy` — When `Tx.run` holds the sender lock.
+- `LockableSigner` — A `Signer` that holds a secret and can drop it.
+- `MnemonicLength` — The BIP-39 word counts: 128 to 256 bits of entropy in 32-bit steps.
 - `OutflowClaim` — The most of one coin the sender may lose, in base units, gas excluded.
 - `Parties` — Whose transaction it is.
 - `ReconcileInput` — What `Tx.reconcile` can be asked about.
@@ -717,7 +724,9 @@ The full entries follow under "API".
 - `fromBytes` — Turns transaction bytes that came from somewhere else into a `Built`, reading everything the lifecycle needs out of the bytes themselves.
 - `fromConfig` — Reads a secret key from configuration and builds its signer.
 - `fromKeypair` — `fromSdkSigner` under the name the spec gave it when a keypair was the only thing it took.
+- `fromMnemonic` — A signer derived from a BIP-39 recovery phrase, **checked first**: the word count (12, 15, 18, 21 or 24), every word in the English list, and the checksum.
 - `fromSdkSigner` — Wraps any `@mysten/sui/cryptography` `Signer`.
+- `fromSecretKey` — A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag names the scheme; a contradicting `scheme` option is refused), a 32-byte hex seed (`0x` optional), or 32 raw bytes — the last two read as `options.scheme`, default `ED25519`.
 - `gaslessStablecoinTransfer` — Builds the canonical transfer shape that an eligible stablecoin can execute without SUI gas: a `Balance<T>` from the SDK's `Transaction#balance` intent, consumed by `0x2::balance::send_funds<T>`.
 - `isUnresolved` — Whether this entry is still waiting for an answer, and therefore something `Tx.reconcileAll` has work to do about.
 - `maxEpochOf` — re-exported from `@unconfirmed/sui-effect`.
@@ -754,6 +763,23 @@ The full entries follow under "API".
 - `layerJev` — The `Gate` already in force, with Jev as its screen and `overrides` applied.
 - `layerJevConfig` — `layerJev` from the environment: `TYPESAFE_API_KEY` (required, redacted), `TYPESAFE_MODEL` and `TYPESAFE_BASE_URL` (optional).
 - `makeJev` — The screen itself, over an `HttpClient` you already have.
+
+### `@unconfirmed/sui-effect/keystore`
+
+- `DEFAULT_ITERATIONS` — PBKDF2-SHA256 iterations for a new seal: OWASP's 2023 recommendation.
+- `DEFAULT_PREFIX` — The `KeyValueStore` key prefix every record is stored under, by default.
+- `KEYSTORE_VERSION` — The format version this release writes and reads.
+- `KeyError` — re-exported from `@unconfirmed/sui-effect`.
+- `KeyErrorReason` — re-exported from `@unconfirmed/sui-effect`.
+- `Keystore` — The sealed keystore: `Keystore.layer(options?)` over a `KeyValueStore`, `Keystore.layerTest` in memory for tests.
+- `KeystoreAccount` — What the keystore says about an account.
+- `KeystoreError` — A keystore operation failed.
+- `KeystoreErrorReason` — Why a keystore operation failed.
+- `KeystoreOptions` — Options of `Keystore.layer` and `Keystore.make`.
+- `KeystoreService` — The keystore's members.
+- `LockableSigner` — re-exported from `@unconfirmed/sui-effect/tx`.
+- `MIN_LAYER_ITERATIONS` — The fewest iterations `Keystore.layer` accepts for a new seal.
+- `SealedKey` — One sealed account as stored, version 1.
 
 ### `@unconfirmed/sui-effect/extension`
 
@@ -808,7 +834,7 @@ The full entries follow under "API".
 ## `@unconfirmed/sui-effect`
 
 
-103 exported symbols.
+105 exported symbols.
 
 ### `Balance` (const)
 
@@ -1732,6 +1758,45 @@ is fixed and known. These are the digests observed on the live networks
 (`getChainIdentifier` returns the genesis checkpoint digest); the SDK ships
 no such table. `devnet` and `localnet` are regenerated, so they are absent
 and `Sui.layerNoDeps` records whatever the node reports instead of asserting.
+
+### `KeyError` (class)
+
+```ts
+export declare class KeyError extends KeyError_base {
+    readonly reason: KeyErrorReason;
+    readonly message: string;
+    /** Nothing was derived or sent. */
+    readonly outcome: Outcome;
+}
+```
+
+A recovery phrase, a secret key or a derivation path was refused. Nothing
+was derived and nothing was sent: outcome `not_applied`.
+
+`message` is a schema field because the sentence comes from the check that
+failed; it never contains the phrase, a word of it, or the key.
+
+### `KeyErrorReason` (const)
+
+```ts
+declare const KeyErrorReason: Schema
+// decodes to: "unavailable" | "invalidMnemonic" | "invalidSecretKey" | "invalidPath" | "unsupportedScheme"
+```
+
+Why a phrase, a secret key or a path was refused.
+
+- `invalidMnemonic`: not 12/15/18/21/24 words, a word outside the BIP-39
+  English list, or a failed checksum. A mistyped phrase is always this,
+  never a valid account nobody owns.
+- `invalidSecretKey`: not a Bech32 `suiprivkey1…`, not 32 bytes (hex or
+  raw), or not a valid key of its scheme.
+- `invalidPath`: a derivation path that is not the scheme's Sui path shape,
+  or an account index outside `[0, 2^31)`.
+- `unsupportedScheme`: a scheme this constructor does not hold keys for
+  (only `ED25519`, `Secp256k1` and `Secp256r1` derive from a mnemonic), or a
+  `scheme` option that contradicts the key's own flag.
+- `unavailable`: the platform has no `crypto.getRandomValues`, which a fresh
+  mnemonic needs (React Native without a CSPRNG polyfill).
 
 ### `KnownNetwork` (const)
 
@@ -4058,7 +4123,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-75 exported symbols.
+82 exported symbols.
 
 ### `Built` (const)
 
@@ -4180,6 +4245,43 @@ export interface FoldResult {
 
 What `foldCoins` did: the plan it ran, and one `Executed` per batch, in
 order.
+
+### `FromMnemonicOptions` (interface)
+
+```ts
+export interface FromMnemonicOptions {
+    /** The scheme to derive. Default `"ED25519"`, which is what every Sui wallet derives first. */
+    readonly scheme?: KeyScheme;
+    /**
+     * The account index on the scheme's standard path, `[0, 2^31)`. Default 0.
+     * Ignored when `path` is given.
+     */
+    readonly account?: number;
+    /**
+     * An explicit derivation path, checked against the scheme's shape:
+     * `m/44'/784'/a'/c'/i'` (Ed25519, every level hardened, SLIP-0010),
+     * `m/54'/784'/a'/c/i` (Secp256k1) or `m/74'/784'/a'/c/i` (Secp256r1).
+     */
+    readonly path?: string;
+}
+```
+
+Options of `Signer.fromMnemonic`.
+
+### `FromSecretKeyOptions` (interface)
+
+```ts
+export interface FromSecretKeyOptions {
+    /**
+     * The scheme of a key that carries none: raw bytes or a 64-digit hex seed
+     * (default `"ED25519"`). For a Bech32 `suiprivkey1…` the key's own flag
+     * decides, and a `scheme` that contradicts it is refused.
+     */
+    readonly scheme?: KeyScheme;
+}
+```
+
+Options of `Signer.fromSecretKey`.
 
 ### `GasPaymentPolicy` (type)
 
@@ -4571,6 +4673,16 @@ export interface JournalService {
 
 Reading and writing the submission journal.
 
+### `KeyScheme` (type)
+
+```ts
+export type KeyScheme = "ED25519" | "Secp256k1" | "Secp256r1";
+```
+
+The schemes a key at rest can be: the three a BIP-39 phrase derives on the
+standard Sui paths. (`MLDSA65` has its own path family and is read only by
+`Signer.fromConfig`; `ZkLogin`, `Passkey` and `MultiSig` hold no secret key.)
+
 ### `LockSenderPolicy` (type)
 
 ```ts
@@ -4597,6 +4709,38 @@ When `Tx.run` holds the sender lock.
 A config provided directly rather than through `SubmitConfig.with` may still
 hold the pre-0.4.0 boolean or another value: `Tx.run` reads `true` as
 `"always"`, `false` as `"never"`, and anything else as `"always"`.
+
+### `LockableSigner` (interface)
+
+```ts
+export interface LockableSigner extends Signer {
+    /** Drops the secret; every later signature fails with `reason: "locked"`. Never fails. */
+    readonly lock: Effect.Effect<void>;
+    /** Whether `lock` has run. Never fails. */
+    readonly locked: Effect.Effect<boolean>;
+}
+```
+
+A `Signer` that holds a secret and can drop it.
+
+`lock` is **disposal, one way**: it zeroes the secret bytes the signer owns,
+zeroes the keypair's own copy where the SDK keeps one, and releases the
+keypair. Afterwards both members fail with `SigningError { reason:
+"locked" }`; there is no unlock — open the account again (`Keystore.unlock`,
+`Signer.fromMnemonic`) for a new signer. `lock` is idempotent and never
+fails.
+
+A `LockableSigner` **is** a `Signer`: every function that takes a signer
+takes this one, and it carries no secret either — the keypair lives in a
+closure, not on the value.
+
+### `MnemonicLength` (type)
+
+```ts
+export type MnemonicLength = 12 | 15 | 18 | 21 | 24;
+```
+
+The BIP-39 word counts: 128 to 256 bits of entropy in 32-bit steps.
 
 ### `OutflowClaim` (const)
 
@@ -4834,12 +4978,20 @@ declare const Signer: {
     readonly fromConfig: (name?: string) => Effect.Effect<Signer, Config.ConfigError>;
     readonly ephemeral: Effect.Effect<Signer, never, never>;
     readonly remote: (signer: RemoteSigner) => Signer;
+    readonly fromMnemonic: (phrase: Redacted.Redacted<string> | string, options?: FromMnemonicOptions) => Effect.Effect<LockableSigner, KeyError>;
+    readonly fromSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, options?: FromSecretKeyOptions) => Effect.Effect<LockableSigner, KeyError>;
+    readonly generateMnemonic: (words?: MnemonicLength) => Effect.Effect<Redacted.Redacted<string>, KeyError>;
+    readonly derivationPath: (scheme: KeyScheme, account?: number) => string;
+    readonly scoped: <E, R>(acquire: Effect.Effect<LockableSigner, E, R>) => Effect.Effect<LockableSigner, E, R | Scope.Scope>;
 }
 ```
 
 The constructors, namespaced the way the spec spells them:
 `Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.fromConfig`,
-`Signer.ephemeral`, `Signer.remote`. The type `Signer` is the interface above.
+`Signer.ephemeral`, `Signer.remote`, and for keys the process holds
+`Signer.fromMnemonic`, `Signer.fromSecretKey`, `Signer.generateMnemonic`,
+`Signer.derivationPath` and `Signer.scoped`. The type `Signer` is the
+interface above.
 
 ### `SubmitConfig` (const)
 
@@ -5635,6 +5787,34 @@ alias kept for callers who hold one.
 
 **Never fails.**
 
+### `fromMnemonic` (const)
+
+```ts
+declare const fromMnemonic: (phrase: Redacted.Redacted<string> | string, options?: FromMnemonicOptions) => Effect.Effect<LockableSigner, KeyError>
+```
+
+A signer derived from a BIP-39 recovery phrase, **checked first**: the word
+count (12, 15, 18, 21 or 24), every word in the English list, and the
+checksum. The SDK's `deriveKeypair` checks none of them, so a phrase with one
+word wrong derives a valid account nobody has ever funded; here it is a
+`KeyError { reason: "invalidMnemonic" }` and nothing is derived. The phrase
+is normalized (trimmed, lowercased, single-spaced) before the check; no
+BIP-39 passphrase is used, which is what every Sui wallet does.
+
+Paths are the standard Sui ones (`Signer.derivationPath`):
+`m/44'/784'/{account}'/0'/0'` (Ed25519, the default),
+`m/54'/784'/{account}'/0/0` (Secp256k1), `m/74'/784'/{account}'/0/0`
+(Secp256r1). An explicit `path` must have its scheme's shape (the SDK's
+`isValidHardenedPath` / `isValidBIP32Path`, with the scheme's own purpose)
+and every level below 2^31.
+
+The answer is a `LockableSigner`: it holds the derived key in a buffer
+nobody else references, and `lock` zeroes it. The BIP-39 seed and the HD
+nodes are zeroed before this returns. A `Redacted` phrase is read, not
+wiped: it is the caller's (`Redacted.wipeUnsafe` it when done).
+
+**Fails with: `KeyError` (`invalidMnemonic`, `invalidPath`, `unsupportedScheme`). The message names a bad word's position, never a word.**
+
 ### `fromSdkSigner` (const)
 
 ```ts
@@ -5673,6 +5853,27 @@ an SDK signer — that is a wiring mistake in the caller, not a runtime
 failure a program recovers from.
 
 **Otherwise never fails: a bad address or signature surfaces as a `SigningError` from the member that produced it, not from construction.**
+
+### `fromSecretKey` (const)
+
+```ts
+declare const fromSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, options?: FromSecretKeyOptions) => Effect.Effect<LockableSigner, KeyError>
+```
+
+A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag
+names the scheme; a contradicting `scheme` option is refused), a 32-byte hex
+seed (`0x` optional), or 32 raw bytes — the last two read as
+`options.scheme`, default `ED25519`.
+
+**The bytes are copied before any keypair is built over them.** The SDK's
+Secp256k1/Secp256r1 keypairs keep a reference to the array they are given,
+so building over the caller's buffer would let a later write to it change
+the key, and zeroing it break the signer. Here the caller's `Uint8Array` is
+copied and left untouched, decoded bytes are zeroed once copied, and the
+answer is a `LockableSigner` whose `lock` zeroes the copy. A
+`Redacted` input is read, not wiped.
+
+**Fails with: `KeyError` (`invalidSecretKey` — the message is fixed and never quotes the input — or `unsupportedScheme` for `MLDSA65`, `ZkLogin`, … and a contradicting `scheme`).**
 
 ### `gaslessStablecoinTransfer` (const)
 
@@ -6763,6 +6964,291 @@ asked is a non-retryable `TransportError`, never a default.
 The screen fails with: `TransportError`.
 
 **Never fails to build.**
+
+## `@unconfirmed/sui-effect/keystore`
+
+
+14 exported symbols.
+
+### `DEFAULT_ITERATIONS` (const)
+
+```ts
+declare const DEFAULT_ITERATIONS = 600000
+```
+
+PBKDF2-SHA256 iterations for a new seal: OWASP's 2023 recommendation.
+
+### `DEFAULT_PREFIX` (const)
+
+```ts
+declare const DEFAULT_PREFIX = "sui-effect/keystore/"
+```
+
+The `KeyValueStore` key prefix every record is stored under, by default.
+
+### `KEYSTORE_VERSION` (const)
+
+```ts
+declare const KEYSTORE_VERSION = 1
+```
+
+The format version this release writes and reads.
+
+### `KeyError` (class)
+
+Re-exported from `@unconfirmed/sui-effect`.
+
+### `KeyErrorReason` (const)
+
+Re-exported from `@unconfirmed/sui-effect`.
+
+### `Keystore` (class)
+
+```ts
+export declare class Keystore extends Keystore_base {
+    /**
+     * The service over the `KeyValueStore` in context, for an application that
+     * builds its own layer. No floor on `iterations`. Never fails.
+     */
+    static readonly make: (options?: KeystoreOptions) => Effect.Effect<KeystoreService, never, KeyValueStore.KeyValueStore>;
+    /**
+     * The keystore over the `KeyValueStore` in context. Builds without reading
+     * anything.
+     *
+     * **Throws** a `RangeError` when `options.iterations` is not an integer of at
+     * least `MIN_LAYER_ITERATIONS` — a configuration mistake that would
+     * make every record cheap to brute-force. Otherwise never fails.
+     */
+    static readonly layer: (options?: KeystoreOptions) => Layer.Layer<Keystore, never, KeyValueStore.KeyValueStore>;
+    /**
+     * An in-memory keystore (`KeyValueStore.layerMemory`) sealing with 1 000
+     * PBKDF2 iterations, so a test does not spend seconds per seal. **Not for
+     * production**: those records are cheap to brute-force. Never fails.
+     */
+    static readonly layerTest: Layer.Layer<Keystore>;
+}
+```
+
+The sealed keystore: `Keystore.layer(options?)` over a `KeyValueStore`,
+`Keystore.layerTest` in memory for tests.
+
+### `KeystoreAccount` (interface)
+
+```ts
+export interface KeystoreAccount {
+    readonly address: SuiAddress;
+    readonly scheme: KeyScheme;
+    /** Whether the account was derived from a recovery phrase (exportable) or imported as a key. */
+    readonly source: "mnemonic" | "secretKey";
+    /** The derivation path, for a mnemonic account. */
+    readonly path?: string;
+    readonly label?: string;
+    readonly createdAt: DateTime.Utc;
+}
+```
+
+What the keystore says about an account. Never carries secret material.
+
+### `KeystoreError` (class)
+
+```ts
+export declare class KeystoreError extends KeystoreError_base {
+    readonly message: string;
+    readonly reason: "unavailable" | "wrongPassword" | "invalidPassword" | "notFound" | "exists" | "noMnemonic" | "corrupt" | "unsupported" | "storage";
+    readonly address?: SuiAddress | undefined;
+    readonly cause?: unknown;
+    /** Nothing was sent. */
+    readonly outcome: Outcome;
+}
+```
+
+A keystore operation failed. Nothing was sent: outcome `not_applied`.
+
+A wrong password is this error with `reason: "wrongPassword"`, never a
+defect. `message` never contains the password or anything sealed.
+
+### `KeystoreErrorReason` (const)
+
+```ts
+declare const KeystoreErrorReason: Schema
+// decodes to: "unavailable" | "wrongPassword" | "invalidPassword" | "notFound" | "exists" | "noMnemonic" | "corrupt" | "unsupported" | "storage"
+```
+
+Why a keystore operation failed.
+
+- `wrongPassword`: the password does not open this account's record (its
+  key-check value does not match).
+- `invalidPassword`: a new password is empty.
+- `notFound`: no record for this address.
+- `exists`: a record for this address is already stored (`import*`).
+- `noMnemonic`: `exportMnemonic` of an account imported from a secret key.
+- `corrupt`: the record does not decode, was moved onto another address, was
+  edited (the AES-GCM tag over the ciphertext and its bound metadata does not
+  verify under a password whose check value matched), or holds a key that is
+  not the address's key.
+- `unsupported`: the record was written by a newer format version, or names
+  a KDF or cipher this version does not know.
+- `unavailable`: the platform has no WebCrypto (`crypto.subtle` or
+  `crypto.getRandomValues`), which React Native lacks without a polyfill.
+- `storage`: the `KeyValueStore` failed; `cause` is its error.
+
+### `KeystoreOptions` (interface)
+
+```ts
+export interface KeystoreOptions {
+    /** The `KeyValueStore` key prefix. Default `DEFAULT_PREFIX`. */
+    readonly prefix?: string;
+    /**
+     * PBKDF2-SHA256 iterations for records sealed from now on (existing records
+     * keep their own until `changePassword`). Default `DEFAULT_ITERATIONS`;
+     * `Keystore.layer` refuses fewer than `MIN_LAYER_ITERATIONS`.
+     */
+    readonly iterations?: number;
+}
+```
+
+Options of `Keystore.layer` and `Keystore.make`.
+
+### `KeystoreService` (interface)
+
+```ts
+export interface KeystoreService {
+    /**
+     * Every account, oldest first. Reads no secret and needs no password.
+     *
+     * Fails with: `KeystoreError` (`storage`; `corrupt` or `unsupported` when a
+     * record does not decode as a version this release reads).
+     */
+    readonly list: Effect.Effect<ReadonlyArray<KeystoreAccount>, KeystoreError>;
+    /**
+     * One account's public description.
+     *
+     * Fails with: `KeystoreError` (`notFound`, `corrupt`, `unsupported`, `storage`).
+     */
+    readonly account: (address: SuiAddress) => Effect.Effect<KeystoreAccount, KeystoreError>;
+    /**
+     * A fresh recovery phrase (`Signer.generateMnemonic`), its account on the
+     * standard path sealed under `password`. Answers the phrase once, redacted,
+     * for the person to write down.
+     *
+     * Fails with: `KeyError` (`unavailable`), `KeystoreError` (`invalidPassword`,
+     * `exists`, `unavailable`, `storage`).
+     */
+    readonly generate: (password: Redacted.Redacted<string>, options?: FromMnemonicOptions & {
+        readonly words?: MnemonicLength;
+        readonly label?: string;
+    }) => Effect.Effect<{
+        readonly account: KeystoreAccount;
+        readonly mnemonic: Redacted.Redacted<string>;
+    }, KeyError | KeystoreError>;
+    /**
+     * Checks a recovery phrase (`Signer.fromMnemonic`'s rules: word list and
+     * checksum), derives it and seals the key and the phrase under `password`.
+     *
+     * Fails with: `KeyError` (`invalidMnemonic`, `invalidPath`,
+     * `unsupportedScheme`), `KeystoreError` (`invalidPassword`, `exists`,
+     * `unavailable`, `storage`).
+     */
+    readonly importMnemonic: (phrase: Redacted.Redacted<string> | string, password: Redacted.Redacted<string>, options?: FromMnemonicOptions & {
+        readonly label?: string;
+    }) => Effect.Effect<KeystoreAccount, KeyError | KeystoreError>;
+    /**
+     * Seals an imported secret key (`Signer.fromSecretKey`'s spellings) under
+     * `password`. The caller's bytes are copied and left as they were.
+     *
+     * Fails with: `KeyError` (`invalidSecretKey`, `unsupportedScheme`),
+     * `KeystoreError` (`invalidPassword`, `exists`, `unavailable`, `storage`).
+     */
+    readonly importSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, password: Redacted.Redacted<string>, options?: FromSecretKeyOptions & {
+        readonly label?: string;
+    }) => Effect.Effect<KeystoreAccount, KeyError | KeystoreError>;
+    /**
+     * Opens an account into a `LockableSigner`. The caller locks it
+     * (`signer.lock`), or acquires it with `Signer.scoped` so the scope does.
+     *
+     * Fails with: `KeystoreError` (`wrongPassword`, `notFound`, `corrupt`,
+     * `unsupported`, `unavailable`, `storage`).
+     */
+    readonly unlock: (address: SuiAddress, password: Redacted.Redacted<string>) => Effect.Effect<LockableSigner, KeystoreError>;
+    /**
+     * Deletes an account's record. Needs no password: it destroys, it reveals
+     * nothing.
+     *
+     * Fails with: `KeystoreError` (`notFound`, `storage`).
+     */
+    readonly remove: (address: SuiAddress) => Effect.Effect<void, KeystoreError>;
+    /**
+     * Re-seals one account under a new password, with a fresh salt and IV and
+     * the layer's current iteration count.
+     *
+     * Fails with: `KeystoreError` (`wrongPassword`, `invalidPassword`,
+     * `notFound`, `corrupt`, `unsupported`, `unavailable`, `storage`).
+     */
+    readonly changePassword: (address: SuiAddress, oldPassword: Redacted.Redacted<string>, newPassword: Redacted.Redacted<string>) => Effect.Effect<void, KeystoreError>;
+    /**
+     * The recovery phrase of a mnemonic account, redacted.
+     *
+     * Fails with: `KeystoreError` (`noMnemonic` for an imported key,
+     * `wrongPassword`, `notFound`, `corrupt`, `unsupported`, `unavailable`,
+     * `storage`).
+     */
+    readonly exportMnemonic: (address: SuiAddress, password: Redacted.Redacted<string>) => Effect.Effect<Redacted.Redacted<string>, KeystoreError>;
+    /**
+     * The account's secret key as a Bech32 `suiprivkey1…`, redacted.
+     *
+     * Fails with: `KeystoreError` (`wrongPassword`, `notFound`, `corrupt`,
+     * `unsupported`, `unavailable`, `storage`).
+     */
+    readonly exportSecretKey: (address: SuiAddress, password: Redacted.Redacted<string>) => Effect.Effect<Redacted.Redacted<string>, KeystoreError>;
+}
+```
+
+The keystore's members.
+
+### `LockableSigner` (interface)
+
+Re-exported from `@unconfirmed/sui-effect/tx`.
+
+### `MIN_LAYER_ITERATIONS` (const)
+
+```ts
+declare const MIN_LAYER_ITERATIONS = 100000
+```
+
+The fewest iterations `Keystore.layer` accepts for a new seal.
+
+### `SealedKey` (const)
+
+```ts
+declare const SealedKey: Schema
+// decodes to:
+// {
+//     readonly address: SuiAddress;
+//     readonly version: 1;
+//     readonly scheme: "ED25519" | "Secp256k1" | "Secp256r1";
+//     readonly source: "mnemonic" | "secretKey";
+//     readonly createdAt: DateTime.Utc;
+//     readonly kdf: {
+//         readonly name: "PBKDF2-SHA256";
+//         readonly iterations: number;
+//         readonly salt: string;
+//     };
+//     readonly cipher: {
+//         readonly name: "AES-256-GCM";
+//         readonly iv: string;
+//     };
+//     readonly check: string;
+//     readonly ciphertext: string;
+//     readonly path?: string | undefined;
+//     readonly label?: string | undefined;
+// }
+```
+
+One sealed account as stored, version 1. Every byte field is standard
+base64; `createdAt` is epoch milliseconds from the Effect `Clock`.
+
+Only `label` is outside the AAD, so it is the one field that may be edited
+in place; every other edit makes the record `corrupt`.
 
 ## `@unconfirmed/sui-effect/extension`
 
