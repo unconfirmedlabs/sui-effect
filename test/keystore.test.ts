@@ -448,3 +448,34 @@ describe("Keystore: derived key material is zeroed (0.5.0)", () => {
     for (const data of aesKeyData) expect(data.every((byte) => byte === 0)).toBe(true)
   })
 })
+
+describe("Keystore: an unknown KDF or cipher is unsupported, not corrupt (0.5.0)", () => {
+  test("a version-1 record naming a KDF or cipher this release does not know", async () => {
+    const reasons = await run(Effect.gen(function*() {
+      const keystore = yield* Keystore
+      yield* keystore.importMnemonic(PHRASE, password)
+      const stored = JSON.parse((yield* raw(ADDRESS)) ?? "{}")
+      const out: Array<string> = []
+      for (const value of [
+        { ...stored, kdf: { name: "Argon2id", memory: 65_536, salt: stored.kdf.salt } },
+        { ...stored, cipher: { name: "XChaCha20-Poly1305", nonce: stored.cipher.iv } },
+        // Malformed, not unknown: still corrupt.
+        { ...stored, kdf: { ...stored.kdf, name: 42 } },
+        { ...stored, cipher: "AES-256-GCM" },
+        { ...stored, kdf: undefined }
+      ]) {
+        yield* put(ADDRESS, JSON.stringify(value))
+        out.push((yield* Effect.flip(keystore.unlock(ADDRESS, password))).reason)
+        out.push((yield* Effect.flip(keystore.list)).reason)
+      }
+      return out
+    }))
+    expect(reasons).toEqual([
+      "unsupported", "unsupported",
+      "unsupported", "unsupported",
+      "corrupt", "corrupt",
+      "corrupt", "corrupt",
+      "corrupt", "corrupt"
+    ])
+  })
+})

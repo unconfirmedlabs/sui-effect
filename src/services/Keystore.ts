@@ -139,6 +139,19 @@ const encodeSealed = Schema.encodeEffect(SealedKeyJson)
 const decodeVersion = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ version: Schema.Number }))
 )
+/**
+ * The algorithm names of a record, read as plain strings before the strict
+ * decode, so a record naming a KDF or cipher this release does not know is
+ * `unsupported` (as a newer `version` is) rather than `corrupt`.
+ */
+const decodeAlgorithms = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({
+    kdf: Schema.Struct({ name: Schema.String }),
+    cipher: Schema.Struct({ name: Schema.String })
+  }))
+)
+const KDF_NAME = "PBKDF2-SHA256"
+const CIPHER_NAME = "AES-256-GCM"
 
 /**
  * What the keystore says about an account. Never carries secret material.
@@ -174,8 +187,9 @@ export interface KeystoreService {
   /**
    * Every account, oldest first. Reads no secret and needs no password.
    *
-   * Fails with: `KeystoreError` (`storage`; `corrupt` or `unsupported` when a
-   * record does not decode as a version this release reads).
+   * Fails with: `KeystoreError` (`storage`; `unsupported` when a record is a
+   * newer format version or names a KDF or cipher this release does not know,
+   * `corrupt` when it otherwise does not decode).
    */
   readonly list: Effect.Effect<ReadonlyArray<KeystoreAccount>, KeystoreError>
   /**
@@ -534,6 +548,20 @@ export const make = (
             `the record under ${key} is format version ${version.version}; this release reads version ${KEYSTORE_VERSION}`,
             keyAddress
           )
+        }
+        // A name that does not decode as a string falls through to the strict
+        // decode below, and is `corrupt` there.
+        const algorithms = yield* decodeAlgorithms(raw).pipe(Effect.option)
+        if (Option.isSome(algorithms)) {
+          const { cipher, kdf } = algorithms.value
+          if (kdf.name !== KDF_NAME || cipher.name !== CIPHER_NAME) {
+            return yield* keystoreError(
+              "unsupported",
+              `the record under ${key} names ${kdf.name !== KDF_NAME ? `the KDF ${kdf.name}` : `the cipher ${cipher.name}`}; ` +
+                `this release reads ${KDF_NAME} and ${CIPHER_NAME}`,
+              keyAddress
+            )
+          }
         }
         const record = yield* decodeSealed(raw).pipe(
           Effect.mapError(() => keystoreError("corrupt", `the record under ${key} does not decode as a version-1 keystore record`, keyAddress))
