@@ -63,8 +63,9 @@ import { Journal } from "./Journal.ts"
 import { defaultReadPolicy } from "./SuiCore.ts"
 import { verifyTransactionSignature } from "./Verify.ts"
 import type { Signer } from "./Signer.ts"
-import type { FoldBatch, FoldPlan } from "./Fold.ts"
-import { fold, foldMovement, planFold, sendFunds } from "./Fold.ts"
+import type { FoldBatch, FoldPlan, SendAllSweep } from "./Fold.ts"
+import { fold, foldMovement, MAX_SWEEP_COINS, planFold, readSweep, sendFunds, sweep } from "./Fold.ts"
+import { verifySponsored } from "./Sponsored.ts"
 import { forgetEntry, recordEntry } from "./RunRecord.ts"
 import type { LockSenderPolicy, SubmitConfigService } from "./SubmitConfig.ts"
 import { SubmitConfig } from "./SubmitConfig.ts"
@@ -3004,12 +3005,13 @@ const firstBelow = (
 const validIntent = Schema.decodeUnknownEffect(Schema.toType(IntentSchema))
 
 /**
- * `Gate.requireIntent`, as `Tx.run` applies it before anything is built: a
- * gate that requires an intent signs nothing that declares none.
+ * `Gate.requireIntent`, as `Tx.run` (and `Enoki.run`) applies it before
+ * anything is built: a gate that requires an intent signs nothing that
+ * declares none. Internal.
  *
  * Fails with: `PolicyDenied` (`intent.required`).
  */
-const requireIntentOf = Effect.fnUntraced(function*(
+export const requireIntentOf = Effect.fnUntraced(function*(
   intent: Intent | undefined
 ): Effect.fn.Return<void, PolicyDenied> {
   const gate = yield* Gate
@@ -3619,21 +3621,62 @@ export const run = Effect.fn("Tx.run")(function*<E = never>(
       if (opts.onSigned !== undefined) yield* opts.onSigned(signed)
       return yield* submit(signed)
     })
-  const withLocks = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-    locked.reduceRight<Effect.Effect<A, E, R>>(
+  return yield* lockedRun({
+    sui,
+    policy: config.lockSender,
+    locked,
+    // A `tx.gas` run's reservation would take the payer's whole balance as of
+    // its build, so it waits for the lock-free runs on its payer first.
+    drains: usesGasCoin(tx) ? payer ?? sender : undefined,
+    build: buildIt,
+    keeps: keepsSenderLock,
+    inFlightOn: (built) => [sender, ...signersOfBytes(built.bytes)],
+    finish
+  })
+})
+
+/**
+ * `Tx.run`'s lock rule, for every run that builds, signs and submits under
+ * the sender lock — `Tx.run` itself and `Enoki.run`. Internal.
+ *
+ * Under `"whenPinned"` every build runs under the locks, and `keeps(built)`
+ * decides whether they are held on through `finish` (signing, submission);
+ * when they are not, the run is registered in flight on `inFlightOn(built)`
+ * before the locks are released, so a `drains` run — one whose recipe uses
+ * `tx.gas` and so reserves its payer's whole balance — waits for it.
+ * `"always"` holds the locks through `finish`, `"never"` takes none. The span
+ * attribute `sui.sender_lock` says which happened. Never fails beyond
+ * `build`'s and `finish`'s errors.
+ */
+export const lockedRun = <A, E1, E2, R1, R2>(opts: {
+  readonly sui: Sui["Service"]
+  readonly policy: unknown
+  /** The addresses to lock, in the order to take them. */
+  readonly locked: ReadonlyArray<SuiAddress>
+  /** The payer whose lock-free runs in flight to wait for before building, if any. */
+  readonly drains: SuiAddress | undefined
+  readonly build: Effect.Effect<Built, E1, R1>
+  readonly keeps: (bytes: Uint8Array) => boolean
+  readonly inFlightOn: (built: Built) => ReadonlyArray<string>
+  readonly finish: (built: Built) => Effect.Effect<A, E2, R2>
+}): Effect.Effect<A, E1 | E2, R1 | R2> => {
+  const { sui, locked, build: buildIt, finish } = opts
+  const withLocks = <B, E, R>(effect: Effect.Effect<B, E, R>): Effect.Effect<B, E, R> =>
+    locked.reduceRight<Effect.Effect<B, E, R>>(
       (inner, address) => sui.withSenderLock(address)(inner),
       effect
     )
-
-  switch (lockSenderPolicyOf(config.lockSender)) {
-    case "never": {
-      yield* Effect.annotateCurrentSpan({ "sui.sender_lock": "none" })
-      return yield* Effect.flatMap(buildIt, finish)
-    }
-    case "always": {
-      yield* Effect.annotateCurrentSpan({ "sui.sender_lock": "held" })
-      return yield* withLocks(Effect.flatMap(buildIt, finish))
-    }
+  switch (lockSenderPolicyOf(opts.policy)) {
+    case "never":
+      return Effect.andThen(
+        Effect.annotateCurrentSpan({ "sui.sender_lock": "none" }),
+        Effect.flatMap(buildIt, finish)
+      )
+    case "always":
+      return Effect.andThen(
+        Effect.annotateCurrentSpan({ "sui.sender_lock": "held" }),
+        withLocks(Effect.flatMap(buildIt, finish))
+      )
     case "whenPinned": {
       // Every build under the lock: whether the bytes will pin a coin or an
       // owned object, or carry a coin reservation, is known only once the
@@ -3644,31 +3687,45 @@ export const run = Effect.fn("Tx.run")(function*<E = never>(
       // `tx.gas` run, whose reservation would take the whole balance as of its
       // build, waits for them first.
       const registry = inFlightRegistryOf(sui.withSenderLock)
-      const drainsPayer = usesGasCoin(tx)
+      const drains = opts.drains
       // The scope the in-flight registration lives in: this one, not the one
       // `Sui.withSenderLock` opens around its effect, which closes when the
       // lock is released — exactly when the run starts being in flight.
-      return yield* Effect.scoped(Effect.gen(function*() {
+      return Effect.scoped(Effect.gen(function*() {
         const scope = yield* Effect.scope
         const step = yield* withLocks(Effect.gen(function*() {
-          if (drainsPayer) yield* drainInFlight(registry, payer ?? sender)
+          if (drains !== undefined) yield* drainInFlight(registry, drains)
           const built = yield* buildIt
-          if (keepsSenderLock(built.bytes)) {
-            return { _tag: "Executed" as const, executed: yield* finish(built) }
+          if (opts.keeps(built.bytes)) {
+            return { _tag: "Done" as const, done: yield* finish(built) }
           }
           // Still under the lock, so a drainer holding it cannot miss this run.
-          yield* Scope.provide(scope)(registerInFlight(registry, [sender, ...signersOfBytes(built.bytes)]))
+          yield* Scope.provide(scope)(registerInFlight(registry, opts.inFlightOn(built)))
           return { _tag: "Built" as const, built }
         }))
-        // On `Tx.run`'s own span: inside the lock the current span is
+        // On the caller's own span: inside the lock the current span is
         // `Sui.withSenderLock`'s.
-        yield* Effect.annotateCurrentSpan({ "sui.sender_lock": step._tag === "Executed" ? "held" : "build" })
-        if (step._tag === "Executed") return step.executed
+        yield* Effect.annotateCurrentSpan({ "sui.sender_lock": step._tag === "Done" ? "held" : "build" })
+        if (step._tag === "Done") return step.done
         return yield* finish(step.built)
       }))
     }
   }
-})
+}
+
+/**
+ * Whether, under `"whenPinned"`, a run whose **gas is someone else's** — an
+ * Enoki-sponsored transaction, whose payment is the sponsor's coins — keeps
+ * the sender lock through signing and submission: the bytes pin an owned or
+ * receiving input, which is the sender's. The sponsor's gas coins are not the
+ * sender's to race. Bytes this version cannot read answer `true`. Internal;
+ * never fails.
+ */
+export const keepsSponsoredSenderLock = (bytes: Uint8Array): boolean =>
+  Option.match(dataOfBytes(bytes), {
+    onNone: () => true,
+    onSome: (data) => ownedInputsOf(data).length > 0
+  })
 
 /**
  * What the journal recorded for one digest, if anything.
@@ -3939,10 +3996,129 @@ export const foldCoins = Effect.fn("Tx.foldCoins")(function*<E = never>(opts: {
 })
 
 /**
+ * What {@link sendAll} did: the sweep it ran and the `Executed` it produced.
+ * `received` is what the recipient's balance of the coin type gained, read
+ * off the effects: for SUI, the sweep less the net gas (more than the sweep
+ * when the deleted coins' storage rebate beats the gas); for any other type,
+ * exactly `sweep.amount`.
+ *
+ * @since 0.5.0
+ */
+export interface SendAllResult {
+  readonly sweep: SendAllSweep
+  readonly executed: Executed
+  readonly received: bigint
+}
+
+/**
+ * Sends **everything** the signer holds of one coin type — every coin object
+ * and the whole address balance — into `recipient`'s address balance, in one
+ * {@link run}, and leaves the sender **nothing** of it: no coin, no balance,
+ * no dust.
+ *
+ * **SUI pays for its own sweep out of the sweep.** The gas coin is made to be
+ * everything — a coin reservation of the whole address balance with every
+ * coin merged into it, or, when the coins hold more, the coins as the gas
+ * payment with the balance redeemed and merged in — and
+ * `0x2::coin::send_funds<SUI>(GasCoin, recipient)` deposits it; gas is
+ * charged against that coin, so the recipient gets the rest and the sender
+ * keeps 0 (localnet, protocol 139: a coin-only, a balance-only and a mixed
+ * account all end at 0 coins and 0 balance). There is no budget to guess and
+ * no refund left behind, which is what a send of `balance − budget` from the
+ * address balance leaves (the unused budget comes back to the sender). **Any
+ * other coin type** sends every coin (`coin::send_funds`) and the whole
+ * balance (`balance::send_funds` of a `FundsWithdrawal`), and gas comes from
+ * the signer's SUI as usual, so the signer needs some.
+ *
+ * **What can remain**: anything that arrives after the read — a deposit into
+ * the balance, a coin — stays with the sender; a spend from the balance that
+ * lands after the read makes the withdrawal too large, and the sweep executes
+ * as a failure (`ExecutionFailed`, `InsufficientFundsForWithdraw`) or is
+ * refused at submit, moving nothing. A SUI sweep paid from a reservation holds
+ * the sender lock through submission and waits for lock-free runs in flight
+ * first, like every `tx.gas` run. More than 500 coin objects do not fit
+ * one transaction: `BuildError`, and `Tx.foldCoins` first.
+ * A SUI account worth less than about twice a budget cannot pay for its own
+ * sweep: that build fails.
+ *
+ * `intent`, `approve` (shown the sweep beside the prepared transaction) and
+ * `onSigned` are `Tx.run`'s.
+ *
+ * Fails with: `BuildError` (nothing to send, the signer is the recipient, too
+ * many coins, or the build), `SimulationFailed`, `PolicyDenied`,
+ * `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`,
+ * `JournalError`, `TransportError` — {@link run}'s — and `E`, whatever
+ * `approve` fails with.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import type { SuiAddress } from "@unconfirmed/sui-effect"
+ * import { Tx, type Signer } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const signer: Signer
+ * declare const newWallet: SuiAddress
+ *
+ * const program = Effect.gen(function*() {
+ *   const { sweep, received } = yield* Tx.sendAll({
+ *     signer,
+ *     recipient: newWallet,
+ *     approve: (prepared, sweep) =>
+ *       Effect.log(`send all ${sweep.amount} of ${sweep.coinType}, gas ${prepared.simulation.gasUsedTotal}`)
+ *   })
+ *   return { swept: sweep.amount, received }
+ * })
+ * ```
+ */
+export const sendAll = Effect.fn("Tx.sendAll")(function*<E = never>(opts: {
+  readonly signer: Signer
+  readonly recipient: SuiAddress
+  /** The coin type to sweep. Default SUI. */
+  readonly coinType?: CoinType
+  /** What the sweep is declared to do; see `Tx.run`. */
+  readonly intent?: Intent
+  /** `Tx.run`'s `approve`, with the sweep it is about to send. */
+  readonly approve?: (prepared: Prepared, sweep: SendAllSweep) => Effect.Effect<void, E>
+  /** `Tx.run`'s `onSigned`. */
+  readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>
+}): Effect.fn.Return<SendAllResult, RunError | E, Sui> {
+  const owner = opts.signer.address
+  if (normalizeSuiAddress(opts.recipient) === normalizeSuiAddress(owner)) {
+    return yield* new BuildError({ message: `${owner} cannot send everything to itself`, cause: opts.recipient })
+  }
+  const plan = yield* readSweep({ owner, recipient: opts.recipient, coinType: opts.coinType ?? CoinType.SUI })
+  yield* Effect.annotateCurrentSpan({
+    "sui.sender": owner,
+    "sui.sweep.coins": plan.coins.length,
+    "sui.sweep.gas": plan.gas
+  })
+  if (plan.amount === 0n) {
+    return yield* new BuildError({ message: `${owner} holds no ${plan.coinType} to send`, cause: plan.coinType })
+  }
+  if (plan.coins.length > MAX_SWEEP_COINS) {
+    return yield* new BuildError({
+      message: `${owner} holds ${plan.coins.length} coin objects of ${plan.coinType}, more than the` +
+        ` ${MAX_SWEEP_COINS} one transaction takes: fold them into the address balance first (Tx.foldCoins), then sweep`,
+      cause: plan.coins.length
+    })
+  }
+  const approve = opts.approve
+  const executed = yield* run(sweep(plan), {
+    signer: opts.signer,
+    ...(opts.intent === undefined ? {} : { intent: opts.intent }),
+    ...(opts.onSigned === undefined ? {} : { onSigned: opts.onSigned }),
+    ...(approve === undefined ? {} : { approve: (prepared: Prepared) => approve(prepared, plan) })
+  })
+  return { sweep: plan, executed, received: executed.balanceChange(opts.recipient, plan.coinType) }
+})
+
+/**
  * The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
  * `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
  * `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
- * `Tx.foldCoins`, `Tx.foldMovement`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`,
+ * `Tx.foldCoins`, `Tx.foldMovement`, `Tx.sendAll`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`,
  * `Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
  * `Tx.reconcileAll`.
  */
@@ -3959,6 +4135,8 @@ export const Tx = {
   fold,
   foldCoins,
   foldMovement,
+  sendAll,
+  verifySponsored,
   submit,
   submitVia,
   verify,
