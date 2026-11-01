@@ -1791,8 +1791,11 @@ const unknownEntry = Effect.fnUntraced(function*(
  * this sender sees this one" true.
  *
  * **It never changes the outcome.** The transaction executed; that is a fact,
- * and a wait that times out or fails does not unmake it. The failure is logged
- * with the digest and `Tx.submit` returns the `Executed` it already has. Turn
+ * and a wait that times out or fails does not unmake it. `Tx.submit` returns
+ * the `Executed` it already has; the miss is the `Tx.awaitVisible` span's
+ * `sui.visibility` attribute (`"visible"`, `"timeout"`, `"failed"`), the
+ * visibility-wait metric's `result`, and a **debug** log line with the digest
+ * — debug since 0.5.0, so a default program's stdout stays clean. Turn
  * the wait off with `SubmitConfig.awaitVisibility: false` and bound it with
  * `SubmitConfig.visibilityTimeout`. Never fails.
  */
@@ -1805,8 +1808,13 @@ const awaitVisible = (
     .waitForTransaction({ digest })
     .pipe(
       Effect.timeoutOption(config.visibilityTimeout),
+      // At debug level, which Effect's default minimum level (`Info`) does not
+      // print: the default logger writes to stdout, and a warning here landed
+      // in the middle of a `--json` CLI's output for a run whose outcome
+      // stands. The fact stays observable as the span attribute
+      // `sui.visibility` and the `result` of the visibility-wait metric.
       Effect.flatMap((visible) =>
-        visible._tag === "Some" ? Effect.succeed("visible") : Effect.logWarning(
+        visible._tag === "Some" ? Effect.succeed("visible") : Effect.logDebug(
           "the transaction executed but did not become visible to reads within" +
             ` SubmitConfig.visibilityTimeout (${Duration.format(config.visibilityTimeout)}); the outcome stands`
         ).pipe(Effect.as("timeout"))
@@ -1816,11 +1824,12 @@ const awaitVisible = (
       // and the outcome it would be printed beside is going to stand anyway. A
       // **defect** is still a bug and is not caught.
       Effect.catch((error) =>
-        Effect.logWarning(
+        Effect.logDebug(
           "the transaction executed but waiting for it to become visible failed; the outcome" +
             ` stands: ${SuiError.describe(error)}`
         ).pipe(Effect.as("failed"))
       ),
+      Effect.tap((result) => Effect.annotateCurrentSpan({ "sui.visibility": result })),
       Effect.timed,
       Effect.flatMap(([duration, result]) => Metrics.recordDuration(Metrics.visibilityWait, duration, { result })),
       // An interrupt here is the caller's to make, and it wins — but the

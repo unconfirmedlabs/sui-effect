@@ -10,7 +10,7 @@ import type { SuiClientTypes } from "@mysten/sui/client"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Transaction } from "@mysten/sui/transactions"
 import { toBase58 } from "@mysten/sui/utils"
-import { Clock, Deferred, Duration, Effect, Fiber, Layer, Logger, Option, Schema } from "effect"
+import { Clock, Deferred, Duration, Effect, Fiber, Layer, Logger, Option, References, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { type NotApplied, type SubmissionUnknown, SuiError, type TransportError } from "../src/domain/errors.ts"
 import { Digest, Nonce, NotAppliedEvidence, SuiAddress } from "../src/domain/schemas.ts"
@@ -357,32 +357,57 @@ describe("2.10 coverage that was missing", () => {
     expect(sameBlocked).toBe(true)
   })
 
-  test("visibilityTimeout bounds a hung waitForTransaction, and the outcome stands", async () => {
+  const hungRun = (extra: Layer.Layer<never>, minimum?: "Debug") => {
     const state = Effect.runSync(
       Effect.provide(SuiCoreFake, SuiCoreFake.layer({ ...baseScript, execute: [executed] }), { local: true })
     )
     const real = makeFromClient(state.client)
     const hung: SuiCoreService = { ...real, waitForTransaction: () => Effect.never }
-    const logged: Array<string> = []
-    const result = await Effect.runPromise(
-      Effect.gen(function*() {
-        const fiber = yield* Effect.forkChild(Tx.run(claim, { signer }))
-        yield* TestClock.adjust("5 seconds")
-        return yield* Fiber.join(fiber)
-      }).pipe(
+    const program = Effect.gen(function*() {
+      const fiber = yield* Effect.forkChild(Tx.run(claim, { signer }))
+      yield* TestClock.adjust("5 seconds")
+      return yield* Fiber.join(fiber)
+    })
+    return Effect.runPromise(
+      (minimum === undefined ? program : program.pipe(Effect.provideService(References.MinimumLogLevel, minimum))).pipe(
         Effect.provide(
           Layer.mergeAll(
             Sui.layerNoDeps.pipe(Layer.provideMerge(Layer.succeed(SuiCore, hung))),
             TestClock.layer(),
             Journal.layerMemory,
             SubmitConfig.layer({ visibilityTimeout: Duration.seconds(5) }),
-            Logger.layer([Logger.map(Logger.formatLogFmt, (line) => logged.push(line))])
+            extra
           ),
           { local: true }
         )
       )
     )
+  }
+
+  test("visibilityTimeout bounds a hung waitForTransaction, and the outcome stands", async () => {
+    const logged: Array<string> = []
+    const result = await hungRun(
+      Logger.layer([Logger.map(Logger.formatLogFmt, (line) => logged.push(line))]),
+      "Debug"
+    )
     expect(result.created(RECEIPT_TYPE)).toHaveLength(1)
+    // 0.5.0: at debug level, printed only when the program asks for it.
     expect(logged.join("\n")).toContain("did not become visible to reads")
+    expect(logged.join("\n")).toContain("level=DEBUG")
+  })
+
+  test("a timed-out visibility wait writes nothing to stdout under the default logger (finding 6)", async () => {
+    const original = console.log
+    const printed: Array<unknown> = []
+    console.log = (...args: Array<unknown>) => {
+      printed.push(args)
+    }
+    try {
+      const result = await hungRun(Layer.empty)
+      expect(result.created(RECEIPT_TYPE)).toHaveLength(1)
+    } finally {
+      console.log = original
+    }
+    expect(printed).toEqual([])
   })
 })
