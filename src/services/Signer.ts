@@ -18,6 +18,8 @@ import { fromHex } from "@mysten/sui/utils"
 import { Config, ConfigProvider, Effect, Redacted, Schema } from "effect"
 import { SigningError } from "../domain/errors.ts"
 import { Signature, SuiAddress } from "../domain/schemas.ts"
+import { createPasskey, passkey, wallet } from "./AccountSigners.ts"
+import { zkLogin } from "./ZkLoginSigner.ts"
 
 /**
  * The signature schemes a {@link Signer} can carry: the SDK's own
@@ -353,12 +355,18 @@ export const remote = (signer: RemoteSigner): Signer => ({
 /**
  * The constructors, namespaced the way the spec spells them:
  * `Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.fromConfig`,
- * `Signer.ephemeral`, `Signer.remote`. The type `Signer` is the interface above.
+ * `Signer.ephemeral`, `Signer.remote`, and the account signers (0.5.0)
+ * `Signer.zkLogin`, `Signer.passkey`, `Signer.createPasskey`,
+ * `Signer.wallet`. The type `Signer` is the interface above.
  */
 export const Signer = {
   fromSdkSigner,
   fromKeypair,
   fromConfig,
   ephemeral,
-  remote
+  remote,
+  zkLogin,
+  passkey,
+  createPasskey,
+  wallet
 } as const

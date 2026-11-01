@@ -77,7 +77,7 @@ jobs:
           bun init -y >/dev/null
           bun add "$TARBALL" effect@4.1.1 @mysten/sui@2.38.0 @mysten/bcs
           cat > check.ts <<'TS'
-          import "@unconfirmed/sui-effect"; import "@unconfirmed/sui-effect/tx"; import "@unconfirmed/sui-effect/journal"; import "@unconfirmed/sui-effect/gate"
+          import "@unconfirmed/sui-effect"; import "@unconfirmed/sui-effect/tx"; import "@unconfirmed/sui-effect/journal"; import "@unconfirmed/sui-effect/gate"; import "@unconfirmed/sui-effect/enoki"
           import "@unconfirmed/sui-effect/extension"; import "@unconfirmed/sui-effect/script"; import "@unconfirmed/sui-effect/testing"
           TS
           # The repo's own pinned tsc (devDependencies: typescript 5.9.3), so the

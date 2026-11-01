@@ -680,6 +680,7 @@ The full entries follow under "API".
 - `LockSenderPolicy` — When `Tx.run` holds the sender lock.
 - `OutflowClaim` — The most of one coin the sender may lose, in base units, gas excluded.
 - `Parties` — Whose transaction it is.
+- `PasskeyProvider` — What a passkey signer asks the authenticator for, structurally: the SDK's `PasskeyProvider` from `@mysten/sui/keypairs/passkey` (its `BrowserPasskeyProvider` is one) without the DOM types it is declared with, so a React Native or extension provider can be typed without a DOM `lib`.
 - `ReconcileInput` — What `Tx.reconcile` can be asked about.
 - `Reconciled` — What one entry of `Tx.reconcileAll` settled to, as a tagged union.
 - `RemoteSigner` — What `remote` needs to know about a credential it does not hold.
@@ -687,10 +688,13 @@ The full entries follow under "API".
 - `ScreenRequest` — What a screen is shown: the sentence, and both things it is compared with.
 - `ScreenedLine` — One rendered line and the probability that the declared summary covers it.
 - `Screening` — What a semantic screen answered: probabilities, never a decision.
+- `SecretSealer` — Seals and unseals a secret for storage.
 - `Signature` — re-exported from `@unconfirmed/sui-effect`.
 - `SignatureScheme`
 - `Signed` — The schema of `Signed`.
 - `Signer` — A credential: who it signs as, how, and the two things it can sign.
+- `StandardWallet` — A Wallet Standard wallet, structurally: anything with a `features` record.
+- `StandardWalletAccount` — A Wallet Standard account, structurally: what `@wallet-standard/base`'s `WalletAccount` carries and this module reads.
 - `SubmitConfig` — The lifecycle settings.
 - `SubmitConfigOverrides` — What `SubmitConfig.with` and `SubmitConfig.layer` accept: any subset of `SubmitConfigService`, with every duration given as a `Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of milliseconds — and converted on the way in.
 - `SubmitConfigService` — Every decision `Tx.build`, `Tx.submit` and `Tx.reconcile` read from context.
@@ -704,6 +708,11 @@ The full entries follow under "API".
 - `Verified` — A `Built` whose simulated effects stayed inside a declared `Intent`.
 - `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
 - `VerifyOptions` — The options both verifiers take.
+- `ZkLogin` — The zkLogin session schemas and store, namespaced: `ZkLogin.Session`, `ZkLogin.SignatureInputs`, `ZkLogin.StoredSession`, `ZkLogin.save`, `ZkLogin.load`, `ZkLogin.remove`.
+- `ZkLoginSession` — The public half of a zkLogin session: everything but the ephemeral secret.
+- `ZkLoginSignatureInputs` — The proof inputs a zkLogin signature carries: the SDK's `ZkLoginSignatureInputs` from `@mysten/sui/zklogin`, as a schema, so a session can be stored and read back.
+- `ZkLoginSignerOptions` — What `zkLogin` needs: the public session and the ephemeral signer.
+- `ZkLoginStoredSession` — One stored zkLogin session: the public session and the sealed ephemeral secret (an Ed25519 32-byte seed, sealed by a `SecretSealer`).
 - `attach` — Attaches a signature somebody else made — a sender's wallet, a remote sponsor, an HSM — to built or already signed bytes, after checking it.
 - `build` — Builds a transaction into signable bytes.
 - `chainOf` — re-exported from `@unconfirmed/sui-effect`.
@@ -735,6 +744,7 @@ The full entries follow under "API".
 - `submit` — Sends signed bytes, and does not stop caring until it knows what happened.
 - `submitVia` — Submits through **someone else** — a relay, a sponsorship service, a backend that holds the only key allowed to talk to the node — and keeps the journal and the evidence rules that `Tx.submit` would have kept.
 - `verify` — Checks built bytes against a declared intent, before anything is signed.
+- `verifySponsored` — Checks that sponsored bytes a service assembled are the transaction the sender asked to have sponsored, before the sender signs them.
 
 ### `@unconfirmed/sui-effect/journal`
 
@@ -754,6 +764,17 @@ The full entries follow under "API".
 - `layerJev` — The `Gate` already in force, with Jev as its screen and `overrides` applied.
 - `layerJevConfig` — `layerJev` from the environment: `TYPESAFE_API_KEY` (required, redacted), `TYPESAFE_MODEL` and `TYPESAFE_BASE_URL` (optional).
 - `makeJev` — The screen itself, over an `HttpClient` you already have.
+
+### `@unconfirmed/sui-effect/enoki`
+
+- `Enoki` — The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`, `Enoki.sponsor`, `Enoki.execute`.
+- `EnokiClient` — The two `EnokiClient` methods sponsorship uses, as `@mysten/enoki` 1.3.2 declares them (the input of `createSponsoredTransaction` narrowed to the `sender` form, plus `jwt`).
+- `EnokiError` — Enoki refused a request: an HTTP 4xx from the Enoki API, or a refusal the caller's `refused` predicate recognised.
+- `EnokiFlow` — The two `EnokiFlow` methods `fromFlow` uses.
+- `execute` — Executes a sponsored transaction through Enoki's `executeSponsoredTransaction`, **through the journal**: this is `Tx.submitVia(signed, send)`, so the `Signed` entry is written before Enoki is called, Enoki is called once, and its answer — a bare digest, never effects — is settled by asking the chain for the digest of the bytes that were signed.
+- `fromFlow` — The signed-in `EnokiFlow` session as a `Signer`: `scheme: "ZkLogin"`, `maxEpoch` and the expiry checks of `Signer.zkLogin`, signing with the flow's own `EnokiKeypair` (`getKeypair`, which asks Enoki for the proof the first time and caches it in the flow's store).
+- `fromWallet` — An Enoki wallet (from `registerEnokiWallets`) as a `Signer`: `Signer.wallet` over its Wallet Standard features, plus the session bound its `enoki:getSession` feature reports, so the signer carries `maxEpoch` and refuses after it like `Signer.zkLogin`.
+- `sponsor` — Asks Enoki to sponsor a transaction, and answers its sponsored bytes as a `Built` that has been checked: `Tx.fromBytes` (the chain), Enoki's digest is the digest of its bytes, and `verifySponsored` (on `/tx`) — the sender is `options.sender`, the gas owner is someone else, and the transaction kind is **exactly** the kind that was sent.
 
 ### `@unconfirmed/sui-effect/extension`
 
@@ -4058,7 +4079,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-75 exported symbols.
+85 exported symbols.
 
 ### `Built` (const)
 
@@ -4621,6 +4642,34 @@ Whose transaction it is. Gas spent by whoever pays it is never an outflow.
 A `Built` is a `Parties` as it is: `sender`, and `gasOwner` only when someone
 else pays.
 
+### `PasskeyProvider` (interface)
+
+```ts
+export interface PasskeyProvider {
+    readonly create: () => Promise<{
+        readonly rawId: ArrayBuffer;
+        readonly response: {
+            readonly getPublicKey: () => ArrayBuffer | null;
+        };
+    }>;
+    readonly get: (challenge: Uint8Array, credentialId?: Uint8Array) => Promise<{
+        readonly response: {
+            readonly authenticatorData: ArrayBuffer;
+            readonly clientDataJSON: ArrayBuffer;
+            readonly signature: ArrayBuffer;
+        };
+    }>;
+}
+```
+
+What a passkey signer asks the authenticator for, structurally: the SDK's
+`PasskeyProvider` from `@mysten/sui/keypairs/passkey` (its
+`BrowserPasskeyProvider` is one) without the DOM types it is declared with,
+so a React Native or extension provider can be typed without a DOM `lib`.
+`create()` answers the `navigator.credentials.create()` credential (its
+`rawId` and `response.getPublicKey()`), `get()` the
+`navigator.credentials.get()` assertion for `challenge`.
+
 ### `ReconcileInput` (type)
 
 ```ts
@@ -4731,6 +4780,27 @@ declare const Screening: Schema
 What a semantic screen answered: probabilities, never a decision. The
 decision is `Gate`'s thresholds, applied in code by `Tx.verify`.
 
+### `SecretSealer` (interface)
+
+```ts
+export interface SecretSealer {
+    /** Fails with: `SigningError`. */
+    readonly seal: (secret: Redacted.Redacted<Uint8Array>, aad: Uint8Array) => Effect.Effect<string, SigningError>;
+    /** Fails with: `SigningError` (`reason: "locked"` when the keystore is locked is the convention). */
+    readonly unseal: (sealed: string, aad: Uint8Array) => Effect.Effect<Redacted.Redacted<Uint8Array>, SigningError>;
+}
+```
+
+Seals and unseals a secret for storage. **sui-effect ships no sealer**: the
+keystore that owns the wrapping key (WebCrypto AES-GCM under a key the
+platform keeps, a passphrase-derived key, the OS keychain) implements this.
+
+`aad` is additional authenticated data the sealer must bind the blob to —
+here, the UTF-8 bytes of the session's address — so a sealed key copied
+under another account's entry does not unseal. A sealer that returns its
+input unchanged stores the ephemeral key in plain text; that is a decision
+the caller makes by writing one, never a default.
+
 ### `Signature` (const)
 
 Re-exported from `@unconfirmed/sui-effect`.
@@ -4834,12 +4904,58 @@ declare const Signer: {
     readonly fromConfig: (name?: string) => Effect.Effect<Signer, Config.ConfigError>;
     readonly ephemeral: Effect.Effect<Signer, never, never>;
     readonly remote: (signer: RemoteSigner) => Signer;
+    readonly zkLogin: (options: import("./ZkLoginSigner.ts").ZkLoginSignerOptions) => Effect.Effect<Signer, SigningError, never>;
+    readonly passkey: (options: {
+        readonly publicKey: Uint8Array;
+        readonly provider: import("./AccountSigners.ts").PasskeyProvider;
+        readonly credentialId?: Uint8Array;
+    }) => Effect.Effect<Signer, SigningError, never>;
+    readonly createPasskey: (provider: import("./AccountSigners.ts").PasskeyProvider) => Effect.Effect<{
+        readonly signer: Signer;
+        readonly publicKey: Uint8Array;
+        readonly credentialId?: Uint8Array;
+    }, SigningError, never>;
+    readonly wallet: (options: {
+        readonly wallet: import("./AccountSigners.ts").StandardWallet;
+        readonly account: import("./AccountSigners.ts").StandardWalletAccount;
+        readonly chain: string;
+        readonly scheme?: SignatureScheme;
+    }) => Effect.Effect<Signer, SigningError, never>;
 }
 ```
 
 The constructors, namespaced the way the spec spells them:
 `Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.fromConfig`,
-`Signer.ephemeral`, `Signer.remote`. The type `Signer` is the interface above.
+`Signer.ephemeral`, `Signer.remote`, and the account signers (0.5.0)
+`Signer.zkLogin`, `Signer.passkey`, `Signer.createPasskey`,
+`Signer.wallet`. The type `Signer` is the interface above.
+
+### `StandardWallet` (interface)
+
+```ts
+export interface StandardWallet {
+    readonly name?: string;
+    readonly features: Readonly<Record<string, unknown>>;
+}
+```
+
+A Wallet Standard wallet, structurally: anything with a `features` record.
+A `Wallet` from `@wallet-standard/base` (or a `WalletWithRequiredFeatures`
+from `@mysten/wallet-standard`) is one.
+
+### `StandardWalletAccount` (interface)
+
+```ts
+export interface StandardWalletAccount {
+    readonly address: string;
+    readonly publicKey: ArrayLike<number>;
+    readonly chains: ReadonlyArray<string>;
+    readonly features?: ReadonlyArray<string>;
+}
+```
+
+A Wallet Standard account, structurally: what `@wallet-standard/base`'s
+`WalletAccount` carries and this module reads.
 
 ### `SubmitConfig` (const)
 
@@ -5324,6 +5440,210 @@ export interface VerifyOptions {
 
 The options both verifiers take.
 
+### `ZkLogin` (const)
+
+```ts
+declare const ZkLogin: {
+    readonly Session: Schema.Struct<{
+        readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress"> & {
+            normalize: (input: string) => SuiAddress;
+            Strict: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        };
+        readonly maxEpoch: Schema.BigIntFromString;
+        readonly proof: Schema.Struct<{
+            readonly proofPoints: Schema.Struct<{
+                readonly a: Schema.$Array<Schema.String>;
+                readonly b: Schema.$Array<Schema.$Array<Schema.String>>;
+                readonly c: Schema.$Array<Schema.String>;
+            }>;
+            readonly issBase64Details: Schema.Struct<{
+                readonly value: Schema.String;
+                readonly indexMod4: Schema.Int;
+            }>;
+            readonly headerBase64: Schema.String;
+            readonly addressSeed: Schema.String;
+        }>;
+        readonly expiresAt: Schema.optionalKey<Schema.Finite>;
+    }>;
+    readonly SignatureInputs: Schema.Struct<{
+        readonly proofPoints: Schema.Struct<{
+            readonly a: Schema.$Array<Schema.String>;
+            readonly b: Schema.$Array<Schema.$Array<Schema.String>>;
+            readonly c: Schema.$Array<Schema.String>;
+        }>;
+        readonly issBase64Details: Schema.Struct<{
+            readonly value: Schema.String;
+            readonly indexMod4: Schema.Int;
+        }>;
+        readonly headerBase64: Schema.String;
+        readonly addressSeed: Schema.String;
+    }>;
+    readonly StoredSession: Schema.Struct<{
+        readonly session: Schema.Struct<{
+            readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress"> & {
+                normalize: (input: string) => SuiAddress;
+                Strict: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            };
+            readonly maxEpoch: Schema.BigIntFromString;
+            readonly proof: Schema.Struct<{
+                readonly proofPoints: Schema.Struct<{
+                    readonly a: Schema.$Array<Schema.String>;
+                    readonly b: Schema.$Array<Schema.$Array<Schema.String>>;
+                    readonly c: Schema.$Array<Schema.String>;
+                }>;
+                readonly issBase64Details: Schema.Struct<{
+                    readonly value: Schema.String;
+                    readonly indexMod4: Schema.Int;
+                }>;
+                readonly headerBase64: Schema.String;
+                readonly addressSeed: Schema.String;
+            }>;
+            readonly expiresAt: Schema.optionalKey<Schema.Finite>;
+        }>;
+        readonly ephemeral: Schema.Struct<{
+            readonly scheme: Schema.Literal<"ED25519">;
+            readonly sealed: Schema.String;
+        }>;
+    }>;
+    readonly save: (store: KeyValueStore.KeyValueStore, key: string, input: {
+        readonly session: ZkLoginSession;
+        readonly ephemeralSecretKey: Redacted.Redacted<Uint8Array>;
+        readonly sealer: SecretSealer;
+    }) => Effect.Effect<void, SigningError, never>;
+    readonly load: (store: KeyValueStore.KeyValueStore, key: string, options: {
+        readonly sealer: SecretSealer;
+    }) => Effect.Effect<Option.Option<Signer>, SigningError, never>;
+    readonly remove: (store: KeyValueStore.KeyValueStore, key: string) => Effect.Effect<void, SigningError, never>;
+}
+```
+
+The zkLogin session schemas and store, namespaced: `ZkLogin.Session`,
+`ZkLogin.SignatureInputs`, `ZkLogin.StoredSession`, `ZkLogin.save`,
+`ZkLogin.load`, `ZkLogin.remove`. The signer itself is `Signer.zkLogin`.
+
+### `ZkLoginSession` (const)
+
+```ts
+declare const ZkLoginSession: Schema
+// decodes to:
+// {
+//     readonly address: SuiAddress;
+//     readonly maxEpoch: bigint;
+//     readonly proof: {
+//         readonly proofPoints: {
+//             readonly a: readonly string[];
+//             readonly b: readonly (readonly string[])[];
+//             readonly c: readonly string[];
+//         };
+//         readonly issBase64Details: {
+//             readonly value: string;
+//             readonly indexMod4: number;
+//         };
+//         readonly headerBase64: string;
+//         readonly addressSeed: string;
+//     };
+//     readonly expiresAt?: number | undefined;
+// }
+```
+
+The public half of a zkLogin session: everything but the ephemeral secret.
+
+- `address` is the zkLogin address. It is checked against the proof (its
+  address seed and issuer) when a signer is made, legacy and current
+  derivations both, so a session for another account is refused.
+- `maxEpoch` is the last epoch the proof is accepted in, the bound the
+  ephemeral key's nonce committed to.
+- `expiresAt`, when known, is a wall-clock deadline in milliseconds since
+  the Unix epoch (Enoki's `ZkLoginSession.expiresAt`). It is a cheap local
+  approximation of `maxEpoch` the signer checks against `Clock`.
+
+Nothing here is secret: the proof is public on chain in every signature the
+session makes. The JWT is deliberately not part of it — a session that can
+sign never needs the token again.
+
+### `ZkLoginSignatureInputs` (const)
+
+```ts
+declare const ZkLoginSignatureInputs: Schema
+// decodes to:
+// {
+//     readonly proofPoints: {
+//         readonly a: readonly string[];
+//         readonly b: readonly (readonly string[])[];
+//         readonly c: readonly string[];
+//     };
+//     readonly issBase64Details: {
+//         readonly value: string;
+//         readonly indexMod4: number;
+//     };
+//     readonly headerBase64: string;
+//     readonly addressSeed: string;
+// }
+```
+
+The proof inputs a zkLogin signature carries: the SDK's
+`ZkLoginSignatureInputs` from `@mysten/sui/zklogin`, as a schema, so a
+session can be stored and read back. Exactly what Enoki's
+`createZkLoginZkp` and `EnokiFlow.getProof` answer.
+
+### `ZkLoginSignerOptions` (interface)
+
+```ts
+export interface ZkLoginSignerOptions {
+    readonly session: {
+        readonly address: string;
+        readonly maxEpoch: bigint | number | string;
+        readonly proof: ZkLoginSignatureInputs;
+        readonly expiresAt?: number;
+    };
+    readonly ephemeral: SdkSigner;
+}
+```
+
+What `zkLogin` needs: the public session and the ephemeral signer.
+
+`ephemeral` is any `@mysten/sui/cryptography` `Signer` — an
+`Ed25519Keypair`, or a `WebCryptoSigner` over a non-extractable key held in
+IndexedDB (what Enoki's `experimental_nativeCryptoSigner` stores). It is the
+key the proof's nonce committed to; that commitment is inside the proof and
+cannot be checked here, so a wrong ephemeral key produces signatures the node
+refuses (`INVALID_ARGUMENT`, which `Tx.submit` reports as itself).
+
+### `ZkLoginStoredSession` (const)
+
+```ts
+declare const ZkLoginStoredSession: Schema
+// decodes to:
+// {
+//     readonly session: {
+//         readonly address: SuiAddress;
+//         readonly maxEpoch: bigint;
+//         readonly proof: {
+//             readonly proofPoints: {
+//                 readonly a: readonly string[];
+//                 readonly b: readonly (readonly string[])[];
+//                 readonly c: readonly string[];
+//             };
+//             readonly issBase64Details: {
+//                 readonly value: string;
+//                 readonly indexMod4: number;
+//             };
+//             readonly headerBase64: string;
+//             readonly addressSeed: string;
+//         };
+//         readonly expiresAt?: number | undefined;
+//     };
+//     readonly ephemeral: {
+//         readonly scheme: "ED25519";
+//         readonly sealed: string;
+//     };
+// }
+```
+
+One stored zkLogin session: the public session and the sealed ephemeral
+secret (an Ed25519 32-byte seed, sealed by a `SecretSealer`). The JSON
+a `save` writes under its key.
+
 ### `attach` (const)
 
 ```ts
@@ -5771,6 +6091,11 @@ declare const isUnresolved: (value: {
     readonly evidence: "expired" | "inputConsumed" | "refused";
     readonly at: import("effect/DateTime").Utc;
 } | {
+    readonly at: import("effect/DateTime").Utc;
+    readonly digest: Digest;
+    readonly _tag: "Executed";
+    readonly checkpoint?: bigint;
+} | {
     readonly _tag: "Signed";
     readonly digest: Digest;
     readonly signed: {
@@ -5813,11 +6138,6 @@ declare const isUnresolved: (value: {
         };
     };
     readonly signedAt: import("effect/DateTime").Utc;
-} | {
-    readonly at: import("effect/DateTime").Utc;
-    readonly digest: Digest;
-    readonly _tag: "Executed";
-    readonly checkpoint?: bigint;
 } | {
     readonly _tag: "Failed";
     readonly digest: Digest;
@@ -6581,6 +6901,36 @@ Every refusal is a `PolicyDenied` whose `rule` says which check:
 
 **Fails with: `PolicyDenied`, `SimulationFailed`, `BuildError`, `TransportError`.**
 
+### `verifySponsored` (const)
+
+```ts
+declare const verifySponsored: (built: Built, expect: {
+    readonly sender: string;
+    readonly gasOwner?: string;
+    readonly transactionKind?: Uint8Array;
+}) => Effect.Effect<Built, PolicyDenied, never>
+```
+
+Checks that sponsored bytes a service assembled are the transaction the
+sender asked to have sponsored, before the sender signs them.
+
+A sponsorship service (Enoki's `createSponsoredTransaction`, or an
+application's own sponsor) takes a transaction **kind** and answers full
+bytes with its gas data added. Those bytes are what the sender's signature
+will authorize, so they are read back, not trusted:
+
+- the sender the bytes name is `expect.sender` (`sponsored.sender`);
+- the bytes name a gas owner, it is not the sender, and it is
+  `expect.gasOwner` when one is given (`sponsored.gasOwner`);
+- when `expect.transactionKind` is given, the bytes' transaction kind is
+  **exactly** those kind bytes (`sponsored.kind`): a service cannot add a
+  command, swap an input or change an argument and still get a signature.
+
+The chain is `Tx.fromBytes`'s check, which made the `Built`. Simulating the
+bytes before signing them is still the caller's (or `Tx.prepare`'s) job.
+
+**Fails with: `PolicyDenied` (rule `sponsored.sender`, `sponsored.gasOwner` or `sponsored.kind`).**
+
 ## `@unconfirmed/sui-effect/journal`
 
 
@@ -6763,6 +7113,206 @@ asked is a non-retryable `TransportError`, never a default.
 The screen fails with: `TransportError`.
 
 **Never fails to build.**
+
+## `@unconfirmed/sui-effect/enoki`
+
+
+8 exported symbols.
+
+### `Enoki` (const)
+
+```ts
+declare const Enoki: {
+    readonly fromFlow: (flow: EnokiFlow, options?: {
+        readonly network?: "mainnet" | "testnet" | "devnet";
+    } | undefined) => Effect.Effect<Signer, SigningError, never>;
+    readonly fromWallet: (options: {
+        readonly wallet: StandardWallet;
+        readonly account: StandardWalletAccount;
+        readonly chain: string;
+        readonly scheme?: SignatureScheme;
+    }) => Effect.Effect<Signer, SigningError, never>;
+    readonly sponsor: (client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
+        readonly sender: SuiAddress;
+        readonly network?: "mainnet" | "testnet" | "devnet";
+        readonly jwt?: string;
+        readonly allowedAddresses?: ReadonlyArray<string>;
+        readonly allowedMoveCallTargets?: ReadonlyArray<string>;
+    }) => Effect.Effect<Built, TransportError | BuildError | PolicyDenied | EnokiError, Sui>;
+    readonly execute: (client: EnokiClient, signed: Signed, options?: {
+        readonly refused?: (cause: unknown) => boolean;
+    } | undefined) => Effect.Effect<Executed, SubmitViaError | EnokiError, Sui>;
+}
+```
+
+The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`,
+`Enoki.sponsor`, `Enoki.execute`.
+
+### `EnokiClient` (interface)
+
+```ts
+export interface EnokiClient {
+    readonly createSponsoredTransaction: (input: {
+        readonly network?: "mainnet" | "testnet" | "devnet";
+        readonly transactionKindBytes: string;
+    } & ({
+        readonly jwt: string;
+        readonly sender?: never;
+        readonly allowedAddresses?: never;
+        readonly allowedMoveCallTargets?: never;
+    } | {
+        readonly sender: string;
+        readonly allowedAddresses?: Array<string>;
+        readonly allowedMoveCallTargets?: Array<string>;
+        readonly jwt?: never;
+    })) => Promise<{
+        readonly bytes: string;
+        readonly digest: string;
+    }>;
+    readonly executeSponsoredTransaction: (input: {
+        readonly digest: string;
+        readonly signature: string;
+    }) => Promise<{
+        readonly digest: string;
+    }>;
+}
+```
+
+The two `EnokiClient` methods sponsorship uses, as `@mysten/enoki` 1.3.2
+declares them (the input of `createSponsoredTransaction` narrowed to the
+`sender` form, plus `jwt`).
+
+### `EnokiError` (class)
+
+```ts
+export declare class EnokiError extends EnokiError_base {
+    readonly refused: boolean;
+    readonly cause: unknown;
+    readonly method: string;
+    readonly status?: number | undefined;
+    readonly code?: string | undefined;
+    /** `not_applied` for a refusal; `unknown` otherwise. */
+    get outcome(): "not_applied" | "unknown";
+    get message(): string;
+}
+```
+
+Enoki refused a request: an HTTP 4xx from the Enoki API, or a refusal the
+caller's `refused` predicate recognised. `refused: true` is the claim that
+nothing was submitted, which makes the outcome `not_applied`; any other
+failure of the execute call is ambiguous, is reconciled by `Tx.submitVia`,
+and only ever surfaces as the `cause` of a `SubmissionUnknown`.
+
+### `EnokiFlow` (interface)
+
+```ts
+export interface EnokiFlow {
+    readonly getSession: () => Promise<{
+        readonly maxEpoch: number;
+        readonly expiresAt: number;
+    } | null>;
+    readonly getKeypair: (input?: {
+        readonly network?: "mainnet" | "testnet" | "devnet";
+    }) => Promise<SdkSigner>;
+}
+```
+
+The two `EnokiFlow` methods `fromFlow` uses. `EnokiFlow` is deprecated
+in `@mysten/enoki` 1.x in favour of `registerEnokiWallets`, whose wallets
+`fromWallet` reads; both are supported.
+
+### `execute` (const)
+
+```ts
+declare const execute: (client: EnokiClient, signed: Signed, options?: {
+    readonly refused?: (cause: unknown) => boolean;
+} | undefined) => Effect.Effect<Executed, SubmitViaError | EnokiError, Sui>
+```
+
+Executes a sponsored transaction through Enoki's
+`executeSponsoredTransaction`, **through the journal**: this is
+`Tx.submitVia(signed, send)`, so the `Signed` entry is written before Enoki
+is called, Enoki is called once, and its answer — a bare digest, never
+effects — is settled by asking the chain for the digest of the bytes that
+were signed. A failure that may have reached the chain is reconciled with the
+full evidence rules and is `SubmissionUnknown` (carrying the bytes) when the
+chain cannot say yet; `Tx.reconcileAll()` settles it later.
+
+The signature sent is `signed.signatures[0]`, the sender's: Enoki holds the
+sponsor's.
+
+`refused` says which Enoki failures are refusals before anything was
+submitted, which fail straight through as `EnokiError { refused: true }`
+and settle the journal entry as `NotApplied { refused }`. The default is an
+HTTP 401 or 403 (Enoki refused the API key or the session); every other
+failure — a 400 included, since Enoki submits to a node and does not say
+whether it got that far — is treated as ambiguous and reconciled.
+
+**Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError` (only from the write before Enoki is called), and `EnokiError` (only `refused: true`).**
+
+### `fromFlow` (const)
+
+```ts
+declare const fromFlow: (flow: EnokiFlow, options?: {
+    readonly network?: "mainnet" | "testnet" | "devnet";
+} | undefined) => Effect.Effect<Signer, SigningError, never>
+```
+
+The signed-in `EnokiFlow` session as a `Signer`: `scheme: "ZkLogin"`,
+`maxEpoch` and the expiry checks of `Signer.zkLogin`, signing with the
+flow's own `EnokiKeypair` (`getKeypair`, which asks Enoki for the proof the
+first time and caches it in the flow's store).
+
+The keypair and the session are read once, here: a session refreshed or
+signed out later is a different signer, made again.
+
+**Fails with: `SigningError` — `reason: "expired"` when the session or its proof has expired, `reason: "unavailable"` when nobody is signed in or the proof could not be fetched.**
+
+### `fromWallet` (const)
+
+```ts
+declare const fromWallet: (options: {
+    readonly wallet: StandardWallet;
+    readonly account: StandardWalletAccount;
+    readonly chain: string;
+    readonly scheme?: SignatureScheme;
+}) => Effect.Effect<Signer, SigningError, never>
+```
+
+An Enoki wallet (from `registerEnokiWallets`) as a `Signer`: `Signer.wallet`
+over its Wallet Standard features, plus the session bound its
+`enoki:getSession` feature reports, so the signer carries `maxEpoch` and
+refuses after it like `Signer.zkLogin`.
+
+**Fails with: `SigningError` — everything `Signer.wallet` fails with, `reason: "unavailable"` when the wallet has no `enoki:getSession` or nobody is signed in, and `reason: "expired"` when the session has expired.**
+
+### `sponsor` (const)
+
+```ts
+declare const sponsor: (client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
+    readonly sender: SuiAddress;
+    readonly network?: "mainnet" | "testnet" | "devnet";
+    readonly jwt?: string;
+    readonly allowedAddresses?: ReadonlyArray<string>;
+    readonly allowedMoveCallTargets?: ReadonlyArray<string>;
+}) => Effect.Effect<Built, TransportError | BuildError | PolicyDenied | EnokiError, Sui>
+```
+
+Asks Enoki to sponsor a transaction, and answers its sponsored bytes as a
+`Built` that has been checked: `Tx.fromBytes` (the chain), Enoki's
+digest is the digest of its bytes, and `verifySponsored` (on `/tx`) — the sender is
+`options.sender`, the gas owner is someone else, and the transaction kind is
+**exactly** the kind that was sent.
+
+`transaction` is a recipe, built kind-only against the `Sui` in context (so
+its object inputs are resolved), or kind bytes already built. Pass `jwt` to
+let Enoki derive the sender from the session instead (Enoki's `jwt` form);
+`sender` is still what the bytes are checked against.
+
+Then: `Tx.sign(built, signer)` (or `Tx.prepare` first, to simulate the
+bytes), then `execute`.
+
+**Fails with: `EnokiError` (`refused: true`: Enoki answered 4xx), `TransportError` (Enoki could not be reached, answered 5xx or 429, or answered something unreadable), `BuildError` (the recipe did not build, or the bytes are not a transaction for this chain), `PolicyDenied` (`enoki.digest`, `sponsored.sender`, `sponsored.gasOwner`, `sponsored.kind`).**
 
 ## `@unconfirmed/sui-effect/extension`
 

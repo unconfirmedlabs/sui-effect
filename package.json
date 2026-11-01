@@ -21,6 +21,10 @@
       "types": "./dist/gate.d.ts",
       "import": "./dist/gate.js"
     },
+    "./enoki": {
+      "types": "./dist/enoki.d.ts",
+      "import": "./dist/enoki.js"
+    },
     "./extension": {
       "types": "./dist/extension.d.ts",
       "import": "./dist/extension.js"
