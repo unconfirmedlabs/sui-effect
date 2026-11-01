@@ -39,6 +39,16 @@ export const testSubmitConfig: Partial<typeof SubmitConfig.defaults> = {
 }
 
 /**
+ * What {@link layerTest} provides, under one name: `Sui`, `SuiCore` and the
+ * fake's handle, `SuiCoreFake`. A test helper that runs programs against the
+ * fake takes `Effect.Effect<A, E, TestServices>` instead of spelling the union
+ * out (an extension test adds its own service: `TestServices | Escrow`).
+ *
+ * @since 0.5.0
+ */
+export type TestServices = Sui | SuiCore | SuiCoreFake
+
+/**
  * The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test
  * can script outcomes and inspect what the fake received.
  *
@@ -63,7 +73,7 @@ export const testSubmitConfig: Partial<typeof SubmitConfig.defaults> = {
  */
 export const layerTest = (
   script: FakeScript = {}
-): Layer.Layer<Sui | SuiCore | SuiCoreFake, NetworkMismatch | TransportError> =>
+): Layer.Layer<TestServices, NetworkMismatch | TransportError> =>
   Sui.layerNoDeps.pipe(
     Layer.provideMerge(SuiCoreFake.layer(script)),
     Layer.provideMerge(SubmitConfig.layer(testSubmitConfig))

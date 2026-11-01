@@ -451,6 +451,12 @@ export interface FakeScript {
    * `failWith` here to make `Tx.build` fail with `SimulationFailed` without
    * touching the `simulate` script a later `Tx.verify` or `preflight` reads;
    * `timeoutThen` blocks the build until it is interrupted.
+   *
+   * Since 0.5.0 it also answers, in turn, an ordinary `simulateTransaction`
+   * when the {@link simulate} script is empty: a test that scripted the build's
+   * simulation alone no longer dies with `FakeUnimplemented` on the preflight
+   * simulate after it. With neither script, that simulate still dies, naming
+   * `simulate` / `SuiTest.scriptSimulate`.
    */
   readonly buildSimulate?: ReadonlyArray<FakeOutcome>
   readonly execute?: ReadonlyArray<FakeOutcome>
@@ -498,6 +504,13 @@ export interface FakeScript {
    * an epoch it does not name answers `NOT_FOUND`, the way a node that pruned
    * the epoch does. Unscripted, the client has no `ledgerService` at all, which
    * is what a JSON-RPC or GraphQL transport looks like.
+   *
+   * Scripted (`ledger: {}` is enough), the ledger service also answers
+   * `ListTransactions` with an `affectedAddress` predicate from the fake's
+   * transaction history — executed and `FakeScript.transactions` alike — which
+   * is what `Sui.streamTransactions({ affectedAddress })` reads (0.5.0). A
+   * transaction affects an address when the address sent it, a balance change
+   * names it, or an object it owned before or after changed.
    *
    * @since 0.4.0
    */
@@ -1334,7 +1347,21 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     executingPayment: ReadonlyArray<string> = [],
     derivedFromBytes = false
   ): Promise<SettledTransaction> => {
-    const outcome = next(method) ?? unimplemented(METHOD_NAMES[method])
+    // An unscripted simulate after a build whose resolver simulate *was*
+    // scripted answers the way that build simulation did: the same bytes
+    // simulate the same way, and a test that scripted `buildSimulate` alone
+    // should not die on the preflight simulate that follows. With neither
+    // script it still dies — and says which script to add, because the build
+    // before it "simulated fine" only by taking its budget from `gasBudget`.
+    const outcome = next(method) ??
+      (method === "simulate" && state.scripts.buildSimulate.length > 0 ? next("buildSimulate") : undefined) ??
+      unimplemented(
+        method === "simulate"
+          ? "simulateTransaction (script `simulate` — or `SuiTest.scriptSimulate` — for the simulate after the" +
+            " build; a build with neither `simulate` nor `buildSimulate` scripted takes its budget from" +
+            " `gasBudget` without simulating anything)"
+          : METHOD_NAMES[method]
+      )
     if (
       derivedFromBytes &&
       (outcome._tag === "succeed" || outcome._tag === "failWith") &&
@@ -2740,10 +2767,94 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     }
   }
 
+  const ownedBy = (address: string, owner: SuiClientTypes.ObjectOwner | null | undefined): boolean =>
+    owner?.$kind === "AddressOwner"
+      ? sameAddress(address, owner.AddressOwner)
+      : owner?.$kind === "ConsensusAddressOwner"
+      ? sameAddress(address, owner.ConsensusAddressOwner.owner)
+      : false
+
+  /**
+   * Whether a transaction moved `address`'s state, the way the gRPC ledger's
+   * `affectedAddress` predicate reads it: the address sent it (and so paid
+   * its gas), a balance change names it, or an object it owned before or
+   * owns after the transaction changed.
+   */
+  const affects = (address: string, transaction: LedgerTransaction): boolean => {
+    if (sameAddress(address, transaction.sender)) return true
+    // The fake's transactions always carry every include.
+    const settled = transaction.settled.transaction as SuiClientTypes.Transaction<
+      { readonly balanceChanges: true; readonly effects: true }
+    >
+    if ((settled.balanceChanges ?? []).some((change) => sameAddress(address, change.address))) return true
+    return (settled.effects?.changedObjects ?? []).some((change) =>
+      ownedBy(address, change.inputOwner) || ownedBy(address, change.outputOwner)
+    )
+  }
+
+  const cursorBytes = (position: string): Uint8Array => new TextEncoder().encode(position)
+  const cursorOf = (bytes: Uint8Array | undefined): string | null =>
+    bytes === undefined || bytes.length === 0 ? null : new TextDecoder().decode(bytes)
+
+  /**
+   * `LedgerService.ListTransactions` with an `affectedAddress` predicate, in
+   * the server-streaming shape the gRPC client returns (`{ responses }`): one
+   * frame per matching digest with its watermark cursor, then an `end` frame —
+   * `ITEM_LIMIT`, `SCAN_LIMIT` (under `FakeScript.scanLimit`) or
+   * `CHECKPOINT_BOUND` — carrying the last position examined. Any other
+   * predicate is not modelled and dies naming it.
+   */
+  const listLedgerTransactions = (input: {
+    readonly filter?: {
+      readonly terms?: ReadonlyArray<{
+        readonly literals?: ReadonlyArray<{
+          readonly predicate?: { readonly oneofKind?: string; readonly affectedAddress?: { readonly address?: string } }
+        }>
+      }>
+    }
+    readonly options?: {
+      readonly limit?: number
+      readonly ordering?: number
+      readonly after?: Uint8Array
+      readonly before?: Uint8Array
+    }
+  }) => {
+    record("ledgerService.listTransactions", input)
+    const predicate = input.filter?.terms?.[0]?.literals?.[0]?.predicate
+    const address = predicate?.oneofKind === "affectedAddress" ? predicate.affectedAddress?.address : undefined
+    if (address === undefined) {
+      return unimplemented("ledgerService.listTransactions (only an affectedAddress predicate is modelled)")
+    }
+    const options = input.options ?? {}
+    const limit = options.limit ?? pageSize
+    async function* responses() {
+      const indexed = (await ledgerTransactions()).map((transaction, position) => ({ transaction, position }))
+      const page = ledgerPage(indexed, ({ transaction }) => affects(address as string, transaction), {
+        limit,
+        after: cursorOf(options.after),
+        before: cursorOf(options.before),
+        order: options.ordering === 1 ? "descending" : "ascending"
+      })
+      for (const { transaction, position } of page.items) {
+        yield {
+          transaction: { digest: transaction.digest },
+          watermark: { cursor: cursorBytes(String(position)) }
+        }
+      }
+      yield {
+        end: { reason: !page.hasNextPage ? 3 : page.items.length >= limit ? 1 : 2 },
+        ...(page.endCursor === null ? {} : { watermark: { cursor: cursorBytes(page.endCursor) } })
+      }
+    }
+    return { responses: responses() }
+  }
+
   const ledger = script.ledger
-  // The two `LedgerService` calls `Tx.reconcile` makes, in the `UnaryCall`
-  // shape the gRPC client returns (`{ response: Promise<…> }`).
+  // The `LedgerService` calls `Tx.reconcile` makes, in the `UnaryCall` shape
+  // the gRPC client returns (`{ response: Promise<…> }`), and the
+  // `affectedAddress` listing `Sui.streamTransactions` makes.
   const ledgerService = ledger === undefined ? undefined : {
+    listTransactions: listLedgerTransactions,
     getServiceInfo: (input: unknown) => {
       record("getServiceInfo", input)
       return {

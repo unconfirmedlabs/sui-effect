@@ -554,6 +554,7 @@ The full entries follow under "API".
 
 ### `@unconfirmed/sui-effect`
 
+- `AffectedAddressFilter` — A filter on transactions by an address whose state they moved — gRPC's `AffectedAddressFilter`, which the SDK's `TransactionFilter` does not expose.
 - `Balance` — A coin balance for one coin type.
 - `BalanceChange` — A balance delta produced by a transaction.
 - `BatchItemError` — What can go wrong decoding one object of a batch read.
@@ -563,8 +564,9 @@ The full entries follow under "API".
 - `ChangedRef` — What the effects say about one object a transaction touched.
 - `CleverError` — A decoded `#[error]` constant.
 - `Coin` — A coin object.
+- `CoinAmount` — An amount of some coin in its smallest unit — MIST for SUI, the coin's own base unit for every other coin — as a plain non-negative `bigint`, encoded as the decimal string every SDK response uses.
 - `CoinMetadata` — The metadata of a coin type.
-- `CoinType` — A coin type in normalized form: the schema, plus `CoinType.normalize` for any spelling and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
+- `CoinType` — A coin type in normalized form: the schema, plus `CoinType.normalize` for any spelling, `CoinType.Strict` for user input and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
 - `CommandResult` — The return values and mutated references of one command.
 - `DecodeError` — BCS content or a schema boundary did not decode.
 - `DecodeKind` — Which of the three things that can go wrong at a decode boundary went wrong.
@@ -711,39 +713,39 @@ The full entries follow under "API".
 - `Verified` — A `Built` whose simulated effects stayed inside a declared `Intent`.
 - `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
 - `VerifyOptions` — The options both verifiers take.
-- `attach` — Attaches a signature somebody else made — a sender's wallet, a remote sponsor, an HSM — to built or already signed bytes, after checking it.
-- `build` — Builds a transaction into signable bytes.
+- `attach` — `Tx.attach`, also exported bare. Attaches a signature somebody else made — a sender's wallet, a remote sponsor, an HSM — to built or already signed bytes, after checking it.
+- `build` — `Tx.build`, also exported bare. Builds a transaction into signable bytes.
 - `chainOf` — re-exported from `@unconfirmed/sui-effect`.
 - `checkClaims` — Compares the simulated effects with the claims, exactly and in code.
-- `cosign` — Adds one more signature to already signed bytes, for a sponsored or multi-party transaction.
+- `cosign` — `Tx.cosign`, also exported bare. Adds one more signature to already signed bytes, for a sponsored or multi-party transaction.
 - `describeClaims` — The claims as sentences, for the edge between the summary and the claims: a harmless sentence must not sit in front of permissions it has no use for.
 - `describeEffects` — The simulated effects as sentences a semantic screen can read: addresses become labels, types lose their package ids, and only SUI carries a number.
-- `ephemeral` — A fresh Ed25519 credential that exists only for this process.
+- `ephemeral` — `Signer.ephemeral`, also exported bare. A fresh Ed25519 credential that exists only for this process.
 - `fold` — The recipe for one fold transaction: merge the batch's coins and deposit them into the owner's address balance with `0x2::coin::send_funds<T>`.
-- `foldCoins` — Folds the signer's coin objects into its address balance: `planFold` for `signer.address`, then one `run` of `fold` per batch, in order — SUI first, paying for its own fold, so a fresh account whose SUI is all coins needs no address balance to start.
-- `fromBytes` — Turns transaction bytes that came from somewhere else into a `Built`, reading everything the lifecycle needs out of the bytes themselves.
-- `fromConfig` — Reads a secret key from configuration and builds its signer.
-- `fromKeypair` — `fromSdkSigner` under the name the spec gave it when a keypair was the only thing it took.
-- `fromMnemonic` — A signer derived from a BIP-39 recovery phrase, **checked first**: the word count (12, 15, 18, 21 or 24), every word in the English list, and the checksum.
-- `fromSdkSigner` — Wraps any `@mysten/sui/cryptography` `Signer`.
-- `fromSecretKey` — A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag names the scheme; a contradicting `scheme` option is refused), a 32-byte hex seed (`0x` optional), or 32 raw bytes — the last two read as `options.scheme`, default `ED25519`.
-- `gaslessStablecoinTransfer` — Builds the canonical transfer shape that an eligible stablecoin can execute without SUI gas: a `Balance<T>` from the SDK's `Transaction#balance` intent, consumed by `0x2::balance::send_funds<T>`.
+- `foldCoins` — `Tx.foldCoins`, also exported bare. Folds the signer's coin objects into its address balance: `planFold` for `signer.address`, then one `run` of `fold` per batch, in order — SUI first, paying for its own fold, so a fresh account whose SUI is all coins needs no address balance to start.
+- `fromBytes` — `Tx.fromBytes`, also exported bare. Turns transaction bytes that came from somewhere else into a `Built`, reading everything the lifecycle needs out of the bytes themselves.
+- `fromConfig` — `Signer.fromConfig`, also exported bare. Reads a secret key from configuration and builds its signer.
+- `fromKeypair` — `Signer.fromKeypair`, also exported bare. `fromSdkSigner` under the name the spec gave it when a keypair was the only thing it took.
+- `fromMnemonic` — `Signer.fromMnemonic`, also exported bare. A signer derived from a BIP-39 recovery phrase, **checked first**: the word count (12, 15, 18, 21 or 24), every word in the English list, and the checksum.
+- `fromSdkSigner` — `Signer.fromSdkSigner`, also exported bare. Wraps any `@mysten/sui/cryptography` `Signer`.
+- `fromSecretKey` — `Signer.fromSecretKey`, also exported bare. A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag names the scheme; a contradicting `scheme` option is refused), a 32-byte hex seed (`0x` optional), or 32 raw bytes — the last two read as `options.scheme`, default `ED25519`.
+- `gaslessStablecoinTransfer` — `Tx.gaslessStablecoinTransfer`, also exported bare. Builds the canonical transfer shape that an eligible stablecoin can execute without SUI gas: a `Balance<T>` from the SDK's `Transaction#balance` intent, consumed by `0x2::balance::send_funds<T>`.
 - `isUnresolved` — Whether this entry is still waiting for an answer, and therefore something `Tx.reconcileAll` has work to do about.
 - `maxEpochOf` — re-exported from `@unconfirmed/sui-effect`.
 - `maxTimestampMsOf` — re-exported from `@unconfirmed/sui-effect`.
 - `planFold` — Plans the transactions that fold an owner's coin objects into its address balance.
-- `reconcile` — Finds out what happened to a transaction that was sent but never answered for.
-- `reconcileAll` — Settles every unresolved entry in the journal: the explicit startup call a long-lived application makes after building a durable `Journal`.
-- `recorded` — What the journal recorded for one digest, if anything.
-- `remote` — Builds a signer around something that signs elsewhere: a KMS, a wallet, a hardware device, another process.
-- `resubmit` — Re-sends signed bytes whose outcome is unknown — the **identical** bytes, never a rebuild — and settles them the way `submit` does.
-- `run` — Build, preflight, sign and submit, under the sender lock wherever two runs could race.
+- `reconcile` — `Tx.reconcile`, also exported bare. Finds out what happened to a transaction that was sent but never answered for.
+- `reconcileAll` — `Tx.reconcileAll`, also exported bare. Settles every unresolved entry in the journal: the explicit startup call a long-lived application makes after building a durable `Journal`.
+- `recorded` — `Tx.recorded`, also exported bare. What the journal recorded for one digest, if anything.
+- `remote` — `Signer.remote`, also exported bare. Builds a signer around something that signs elsewhere: a KMS, a wallet, a hardware device, another process.
+- `resubmit` — `Tx.resubmit`, also exported bare. Re-sends signed bytes whose outcome is unknown — the **identical** bytes, never a rebuild — and settles them the way `submit` does.
+- `run` — `Tx.run`, also exported bare. Build, preflight, sign and submit, under the sender lock wherever two runs could race.
 - `sendFunds` — Sends `amount` of a coin type into `recipient`'s **address balance**: `0x2::balance::send_funds<T>(tx.balance({ type, balance: amount }), recipient)`, the canonical transfer on an address-balance account.
-- `sign` — Signs built bytes.
-- `sponsored` — Turns a recipe into a sponsored one: the sender owns the transaction, the gas owner pays, and gas comes from the sponsor's address balance rather than from coin objects, so the two parties never have to agree on a gas coin and can sign in either order.
-- `submit` — Sends signed bytes, and does not stop caring until it knows what happened.
-- `submitVia` — Submits through **someone else** — a relay, a sponsorship service, a backend that holds the only key allowed to talk to the node — and keeps the journal and the evidence rules that `Tx.submit` would have kept.
-- `verify` — Checks built bytes against a declared intent, before anything is signed.
+- `sign` — `Tx.sign`, also exported bare. Signs built bytes.
+- `sponsored` — `Tx.sponsored`, also exported bare. Turns a recipe into a sponsored one: the sender owns the transaction, the gas owner pays, and gas comes from the sponsor's address balance rather than from coin objects, so the two parties never have to agree on a gas coin and can sign in either order.
+- `submit` — `Tx.submit`, also exported bare. Sends signed bytes, and does not stop caring until it knows what happened.
+- `submitVia` — `Tx.submitVia`, also exported bare. Submits through **someone else** — a relay, a sponsorship service, a backend that holds the only key allowed to talk to the node — and keeps the journal and the evidence rules that `Tx.submit` would have kept.
+- `verify` — `Tx.verify`, also exported bare. Checks built bytes against a declared intent, before anything is signed.
 
 ### `@unconfirmed/sui-effect/journal`
 
@@ -789,8 +791,8 @@ The full entries follow under "API".
 - `PromiseFace` — The Promise face of a service interface.
 - `SuiExtension` — The namespace the spec spells: `SuiExtension.fromService(...)`, plus the leaf marker a service uses to say "this member is a value, not a namespace" (`SuiExtension.leaf(value)`, typed `SuiExtension.Leaf<T>`).
 - `SuiExtensionOptions` — What `fromService` needs to know beyond the service key itself.
-- `fromService` — Turns an Effect service into a `SuiClientRegistration` a Promise consumer passes to `client.$extend(...)`.
-- `leaf` — Marks a value as a `Leaf`: the Promise face passes it through untouched instead of walking into it.
+- `fromService` — `SuiExtension.fromService`, also exported bare. Turns an Effect service into a `SuiClientRegistration` a Promise consumer passes to `client.$extend(...)`.
+- `leaf` — `SuiExtension.leaf`, also exported bare. Marks a value as a `Leaf`: the Promise face passes it through untouched instead of walking into it.
 
 ### `@unconfirmed/sui-effect/script`
 
@@ -823,6 +825,7 @@ The full entries follow under "API".
 - `SuiCoreFake` — The in-memory `SuiCore`.
 - `SuiCoreFakeState` — What a test can do to the fake while it runs.
 - `SuiTest` — The harness: everything an extension's tests need to drive the fake from inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
+- `TestServices` — What `layerTest` provides, under one name: `Sui`, `SuiCore` and the fake's handle, `SuiCoreFake`.
 - `fakeCoin` — A gas coin for `FakeScript.coins`, in the SDK's `SuiClientTypes.Coin` shape, with the fields a fixture rarely cares about filled in: `coinType` defaults to SUI, `version` to 1 and `digest` to a `fakeDigest`.
 - `fakeDigest` — A deterministic base58 32-byte digest, for fixtures, already branded as a `Digest` so it compares with `executed.digest` and fills any field typed `Digest` without a cast.
 - `layerExtensionTest` — An extension's own layer over `layerTest`, which is the whole wiring an extension test needs.
@@ -834,16 +837,42 @@ The full entries follow under "API".
 ## `@unconfirmed/sui-effect`
 
 
-105 exported symbols.
+107 exported symbols.
+
+### `AffectedAddressFilter` (interface)
+
+```ts
+export interface AffectedAddressFilter {
+    /** The address, in any spelling `normalizeSuiAddress` takes. */
+    readonly affectedAddress: string;
+    readonly sender?: never;
+    readonly function?: never;
+}
+```
+
+A filter on transactions by an address whose state they moved — gRPC's
+`AffectedAddressFilter`, which the SDK's `TransactionFilter` does not
+expose. It matches a transaction after which the address owns an object, one
+that mutated, transferred away, deleted or wrapped an object the address
+owned, and one that changed the address's balance through an accumulator
+event: incoming transfers included, which a `sender` filter cannot find.
+
+Served by the gRPC ledger service only. On any other transport a listing
+with it fails with a non-retryable `TransportError` whose `status` is
+`UNIMPLEMENTED`, rather than quietly answering the sender's own
+transactions.
 
 ### `Balance` (const)
 
 ```ts
 declare const Balance: Schema
-// decodes to: { readonly coinType: CoinType; readonly balance: Mist; readonly coinBalance: Mist; readonly addressBalance: Mist; }
+// decodes to: { readonly coinType: CoinType; readonly balance: bigint; readonly coinBalance: bigint; readonly addressBalance: bigint; }
 ```
 
-A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`.
+A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`. The
+amounts are `CoinAmount`s in the coin's own smallest unit — MIST only
+when `coinType` is SUI (they were branded `Mist` for every coin before
+0.5.0).
 
 ### `BalanceChange` (const)
 
@@ -1063,12 +1092,25 @@ declare const Coin: Schema
 //         readonly $kind: "Unknown";
 //     };
 //     readonly type: StructTag;
-//     readonly balance: Mist;
+//     readonly balance: bigint;
 // }
 ```
 
 A coin object. Mirrors `SuiClientTypes.Coin`: `type` is the full object type
 (`0x2::coin::Coin<T>`), `balance` the coin's value in its smallest unit.
+
+### `CoinAmount` (const)
+
+```ts
+declare const CoinAmount: Schema
+// decodes to: bigint
+```
+
+An amount of some coin in its smallest unit — MIST for SUI, the coin's own
+base unit for every other coin — as a plain non-negative `bigint`, encoded
+as the decimal string every SDK response uses. Which unit it is depends on
+the coin type beside it, so it carries no brand: `Mist` is for amounts
+that are always SUI (gas), and a SUI balance is `Mist.make(amount)` away.
 
 ### `CoinMetadata` (const)
 
@@ -1088,7 +1130,8 @@ declare const CoinType: Schema
 ```
 
 A coin type in normalized form: the schema, plus `CoinType.normalize` for any
-spelling and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
+spelling, `CoinType.Strict` for user input and `CoinType.SUI`, the
+normalized `0x2::sui::SUI`.
 
 ### `CommandResult` (const)
 
@@ -3608,11 +3651,26 @@ export interface SuiService {
      * `ExecutionFailed` — not a failure of the stream, which `getTransaction`'s
      * "a failure is a failure" rule would make it.
      *
-     * Fails with: `TransportError`.
+     * **`{ affectedAddress }` (0.5.0)** lists every transaction that moved the
+     * address's state — incoming transfers as well as its own — through the gRPC
+     * ledger service's `affectedAddress` predicate (see
+     * `AffectedAddressFilter`). Ordering, `after`/`before` and the cursors are
+     * the other filters' exactly: ledger order, oldest first unless
+     * descending, fifty digests a page, and an `endCursor` in the SDK's own
+     * encoding. Each page is one listing of digests and then one
+     * `getTransaction` per digest, so it costs a page's worth of reads; a
+     * digest the node prunes between the two is left out of the page. On a
+     * transport without the gRPC ledger service it fails with a non-retryable
+     * `TransportError` whose `status` is `UNIMPLEMENTED` — never a silent
+     * sender-only answer. A pruning node (localnet keeps a few dozen
+     * checkpoints) lists only what it still holds.
+     *
+     * Fails with: `TransportError` (`status: "UNIMPLEMENTED"` for an
+     * `affectedAddress` filter on a transport that cannot serve it).
      *
      * @since 0.4.0
      */
-    readonly streamTransactions: (filter?: TransactionFilter, opts?: ListOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
+    readonly streamTransactions: (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
     /**
      * `streamTransactions` a page at a time, each page carrying the cursor to
      * resume from (see `streamEventPages`).
@@ -3621,7 +3679,7 @@ export interface SuiService {
      *
      * @since 0.4.0
      */
-    readonly streamTransactionPages: (filter?: TransactionFilter, opts?: ListOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
+    readonly streamTransactionPages: (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
     /**
      * Every transaction matching `filter`, oldest first, without end — the
      * transaction twin of `tailEvents`, with the same polling, retry and
@@ -3636,7 +3694,7 @@ export interface SuiService {
      *
      * @since 0.4.0
      */
-    readonly tailTransactions: (filter?: TransactionFilter, opts?: TailOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
+    readonly tailTransactions: (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
     /**
      * `tailTransactions` a page at a time (see `tailEventPages`), with the
      * same caveat: a filtered tail whose completeness matters uses a single
@@ -3647,7 +3705,7 @@ export interface SuiService {
      *
      * @since 0.4.0
      */
-    readonly tailTransactionPages: (filter?: TransactionFilter, opts?: TailOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
+    readonly tailTransactionPages: (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
     /**
      * Serializes work for one sender, so two transactions from the same address
      * cannot pick the same gas coin. Adds no failures of its own.
@@ -7625,6 +7683,18 @@ export interface ReportOptions {
      * reports only those.
      */
     readonly journal?: JournalService;
+    /**
+     * How many transactions the program submitted that the network answered as
+     * applied, for `ExitCodeOptions.applied`: above zero, with nothing
+     * unresolved, a failure that would exit 2, 4 or 130 exits 5. `report` cannot
+     * count them itself — the journal it reads may hold other processes'
+     * entries — so a CLI that runs several commands keeps the count (one per
+     * `Executed`, or `ExecutionFailed`, it saw) and hands it over. Left out, it
+     * is zero.
+     *
+     * @since 0.5.0
+     */
+    readonly applied?: number;
 }
 ```
 
@@ -7683,6 +7753,33 @@ export declare class Script extends Script_base {
      * Fails with: `ConfigError`.
      */
     static readonly layerReadOnlyNoDeps: Layer.Layer<ScriptReadOnly, Config.ConfigError, Sui | SuiCore>;
+    /**
+     * The logger `Script.run` installs, as a layer for a program that owns its
+     * process: every `Effect.log` — the program's and the library's (the
+     * `SuiCore` read retries at debug, `Tx.submit`'s visibility warning, a
+     * tail's retry warnings) — rendered as logfmt on stderr, and nothing on
+     * stdout.
+     *
+     * Effect's default logger writes to `console.log`, which is **stdout**, so
+     * without this a CLI whose stdout is one JSON document (`--json`) gets a
+     * library warning in the middle of it. It replaces the loggers in force.
+     * `stderr` defaults to `process.stderr`; a writer that throws loses its line.
+     * It does not read `SUI_LOG_LEVEL` (that is `Script.run`'s); set
+     * `References.MinimumLogLevel` yourself. Never fails.
+     *
+     * @example
+     * ```ts
+     * const exit = await Effect.runPromiseExit(
+     *   command.pipe(Effect.provide(Script.layerStderrLogger()))
+     * )
+     * process.exitCode = await Script.report(exit)
+     * ```
+     *
+     * @since 0.5.0
+     */
+    static readonly layerStderrLogger: (options?: {
+        readonly stderr?: (line: string) => void;
+    }) => Layer.Layer<never>;
     /** See `exitCode`. */
     static readonly exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number;
     /** See `run`. */
@@ -7801,6 +7898,13 @@ on the same axis. `SchemaError` — what Effect's own `Config.schema` and
 because in a script it can only mean the input a person gave did not fit the
 schema, and no retry fixes that.
 
+**effect/cli's `CliError` (0.5.0)** is recognised by its marker, without an
+import: a bad command line (an unknown option or subcommand, a missing or
+invalid value, `ShowHelp` carrying parse errors) exits 2, `ShowHelp` with no
+errors — `--help` — exits 0, and a `UserError` exits as the `cause` it wraps
+would. It is read before a declared exit code, because `ShowHelp` declares
+`[Runtime.errorExitCode]` 1, which on this axis means a defect.
+
 **While a submission is outstanding** (`ExitCodeOptions.unresolved`),
 any failure that would exit 2, 4 or 130 — a declared `exitCode` included —
 exits 3, applied transactions or not: reconcile before anything else.
@@ -7853,9 +7957,17 @@ yourself rather than `process.exit`, so buffered output still flushes.
 
 It is not quite `run`'s tail. It counts **every** unresolved entry in the
 journal it is given — in a shared durable store, another process's too —
-and any one of them turns a would-be 2, 4 or 130 into 3. It has no count of
-what applied, so it never turns a failure into 5 for an applied
-transaction: that rule needs the run record only `Script.run` keeps.
+and any one of them turns a would-be 2, 4 or 130 into 3. It cannot count
+what applied, so a multi-command CLI hands that over as
+`ReportOptions.applied` (0.5.0), and then a failure after an applied
+transaction exits 5 as it does under `run`.
+
+**effect/cli (0.5.0).** A `CliError` is mapped without importing
+`effect/cli`: `ShowHelp` with no errors exits 0, `UserError` exits as its
+`cause` would, and every other `CliError` exits 2; no failure line is
+printed for one, because the CLI runner has already rendered it. Library
+log lines are the program's logger's business: provide
+`Script.layerStderrLogger` so they reach stderr, not a JSON stdout.
 
 **Never fails.**
 
@@ -7906,7 +8018,7 @@ Returns the exit code as well as passing it to `exit`, so a test can inject
 ## `@unconfirmed/sui-effect/testing`
 
 
-20 exported symbols.
+21 exported symbols.
 
 ### `CLOCK_TYPE` (const)
 
@@ -8287,6 +8399,12 @@ export interface FakeScript {
      * `failWith` here to make `Tx.build` fail with `SimulationFailed` without
      * touching the `simulate` script a later `Tx.verify` or `preflight` reads;
      * `timeoutThen` blocks the build until it is interrupted.
+     *
+     * Since 0.5.0 it also answers, in turn, an ordinary `simulateTransaction`
+     * when the `simulate` script is empty: a test that scripted the build's
+     * simulation alone no longer dies with `FakeUnimplemented` on the preflight
+     * simulate after it. With neither script, that simulate still dies, naming
+     * `simulate` / `SuiTest.scriptSimulate`.
      */
     readonly buildSimulate?: ReadonlyArray<FakeOutcome>;
     readonly execute?: ReadonlyArray<FakeOutcome>;
@@ -8334,6 +8452,13 @@ export interface FakeScript {
      * an epoch it does not name answers `NOT_FOUND`, the way a node that pruned
      * the epoch does. Unscripted, the client has no `ledgerService` at all, which
      * is what a JSON-RPC or GraphQL transport looks like.
+     *
+     * Scripted (`ledger: {}` is enough), the ledger service also answers
+     * `ListTransactions` with an `affectedAddress` predicate from the fake's
+     * transaction history — executed and `FakeScript.transactions` alike — which
+     * is what `Sui.streamTransactions({ affectedAddress })` reads (0.5.0). A
+     * transaction affects an address when the address sent it, a balance change
+     * names it, or an object it owned before or after changed.
      *
      * @since 0.4.0
      */
@@ -8531,6 +8656,17 @@ inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
 Every member requires `SuiCoreFake`, which `layerTest` and
 `layerExtensionTest` provide.
 
+### `TestServices` (type)
+
+```ts
+export type TestServices = Sui | SuiCore | SuiCoreFake;
+```
+
+What `layerTest` provides, under one name: `Sui`, `SuiCore` and the
+fake's handle, `SuiCoreFake`. A test helper that runs programs against the
+fake takes `Effect.Effect<A, E, TestServices>` instead of spelling the union
+out (an extension test adds its own service: `TestServices | Escrow`).
+
 ### `fakeCoin` (const)
 
 ```ts
@@ -8595,7 +8731,7 @@ operator service, a sibling extension's test layer).
 ### `layerTest` (const)
 
 ```ts
-declare const layerTest: (script?: FakeScript) => Layer.Layer<Sui | SuiCore | SuiCoreFake, NetworkMismatch | TransportError>
+declare const layerTest: (script?: FakeScript) => Layer.Layer<TestServices, NetworkMismatch | TransportError>
 ```
 
 The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test

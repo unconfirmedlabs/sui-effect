@@ -769,7 +769,7 @@ bytes finish.
 |---|---|
 | 0 | success |
 | 1 | a defect, or an unclassified failure |
-| 2 | configuration: `ConfigError`, `NetworkMismatch`, `SchemaError`, the mainnet gate |
+| 2 | configuration: `ConfigError`, `NetworkMismatch`, `SchemaError`, the mainnet gate, an effect/cli parse error (`--help` alone is 0; a `UserError` exits as its cause) |
 | 3 | unknown outcome: reconcile before sending anything else |
 | 4 | nothing applied: safe to retry |
 | 5 | applied on chain: `ExecutionFailed` (gas charged) or `UnexpectedEffects` (it ran; the receipt is missing) |
@@ -788,13 +788,18 @@ Ctrl-C after the execute answered must not read as "safe to retry". 1, 3 and 5
 are never rewritten. `Script.run` finds the journal wherever the program provided it, so
 this holds for a durable journal provided inside the program too.
 
-**`Script.report(exit, { stderr?, journal? })`** is those last two steps on
+**`Script.report(exit, { stderr?, journal?, applied? })`** is those last two steps on
 their own — the diagnostic lines and the unresolved entries, with the exit code
 as the answer — for a CLI that owns its own argv parsing and process. Assign it
 to `process.exitCode` rather than calling `process.exit`. It lists **every**
 unresolved entry of the journal it is given, another process's included in a
-shared store, and any one of them turns a would-be 2, 4 or 130 into 3; it has
-no count of what applied, so the "applied → 5" rule is `Script.run`'s alone.
+shared store, and any one of them turns a would-be 2, 4 or 130 into 3; it cannot
+count what applied, so a multi-command CLI passes `applied` (the transactions it
+saw execute) and gets the "applied → 5" rule too. Provide
+**`Script.layerStderrLogger()`** around the program: library log lines — the
+"did not become visible within `visibilityTimeout`" warning above all — go
+through Effect's logger, whose default writes to **stdout**, and would break a
+`--json` document. `Script.run` installs it for you.
 `Script.run` lists, and counts, only the entries its own program wrote.
 `Script.layerNoDeps`, `layerWithSigner` and `layerReadOnlyNoDeps` take the
 network from the `SuiCore` underneath, not from `SUI_NETWORK`, so they build
@@ -947,7 +952,8 @@ scripts `getTransaction: [FakeOutcome.notFound()]`. A **sponsored** submit needs
 with a gRPC `INVALID_ARGUMENT`, the way a validator does. And the build's
 simulate is the resolver's — recorded, so `SuiTest.calls("simulateTransaction")`
 sees it, and answered by `FakeScript.buildSimulate` if there is one and by the
-ordered `simulate` script otherwise; like the SDK's core resolver, it runs only
+ordered `simulate` script otherwise (and a later simulate with no `simulate`
+script answers from `buildSimulate`); like the SDK's core resolver, it runs only
 when the recipe left the budget unset, and `Tx.build` simulates explicitly
 otherwise. An execute outcome scripted with a digest other than the bytes' own
 stops the test with a defect — a node never answers with another transaction's
@@ -970,7 +976,16 @@ Executions charge gas to the balance, debit withdrawals and follow
 The fake also serves the ledger reads: `listTransactions` and `listEvents`
 page through every transaction it was scripted with or executed, filtered by
 the sender and Move calls in the bytes, and `FakeScript.scanLimit` makes pages
-come back short or empty the way a scan-limited node's do. `FakeScript.names`
+come back short or empty the way a scan-limited node's do. With a scripted
+`FakeScript.ledger` (`{}` is enough) it also answers the gRPC ledger's
+`affectedAddress` listing behind `sui.streamTransactions({ affectedAddress })`,
+which lists incoming transfers as well as an address's own transactions; without
+one the fake is a transport that cannot, and the stream fails with
+`TransportError { status: "UNIMPLEMENTED" }`, as it would on JSON-RPC or GraphQL.
+`TestServices` names what `layerTest` provides. To share one memory
+`KeyValueStore` between two journal layers, build it once —
+`Effect.provide(KeyValueStore.KeyValueStore, KeyValueStore.layerMemory)` — and
+give both `Layer.succeed(KeyValueStore.KeyValueStore, store)`. `FakeScript.names`
 answers the name-service reads, and `FakeScript.ledger` serves the pruning
 history reconcile asks a gRPC node for.
 

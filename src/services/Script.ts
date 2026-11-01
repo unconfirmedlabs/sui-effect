@@ -271,6 +271,34 @@ export class Script extends Context.Service<Script, ScriptService>()("@unconfirm
     })
   )
 
+  /**
+   * The logger `Script.run` installs, as a layer for a program that owns its
+   * process: every `Effect.log` — the program's and the library's (the
+   * `SuiCore` read retries at debug, `Tx.submit`'s visibility warning, a
+   * tail's retry warnings) — rendered as logfmt on stderr, and nothing on
+   * stdout.
+   *
+   * Effect's default logger writes to `console.log`, which is **stdout**, so
+   * without this a CLI whose stdout is one JSON document (`--json`) gets a
+   * library warning in the middle of it. It replaces the loggers in force.
+   * `stderr` defaults to `process.stderr`; a writer that throws loses its line.
+   * It does not read `SUI_LOG_LEVEL` (that is `Script.run`'s); set
+   * `References.MinimumLogLevel` yourself. Never fails.
+   *
+   * @example
+   * ```ts
+   * const exit = await Effect.runPromiseExit(
+   *   command.pipe(Effect.provide(Script.layerStderrLogger()))
+   * )
+   * process.exitCode = await Script.report(exit)
+   * ```
+   *
+   * @since 0.5.0
+   */
+  static readonly layerStderrLogger = (
+    options?: { readonly stderr?: (line: string) => void }
+  ): Layer.Layer<never> => Logger.layer([stderrLogger(safeWriter(options?.stderr))])
+
   /** See {@link exitCode}. */
   static readonly exitCode = <A, E>(
     exit: Exit.Exit<A, E>,
@@ -309,6 +337,18 @@ export interface ReportOptions {
    * reports only those.
    */
   readonly journal?: JournalService
+  /**
+   * How many transactions the program submitted that the network answered as
+   * applied, for {@link ExitCodeOptions.applied}: above zero, with nothing
+   * unresolved, a failure that would exit 2, 4 or 130 exits 5. `report` cannot
+   * count them itself — the journal it reads may hold other processes'
+   * entries — so a CLI that runs several commands keeps the count (one per
+   * `Executed`, or `ExecutionFailed`, it saw) and hands it over. Left out, it
+   * is zero.
+   *
+   * @since 0.5.0
+   */
+  readonly applied?: number
 }
 
 /**
@@ -326,16 +366,24 @@ export interface ReportOptions {
  *
  * It is not quite `run`'s tail. It counts **every** unresolved entry in the
  * journal it is given — in a shared durable store, another process's too —
- * and any one of them turns a would-be 2, 4 or 130 into 3. It has no count of
- * what applied, so it never turns a failure into 5 for an applied
- * transaction: that rule needs the run record only `Script.run` keeps.
+ * and any one of them turns a would-be 2, 4 or 130 into 3. It cannot count
+ * what applied, so a multi-command CLI hands that over as
+ * {@link ReportOptions.applied} (0.5.0), and then a failure after an applied
+ * transaction exits 5 as it does under `run`.
+ *
+ * **effect/cli (0.5.0).** A `CliError` is mapped without importing
+ * `effect/cli`: `ShowHelp` with no errors exits 0, `UserError` exits as its
+ * `cause` would, and every other `CliError` exits 2; no failure line is
+ * printed for one, because the CLI runner has already rendered it. Library
+ * log lines are the program's logger's business: provide
+ * {@link Script.layerStderrLogger} so they reach stderr, not a JSON stdout.
  *
  * Never fails.
  *
  * @example
  * ```ts
  * const exit = await runtime.runPromiseExit(command())
- * process.exitCode = await Script.report(exit, { journal })
+ * process.exitCode = await Script.report(exit, { journal, applied })
  * ```
  *
  * @since 0.1.2
@@ -351,9 +399,15 @@ export const report = async <A, E>(
   // ran too late, an extension error raised past `Tx.submit` — leaves the
   // same record on the wire, and the operator needs the same bytes.
   const unresolved = await readUnresolved(options?.journal)
-  writeFailure(exit, write, new Set(unresolved.map((entry) => entry.digest)))
+  // effect/cli's runner renders its own errors (help, the parse error, a
+  // handler's `UserError`) before the `Exit` reaches here; a second line would
+  // only repeat it.
+  const failure = Cause.findErrorOption(exit.cause)
+  if (failure._tag === "None" || !isCliError(failure.value) || Cause.hasDies(exit.cause)) {
+    writeFailure(exit, write, new Set(unresolved.map((entry) => entry.digest)))
+  }
   for (const line of unresolvedLines(unresolved)) write(line)
-  return exitCode(exit, { unresolved: unresolved.length })
+  return exitCode(exit, { unresolved: unresolved.length, applied: options?.applied ?? 0 })
 }
 
 /**
@@ -502,6 +556,13 @@ export interface ExitCodeOptions {
  * because in a script it can only mean the input a person gave did not fit the
  * schema, and no retry fixes that.
  *
+ * **effect/cli's `CliError` (0.5.0)** is recognised by its marker, without an
+ * import: a bad command line (an unknown option or subcommand, a missing or
+ * invalid value, `ShowHelp` carrying parse errors) exits 2, `ShowHelp` with no
+ * errors — `--help` — exits 0, and a `UserError` exits as the `cause` it wraps
+ * would. It is read before a declared exit code, because `ShowHelp` declares
+ * `[Runtime.errorExitCode]` 1, which on this axis means a defect.
+ *
  * **While a submission is outstanding** ({@link ExitCodeOptions.unresolved}),
  * any failure that would exit 2, 4 or 130 — a declared `exitCode` included —
  * exits 3, applied transactions or not: reconcile before anything else.
@@ -556,6 +617,10 @@ const rawExitCode = <E>(cause: Cause.Cause<E>, unresolved: number): number => {
  */
 const codeOfError = (error: unknown, unresolved: number): number => {
   if (isConfigError(error)) return EXIT.configuration
+  // Before the declared code: effect/cli's `ShowHelp` declares
+  // `[Runtime.errorExitCode]` 1 for a parse failure shown with help, and 1 is
+  // "defect" on this axis.
+  if (isCliError(error)) return codeOfCliError(error, unresolved)
   // A declared exit code is the most specific thing an error can say about
   // itself: the author chose the number.
   const declared = declaredExitCode(error)
@@ -586,6 +651,35 @@ const codeOfError = (error: unknown, unresolved: number): number => {
     return codeOfOutcome(SuiErrorHelpers.outcome(error))
   }
   return EXIT.defect
+}
+
+/**
+ * effect/cli's error marker. Read structurally, by the string key every
+ * `CliError` class carries (`"~effect/cli/CliError"`, what
+ * `CliError.isCliError` checks), so this module never imports `effect/cli`.
+ */
+const CLI_ERROR = "~effect/cli/CliError"
+
+const isCliError = (error: unknown): error is { readonly _tag: string } =>
+  Predicate.hasProperty(error, CLI_ERROR) && hasTag(error)
+
+/**
+ * The exit code of an effect/cli failure: `ShowHelp` with no errors is a help
+ * request that was answered (0); `UserError` is a command handler's own
+ * failure, wrapped, so its `cause` decides; every other `CliError` — an
+ * unknown option or subcommand, a missing or invalid value, `ShowHelp` with
+ * parse errors — is the command line not fitting the program, which no retry
+ * fixes (2).
+ */
+const codeOfCliError = (error: { readonly _tag: string }, unresolved: number): number => {
+  if (error._tag === "ShowHelp") {
+    const errors = Predicate.hasProperty(error, "errors") ? error.errors : undefined
+    return Array.isArray(errors) && errors.length > 0 ? EXIT.configuration : EXIT.success
+  }
+  if (error._tag === "UserError" && Predicate.hasProperty(error, "cause")) {
+    return codeOfError(error.cause, unresolved)
+  }
+  return EXIT.configuration
 }
 
 const codeOfOutcome = (outcome: string): number => {
@@ -786,7 +880,7 @@ export const run = async <A, E>(
   const fiber = Effect.runFork(
     effect.pipe(
       Effect.provide(
-        Layer.mergeAll(options?.layer ?? Script.layer, Logger.layer([stderrLogger(write)]), logLevelLayer)
+        Layer.mergeAll(options?.layer ?? Script.layer, Script.layerStderrLogger({ stderr: write }), logLevelLayer)
       ),
       Effect.provideService(RunRecord, record)
     )
