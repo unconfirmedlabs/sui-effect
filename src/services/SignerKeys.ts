@@ -16,7 +16,9 @@
  * caller that mutates it changes the key. `Ed25519Keypair` copies. Here every
  * keypair is built over a buffer this module allocated and nobody else holds,
  * and every intermediate this module owns (decoded Bech32 bytes, the BIP-39
- * seed, the HD nodes) is zeroed once the keypair exists.
+ * seed, the root and leaf HD nodes) is zeroed once the keypair exists. The
+ * intermediate nodes `@scure/bip32` builds along the path never reach this
+ * module and are left to the collector.
  *
  * Nothing here calls `getSecretKey()`: it returns an immutable string that can
  * never be wiped.
@@ -364,7 +366,8 @@ export const generateMnemonic = (
 
 /**
  * Derives the held key of `scheme` on `path` from a **validated, normalized**
- * phrase. The 64-byte seed and the HD nodes are zeroed before this returns.
+ * phrase. The 64-byte seed and the root and leaf HD nodes are zeroed before
+ * this returns; `@scure/bip32`'s intermediate nodes are not reachable here.
  */
 export const deriveHeldKey = (
   normalized: string,

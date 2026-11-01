@@ -22,12 +22,14 @@
  *   figure for PBKDF2-SHA256), 16-byte random salt, 512 bits out. The first
  *   256 bits are the AES key (imported non-extractable); the second 256 are
  *   hashed into `check`, a key-check value that tells a wrong password
- *   (`wrongPassword`) from a record that was altered (`corrupt`) — at the same
- *   brute-force cost as trying the cipher, since both need the full KDF.
+ *   (`wrongPassword`) from a record whose ciphertext or bound metadata was
+ *   altered (`corrupt`). The two halves are independent PBKDF2 blocks, so a
+ *   guess costs one block (`iterations` HMACs) and an unlock two: the
+ *   security is the iteration count, the unlock pays double.
  * - **Cipher**: AES-256-GCM, 12-byte random IV per seal, 128-bit tag.
  * - **AAD**: `sui-effect/keystore/v1`, the address, the scheme, the source
  *   and the path, newline-separated. A record copied onto another address, or
- *   whose metadata was edited, does not open.
+ *   whose bound metadata was edited, does not open (`corrupt`).
  * - **Plaintext**: the 32-byte secret key, followed for a mnemonic account by
  *   the normalized phrase in UTF-8. Unlocking reads only the 32 bytes, so the
  *   phrase never becomes a string unless `exportMnemonic` is asked for it.
@@ -105,8 +107,11 @@ const AAD_DOMAIN = "sui-effect/keystore/v1"
  * One sealed account as stored, version 1. Every byte field is standard
  * base64; `createdAt` is epoch milliseconds from the Effect `Clock`.
  *
- * Only `label` is outside the AAD, so it is the one field that may be edited
- * in place; every other edit makes the record `corrupt`.
+ * The AAD binds `address`, `scheme`, `source` and `path` (an absent `path`
+ * and `path: ""` are the same AAD); an edit to one of them, to the `iv` or to
+ * the ciphertext is `corrupt`. `label` and `createdAt` are outside it and may
+ * be edited in place. An edited `salt`, `iterations` or `check` derives a
+ * check value that does not match, so it reads as `wrongPassword`.
  *
  * @since 0.5.0
  */
