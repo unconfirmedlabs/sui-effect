@@ -127,7 +127,10 @@ const baseScript = {
   chainId: CHAIN_ID,
   clockTimestampMs: CLOCK_MS,
   objects: [escrow],
-  coins: [coinOf("c01", owner), coinOf("c02", sponsorOwner)]
+  coins: [coinOf("c01", owner), coinOf("c02", sponsorOwner)],
+  // Gas for the sponsored paths comes from an address balance, which
+  // `Tx.build` checks covers the budget before anything is signed.
+  balances: [{ coinType: "0x2::sui::SUI", balance: "1000000000", coinBalance: "0", addressBalance: "1000000000" }]
 }
 
 const claim = (tx: Transaction) => {
@@ -573,19 +576,14 @@ describe("SuiError.describe accepts a foreign error", () => {
 })
 
 describe("Sui.getObjectsStrict (item 1)", () => {
-  test("the new name and the deprecated one are the same function", async () => {
-    const [strict, legacy] = await run(
+  test("reads every id or fails; the 0.1.x alias getObjectsOrFail is gone (0.4.0)", async () => {
+    const strict = await run(
       Effect.gen(function*() {
         const sui = yield* Sui
-        return [
-          yield* sui.getObjectsStrict([ObjectId.make(ESCROW_ID)]),
-          yield* sui.getObjectsOrFail([ObjectId.make(ESCROW_ID)])
-        ] as const
+        return yield* sui.getObjectsStrict([ObjectId.make(ESCROW_ID)])
       })
     )
     expect(strict).toHaveLength(1)
-    expect(legacy).toHaveLength(1)
-    expect(strict[0]?.id).toBe(legacy[0]!.id)
   })
 })
 

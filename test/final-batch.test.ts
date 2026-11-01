@@ -67,36 +67,36 @@ const claim = (tx: Transaction) => {
 
 // ---------------------------------------------------------------------------
 
-describe("A1. the effect peer is the stable 4.0.x line, and everything says so", () => {
+describe("A1. the effect peer is the stable 4.1.x line, and everything says so", () => {
   const manifest = JSON.parse(readFileSync("package.json", "utf8"))
   const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
   const readme = readFileSync("README.md", "utf8")
 
-  test("the peer dependency admits stable 4.0.x and no release candidate", () => {
+  test("the peer dependency admits stable 4.1.x and no release candidate", () => {
     // rc.113 renamed `Config.nonEmptyString`/`string`/`redacted`, which this
     // package calls at four sites, and rc.118 moved `effect/unstable/*`, so a
     // range that admitted a release candidate admitted a version where the
     // package neither typechecks nor loads.
-    expect(manifest.peerDependencies.effect).toBe(">=4.0.3 <4.1")
-    expect(manifest.devDependencies.effect).toBe("4.0.3")
-    expect(manifest.devDependencies["@effect/platform-bun"]).toBe("4.0.3")
+    expect(manifest.peerDependencies.effect).toBe(">=4.1.1 <4.2")
+    expect(manifest.devDependencies.effect).toBe("4.1.1")
+    expect(manifest.devDependencies["@effect/platform-bun"]).toBe("4.1.1")
   })
 
   test("the CI matrix proves the version the peer range is developed against", () => {
     const matrix = /effect: \[([^\]]*)\]/.exec(workflow)?.[1] ?? ""
-    expect(matrix).toContain("4.0.3")
+    expect(matrix).toContain("4.1.1")
     expect(matrix).not.toContain("rc.")
   })
 
   test("the README version table agrees", () => {
-    expect(readme).toContain("| `effect` | `>=4.0.3 <4.1` |")
+    expect(readme).toContain("| `effect` | `>=4.1.1 <4.2` |")
     expect(readme).not.toContain("4.0.0-rc.112`, in CI")
   })
 
   test("the template admits the same range", () => {
     const template = JSON.parse(readFileSync("examples/extension-template/package.json", "utf8"))
-    expect(template.peerDependencies.effect).toBe(">=4.0.3 <4.1")
-    expect(template.devDependencies.effect).toBe("4.0.3")
+    expect(template.peerDependencies.effect).toBe(">=4.1.1 <4.2")
+    expect(template.devDependencies.effect).toBe("4.1.1")
   })
 })
 
@@ -126,6 +126,14 @@ describe("A2. every CI job can pass as written", () => {
     expect(job).toContain('TARBALL="$(ls "$GITHUB_WORKSPACE"/unconfirmed-sui-effect-*.tgz | head -n 1)"')
     // Not `bunx tsc`, whose version is whatever the registry serves that day.
     expect(job).toContain('"$GITHUB_WORKSPACE/node_modules/.bin/tsc"')
+  })
+
+  test("the effect matrix installs effect and @effect/platform-bun as one pair, with no fallback", () => {
+    // `… || bun add -d effect@X` used to keep platform-bun at the lockfile's
+    // version beside another effect when the pair did not resolve.
+    const install = /bun add -d effect@[^\n]*/.exec(jobNamed("effect-matrix"))?.[0] ?? ""
+    expect(install).toContain("@effect/platform-bun@${{ matrix.effect }}")
+    expect(install).not.toContain("||")
   })
 
   test("the LLMS generator never kills the test run", () => {
@@ -541,7 +549,7 @@ describe("C. the minor findings", () => {
     // `0x2` and its padded spelling are one address; comparing them as written
     // took two locks on one account.
     const source = readFileSync("src/services/Tx.ts", "utf8")
-    expect(source).toContain("normalizeSuiAddress(opts.gasOwner) === normalizeSuiAddress(sender)")
+    expect(source).toContain("normalizeSuiAddress(intended.gasOwner) !== normalizeSuiAddress(sender)")
   })
 
   test("awaitVisible swallows failures, never defects", async () => {

@@ -131,8 +131,10 @@ export class EscrowUnsupportedNetwork extends Schema.TaggedError<EscrowUnsupport
 the instance, encoded by `SuiError.toJson` with no patch-back, decodable again,
 and visible to `Schema.is`. `SuiError.outcome` and `Script.exitCode` read it
 exactly as they read the class field, so the two forms are interchangeable at
-every call site and **the class-field form keeps working**; use `Schema.tag` for
-errors you are writing now.
+every call site. **Pick one per package and keep it.** The template uses the
+class field, because the converted packages it is copied into already do;
+`Schema.tag` is the better choice for a new package whose errors are logged as
+JSON and decoded back. Neither is deprecated.
 
 **Tag strings are namespaced by whoever defined them, and sui-effect's are
 not.** @unconfirmed/sui-effect's own tags are bare — `TransportError`,
@@ -341,7 +343,8 @@ when you know the type the bytes came from and the tag check runs here too:
 
 `expectedType` on `SuiSchema.bcs` is **optional**, and there are two cases that
 have no tag to compare. A Move **return value**: `sui.view(recipe,
-bcs.Address())` takes a bare `@mysten/bcs` layout, so nothing has to invent a
+bcs.Address)` takes a bare `@mysten/bcs` layout (`bcs.Address` is a value, not a
+function), so nothing has to invent a
 type for a codec that will never meet an object. And an **event payload** whose
 Move type contains a package id the decoder does not know — an event decoder is
 usually written once and used against whatever package the deployment
@@ -379,6 +382,29 @@ validated. Anything that arrived from a node, a user or an upstream package goes
 through `Schema.decodeUnknownEffect(ObjectId)` and becomes a typed
 `DecodeError`.
 
+**A value a human typed goes through `.Strict`.** The plain `SuiAddress` and
+`ObjectId` decoders pad — `"2"` decodes to `0x…02`, and a 60-digit paste that
+lost four characters is a different, valid address. Since 0.4.0 they refuse
+`""`, a bare `"0x"` and non-hex, but they still pad, which is right for a node
+and a config file and wrong for a recipient field.
+`Schema.decodeUnknownEffect(SuiAddress.Strict)` (and `ObjectId.Strict`) takes
+exactly 64 hex digits, `0x` optional, and brands the same type:
+
+<!-- inline -->
+
+```ts
+const recipient = yield* Schema.decodeUnknownEffect(SuiAddress.Strict)(input)
+```
+
+So the four ways to get an id are: `.make` for the padded literal, `.normalize`
+for a shorthand literal (`"0x6"`), the plain decoder for a value from a node or
+a config file, and `.Strict` for a value a human typed. Move types have the
+same pair: `CoinType.normalize` / `StructTag.normalize` pad the address inside
+a tag, and `CoinType.SUI` is the padded SUI coin type. The `Sui` reads that take
+a type (`getBalance`, `streamCoins`, `getCoinMetadataOption`,
+`streamOwnedObjects({ type })`) and `Executed.balanceChange` accept a plain
+string and normalize it themselves, so none of them needs a brand.
+
 When the error you would build *needs a field you do not have* — a `DecodeError`
 wants an `objectId` and you are decoding an event payload with no object — that
 is the signal to declare your own error, or to return an `Option`, rather than
@@ -406,6 +432,13 @@ const shares = sui.streamDynamicFields(parentId).pipe(
 )
 ```
 
+To read **one** field, build its key with `SuiSchema.name` — from a codec,
+`SuiSchema.name(Key, key)`, or from a layout and the Move type,
+`SuiSchema.name(bcs.u64(), "u64", 7)` — so the key's type string and its bytes
+come from one description, and pass a `schema` to
+`sui.getDynamicFieldOption(parent, name, { schema })`, which checks the value's
+type and decodes it (`Option<DecodedDynamicField<S>>`).
+
 Do **not** reach for the SDK's `normalizeStructTag` here. A dynamic-field key is
 legally a primitive — `u64`, `bool`, `address`, `vector<u8>` — and
 `normalizeStructTag` throws on every one of them, so the obvious filter dies as
@@ -419,8 +452,11 @@ for it.
 
 Absence is not always an error. `sui.getObjectOption(id, { schema })` is `None`
 for a missing or deleted object, and an extension whose domain says "there may
-be no profile yet" is right to return `Option` (or `null`, at a Promise
-boundary) rather than inventing a `NotFound` error. Reserve an error for the
+be no profile yet" is right to return `Option` rather than inventing a
+`NotFound` error. Return `Option` from the Effect member and nothing else: the
+Promise face maps `Effect<Option<A>>` to `Promise<A | undefined>` itself
+(`FaceValue`, since 0.4.0), so a Promise consumer gets `undefined` and an Effect
+consumer gets `Option` from the one member. Reserve an error for the
 case where the caller asked for something that must exist.
 
 `sui.getObjects(ids, opts)` returns a per-item `Result`, because one missing id
@@ -431,7 +467,7 @@ out of fifty is not a failed read. Two idioms, and you should pick deliberately:
   `Result.getOrElse(result, () => fallback)` per item, or a `Map` keyed by id so
   a caller can ask about one;
 - **hard** — every id must be there: `sui.getObjectsStrict(ids, opts)` (named
-  `getObjectsOrFail` before 0.1.2, and still reachable under that name), which
+  `getObjectsOrFail` before 0.1.2; that alias was removed in 0.4.0), which
   fails with the first item's error (`ObjectNotFound`, `ObjectDeleted`,
   `ObjectUnavailable` or `DecodeError`) and otherwise hands back the objects in
   the order of the ids.
@@ -522,6 +558,35 @@ that set its own gas owner (anything built with `Tx.sponsored`) is caught too.
 An extension whose two parties cannot both sign in one process — the sponsor is
 a remote service, the sender is a wallet — uses the explicit lifecycle instead:
 `Tx.build`, `Tx.sign`, hand the bytes over, `Tx.cosign`, `Tx.submit`.
+
+**Two ways to pay, and they lock differently.** `Tx.sponsored({ sender,
+gasOwner })` leaves the gas payment empty, which means *the gas owner's SUI
+address balance pays*: no coin is selected, so `Tx.run` never takes the
+sponsor's lock and one sponsor can pay for many senders at once; with no owned
+input the bytes pin nothing, so the sender's lock is held for the build alone.
+That balance must cover the budget plus what the bytes withdraw from it —
+localnet faucet SUI arrives as coins, and a sponsor folds them into its address
+balance with `Tx.foldCoins({ signer: sponsor })` — and `Tx.build` refuses with
+`BuildError`, before anything is signed, when it does not. A recipe fragment
+that may run under `Tx.sponsored` never uses `tx.gas`: with an empty payment the
+gas coin is empty, the simulate passes (the node mocks one) and execution fails
+charging gas, so `Tx.build` refuses such bytes with `BuildError`. Draw funds
+with `tx.coin({ balance, useGasCoin: false })` or `Tx.sendFunds({ ...,
+useGasCoin: false })`, never `tx.splitCoins(tx.gas, ...)`. The alternative is coin-paid sponsorship: `Tx.run(recipe, { signer,
+gasOwner, sponsor })` **without** `Tx.sponsored` selects the sponsor's coins,
+and then the sponsor's lock is held too, in ascending address order, because
+two runs could pick the same coin. Either way the gas owner is read from the
+recipe before any lock is taken, so a recipe that sets it itself needs no
+`opts.gasOwner`.
+
+**A stateless sponsor rebuilds nothing.** A sponsor service that receives the
+sender's bytes and signature over HTTP gets a `Built` back with
+`Tx.fromBytes(bytes)` (expiration and chain read off the bytes; other-chain
+bytes refused), adds the sender's signature with `Tx.attach(built, signature)`,
+which verifies it and requires the signer to be the sender or the gas owner,
+then `Tx.cosign(signed, sponsor)` and `Tx.submit`. `Built.gasOwner` and
+`Signed.gasOwner` are read from the bytes, present only when the gas owner is
+not the sender.
 
 ### A signer double, for tests
 
@@ -614,8 +679,8 @@ for the malformed case; so should you.
 Two things not to promise in the docs you write around it. `Config.option` turns
 an **empty** variable into "unset", so `FOO=""` takes the default rather than
 failing — do not write "an empty value is a `ConfigError`" above a
-`Config.option`. And `Effect.withConfigProvider` does not exist in Effect v4
-(4.0.3): a test provides the provider like anything else, with
+`Config.option`. And `Effect.withConfigProvider` does not exist in Effect v4: a
+test provides the provider like anything else, with
 `ConfigProvider.layer(ConfigProvider.fromEnvRecord({ … }))` or
 `Effect.provideService(effect, ConfigProvider.ConfigProvider, provider)`.
 
@@ -671,13 +736,47 @@ different extensions on the same client. After that:
 
 - an `Effect` member is a zero-argument method returning a `Promise`;
 - a function returning an `Effect` keeps its arguments and returns a `Promise`;
+- an `Effect<Option<A>>` resolves to `A | undefined` (`FaceValue<A>`), so a
+  Promise consumer never sees an `Option`; a `Stream`'s items are passed as
+  they are;
 - a `Stream` is an `AsyncIterable`, usable in `for await`;
 - a nested namespace is mapped recursively, **including one typed as an
   `interface`** — the recursion is by type, not by how the member was declared;
 - a plain value passes through;
 - a rejection is **the same tagged error instance**, so a Promise consumer can
   still switch on `_tag` and read `outcome`;
-- `dispose()` releases everything the layer acquired.
+- `$dispose()` releases everything the layer acquired, and `$reconcileAll()`
+  runs `Tx.reconcileAll()` over the registration's journal.
+
+**Calling it from plain TypeScript.** A member that takes a `Signer` or a
+branded id takes the same values on the face: a `Signer` from
+`@unconfirmed/sui-effect/tx`, an `ObjectId` from `.normalize` (a literal) or
+`Schema.decodeUnknownSync(ObjectId.Strict)` (a value a user typed). A bare
+string does not typecheck, on purpose. `SuiError.describe` and `outcome` take
+`unknown`, so a `catch` needs no cast:
+
+<!-- inline -->
+
+```ts
+import { ObjectId, SuiError } from "@unconfirmed/sui-effect"
+import { Signer } from "@unconfirmed/sui-effect/tx"
+
+const signer = Signer.fromKeypair(Ed25519Keypair.fromSecretKey(secretKey))
+const client = new SuiGrpcClient({ network: "testnet", baseUrl }).$extend(escrow({}))
+const id = ObjectId.normalize("0xe5c0")
+const escrow = await client.escrow.get(id)
+await client.escrow.claimFor(id, { signer }).catch((e: unknown) => {
+  console.error(SuiError.describe(e), SuiError.outcome(e))
+})
+```
+
+**A Promise consumer sets the lifecycle on the registration.** It has no
+`SubmitConfig.with` and no layer to provide a journal through, so
+`SuiExtensionOptions` carries both: `submit` (the same overrides as
+`SubmitConfig.with` — `maxGasBudget`, `executeTimeout: "10 seconds"`, …) and
+`journal` (a durable one from `@unconfirmed/sui-effect/journal`, for a consumer
+that must survive a restart). `$reconcileAll()` settles what that journal holds
+at startup. Thread both through your own registration options.
 
 ### Synchronous members, `$ready` and `warm`
 
@@ -695,9 +794,12 @@ so `await client.status()` and `for await (const x of client.owned.stream(a))`
 are each right before anything has been awaited.
 
 So a synchronous member used before the runtime exists fails with
-`ExtensionNotReady`, naming itself — a value read as a string throws, a
-synchronous call rejects — instead of quietly handing back a `Promise` where the
-type says `Recipe`. (That is the bug worth naming: the old behaviour worked on
+`ExtensionNotReady`, naming itself, instead of quietly handing back a `Promise`
+where the type says `Recipe`: a cold recipe builder's result is callable, and
+applying it (`recipe(tx)`) throws `ExtensionNotReady` naming the member; a cold
+plain value throws on the names only a value has (`.length`, `.startsWith`,
+`toString`, `valueOf`, `toJSON`, …), on spread and on string conversion, and
+prints as `<ExtensionNotReady ext.member>`. (That is the bug worth naming: the old behaviour worked on
 the *second* call, once the member had become real, so it survived review and
 broke in production.) Two cures, both yours to choose:
 
@@ -771,13 +873,14 @@ paragraph. The template has a test for the warm face on a network with no
 built-in chain id; a conversion should have one too.
 
 **What a cold call actually is.** The value a member call returns before the
-runtime exists is a real `Promise` subclass that also implements
-`Symbol.asyncIterator`, because nothing yet knows whether the member was an
-`Effect` (a Promise) or a `Stream` (an `AsyncIterable`). So `instanceof Promise`
-holds, `for await` works, and in `bun:test`
-`await expect(client.ext.thing()).rejects.toBeInstanceOf(ExtensionNotReady)`
-does what it looks like. (In 0.1.0 it was a bare thenable and `.rejects` did not
-recognise it; `await ... .catch()` was the workaround and is no longer needed.)
+runtime exists is a callable `Proxy` whose prototype is a `Promise` subclass
+that also implements `Symbol.asyncIterator`, because nothing yet knows whether
+the member was an `Effect` (a Promise), a `Stream` (an `AsyncIterable`) or a
+recipe builder (a function). So `instanceof Promise` holds, `await` and `then`
+work, `for await` works, and applying it throws `ExtensionNotReady`. `typeof`
+is `"function"`, and `bun:test`'s `expect(...).rejects` wants a native
+Promise, so a test of a cold call writes
+`await expect(Promise.resolve(client.ext.thing())).rejects.toBeInstanceOf(ExtensionNotReady)`.
 
 Its rejection is also **pre-handled**: a cold call nobody awaits —
 `client.ext.doThing()` written as a statement — rejects with
@@ -852,26 +955,31 @@ and the template has one to copy:
 property of the extended client's type — no cast, and no `| undefined` under
 `noUncheckedIndexedAccess`. `options.sui` pins the chain identifier the node
 must report, which is how an extension whose deployment names a custom network's
-`chainIdentifier` refuses to run against another chain. And `$dispose()` (still
-available as `dispose()`) is not final: it releases what the layer acquired and
+`chainIdentifier` refuses to run against another chain. And `$dispose()` is not
+final: it releases what the layer acquired and
 forgets the runtime, and the next call builds a fresh one, so dispose when the
 consumer is done rather than between calls. Registering the same extension
 twice, or on two clients, still gives two independent runtimes and two layer
 builds — two copies of whatever *your* layer holds.
 
-**The base is shared per client per chain id, and it matters more than it
-sounds.** `Sui` owns the sender lock: one semaphore per address, which is what
-stops two `Tx.run`s from selecting the same gas coin. When each registration
-built its own `Sui`, two extensions on one client had two lock maps and could do
-exactly that, and "register each extension once" did not help.
+**The sender lock is process-wide; the base is shared per client per chain
+id.** The sender lock — one semaphore per address — is what stops two
+`Tx.run`s from selecting the same gas coin. Under the default
+`SubmitConfig.lockSender: "whenPinned"` it covers every build, and the
+submission only when the bytes pin an owned input or a gas coin; gas from the
+address balance (the default) pins none. Every Promise-face registration
+takes **the same** lock per address, on every client and whatever chain id it
+pinned, so a `warm` and a lazy registration, or two clients, cannot equivocate
+one coin. (Before 0.4.0 the lock map belonged to each shared base, and a warm
+`{ chainId }` registration beside a lazy `{}` one on the same client sent
+concurrent transactions over one gas coin.)
 
 Every registration on one client whose **effective chain id** is the same —
 `warm.chainId`, else `sui.chainId`, else the built-in entry for the network —
-shares one `Sui`, one transport and one lock map. The key is the chain, not the
+shares one `Sui` and one transport. The key is the chain, not the
 registration's style, so a `warm` registration and a lazy one on the same chain
-do share; keying them apart is how the template's own pair used to end up with
-two lock maps. A registration that pins a *different* chain id is asking for a
-different `Sui` and gets one, on purpose.
+do share. A registration that pins a *different* chain id is asking for a
+different `Sui` and gets one, on purpose — but not a different lock.
 
 Because a `warm` registration has to build synchronously, the shared base for a
 known chain id is the **pinned** one, and a lazy registration joining it
@@ -880,7 +988,7 @@ however many lazy registrations join, so nothing is lost and nothing is
 duplicated.
 
 So: **register every extension on a client the same way and with the same chain
-id**, or accept two of everything. It is reference counted: the base is built by
+id**, or accept two transports and two chain-id reads. It is reference counted: the base is built by
 the first registration that needs it and released when the **last** one is
 disposed, so `$dispose()` on one extension never tears the transport out from
 under another.
@@ -1006,11 +1114,16 @@ that sorts out the two failures:
 import { SuiGraphQL } from "@unconfirmed/sui-effect"
 
 const chainId = SuiGraphQL.query(
-  (client) => client.query({ query: "{ chainIdentifier }", variables: {} }),
+  (client, signal) => client.query({ query: "{ chainIdentifier }", variables: {}, signal }),
   "chainIdentifier"
 )
 // Effect<…, GraphQLUnavailable | TransportError, SuiGraphQL>
 ```
+
+`run` receives the Effect's `AbortSignal` as its second argument. Pass it as the
+query's `signal`, so `Effect.timeout` and interruption cancel the request the
+way they cancel every `SuiCore` call; a one-argument callback still compiles,
+and is a request nothing can cancel.
 
 A rejection from `SuiGraphQL.layerUnavailable` is already a
 `GraphQLUnavailable` and is passed through unchanged; anything else becomes
@@ -1025,8 +1138,16 @@ else: no network, no HTTP mock, no hand-rolled client.
 
 @@ test/escrow.test.ts :: const provide = <A, E>( ::   )
 
-`layerExtensionTest(extensionLayer, script)` is the extension's layer over
-`layerTest(script)`, which is the **real** `Sui` over the in-memory `SuiCore`.
+`SuiTest.provide(layer)` is the whole wiring: it provides the layer together
+with a fresh `Journal.layerMemory` and Effect's `TestClock`, all built locally
+(`{ local: true }`), so no test shares a journal, a clock or a fake with
+another — forgetting one of the three used to be how tests leaked state into
+each other silently. `layerExtensionTest(extensionLayer, script)` is the
+extension's layer over `layerTest(script)`, which is the **real** `Sui` over
+the in-memory `SuiCore`. `layerTest` also puts `testSubmitConfig` in force — a
+resubmit schedule with no delay — so a re-send path does not sleep through the
+production schedule on the real clock; a test about the schedule sets its own
+with `SubmitConfig.with`.
 So a test exercises the production high tier: the include sets, the BCS bridge,
 the chunked batch reads, the sender lock and every `Tx` step.
 
@@ -1048,13 +1169,23 @@ and scripted outcomes for simulate, execute and `getTransaction`:
 
 @@ test/escrow.test.ts :: const script = { :: }
 
-**`waitForTransaction` is scripted through `getTransaction`.** There is no
-separate knob: `Tx.submit` waits by polling `getTransaction`, so the ordered
-`FakeScript.getTransaction` outcomes (and `FakeScript.transactions` / 
-`SuiTest.recordTransaction` for answers keyed by digest) are what decide whether
-a wait succeeds, times out or reports the transaction missing. A test that wants
-"executed, then not visible for two polls, then visible" scripts exactly that
-list.
+**`waitForTransaction` is scripted through `getTransaction`, and its delay
+through `visibilityDelay`.** `Tx.submit` waits by polling `getTransaction`, so
+the ordered `FakeScript.getTransaction` outcomes (and `FakeScript.transactions`
+/ `SuiTest.recordTransaction` for answers keyed by digest) decide whether a
+wait succeeds, times out or reports the transaction missing. An executed
+transaction is visible at once unless `FakeScript.visibilityDelay` (milliseconds
+of `TestClock` time, or `"never"`) — or `SuiTest.setVisibilityDelay` mid-test —
+holds the wait, which is how a test interrupts a submission *after* the execute
+answered and before it became readable.
+
+**A scripted execute digest must be the bytes' own.** The fake keys every
+transaction by the digest of the bytes it was handed; an execute outcome
+scripted with a different `digest` stops the test with a defect naming both,
+because a node never answers one transaction with another's digest (and
+`Tx.submit` reconciles such an answer instead of returning it). `fakeDigest(n)`
+is a branded `Digest` for fixtures that need one, and `fakeCoin({ … })` a coin
+fixture with no cast.
 
 `FakeScript.coinMetadata` is the same idea for `getCoinMetadata`: a record keyed
 by coin type, with an unscripted type answering `{ coinMetadata: null }` the way
@@ -1083,7 +1214,7 @@ a test that submits provides its own to stay isolated.
 
 ### Scripting a submit, and the traps in it
 
-Four things about the fake decide whether a submit test means anything.
+Six things about the fake decide whether a submit test means anything.
 
 **`Tx.submit` asks `getTransaction` when it cannot get a clean answer.** A
 retryable transport failure, a timeout, anything that leaves the outcome open
@@ -1129,7 +1260,11 @@ and on the fake that simulate is the **resolver's**: it is recorded (so
 `simulate` script. So `simulate: [FakeOutcome.failWith(...)]` makes `Tx.build`
 and `Tx.run` fail with `SimulationFailed` the way a node would, and
 `buildSimulate` is the slot to use when a test needs the build's simulate and
-an explicit `sui.simulate` to answer differently.
+an explicit `sui.simulate` to answer differently. The fake's resolver mirrors
+the SDK's core resolver, which simulates only to choose a budget: a recipe that
+calls `tx.setGasBudget(...)` gets no resolver simulate, and the build's simulate
+is `Tx.build`'s own explicit one — recorded without `resolver: true` and
+answered by the ordered `simulate` script.
 
 **`layerTest` asserts the built-in chain id for `mainnet` and `testnet`.**
 It is `Sui.layerNoDeps`, the production layer, so a script that says
@@ -1152,7 +1287,20 @@ the object map as usual. `SuiTest.scriptGetObject(outcomes)` sets it mid-test.
 `FakeScript.balances` is keyed by **owner and coin type**: an entry with an
 `owner` answers only for that address, one without answers for any (which is
 what a pre-0.1.2 script meant), and an owner with no entry gets zero, the way a
-node answers.
+node answers. That zero matters for a sponsored build: `Tx.build` checks that
+the gas owner's SUI **address balance** covers the budget when the gas payment
+is empty (`Tx.sponsored`), so a sponsored-flow fixture scripts a balance with an
+`addressBalance` for the sponsor, or the build fails with `BuildError`.
+
+The fake models those **address balances** (0.4.0): seeded from
+`FakeScript.balances[].addressBalance`, set with `SuiTest.setAddressBalance`,
+read back with `SuiTest.addressBalance`. Its resolver pays gas from the payer's
+balance when it covers the budget and the PTB does not use `tx.gas`, and from
+coins otherwise, the way the SDK's does; a payer with neither fails the build
+with `BuildError` ("No valid gas coins found"). So an owner-less balance
+scripted beside coins means address-balance gas (`payment: []`); script
+`addressBalance: "0"` for the payer when a test means coin gas. Executions
+charge gas to the balance, debit withdrawals and follow `send_funds` deposits.
 
 ### The fixture package's `node_modules` is not your source
 
@@ -1268,8 +1416,8 @@ and `src/errors.ts` shows both forms.
 way the template does — `readonly outcome: Outcome = "unknown"` beside the
 schema fields — keeps the call site clean, and a class field is not part of the
 schema, so encoding alone would drop exactly the field a wrapper script acts on.
-`toJson` reads it off the instance and puts it back. Keep declaring it as a
-field; there is nothing to change in your errors. That is
+`toJson` reads it off the instance and puts it back, so whichever form section
+2 you picked, there is nothing to change in your errors. That is
 what makes a structured log of a failed run useful, and it is a reason to give
 every field of an error a schema rather than stuffing detail into a string.
 
@@ -1281,8 +1429,34 @@ cause }))` around a `Tx.run` turns a charged `ExecutionFailed` (exit 5, do not
 retry) into an unclassified error (exit 1) or, worse, into a default
 `not_applied` (exit 4, "safe to retry") and the wrapper retries a transaction
 that already ran. Copy both fields: `outcome: SuiError.outcome(cause)` and the
-digest from `digestOf(cause)`, or do not wrap at all. The same applies to a CLI
+digest from `SuiError.digestOf(cause)`, or do not wrap at all. The same applies to a CLI
 that catches at the command boundary and re-raises its own error type.
+
+**Mapping a Move abort to your own error.** A member that wants
+`EscrowAlreadyClaimed` rather than a bare `ExecutionFailed` asks
+`SuiError.isMoveAbort(cause, { module: "escrow", constant: "EAlreadyClaimed" })`
+— any of `package`, `module`, `function`, `constant` and `code` may be given,
+and all that are must match — or reads the whole location with
+`SuiError.moveAbort(cause)`, an `Option<MoveAbortInfo>`. Both work on a
+`SimulationFailed` (nothing charged) and an `ExecutionFailed` (charged), so
+keep the outcome of the one you got: map the first to a `not_applied` error and
+the second to an `applied` one. **After an upgrade the abort's `package` is the
+latest package id**, not the original one, so match on `module` and `constant`
+unless you really mean one version.
+
+`SuiError.describe` prints such an abort as one line —
+`ExecutionFailed MoveAbort 0x…::escrow::claim EAlreadyClaimed "already claimed" (line 42) in command 1`
+— and never the packed clever-error code; `{ tag: false }` drops the leading
+tag.
+
+**An error may declare its own exit code.** An integer `exitCode` (1–255) on an
+error — a plain field, or Effect's `[Runtime.errorExitCode]` marker when there
+is no such field — is honoured by `Script.exitCode`, after `ConfigError` and before
+`outcome` — which is how a user-input error exits 2 instead of 4. Two rules
+override it: while this run left a submission unresolved, a failure that would
+exit 2, 4 or 130 exits 3, applied or not — reconcile before anything else; and
+otherwise, once this run applied a transaction, the same failure exits 5, and
+`Script.run` prints the applied digests with "do not send them again".
 
 **A CLI with its own argv parser does not need `Script.run`.** `Script.run` is a
 whole entrypoint — it builds the layer, forks the root fiber, installs signal
@@ -1293,7 +1467,10 @@ failure (with a `SubmissionUnknown`'s bytes) plus every unresolved journal
 entry, and returns the exit code. Assign it to `process.exitCode` rather than
 calling `process.exit`, so buffered output flushes, and pass the journal the
 program actually ran with — reading the default reference would look in the
-process-wide in-memory journal and find nothing.
+process-wide in-memory journal and find nothing. `Script.report` lists **every**
+unresolved entry in that journal, including another process's in a shared
+store; `Script.run` records the entries its own program wrote, wherever the
+journal was provided, and lists only those.
 
 Two of those deserve a second look. `UnexpectedEffects` — what
 `executed.expectCreated(type)` fails with — is **applied**, exit 5: it can only
@@ -1302,7 +1479,8 @@ receipt is missing; treating it as "safe to retry" would run the caller's intent
 twice. And a `Cause.TimeoutError` from an `Effect.timeout` wrapped *around* a
 submission exits 3, not 4, when the journal still holds an unresolved entry: the
 outer timeout interrupts the submission from outside and the bytes may be on the
-wire. `Script.run` prints those unresolved entries, with their base64 bytes, on
+wire. So does any other failure that would exit 2 or 4 while an entry is
+unresolved. `Script.run` prints those unresolved entries, with their base64 bytes, on
 every non-zero exit.
 
 ## 12. Converting an existing facade
@@ -1379,7 +1557,7 @@ conversion is mechanical except where the behaviour deliberately changed.
 | `TransactionFailedError { digest, status }` | `ExecutionFailed { digest, reason, command, effects }` |
 | `getObjectContent` | `sui.getObject(id)` — with no schema, `content` is the raw bytes |
 | `getOptionalObjectContent` | `sui.getObjectOption` — `None` for missing and deleted, which is also the blessed way to express domain absence |
-| `getObjectsContent` | `sui.getObjects` — chunked, integrity-checked, a per-item `Result` instead of silently dropping errored ids; `sui.getObjectsStrict` (the deprecated `getObjectsOrFail`) when every id must be there |
+| `getObjectsContent` | `sui.getObjects` — chunked, integrity-checked, a per-item `Result` instead of silently dropping errored ids; `sui.getObjectsStrict` when every id must be there |
 | `listDynamicFields` | `sui.streamDynamicFields` |
 | filtering dynamic fields by key type | filter entries on `name.type` with `SuiSchema.matchesType` (never `normalizeStructTag`, which throws on the primitive key types), then decode `name.bcs` with `SuiSchema.decode(keyCodec, entry.name.bcs)`; the entry carries both |
 | `deriveDynamicFieldID` + `getObjectOption` for existence | `sui.getDynamicFieldOption(parent, name)` — one call, `None` for absent |
@@ -1390,7 +1568,7 @@ conversion is mechanical except where the behaviour deliberately changed.
 | `TxThunk` | `Recipe = (tx) => void`. Every thunk in the SDKs is already synchronous; a **consumer's** `async (tx) => …` is not, and it hoists its `await` in front of the recipe — the read happens in the surrounding Effect, the recipe stays pure |
 | `buildTx(...thunks)` | compose recipes: `(tx) => { a(tx); b(tx) }`, then `Tx.build`. When what you need is a `Transaction` **object** to hand to something else, build it yourself: `const tx = new Transaction(); recipe(tx)` — `Tx.build` returns signed-ready bytes and needs a sender |
 | `signAndExecute` / `execThunks` | `Tx.run(recipe, { signer })`; the separate `waitForTransaction` is gone |
-| `ParallelTransactionExecutor` | `Tx.run` per PTB, under the sender lock. Parallel submission from one address needs distinct gas owners (`Tx.sponsored`) and is otherwise deferred: the lock is what stops two transactions picking the same gas coin |
+| `ParallelTransactionExecutor` | `Tx.run` per PTB. With gas from the address balance (the default, once the coins are folded with `Tx.foldCoins`) a PTB with no owned input pins nothing, so under `lockSender: "whenPinned"` runs from one address are serialized only for their builds and submitted concurrently; a PTB that pins a coin or an owned object holds the sender lock through submit, which is what stops two transactions picking the same gas coin |
 | `ExecResult` and its extractors | `Executed` with `created(type)`, `createdWhere(predicate)`, `packagesPublished()`, `balanceChange(address, coinType)`, `expectCreated` |
 | a `register(client)` building a class of Promise methods | the service above plus `SuiExtension.fromService`, with `warm` when the surface has synchronous members |
 | a hand-rolled idempotent submitter (persist the signed bytes, execute, wait, re-poll by digest on error, resubmit the identical bytes) | `Tx.build` → `Tx.sign` → `Tx.submit` with a durable `Journal` (`@unconfirmed/sui-effect/journal`), and `Tx.reconcileAll()` at startup. The journal write before the first send, the verbatim resubmit and the reconcile are all in `Tx.submit`; what stays yours is the domain record, which goes in `Tx.run`'s `onSigned` hook |
@@ -1398,7 +1576,7 @@ conversion is mechanical except where the behaviour deliberately changed.
 | a `ready()` that checks the genesis digest before anything else | `Sui.layerNoDepsWith({ chainId: deployment.chainIdentifier })`. `Sui.layerNoDeps` asserts the **built-in table's** id for the client's network, which is not the same claim as "this is the chain my deployment manifest was generated against"; `layerNoDepsPinned(chainId)` asserts nothing and makes no call, for a consumer that has already checked |
 | a standalone read function the predecessor exported (`getReleaseById(client, id)`) | a member on the service taking the branded id and returning decoded content. Grep the consumer for the **function name**, not for a facade call site: a removed standalone export does not appear in any `client.*` search |
 
-Five behaviour changes to put in the conversion issues:
+Seven behaviour changes to put in the conversion issues:
 
 1. `getObjects` returns a per-item `Result`; ids that failed are no longer
    silently dropped. `getObjectsStrict` is the fail-first variant.
@@ -1482,16 +1660,16 @@ Reject an extension that:
 - typechecks its tests against an isolated-consumer fixture's installed
   `node_modules` (see section 10) rather than against the source under test.
 
-The effect-ts skill's own checklist still applies underneath: v3 names,
-`Effect.gen` returned from a plain arrow, throwing inside an Effect, mutable
-module-level state, `run*` outside an entrypoint.
+Effect's own rules still apply underneath: no v3 names, no `Effect.gen`
+returned from a plain arrow where `Effect.fn` belongs, no throwing inside an
+Effect, no mutable module-level state, no `run*` outside an entrypoint.
 
 ## 15. Copying the template
 
 @@ package.json :: "peerDependencies": { :: } :: json
 
 `@unconfirmed/sui-effect`, `effect`, `@mysten/sui` and **`@mysten/bcs`** are peer
-dependencies, with the exact rcs pinned in `devDependencies`. `@mysten/bcs` is
+dependencies, with exact versions pinned in `devDependencies`. `@mysten/bcs` is
 on that list because your BCS layouts are `BcsType`s from it and they cross the
 boundary into `SuiSchema.bcs`: two copies in one process is two `BcsType`
 classes, and a codec built with one is not the codec the other's `instanceof`
@@ -1549,8 +1727,8 @@ change — the dependency needs a form that does not exist on the registry.
 
 ```bash
 cd /path/to/sui-effect && bun run build && npm pack
-mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-0.1.0.tgz vendor/
-cd /path/to/your-package && bun add -d ./vendor/unconfirmed-sui-effect-0.1.0.tgz
+mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-0.4.0.tgz vendor/
+cd /path/to/your-package && bun add -d ./vendor/unconfirmed-sui-effect-0.4.0.tgz
 ```
 
 It is also the only form that proves anything: an isolated consumer of the
@@ -1585,15 +1763,16 @@ bun install --force
 Verify it took: `cat node_modules/@unconfirmed/sui-effect/package.json | grep version`, or
 grep the shipped `dist` for the change you are looking for.
 
-**Until the first publish, bun probes the registry for every peer.** It does so
-even for a peer a local dependency already satisfies, and an unpublished name
-404s the install. The escape is
+**While your peer range names an unpublished version, bun probes the registry
+for every peer.** It does so even for a peer a local dependency already
+satisfies, so a range the registry cannot serve yet — a release still in
+flight — fails the install. The escape is
 `"peerDependenciesMeta": { "@unconfirmed/sui-effect": { "optional": true } }` in your
 `package.json` — which the template ships, because it is copied verbatim.
 
 Put both halves of the swap on the release checklist:
 
-1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.1.0 <0.3.0"`, which is what the template ships since 0.2.0 — a range rather than a caret, because 0.x carets do not span a minor and the 0.1 and 0.2 surfaces differ only in the `optionalKey` rule of §2);
+1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.4.0 <0.5.0"`, which is what the template ships for 0.4.x — a range rather than a caret, written out so the one minor it spans is explicit: a 0.x minor may break, and 0.4.0 did, see `CHANGELOG.md`);
 2. **delete the `peerDependenciesMeta` entry.** Left in, it turns a genuinely
    missing peer into a silent `undefined` at import time;
 3. re-run the isolated-consumer check against the published package.
@@ -1620,12 +1799,13 @@ import { SuiGrpcClient } from "@mysten/sui/grpc"
 import { Sui, SuiCore } from "@unconfirmed/sui-effect"
 import { Effect, Layer, ManagedRuntime } from "effect"
 
-const client = new SuiGrpcClient({ network: deployment.network, url: deployment.url })
+const client = new SuiGrpcClient({ network: deployment.network, baseUrl: deployment.url })
 
 // `layerNoDepsWith({ chainId })` over the client you already have: the chain id
 // asserted is the deployment's, not the built-in table's entry for the network.
+// `provideMerge`, not `provide`: `runSui` hands the program `SuiCore` as well.
 const layer = Sui.layerNoDepsWith({ chainId: deployment.chainIdentifier }).pipe(
-  Layer.provide(SuiCore.layerFromClient(client))
+  Layer.provideMerge(SuiCore.layerFromClient(client))
 )
 
 export const runtime = ManagedRuntime.make(layer)
@@ -1734,11 +1914,12 @@ for hours, a cached failed build is a much longer outage than in a tab.
 semaphore in one runtime's memory. Two isolates, two Durable Objects, two
 regions — two locks, and nothing stops both picking the same gas coin. Either
 serialize submissions for an address through one Durable Object (which is what
-DOs are for), or stop depending on the lock: with `tx.setGasPayment([])` there is
-no gas coin to equivocate on, the node picks from the address balance, and
-`SubmitConfig.lockSender: false` is then correct rather than reckless. A
-sponsored transaction built with `Tx.sponsored` already has an empty gas
-payment, and `Tx.build` preserves it through the resolver.
+DOs are for), or stop depending on the lock: gas from the address balance — the
+default, and a guarantee under `SubmitConfig.gasPayment:
+"requireAddressBalance"` — leaves no gas coin to equivocate on, so a PTB with no
+owned input pins nothing and `SubmitConfig.lockSender: "never"` is then correct
+rather than reckless. A sponsored transaction built with `Tx.sponsored` already
+has an empty gas payment, and `Tx.build` preserves it through the resolver.
 
 **Time is not wall-clock time in a DO alarm.** `Tx.submit`'s resubmit schedule
 and `visibilityTimeout` are Effect sleeps inside one invocation; a Durable
@@ -1751,40 +1932,23 @@ journal for anything longer.
 
 `@unconfirmed/sui-effect/journal` needs a `KeyValueStore`, and Effect ships
 memory, filesystem, SQL and Web Storage layers — none of which exist in a DO.
-`KeyValueStore.makeStringOnly({ get, set, remove, clear, size })` is the whole
-adapter: five members over strings, and the journal uses nothing else (its
-entries are JSON and its unresolved index is one more key).
+`KeyValueStore.makeStringOnly({ get, set, remove, clear, size, keys })` is the
+whole adapter: six members over strings, and the journal uses nothing else. Its
+entries are JSON, one key per digest, and `listUnresolved` enumerates them
+through `keys` (a DO's `storage.list()`), so `keys` is the member the journal
+cannot do without. Wrap each call in `Effect.tryPromise` so a storage failure is
+a `KeyValueStoreError` — which the journal turns into `JournalError` — rather
+than a defect. `DurableStorage` is the slice of `DurableObjectStorage` the
+adapter touches; in a Worker, pass `ctx.storage` and use the real type.
 
-<!-- inline -->
-
-```ts
-import { KeyValueStore } from "effect/persistence"
-import { Effect, Layer } from "effect"
-import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
-
-const durableStore = (storage: DurableObjectStorage) =>
-  KeyValueStore.makeStringOnly({
-    get: (key) =>
-      Effect.map(
-        Effect.promise(() => storage.get<string>(key)),
-        Option.fromNullishOr
-      ),
-    set: (key, value) => Effect.promise(() => storage.put(key, value)),
-    remove: (key) => Effect.asVoid(Effect.promise(() => storage.delete(key))),
-    clear: Effect.promise(() => storage.deleteAll()),
-    size: Effect.map(Effect.promise(() => storage.list()), (map) => map.size)
-  })
-
-const journal = (storage: DurableObjectStorage) =>
-  layerKeyValueStore({ onUnresolved: "ignore" }).pipe(
-    Layer.provide(Layer.succeed(KeyValueStore.KeyValueStore, durableStore(storage)))
-  )
-```
+@@ recipes/durable-object.ts :: import { Effect, Layer } from "effect" ::   )
 
 Build it once per DO instance, alongside the runtime. `onUnresolved: "fail"`
 refuses to build while the store still holds unsettled entries, which is the
 right setting for a process whose startup is allowed to demand attention and
-the wrong one for a DO that must answer the next request.
+the wrong one for a DO that must answer the next request. A DO that lives for
+months calls `pruneSettled(before)` from `@unconfirmed/sui-effect/journal` in an
+alarm, so the scan `listUnresolved` does over every entry stays short.
 
 ## 19. Relay and sponsor envelopes
 
@@ -1851,10 +2015,10 @@ conversion has to carry. Everything here is documented somewhere above; this is
 the page to read before the conversion rather than after it.
 
 - **Register every extension on a client the same way and with the same chain
-  id** — all `warm: { chainId }`, or all lazy, and the same id. The base `Sui`,
-  its transport and its **sender-lock map** are shared per client per effective
-  chain id; disagreeing registrations get two of everything and two `Tx.run`s
-  for one address stop serializing.
+  id** — all `warm: { chainId }`, or all lazy, and the same id. The base `Sui`
+  and its transport are shared per client per effective chain id; disagreeing
+  registrations get two transports and two chain-id reads. The **sender lock**
+  is process-wide since 0.4.0, so they no longer get two locks.
 - **Expect `SubmissionUnknown`, not `NotApplied { inputConsumed }`,** for almost
   every stuck submission whose PTB touched a shared object or an owned object
   older than the gas coin. `inputConsumed` needs the *consuming* transaction's
@@ -1862,12 +2026,18 @@ the page to read before the conversion rather than after it.
   and Sui's Lamport versioning means that is usually not what happened. Plan an
   operator path or a `Tx.reconcileAll()` at startup; do not build a retry loop
   that waits for `NotApplied`.
-- **A gRPC `NOT_FOUND` during resolution arrives as a `BuildError`** naming the
-  object inputs the resolver was about to look up. And devnet's simulate may not
+- **A resolver refusal arrives as a `BuildError`** with the node's message: a
+  gRPC `NOT_FOUND` (naming the object inputs the resolver was about to look
+  up), `INVALID_ARGUMENT` or `FAILED_PRECONDITION` (an object owned by someone
+  else, a function that does not exist, gas selection that found no coin), and
+  the SDK resolver's own errors. A `TransportError` out of `Tx.build` is named
+  `"Tx.build"` and is a transport problem. And devnet's simulate may not
   resolve a just-created object for a while **even after `waitForTransaction`
   returned**: visibility of a transaction is not visibility of its objects in
   the resolver path. Retry the build, do not re-read and despair.
-- **Use stable `effect@4.0.3` or a later 4.0.x.** Release candidates are not
+- **Use `effect@4.1.1` or a later 4.1.x**, matching the sui-effect peer range
+  (`>=4.1.1 <4.2`; a custom `KeyValueStore` must implement `keys`, which 4.1
+  added). Release candidates are not
   supported: rc.113 renamed `Config.nonEmptyString`, `Config.string` and
   `Config.redacted`, and rc.118 moved `effect/unstable/*` to `effect/*` — and
   two copies of `effect` in one process is a different
@@ -1892,8 +2062,37 @@ the page to read before the conversion rather than after it.
   `SuiSchema.matchesType`; `normalizeStructTag` throws on `u64`, `bool`,
   `address` and `vector<u8>`.
 - **`Stream.runCollect` returns a plain `Array`** in Effect v4, not a `Chunk`.
-- **`Effect.withConfigProvider` does not exist** in 4.0.3: provide the
-  `ConfigProvider` service.
+- **Allowances are SDK pass-through.** `tx.balance({ allowance, … })`,
+  `tx.coin({ allowance, … })` and `tx.withdrawal({ from: "allowance", allowance,
+  funder })` (`@mysten/sui` 2.31+) go in a recipe like any other command, and
+  `Tx.build` resolves them through the SDK. sui-effect has no helper for them;
+  the fake debits a `FundsWithdrawal` from its source (an allowance's from its
+  funder) but checks no allowance limit, so a limit is tested against a
+  network, not on `layerTest`.
+- **`Tx.sponsored` spends the sponsor's SUI address balance**, not its coins,
+  and `Tx.build` refuses with `BuildError` when that balance is below the
+  budget plus the SUI the bytes withdraw from it, or when the bytes use
+  `tx.gas` (empty under an address-balance payment). Coin-paid sponsorship is `Tx.run(recipe, { signer, gasOwner,
+  sponsor })` without `Tx.sponsored` (section 5).
+- **Gas comes from the address balance by default**, so write recipe fragments
+  that keep it that way: `tx.coin({ balance })` / `tx.balance(...)` rather than
+  `tx.splitCoins(tx.gas, ...)` (a `tx.gas` user pays with a coin or a coin
+  reservation), and `Tx.sendFunds` for a plain transfer into a balance. A
+  consumer folds its coins once with `Tx.foldCoins({ signer })`; until then the
+  resolver pays with coins and the run holds the sender lock through submit.
+- **A lost submission is re-sent, not rebuilt.** `Tx.resubmit(error)` re-sends a
+  `SubmissionUnknown`'s identical bytes (and refuses when the journal already
+  says `NotApplied`); `Tx.reconcileAll({ resubmit: true })` does it for every
+  entry still unknown at startup.
+- **Funding a dev address is SDK pass-through too.** Call
+  `requestSuiFromFaucetV3({ host: getFaucetHost("devnet"), recipient })` from
+  `@mysten/sui/faucet` (2.34+; devnet and testnet run the proof-of-work V3
+  faucet). It pays into the **address balance**, not a coin object, which
+  `sui.getBalance(owner).balance` counts and `streamCoins` does not list.
+  **Localnet runs the V2 faucet** (`requestSuiFromFaucetV2({ host:
+  getFaucetHost("localnet"), recipient })`, `POST /v2/gas`), which pays a
+  **coin** — so an account funded there pays gas with coins, and a sponsor has
+  nothing in its address balance, until it folds them with `Tx.foldCoins`.
 - **`SuiError.describe` covers `GraphQLUnavailable` and `ExtensionNotReady`**,
   and `Script.run` prints them like any other tag.
 - **Write a `PromiseFace<Service>` type test per namespace**, and put `test` in
@@ -1904,9 +2103,12 @@ the page to read before the conversion rather than after it.
   `SuiExtension.leaf`.** `Uint8Array`, `Date`, `Promise`, arrays and BCS codecs
   are leaves already; everything else with a prototype of its own is passed
   through by the runtime and must say so in the type.
-- **A cold call is a real `Promise`** that is also an `AsyncIterable`, and its
-  rejection is pre-handled, so `expect(...).rejects` works and an un-awaited
-  cold call cannot abort the test run.
+- **A cold call is a callable `Proxy` over a `Promise`** that is also an
+  `AsyncIterable`: `instanceof Promise`, `await` and `for await` work, but
+  `typeof` is `"function"`, so in `bun:test` write
+  `expect(Promise.resolve(cold)).rejects` (a bare `expect(cold).rejects` does
+  not see a Promise). Its rejection is pre-handled, so an un-awaited cold call
+  cannot abort the test run.
 - **`outcome` survives `SuiError.toJson`** even as a class field; keep declaring
   it as one.
 - **`warm` throws *any* layer failure synchronously out of `$extend`**, not only

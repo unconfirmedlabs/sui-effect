@@ -9,6 +9,7 @@
  *
  * There is no second implementation to keep in step, which is the whole point.
  */
+import type { SuiExtensionOptions } from "@unconfirmed/sui-effect/extension"
 import { SuiExtension } from "@unconfirmed/sui-effect/extension"
 import type { EscrowOptions } from "./Escrow.ts"
 import { Escrow } from "./Escrow.ts"
@@ -24,12 +25,17 @@ export interface EscrowRegistrationOptions extends EscrowOptions {
    * is no built-in entry for those; `register` throws without it. On `mainnet`
    * and `testnet` the built-in table answers and this is optional.
    *
-   * Give the same id to **every** registration on one client. The base `Sui`,
-   * its transport and its sender-lock map are shared per client **per chain
-   * id**, so two registrations that disagree get two of everything and two
-   * `Tx.run`s for one address stop serializing.
+   * Give the same id to **every** registration on one client. The base `Sui`
+   * and its transport are shared per client **per chain id**, so two
+   * registrations that disagree build two of them. (The sender lock is
+   * process-wide whatever the id, so two `Tx.run`s for one address serialize
+   * either way.)
    */
   readonly chainId?: string
+  /** Lifecycle overrides for every call (`SubmitConfig` fields, durations as `"10 seconds"`). */
+  readonly submit?: SuiExtensionOptions<Escrow, never>["submit"]
+  /** The journal every call records submissions in; durable for a restartable consumer. */
+  readonly journal?: SuiExtensionOptions<Escrow, never>["journal"]
 }
 
 /**
@@ -39,7 +45,7 @@ export interface EscrowRegistrationOptions extends EscrowOptions {
  * const client = new SuiGrpcClient({ network: "testnet", baseUrl }).$extend(escrow(options))
  * const info = await client.escrow.get(id)
  * for await (const item of client.escrow.owned.stream(owner)) console.log(item.id)
- * await client.escrow.dispose()
+ * await client.escrow.$dispose()
  * ```
  *
  * It is registered `warm`, like `platform` in `Platform.ts`: the service has
@@ -50,7 +56,8 @@ export interface EscrowRegistrationOptions extends EscrowOptions {
  *
  * The runtime is built inside `register`, over `SuiCore.layerFromClient(client)`,
  * a `Sui` pinned to `options.chainId` and `Escrow.layer`, so the extension and
- * the consumer share one transport, one chain identity and one sender-lock map.
+ * the consumer share one transport and one chain identity, and every face in the
+ * process shares one sender lock.
  *
  * Throws out of `register` when the network has no built-in chain identifier
  * and `options.chainId` was not given.
@@ -59,5 +66,7 @@ export const escrow = (options: EscrowRegistrationOptions) =>
   SuiExtension.fromService(Escrow, {
     name: "escrow",
     layer: Escrow.layer(options),
-    warm: options.chainId === undefined ? {} : { chainId: options.chainId }
+    warm: options.chainId === undefined ? {} : { chainId: options.chainId },
+    ...(options.submit === undefined ? {} : { submit: options.submit }),
+    ...(options.journal === undefined ? {} : { journal: options.journal })
   })

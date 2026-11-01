@@ -18,6 +18,7 @@ import { DecodeError, decodePayload, ExecutionFailed, UnexpectedEffects } from "
 import {
   BalanceChange,
   ChangedObject,
+  type Coin,
   CoinType,
   Digest,
   Event,
@@ -30,7 +31,9 @@ import {
   TransactionEffects,
   Version
 } from "./schemas.ts"
-import { typeMatches } from "./bcs.ts"
+import { decodeContent, expectedTypeOf, typeMatches } from "./bcs.ts"
+
+const decodeObjectType = Schema.decodeUnknownOption(ObjectType)
 
 const isAccumulatorWrite = (change: ChangedObject): boolean =>
   change.outputState === "AccumulatorWriteV1"
@@ -81,12 +84,20 @@ export const objectRefOf = (ref: ChangedRef): ObjectRef | undefined =>
  * `tx.receivingRef(...)`, which takes the same three fields this returns.
  * Passing a shared object by `objectRef` produces bytes a validator rejects.
  *
+ * A {@link Coin} from `Sui.listCoins` / `Sui.streamCoins` is accepted too
+ * (since 0.4.0): it is an owned object with its id under `objectId`, which is
+ * exactly what a coin passed to `tx.objectRef` or `tx.setGasPayment` needs,
+ * and it always carries a version and a digest, so for a `Coin` the answer is
+ * never `undefined`.
+ *
  * `undefined` when the effects did not carry a version or a digest — a deleted
  * object has no output version, and nothing can be consumed without both.
  * Never fails.
  */
-export const sdkRefOf = (ref: ChangedRef | ObjectRef): SdkObjectRef | undefined =>
-  ref.version === undefined || ref.digest === undefined
+export const sdkRefOf = (ref: ChangedRef | ObjectRef | Coin): SdkObjectRef | undefined =>
+  "objectId" in ref
+    ? { objectId: ref.objectId, version: ref.version.toString(), digest: ref.digest }
+    : ref.version === undefined || ref.digest === undefined
     ? undefined
     : { objectId: ref.id, version: ref.version.toString(), digest: ref.digest }
 
@@ -101,15 +112,21 @@ export interface SdkObjectRef {
  * A transaction the network executed, built from the fixed execute include set:
  * effects, events, balance changes and object types.
  *
- * **`events` is `ReadonlyArray<Event>`, not `SuiClientTypes.Event[]`.** It is
- * that type minus `json`: `packageId`, `module`, `sender`, `eventType` and
- * `bcs`, with the branded ids this package uses. The SDK's `json` is dropped on
- * purpose — it is the node's own rendering, it is absent on most transports,
- * and the decode a caller wants is `SuiSchema.decode(codec, event.bcs)`, which
+ * **`events` is `ReadonlyArray<Event>`, not `SuiClientTypes.Event[]`.** It
+ * carries `packageId`, `module`, `sender`, `eventType` and `bcs`, with the
+ * branded ids this package uses, and an **optional** `json`: the node's own
+ * rendering, present only when the source carried one — a reduced envelope
+ * read through {@link Executed.fromPartial} may; a gRPC execute never does. Do
+ * not branch on it. The decode a caller wants is {@link Executed.eventsOf} /
+ * {@link Executed.expectEvent} (or `SuiSchema.decode(codec, event.bcs)`), which
  * gives a typed value rather than a shape that changes with the node. Code
- * typed against the SDK's `Event[]` therefore does not accept these; take
- * `ReadonlyArray<Event>` from `@unconfirmed/sui-effect`, or map the fields you
- * need.
+ * typed against the SDK's `Event[]` (whose `json` is required) therefore does
+ * not accept these; take `ReadonlyArray<Event>` from `@unconfirmed/sui-effect`,
+ * or map the fields you need.
+ *
+ * The data fields are `digest`, `effects`, `events`, `balanceChanges`,
+ * `objectTypes` (object id to Move type), `checkpoint` (`null` until the node
+ * says) and `timestampMs` (`null` likewise).
  */
 export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   digest: Digest,
@@ -128,7 +145,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   private typeOf(objectId: ObjectId): ObjectType | undefined {
     const type = this.objectTypes[objectId]
     if (type === undefined) return undefined
-    const decoded = Schema.decodeUnknownOption(ObjectType)(type)
+    const decoded = decodeObjectType(type)
     return decoded._tag === "Some" ? decoded.value : undefined
   }
 
@@ -174,15 +191,12 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
   }
 
   /**
-   * Objects this transaction created, optionally filtered by Move type
-   * (compared with `normalizeStructTag`). Never fails.
+   * Objects this transaction created, optionally filtered by Move type through
+   * `typeMatches`: a bare tag matches every instantiation of the generic, a
+   * parameterized one is compared in full after normalization. Never fails.
    */
   created(type?: string): ReadonlyArray<ChangedRef> {
-    return this.select(
-      (change) => change.idOperation === "Created" && Executed.wroteAnObject(change),
-      "output",
-      Executed.byType(type)
-    )
+    return this.createdWhere(Executed.byType(type) ?? (() => true))
   }
 
   /**
@@ -190,7 +204,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    *
    * The direct replacement for the substring matching every repo hand-rolls
    * (`createdByType("::Receipt")`), without making substring matching the
-   * default: `created(type)` still compares normalized struct tags.
+   * default: `created(type)` still compares through `typeMatches`.
    * Never fails.
    */
   createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef> {
@@ -288,8 +302,12 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
     return refs
   }
 
-  /** The net balance change for one address and coin type, in MIST. Never fails. */
-  balanceChange(address: SuiAddress, coinType: CoinType): bigint {
+  /**
+   * The net balance change for one address and coin type, in the coin's base
+   * unit (MIST for SUI). `coinType` is any spelling — `"0x2::sui::SUI"`,
+   * `CoinType.SUI` — compared under the one Move type rule. Never fails.
+   */
+  balanceChange(address: SuiAddress, coinType: CoinType | string): bigint {
     let total = 0n
     for (const change of this.balanceChanges) {
       if (change.address === address && typeMatches(coinType, change.coinType)) {
@@ -375,9 +393,197 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
       })
     )
   }
+
+  /**
+   * Every event this transaction emitted whose type matches the codec's Move
+   * type, decoded with that codec, in emission order.
+   *
+   * The codec is a `SuiSchema.bcs(layout, type)` (or anything piped from one):
+   * the type it was built with selects the events under the one Move type rule
+   * (`typeMatches` — a bare tag matches every instantiation of a generic event),
+   * and its layout decodes each one's `bcs`. Pass `eventType` to select by a
+   * different type than the codec records, or to give one to a codec built
+   * without a type.
+   *
+   * **After a package upgrade an event struct keeps the id of the package that
+   * first defined it**, even when a later version emits it, so a codec tagged
+   * with the latest package id selects nothing for a struct that existed in v1.
+   *
+   * No match is an empty array, not a failure; {@link expectEvent} is the
+   * "exactly one" form. An event with no BCS (a relay envelope that rendered
+   * events as JSON, read through {@link Executed.fromPartial}) fails to decode.
+   *
+   * Fails with: `DecodeError` — `kind: "bytes"` when a selected event's bytes do
+   * not parse, `kind: "type"` when neither the codec nor `eventType` names a
+   * Move type to select by.
+   *
+   * @since 0.4.0
+   *
+   * @example
+   * ```ts
+   * import { bcs } from "@mysten/sui/bcs"
+   * import { Effect } from "effect"
+   * import { SuiSchema } from "@unconfirmed/sui-effect"
+   * import type { Executed } from "@unconfirmed/sui-effect"
+   *
+   * const Posted = SuiSchema.bcs(bcs.struct("Posted", { index: bcs.u64() }), `${PKG}::board::Posted`)
+   *
+   * const indices = (executed: Executed) =>
+   *   Effect.map(executed.eventsOf(Posted), (events) => events.map((event) => event.index))
+   * ```
+   */
+  eventsOf<T>(
+    codec: Schema.Codec<T, Uint8Array>,
+    eventType?: string
+  ): Effect.Effect<ReadonlyArray<T>, DecodeError> {
+    return Effect.flatMap(
+      selectingType(codec, eventType),
+      (wanted) =>
+        Effect.forEach(
+          this.eventsOfType(wanted),
+          (event) => decodeContent(codec, event.bcs, { expectedType: wanted, actualType: event.eventType })
+        )
+    )
+  }
+
+  /**
+   * The single event of the codec's type this transaction emitted, decoded.
+   *
+   * The "this call emits exactly one `Posted`" assertion, so a caller does not
+   * write `events.find(...)` plus a decode plus a `die` for the missing case.
+   * Selection and decoding are {@link eventsOf}'s.
+   *
+   * Fails with: `UnexpectedEffects` when the transaction emitted no event of
+   * that type, or more than one — its `found` holds the emitting package id of
+   * each matching event, so its length is the count; `DecodeError` when the one
+   * event does not decode, or when there is no Move type to select by.
+   *
+   * @since 0.4.0
+   */
+  expectEvent<T>(
+    codec: Schema.Codec<T, Uint8Array>,
+    eventType?: string
+  ): Effect.Effect<T, UnexpectedEffects | DecodeError> {
+    return Effect.flatMap(selectingType(codec, eventType), (wanted): Effect.Effect<T, UnexpectedEffects | DecodeError> => {
+      const matching = this.eventsOfType(wanted)
+      const only = matching[0]
+      if (matching.length !== 1 || only === undefined) {
+        return Effect.fail(
+          new UnexpectedEffects({
+            digest: this.digest,
+            expected: `exactly one event ${wanted}`,
+            found: matching.map((event) => event.packageId)
+          })
+        )
+      }
+      return decodeContent(codec, only.bcs, { expectedType: wanted, actualType: only.eventType })
+    })
+  }
+
+  private eventsOfType(type: string): ReadonlyArray<Event> {
+    return this.events.filter((event) => typeMatches(type, event.eventType))
+  }
+
+  /**
+   * The package this transaction published — or the new version an upgrade
+   * created — and its `UpgradeCap`.
+   *
+   * A publish creates exactly one package (`packagesPublished()`) and one
+   * `0x2::package::UpgradeCap`; an upgrade creates the new package version
+   * and **mutates** the cap it was authorized with, so `upgradeCap` is the
+   * created cap when there is one and the mutated one otherwise. The cap is
+   * found through `objectTypes`, which every execute and `Tx.submit` reads.
+   *
+   * Remember that a publish's `UpgradeCap` must go somewhere: the recipe
+   * `transferObjects`es the `tx.publish(...)` result to the sender, or the
+   * transaction fails with an unused value.
+   *
+   * Fails with: `UnexpectedEffects` when the transaction published no package
+   * or more than one (`found` lists the package ids), or when no single
+   * `UpgradeCap` was created or mutated (`found` lists the caps it saw).
+   *
+   * @since 0.4.0
+   *
+   * @example
+   * ```ts
+   * import { Effect } from "effect"
+   * import { Tx } from "@unconfirmed/sui-effect/tx"
+   *
+   * const deploy = Effect.gen(function*() {
+   *   const executed = yield* Tx.run(publishRecipe, { signer })
+   *   const { packageId, upgradeCap } = yield* executed.expectPublished()
+   *   return { packageId, upgradeCapId: upgradeCap.id }
+   * })
+   * ```
+   */
+  expectPublished(): Effect.Effect<Published, UnexpectedEffects> {
+    const packages = this.packagesPublished()
+    const pkg = packages[0]
+    if (packages.length !== 1 || pkg === undefined) {
+      return Effect.fail(
+        new UnexpectedEffects({
+          digest: this.digest,
+          expected: "exactly one published package",
+          found: packages.map((ref) => ref.id)
+        })
+      )
+    }
+    const created = this.created(UPGRADE_CAP_TYPE)
+    const caps = created.length > 0 ? created : this.mutated(UPGRADE_CAP_TYPE)
+    const cap = caps[0]
+    if (caps.length !== 1 || cap === undefined) {
+      return Effect.fail(
+        new UnexpectedEffects({
+          digest: this.digest,
+          expected: `exactly one ${UPGRADE_CAP_TYPE}`,
+          found: caps.map((ref) => ref.id)
+        })
+      )
+    }
+    return Effect.succeed({ packageId: pkg.id, package: pkg, upgradeCap: cap })
+  }
 }
 
-/** The `include` set every execute, simulate and transaction read asks for. */
+/**
+ * The Move type that selects events for `eventsOf`/`expectEvent`: the caller's
+ * override, else the type the codec was built with.
+ */
+const selectingType = <T>(
+  codec: Schema.Codec<T, Uint8Array>,
+  eventType: string | undefined
+): Effect.Effect<string, DecodeError> => {
+  const wanted = eventType ?? expectedTypeOf(codec)
+  return wanted === undefined
+    ? Effect.fail(
+      new DecodeError({
+        kind: "type",
+        issue: "the codec carries no Move type to select events by: build it with" +
+          " SuiSchema.bcs(layout, eventType), or pass eventType to eventsOf/expectEvent"
+      })
+    )
+    : Effect.succeed(wanted)
+}
+
+/** The Move type of the capability a publish creates and an upgrade consumes. */
+const UPGRADE_CAP_TYPE = "0x2::package::UpgradeCap"
+
+/**
+ * What {@link Executed.expectPublished} answers: the package id, the package's
+ * own changed ref, and the `UpgradeCap` that governs it.
+ *
+ * @since 0.4.0
+ */
+export interface Published {
+  readonly packageId: ObjectId
+  readonly package: ChangedRef
+  readonly upgradeCap: ChangedRef
+}
+
+/**
+ * The `include` set every execute, simulate and transaction read asks for, and
+ * the one `Executed.fromTransactionResult` is typed over: a `SuiCore` read made
+ * with `{ include: EXECUTE_INCLUDE }` is a result that method accepts.
+ */
 export const EXECUTE_INCLUDE = {
   effects: true,
   events: true,
@@ -401,7 +607,7 @@ const decodeExecuted = (input: unknown) => decodeExecutedAst(input, { errors: "a
  * and `DecodeError` when the response does not carry the include set that was
  * asked for.
  */
-export const fromTransactionResult = Effect.fn("Executed.fromTransactionResult")(
+export const fromTransactionResult = Effect.fnUntraced(
   function*(
     result: SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
   ): Effect.fn.Return<Executed, ExecutionFailed | DecodeError> {

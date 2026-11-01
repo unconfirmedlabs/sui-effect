@@ -1,6 +1,6 @@
 /**
  * Reads one Escrow object and an optional dynamic field on it, written
- * against the canonical 2.30 SDK: a gRPC client, the Core API, manual BCS.
+ * against the canonical 2.38 SDK: a gRPC client, the Core API, manual BCS.
  *
  * Compare with `examples/compare-read.effect.ts`. Both print identical
  * output for the same id.

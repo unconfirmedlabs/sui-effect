@@ -16,13 +16,15 @@ every code block in it is copied from this directory.
 | `src/Escrow.ts` | The service: a read, a recipe fragment, a submit-on-behalf operation, a nested namespace, and `layer` / `layerConfig` / `layerTest` |
 | `src/upstream.ts` | A stand-in for a third-party Promise SDK, wrapped in `src/Escrow.ts` with `SuiCore.use` and `Effect.tryPromise` |
 | `src/extension.ts` | `SuiExtension.fromService`: the Promise face, derived, never hand-written |
+| `recipes/durable-object.ts` | Not part of the package (outside `src/`, so neither built nor shipped): the `KeyValueStore` over Durable Object storage that backs `@unconfirmed/sui-effect/journal` in a Worker, compiled here so the guide's copy of it compiles |
+| `test/durable-object.test.ts` | The durable journal running over that adapter, against an in-memory stand-in for `ctx.storage` |
 | `test/escrow.test.ts` | The whole test suite on `layerExtensionTest` and `SuiTest` from `@unconfirmed/sui-effect/testing`. No network, no mocks of its own |
 
 ## Running it here
 
 ```bash
 cd examples/extension-template
-bun run check        # tsc --noEmit && bun test
+bun run check        # tsc --noEmit && bun test && bun scripts/check-package.ts
 ```
 
 From the repository root, `bun run check:template` does the same thing.
@@ -42,7 +44,7 @@ than a published version, use the packed tarball, not `link:` or `bun link`:
 ```bash
 cd /path/to/sui-effect && bun run build && npm pack
 mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-*.tgz vendor/
-bun add -d ./vendor/unconfirmed-sui-effect-0.1.0.tgz
+bun add -d ./vendor/unconfirmed-sui-effect-<version>.tgz
 ```
 
 `link:` and `bun link` symlink the checkout, and **module resolution follows the
@@ -67,7 +69,7 @@ conversion can be re-run against the same library.
    `tsconfig.build.json`**, and install the dependencies:
 
    ```bash
-   bun add -d @unconfirmed/sui-effect effect@4.0.3 @mysten/sui@2.30.0 @mysten/bcs \
+   bun add -d @unconfirmed/sui-effect effect@4.1.1 @mysten/sui@2.38.0 @mysten/bcs \
      @effect/language-service @types/bun typescript
    ```
 
@@ -79,8 +81,8 @@ conversion can be re-run against the same library.
    block this template ships already says so; `devDependencies` is what pins
    the exact versions you build and test against.
 
-   `effect`'s peer range is `>=4.0.3 <4.1` (stable 4.0.x) and its dev
-   dependency is pinned exactly (`4.0.3`). Release candidates are not
+   `effect`'s peer range is `>=4.1.1 <4.2` (stable 4.1.x) and its dev
+   dependency is pinned exactly (`4.1.1`). Release candidates are not
    supported: rc.113 renamed `Config.nonEmptyString`, `Config.string` and
    `Config.redacted` to `Config.NonEmptyString`, `Config.String` and
    `Config.Redacted`. Match whatever `@unconfirmed/sui-effect`'s own
@@ -102,7 +104,10 @@ conversion can be re-run against the same library.
    `EscrowContent`, `escrowType`, `receiptType`, `SettlementContent` — is a
    **function of the package id**, because a Move type name contains one:
    configuring a different package has to move the codecs with it. Keep that
-   shape.
+   shape. Rename freely: `scripts/check-package.ts` names none of these
+   exports. It reads the subpaths from `package.json`'s `exports` map, learns
+   what each one exports by importing the matching `src/` file, and requires
+   the packed `dist/` to export the same names.
 5. Keep the shape: reads through `Sui`, writes through `Tx`, contributions as
    recipe fragments, signers as parameters, every error a `Schema.TaggedError`
    with an `outcome`, and the Promise face derived from the service.
@@ -130,7 +135,10 @@ first, which is what a copied-out package has after `bun install`, and only
 falls back to the sui-effect repository two directories up when that repository
 is really there (it checks the `name` in its `package.json`). Whichever copy of
 `@unconfirmed/sui-effect` it finds has to be **built**, because the consumer imports its
-`exports` map; a published tarball always is.
+`exports` map; a published tarball always is. It hard-codes none of the
+template's names: every subpath in `exports` must export, from the packed
+`dist/`, every value its `src/` file exports — so it keeps working after you
+rename `Escrow`, and it catches a subpath you add but forget to build.
 
 To publish:
 
@@ -146,11 +154,12 @@ To publish:
 `src/extension.ts` and `src/Platform.ts` both register `warm` and both thread
 an `options.chainId` through. That is deliberate and it is the rule:
 
-- **Every registration on one client gets the same chain id.** The base `Sui`,
-  its transport and its **sender-lock map** are shared per client per effective
-  chain id. Two registrations that disagree — or one `warm` on a pinned id and
-  one lazy with none — get two of everything, and two `Tx.run`s for one address
-  stop serializing.
+- **Every registration on one client gets the same chain id.** The base `Sui`
+  and its transport are shared per client per effective chain id. Two
+  registrations that disagree — or one `warm` on a pinned id and one lazy with
+  none — build two of them and read the chain id twice. (The **sender lock** is
+  process-wide, keyed by address, so two `Tx.run`s for one address serialize
+  across registrations and clients either way.)
 - **`warm` needs a chain id it can take.** It builds the runtime inside
   `register`, synchronously, so it never asks the node. `mainnet` and `testnet`
   are in the built-in table; `devnet`, `localnet` and any custom network are

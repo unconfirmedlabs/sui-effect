@@ -60,7 +60,7 @@ const unavailableClient = (reason: string): SuiGraphQLClient =>
  * const names = Effect.gen(function*() {
  *   const graphql = yield* SuiGraphQL
  *   return yield* Effect.tryPromise({
- *     try: () => graphql.query({ query: "{ chainIdentifier }" }),
+ *     try: () => graphql.query({ query: "{ chainIdentifier }", variables: {} }),
  *     catch: (cause) => TransportError.fromUnknown("graphql.query", cause)
  *   })
  * })
@@ -125,7 +125,9 @@ export class SuiGraphQL extends Context.Service<SuiGraphQL, SuiGraphQLClient>()(
    * endpoint was missing. This is those three lines, once.
    *
    * `method` is what a `TransportError` is labelled with; give the query's own
-   * name so a log says which read failed.
+   * name so a log says which read failed. `run` receives the Effect's
+   * `AbortSignal` as its second argument: pass it on as the query's `signal`,
+   * so `Effect.timeout` and interruption cancel the request.
    *
    * Fails with: `GraphQLUnavailable` (there is no usable endpoint),
    * `TransportError` (the call reached one and failed).
@@ -135,18 +137,18 @@ export class SuiGraphQL extends Context.Service<SuiGraphQL, SuiGraphQLClient>()(
    * import { SuiGraphQL } from "@unconfirmed/sui-effect"
    *
    * const chain = SuiGraphQL.query(
-   *   (client) => client.query({ query: "{ chainIdentifier }" }),
+   *   (client, signal) => client.query({ query: "{ chainIdentifier }", variables: {}, signal }),
    *   "chainIdentifier"
    * )
    * ```
    */
   static readonly query = <A>(
-    run: (client: SuiGraphQLClient) => Promise<A>,
+    run: (client: SuiGraphQLClient, signal: AbortSignal) => Promise<A>,
     method = "SuiGraphQL.query"
   ): Effect.Effect<A, GraphQLUnavailable | TransportError, SuiGraphQL> =>
     Effect.flatMap(SuiGraphQL, (client) =>
       Effect.tryPromise({
-        try: () => run(client),
+        try: (signal) => run(client, signal),
         catch: (cause) =>
           cause instanceof GraphQLUnavailable ? cause : TransportError.fromUnknown(method, cause)
       }))

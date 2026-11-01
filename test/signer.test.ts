@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test"
-import type { PublicKey, SignatureScheme } from "@mysten/sui/cryptography"
+import type { Keypair, PublicKey, SignatureScheme } from "@mysten/sui/cryptography"
 import { decodeSuiPrivateKey, Signer as SdkSigner } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
 import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
-import { ConfigProvider, Effect } from "effect"
+import { ConfigProvider, Effect, Redacted } from "effect"
 import { SigningError } from "../src/domain/errors.ts"
 import { Signature, SuiAddress } from "../src/domain/schemas.ts"
-import { Signer } from "../src/services/Signer.ts"
+import { fromRedactedSecret, Signer } from "../src/services/Signer.ts"
 
 const bytes = new Uint8Array([1, 2, 3, 4])
 
@@ -63,6 +63,26 @@ describe("Signer.fromConfig", () => {
       expect(signer.address).toBe(SuiAddress.make(keypair.toSuiAddress()))
     })
   }
+
+  // ML-DSA-65 shipped in @mysten/sui 2.36; the peer range still admits 2.28 and
+  // the SDK matrix runs 2.30, so the keypair class is imported on demand here
+  // exactly as `Signer.fromConfig` does.
+  test("decodes a Bech32 MLDSA65 key", async () => {
+    const specifier = "@mysten/sui/keypairs/mldsa65"
+    const mod: { MLDSA65Keypair: { generate: () => Keypair } } | undefined = await import(specifier)
+      .catch(() => undefined)
+    if (mod === undefined) return
+    const keypair = mod.MLDSA65Keypair.generate()
+    const secret = keypair.getSecretKey()
+    // Widened to `string`: on an SDK before 2.36 `SignatureScheme` has no
+    // `"MLDSA65"`, and the SDK matrix typechecks this file against 2.30.
+    expect<string>(decodeSuiPrivateKey(secret).scheme).toBe("MLDSA65")
+    const signer = await run(
+      Effect.provide(Signer.fromConfig(), withEnv({ SUI_PRIVATE_KEY: secret }))
+    )
+    expect<string>(signer.scheme).toBe("MLDSA65")
+    expect(signer.address).toBe(SuiAddress.make(keypair.toSuiAddress()))
+  })
 
   test("reads the name it is given", async () => {
     const keypair = new Ed25519Keypair()
@@ -203,5 +223,21 @@ describe("Signer.fromSdkSigner", () => {
   test("fromKeypair is the same function under its old name", () => {
     const keypair = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(4))
     expect(Signer.fromKeypair(keypair).address).toBe(Signer.fromSdkSigner(keypair).address)
+  })
+})
+
+describe("Signer.fromConfig wipes the secret it decoded", () => {
+  test("after a successful decode the Redacted can no longer be read", async () => {
+    const secret = Redacted.make(Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(4)).getSecretKey())
+    const signer = await Effect.runPromise(fromRedactedSecret(secret, "SUI_PRIVATE_KEY"))
+    expect(signer.scheme).toBe("ED25519")
+    expect(() => Redacted.value(secret)).toThrow()
+  })
+
+  test("after a failed decode too", async () => {
+    const secret = Redacted.make("suiprivkey1notakey")
+    const exit = await Effect.runPromiseExit(fromRedactedSecret(secret, "SUI_PRIVATE_KEY"))
+    expect(exit._tag).toBe("Failure")
+    expect(() => Redacted.value(secret)).toThrow()
   })
 })

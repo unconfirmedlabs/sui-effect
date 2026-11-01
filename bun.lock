@@ -5,18 +5,18 @@
     "": {
       "name": "sui-effect",
       "devDependencies": {
-        "@effect/language-service": "0.87.2",
-        "@effect/platform-bun": "4.0.3",
-        "@mysten/bcs": "2.1.1",
-        "@mysten/sui": "2.30.0",
+        "@effect/language-service": "0.87.5",
+        "@effect/platform-bun": "4.1.1",
+        "@mysten/bcs": "2.1.3",
+        "@mysten/sui": "2.38.0",
         "@types/bun": "1.4.2",
-        "effect": "4.0.3",
+        "effect": "4.1.1",
         "typescript": "5.9.3",
       },
       "peerDependencies": {
-        "@mysten/bcs": "^2.1.1",
+        "@mysten/bcs": "^2.1.3",
         "@mysten/sui": "^2.28",
-        "effect": ">=4.0.3 <4.1",
+        "effect": ">=4.1.1 <4.2",
       },
     },
   },
@@ -25,11 +25,11 @@
 
     "@0no-co/graphqlsp": ["@0no-co/graphqlsp@1.17.5", "", { "dependencies": { "@gql.tada/internal": "^1.2.1", "graphql": "^15.5.0 || ^16.0.0 || ^17.0.0" }, "peerDependencies": { "typescript": "^5.0.0 || ^6.0.0" } }, "sha512-wsygfTO3pdkz4idDw8BxdMdgB9AB8nuJDJTUwYy87BiZEZRXS4bEfn4oNl9VtxTo6j2lzX/gED+IvOgxsSy2Jg=="],
 
-    "@effect/language-service": ["@effect/language-service@0.87.2", "", { "bin": { "effect-language-service": "cli.js" } }, "sha512-CfiSoaVQO8pZgaMZGw5VvMvRGybsJ2LaSDoLYaqiVGvo/YYPYVR2GzUKY0h1NtIweq/+SQ5XLrvtzPIttWQ0GQ=="],
+    "@effect/language-service": ["@effect/language-service@0.87.5", "", { "bin": { "effect-language-service": "cli.js" } }, "sha512-np/zJgk71/PyHxtoqyUKLYcpQhoRBI+L6+1Z0ILk35JSQ/lvXzwlwOwddYZLDkeC4bdF2ukKekqKlla/F88R5w=="],
 
-    "@effect/platform-bun": ["@effect/platform-bun@4.0.3", "", { "dependencies": { "@effect/platform-node-shared": "^4.0.3" }, "peerDependencies": { "effect": "^4.0.3" } }, "sha512-Pl2TXjRTRRvGxtGfYWW8L+B1qkZo8mEx7Itvo2lUd15OQPZGDE111S6JDm9EgGfDK3BUz3sbyNeQD687GQm2iQ=="],
+    "@effect/platform-bun": ["@effect/platform-bun@4.1.1", "", { "dependencies": { "@effect/platform-node-shared": "^4.1.1" }, "peerDependencies": { "effect": "^4.1.1" } }, "sha512-//p0xPsbvuRfcO+cvq5JqVzR0TLUUS5yNC40xbZ08JNiszg5IxypAgrpKswKpjs2lYvybxdw5DSyVcEWW33Cbg=="],
 
-    "@effect/platform-node-shared": ["@effect/platform-node-shared@4.0.3", "", { "dependencies": { "@types/ws": "^8.18.2", "ws": "^8.22.0" }, "peerDependencies": { "effect": "^4.0.3" } }, "sha512-5srkJfmWklWSgwZwlkMeTXobfNtxuwuTCvY9JWdPXRv/PBXAe5kKSptzRxT778oFFsaE9IMI8X61pvkifT9Eug=="],
+    "@effect/platform-node-shared": ["@effect/platform-node-shared@4.1.1", "", { "dependencies": { "@types/ws": "^8.18.2", "ws": "^8.22.0" }, "peerDependencies": { "effect": "^4.1.1" } }, "sha512-29zdEDs3i5W+t92+mWTFNSfzSHsTpZMcFZ9k4lkkz4tETlC1m4lRwjdjieJtvQ/bKHMnYrCtZwizsBFSf3L5Yg=="],
 
     "@gql.tada/cli-utils": ["@gql.tada/cli-utils@1.9.3", "", { "dependencies": { "@0no-co/graphqlsp": "^1.17.3", "@gql.tada/internal": "1.2.2", "graphql": "^15.5.0 || ^16.0.0 || ^17.0.0" }, "peerDependencies": { "@gql.tada/svelte-support": "1.0.3", "@gql.tada/vue-support": "1.0.3", "typescript": "^5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0" }, "optionalPeers": ["@gql.tada/svelte-support", "@gql.tada/vue-support"] }, "sha512-P1TiXErpJwIi73sei5fzwGA/SOeCaIHFWFR4RdZPLwqxZzQN0T6MAUivzXBgKCORL67rvYnLaaPoWeqWq/61ug=="],
 
@@ -37,15 +37,19 @@
 
     "@graphql-typed-document-node/core": ["@graphql-typed-document-node/core@3.2.0", "", { "peerDependencies": { "graphql": "^0.8.0 || ^0.9.0 || ^0.10.0 || ^0.11.0 || ^0.12.0 || ^0.13.0 || ^14.0.0 || ^15.0.0 || ^16.0.0 || ^17.0.0" } }, "sha512-mB9oAsNCm9aM3/SOv4YtBMqZbYj10R7dkq8byBqxGY/ncFwhf2oQzMV+LCRlWoDSEBJ3COiR1yeDvMtsoOsuFQ=="],
 
-    "@mysten/bcs": ["@mysten/bcs@2.1.1", "", { "dependencies": { "@mysten/utils": "^0.4.1", "@scure/base": "^2.3.0" } }, "sha512-IDYomoQ6+yvOIClBHmNdScttv+h/HbGGHLEdUmGQptR3YdqqLM5vJD28wf2QP/UXCEBkCoG7TOT6pFNw8ExYmA=="],
+    "@mysten/bcs": ["@mysten/bcs@2.1.3", "", { "dependencies": { "@mysten/utils": "^0.4.2", "@scure/base": "^2.3.0" } }, "sha512-sg3hstwDLQQmQTpiX8Vzs13bEEGTqnhp1gUzBLlVQ493xyTTCDwB/jXGzT0g2I/GXd2o1B3s7Bd67Ua3VZo+Jw=="],
 
-    "@mysten/sui": ["@mysten/sui@2.30.0", "", { "dependencies": { "@graphql-typed-document-node/core": "^3.2.0", "@mysten/bcs": "^2.1.1", "@mysten/utils": "^0.4.1", "@noble/curves": "^2.3.0", "@noble/hashes": "^2.3.0", "@protobuf-ts/grpcweb-transport": "^2.11.1", "@protobuf-ts/runtime": "^2.11.1", "@protobuf-ts/runtime-rpc": "^2.11.1", "@scure/base": "^2.3.0", "@scure/bip32": "^2.3.0", "@scure/bip39": "^2.3.0", "gql.tada": "^1.11.3", "graphql": "^17.0.2", "poseidon-lite": "0.3.0", "valibot": "^1.4.2" } }, "sha512-qGpcE1jy7n9Ra9y8QQup2Ia2TLPZckrg1gJxJvszqOCp8jIPyAAvgvfhQxx7lI944625MIvasb7LRZiuGb0Z2Q=="],
+    "@mysten/sui": ["@mysten/sui@2.38.0", "", { "dependencies": { "@graphql-typed-document-node/core": "^3.2.0", "@mysten/bcs": "^2.1.3", "@mysten/utils": "^0.4.2", "@noble/curves": "^2.3.0", "@noble/hashes": "^2.3.0", "@noble/post-quantum": "^0.7.1", "@protobuf-ts/grpcweb-transport": "^2.11.1", "@protobuf-ts/runtime": "^2.11.1", "@protobuf-ts/runtime-rpc": "^2.11.1", "@scure/base": "^2.3.0", "@scure/bip32": "^2.3.0", "@scure/bip39": "^2.3.0", "gql.tada": "^1.11.3", "graphql": "^17.0.2", "poseidon-lite": "0.3.0", "valibot": "^1.4.2" } }, "sha512-j/uG+waSo62eWH0c3+a/3V8tnsAUTKfe7OIXtIDmhPLQcWnPCchf0R5WjxMx904Vh61qfYmrySFYoAau2+7bwA=="],
 
-    "@mysten/utils": ["@mysten/utils@0.4.1", "", { "dependencies": { "@scure/base": "^2.3.0" } }, "sha512-gffLJ84CbqG/CcOPuVlwXIRu37tFn0BtUx7CQtbLwJzWjUE7FU2Gq8BXWjzxImnvufcyLTaNWtCPG6wq22Zhog=="],
+    "@mysten/utils": ["@mysten/utils@0.4.2", "", {}, "sha512-K/5eBuYKxUFCrYcic1lvYvWE9OVSH581cjVjwsSJGUqPit91nZq2acUwes+B4lo98VE/CILIUeBcyEIvuNxMhA=="],
+
+    "@noble/ciphers": ["@noble/ciphers@2.4.0", "", {}, "sha512-AnjFn0Jv92laAkvMrghlFZq4qQCIN/4DxFV/eooqtC2YTjB7kBeLMS2T9KJX4Dn+ZVXLOwK0lSgqDtx9gvxtiw=="],
 
     "@noble/curves": ["@noble/curves@2.4.0", "", { "dependencies": { "@noble/hashes": "2.4.0" } }, "sha512-P4/62zrgfH33CneE3Dn4WhJVA22YUU0eR51wKIan4NVRvwsA0YnPTwWGpNbpuacSujmSFLvyzpyuR30+fbq2Ew=="],
 
     "@noble/hashes": ["@noble/hashes@2.4.0", "", {}, "sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA=="],
+
+    "@noble/post-quantum": ["@noble/post-quantum@0.7.1", "", { "dependencies": { "@noble/ciphers": "2.4.0", "@noble/curves": "2.4.0", "@noble/hashes": "2.4.0" } }, "sha512-+P9981IiAnVh+rmcubozzVwrEy3XsN/tMhTnvsjV9VDaYpOnNCqWqKo2FLWxbu92YHfjGIlE5XnW175UK+ln+Q=="],
 
     "@protobuf-ts/grpcweb-transport": ["@protobuf-ts/grpcweb-transport@2.11.1", "", { "dependencies": { "@protobuf-ts/runtime": "^2.11.1", "@protobuf-ts/runtime-rpc": "^2.11.1" } }, "sha512-1W4utDdvOB+RHMFQ0soL4JdnxjXV+ddeGIUg08DvZrA8Ms6k5NN6GBFU2oHZdTOcJVpPrDJ02RJlqtaoCMNBtw=="],
 
@@ -67,7 +71,7 @@
 
     "bun-types": ["bun-types@1.4.2", "", { "dependencies": { "@types/node": "*" } }, "sha512-bxV1FgK7yBIzjRe5zBozIM4Bem11ZJcCXSrjWRG3YWLt8yFDePu4cLjpebO8OvPeIE9trbyPF4fuj3Cia4Fj3w=="],
 
-    "effect": ["effect@4.0.3", "", {}, "sha512-LoWn/Uwwx0JjHSDmBAAahx8sB+klzM6vsZovnbYowBNw6B4QScJLRLBByO61plvNiycx7HPN8FnsWUCu0eXW5w=="],
+    "effect": ["effect@4.1.1", "", {}, "sha512-XYu65BrcmNqu5i7PPvP4dqL+R5ma37zIsfuSPjcn78mog+6e5PkilNg7Xo+pBpjXJYlWEIpH4j91tMrfW05CMw=="],
 
     "gql.tada": ["gql.tada@1.11.3", "", { "dependencies": { "@0no-co/graphql.web": "^1.3.2", "@0no-co/graphqlsp": "^1.17.3", "@gql.tada/cli-utils": "1.9.3", "@gql.tada/internal": "1.2.2" }, "peerDependencies": { "typescript": "^5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0" }, "bin": { "gql-tada": "./bin/cli.js", "gql.tada": "./bin/cli.js" } }, "sha512-5JCI4j2f0nug8ILaCQys/yjOP78QqqjVUf47OQsME63rZfemsHT3e5vcfbHsnZiG6vxyqpKUJArtXEVwSefUhw=="],
 

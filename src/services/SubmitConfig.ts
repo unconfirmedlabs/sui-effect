@@ -14,6 +14,51 @@ import { U32_MAX } from "../domain/schemas.ts"
 export type ExpirationPolicy = "validDuring" | "epoch" | "none"
 
 /**
+ * When `Tx.run` holds the sender lock.
+ *
+ * - `"whenPinned"` (the default): for **every build**, and on through signing,
+ *   `onSigned` and submission **only when the built bytes pin a versioned
+ *   object or carry a gas payment** — an owned or receiving input, a gas coin,
+ *   or a coin reservation. A coin reservation is what a recipe that uses
+ *   `tx.gas` gets when its payer has an address balance, and it reserves the
+ *   payer's **whole** SUI balance as of the build: a spend landing before it is
+ *   sent makes the node refuse it. So it holds the lock, and a run that uses
+ *   `tx.gas` first waits, before it builds, for the lock-free runs in flight on
+ *   its payer. Bytes that pin nothing (an empty payment, gas drawn from the
+ *   address balance at execution; pure, shared and `FundsWithdrawal` inputs)
+ *   release it before signing, so address-balance transactions from one sender
+ *   are sent and awaited concurrently.
+ * - `"always"`: from build through submit on every run, the rule before 0.4.0.
+ * - `"never"`: no lock at all.
+ *
+ * A config provided directly rather than through `SubmitConfig.with` may still
+ * hold the pre-0.4.0 boolean or another value: `Tx.run` reads `true` as
+ * `"always"`, `false` as `"never"`, and anything else as `"always"`.
+ *
+ * @since 0.4.0
+ */
+export type LockSenderPolicy = "whenPinned" | "always" | "never"
+
+/**
+ * How `Tx.build` treats a gas payment the recipe left unset.
+ *
+ * - `"preferAddressBalance"` (the default): the resolver decides, and every
+ *   SDK resolver pays from the payer's SUI address balance when it covers the
+ *   budget and the transaction does not use `tx.gas`, and from coins
+ *   otherwise.
+ * - `"requireAddressBalance"`: the payment is pinned to the address balance
+ *   (`[]`) before the build, unless the transaction uses `tx.gas`, and the
+ *   build fails with `BuildError` when the balance cannot cover the budget or
+ *   the resolver paid with coin objects. Fold coins first with
+ *   `Tx.foldCoins`.
+ *
+ * A payment the recipe set itself is the recipe's choice under either policy.
+ *
+ * @since 0.4.0
+ */
+export type GasPaymentPolicy = "preferAddressBalance" | "requireAddressBalance"
+
+/**
  * Whether `Tx.reconcile` is allowed to conclude that an expiration window
  * closed on a transaction the node does not know.
  *
@@ -69,7 +114,8 @@ export interface SubmitConfigService {
   /**
    * The largest gas budget `Tx.build` will accept. The budget itself is chosen
    * by the node's simulation during build; this is the ceiling above which
-   * building fails with `BuildError` rather than signing an expensive mistake.
+   * building fails with `PolicyDenied { rule: "maxGasBudget" }` rather than
+   * signing an expensive mistake.
    */
   readonly maxGasBudget: Mist
   /**
@@ -78,8 +124,19 @@ export interface SubmitConfigService {
    * `Tx.run` stays typed.
    */
   readonly preflight?: (simulation: Simulation) => Effect.Effect<void, PolicyDenied>
-  /** Whether `Tx.run` holds the sender lock from build through submit. */
-  readonly lockSender: boolean
+  /**
+   * When `Tx.run` holds the sender lock; see {@link LockSenderPolicy}.
+   * Defaults to `"whenPinned"`. Before 0.4.0 this was a boolean, and `true` /
+   * `false` given as overrides still mean `"always"` / `"never"`.
+   */
+  readonly lockSender: LockSenderPolicy
+  /**
+   * How an unset gas payment is chosen; see {@link GasPaymentPolicy}.
+   * Defaults to `"preferAddressBalance"`.
+   *
+   * @since 0.4.0
+   */
+  readonly gasPayment: GasPaymentPolicy
   /**
    * How `Tx.submit` re-sends the identical bytes after a retryable transport
    * failure or a timeout. It never rebuilds, so a retry can only ever land the
@@ -156,7 +213,8 @@ export const defaults: SubmitConfigService = {
   expiration: "validDuring",
   // The protocol's own maximum gas budget (50 SUI). Lower it to cap spend.
   maxGasBudget: 50_000_000_000n as Mist,
-  lockSender: true,
+  lockSender: "whenPinned",
+  gasPayment: "preferAddressBalance",
   resubmit: Schedule.min([
     Schedule.exponential("250 millis"),
     Schedule.spaced("30 seconds")
@@ -171,25 +229,57 @@ export const defaults: SubmitConfigService = {
   nonce: Random.nextIntBetween(0, U32_MAX)
 }
 
+/** The fields of {@link SubmitConfigService} that hold a `Duration`. */
+type DurationField = "validFor" | "executeTimeout" | "expiryMargin" | "reconcileRecheck" | "visibilityTimeout"
+
 /**
- * The lifecycle settings.
+ * What {@link SubmitConfig.with} and {@link SubmitConfig.layer} accept: any
+ * subset of {@link SubmitConfigService}, with every duration given as a
+ * `Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of
+ * milliseconds — and converted on the way in. The value in force (what
+ * `yield* SubmitConfig` answers) always holds `Duration`s. `lockSender` also
+ * takes the boolean it was before 0.4.0: `true` is `"always"`, `false`
+ * `"never"`.
  *
- * Because this is a `Context.Reference` and not a service, it never appears in
- * an `R`: a one-shot script gets the defaults with no wiring, and an
- * application overrides what it cares about with
- * {@link SubmitConfig.with} (one effect) or {@link SubmitConfig.layer} (a whole
- * application), both of which spread {@link SubmitConfig.defaults} for you.
- *
- * @example
- * ```ts
- * import { Effect } from "effect"
- * import { Mist } from "@unconfirmed/sui-effect"
- * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
- *
- * const strict = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
- *   effect.pipe(SubmitConfig.with({ maxGasBudget: Mist.make(100_000_000n) }))
- * ```
+ * @since 0.4.0
  */
+export type SubmitConfigOverrides = {
+  readonly [K in keyof SubmitConfigService]?: K extends DurationField ? Duration.Input
+    : K extends "lockSender" ? LockSenderPolicy | boolean
+    : SubmitConfigService[K]
+}
+
+const DURATION_FIELDS: ReadonlyArray<DurationField> = [
+  "validFor",
+  "executeTimeout",
+  "expiryMargin",
+  "reconcileRecheck",
+  "visibilityTimeout"
+]
+
+/**
+ * `base` ({@link defaults} unless given) with `overrides` applied, every
+ * duration converted.
+ *
+ * An input that is not a valid `Duration.Input` — reachable only past the type
+ * checker — throws, which is a defect at the edge that set it.
+ */
+const resolve = (
+  overrides: SubmitConfigOverrides,
+  base: SubmitConfigService = defaults
+): SubmitConfigService => {
+  const merged: Record<string, unknown> = { ...base, ...overrides }
+  for (const field of DURATION_FIELDS) {
+    const value = overrides[field]
+    if (value !== undefined) merged[field] = Duration.fromInputUnsafe(value)
+  }
+  // The boolean spelling from before 0.4.0: `true` was "lock from build
+  // through submit on every run", which is `"always"`.
+  if (typeof overrides.lockSender === "boolean") merged.lockSender = overrides.lockSender ? "always" : "never"
+  return merged as unknown as SubmitConfigService
+}
+
+/** The reference itself; {@link SubmitConfig} is it with the constructors attached. */
 const SubmitConfigRef = Context.Reference<SubmitConfigService>(
   "@unconfirmed/sui-effect/SubmitConfig",
   { defaultValue: () => defaults }
@@ -202,7 +292,8 @@ const SubmitConfigRef = Context.Reference<SubmitConfigService>(
  * The spread is the point: a `Context.Reference` holds one whole value, so
  * providing it by hand means writing `{ ...SubmitConfig.defaults, ... }` at
  * every site and casting every branded literal back to its field's type. This
- * does both. The `Journal.layerMemory` precedent is the same idea.
+ * does both, and takes every duration as a `Duration.Input` (`"3 seconds"`).
+ * The `Journal.layerMemory` precedent is the same idea.
  *
  * Never fails, requires nothing.
  *
@@ -213,16 +304,24 @@ const SubmitConfigRef = Context.Reference<SubmitConfigService>(
  * import { Layer } from "effect"
  * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
  *
- * const app = Layer.mergeAll(SubmitConfig.layer({ resubmitAttempts: 1 }))
+ * const app = Layer.mergeAll(
+ *   SubmitConfig.layer({ resubmitAttempts: 1, executeTimeout: "10 seconds" })
+ * )
  * ```
  */
-const layer = (overrides: Partial<SubmitConfigService>): Layer.Layer<never> =>
-  Layer.succeed(SubmitConfigRef, { ...defaults, ...overrides })
+const layer = (overrides: SubmitConfigOverrides): Layer.Layer<never> =>
+  Layer.sync(SubmitConfigRef, () => resolve(overrides))
 
 /**
- * {@link defaults} with `overrides` applied, provided to one effect — the
- * `.pipe`-able form of {@link layer}, for overriding the lifecycle for a single
- * submission rather than for a whole application.
+ * The config **in force** with `overrides` applied, provided to one effect —
+ * the `.pipe`-able form of {@link layer}, for overriding the lifecycle for a
+ * single submission rather than for a whole application.
+ *
+ * It merges over whatever is in force where the effect runs, not over
+ * {@link defaults}, the way `Gate.with` does: a `SubmitConfig.layer` (or the
+ * fast config `layerTest` installs) stays in force for every field the
+ * overrides leave out, and two nested `with`s compose. Before 0.4.0 it reset
+ * to the defaults.
  *
  * Never fails, requires nothing.
  *
@@ -240,12 +339,44 @@ const layer = (overrides: Partial<SubmitConfigService>): Layer.Layer<never> =>
  * ```
  */
 const withOverrides =
-  (overrides: Partial<SubmitConfigService>) =>
+  (overrides: SubmitConfigOverrides) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-    Effect.provideService(effect, SubmitConfigRef, { ...defaults, ...overrides })
+    Effect.updateService(effect, SubmitConfigRef, (inForce) => resolve(overrides, inForce))
 
+/**
+ * The lifecycle settings.
+ *
+ * Because this is a `Context.Reference` and not a service, it never appears in
+ * an `R`: a one-shot script gets the defaults with no wiring, and an
+ * application overrides what it cares about with
+ * {@link SubmitConfig.with} (one effect), which merges over the config **in
+ * force** so an outer override survives an inner one, or
+ * {@link SubmitConfig.layer} (a whole application), which spreads
+ * {@link SubmitConfig.defaults} for you.
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { Mist } from "@unconfirmed/sui-effect"
+ * import { SubmitConfig } from "@unconfirmed/sui-effect/tx"
+ *
+ * const strict = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+ *   effect.pipe(SubmitConfig.with({ maxGasBudget: Mist.make(100_000_000n) }))
+ * ```
+ */
 export const SubmitConfig = Object.assign(SubmitConfigRef, {
+  /** The settings in force when nothing overrides them. */
   defaults,
+  /**
+   * A `Layer` that puts `defaults` in force with `overrides` applied, for an
+   * application or a test that sets its lifecycle policy once at the edge.
+   * Never fails, requires nothing.
+   */
   layer,
+  /**
+   * The config in force with `overrides` applied, provided to one effect:
+   * the `.pipe`-able form of `layer`, merging over what is in force rather
+   * than over `defaults`. Never fails, requires nothing.
+   */
   with: withOverrides
 })

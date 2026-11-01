@@ -13,9 +13,10 @@
  * `ConfigError` and `NetworkMismatch` exit 2, `ObjectNotFound`,
  * `ObjectDeleted`, `ObjectUnavailable`, `DecodeError`, `TransportError`,
  * `BuildError`, `SimulationFailed`, `SigningError`, `PolicyDenied`,
- * `NotApplied`, `JournalError` and `UnexpectedEffects` exit 4,
- * `ExecutionFailed` exits 5, and `SubmissionUnknown` exits 3 with the signed
- * bytes on stderr so the submission can be reconciled.
+ * `NotApplied` and `JournalError` exit 4 (nothing applied), `ExecutionFailed`
+ * and `UnexpectedEffects` exit 5 (applied on chain: gas was charged, and for
+ * the second only the receipt is missing), and `SubmissionUnknown` exits 3
+ * with the signed bytes on stderr so the submission can be reconciled.
  */
 import { bcs } from "@mysten/sui/bcs"
 import { Config, Console, Effect } from "effect"

@@ -22,11 +22,17 @@ export {
   type SignatureScheme
 } from "./services/Signer.ts"
 
+/** Signature verification: the Effect face of `@mysten/sui/verify`. */
+export { Verify, type VerifyOptions } from "./services/Verify.ts"
+
 /** The lifecycle settings, with the spec's defaults in force by default. */
 export {
   type ExpirationPolicy,
   type ExpiryEvidencePolicy,
+  type GasPaymentPolicy,
+  type LockSenderPolicy,
   SubmitConfig,
+  type SubmitConfigOverrides,
   type SubmitConfigService
 } from "./services/SubmitConfig.ts"
 
@@ -36,20 +42,24 @@ export { Journal, type JournalService } from "./services/Journal.ts"
 /** The lifecycle as a serializable union, for what the journal holds. */
 export { isUnresolved, JournalEntry, UNRESOLVED_TAGS } from "./domain/journal-entry.ts"
 
-/** Build, sign, cosign, canonical recipe helpers, submit, reconcile, run. */
+/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, reconcile, resubmit, run, foldCoins. */
 export {
+  attach,
   build,
   cosign,
+  fromBytes,
   gaslessStablecoinTransfer,
   type Built,
+  foldCoins,
+  type FoldResult,
   Reconciled,
-  type ReconciledOutcome,
   type ReconcileInput,
   type RunError,
   type SubmitError,
   recorded,
   reconcile,
   reconcileAll,
+  resubmit,
   run,
   sign,
   Signed,
@@ -60,6 +70,9 @@ export {
   submitVia,
   Tx
 } from "./services/Tx.ts"
+
+/** Folding coins into the address balance, and sending into one. */
+export { fold, type FoldBatch, type FoldGas, type FoldPlan, planFold, sendFunds } from "./services/Fold.ts"
 
 /** The expiration union and the bounds `Tx.reconcile` reasons about. */
 export {

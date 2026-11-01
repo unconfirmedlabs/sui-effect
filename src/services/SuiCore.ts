@@ -14,7 +14,7 @@ import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
 import { isSuiGrpcClient, SuiGrpcClient } from "@mysten/sui/grpc"
 import type { TransactionPlugin } from "@mysten/sui/transactions"
-import { Config, ConfigProvider, Context, Effect, Layer, Predicate, Schedule, Schema } from "effect"
+import { Config, ConfigProvider, Context, Duration, Effect, Layer, Option, Predicate, Schedule, Schema } from "effect"
 import {
   ObjectDeleted,
   ObjectNotFound,
@@ -25,6 +25,7 @@ import {
 } from "../domain/errors.ts"
 
 import { classifyTransportCause } from "../domain/errors.ts"
+import * as Metrics from "../domain/metrics.ts"
 import { Digest, executionReasonOf, ExecutionReason, KnownNetwork, ObjectId } from "../domain/schemas.ts"
 
 export { RETRYABLE_GRPC_STATUSES } from "../domain/errors.ts"
@@ -75,8 +76,39 @@ const rethrowDefects = (cause: unknown): void => {
   if (Predicate.hasProperty(cause, DefectMarker)) throw cause
 }
 
+/**
+ * The messages the SDK throws, before any request is made, when the *caller*
+ * passed an argument it cannot act on: a filter with no predicate or two, a
+ * malformed function or event filter, a function filter that cannot be
+ * paginated, contradictory pagination bounds.
+ *
+ * Those are bugs in the calling program, not the network: retrying cannot help
+ * and a `TransportError` says the wrong thing about where to look. So they are
+ * re-thrown and surface as a defect carrying the SDK's own sentence. Matched by
+ * message because the SDK throws a plain `Error` for them; a message this list
+ * does not know falls back to a `TransportError`, which is what it always was.
+ */
+const SDK_ARGUMENT_ERRORS: ReadonlyArray<string> = [
+  "Paginating transactions filtered by function requires",
+  "Invalid function filter",
+  "Invalid emitModule filter",
+  "Invalid eventType filter",
+  "filter must specify exactly one of",
+  "Only one of `after` or `before` may be provided",
+  "`after` can not be combined with descending",
+  "`before` can not be combined with ascending"
+]
+
+/** Whether a thrown value is one of the SDK's caller-argument refusals. Never fails. */
+const isSdkArgumentError = (cause: unknown): cause is Error =>
+  cause instanceof Error &&
+  cause.constructor === Error &&
+  !Predicate.hasProperty(cause, "code") &&
+  SDK_ARGUMENT_ERRORS.some((prefix) => cause.message.includes(prefix))
+
 const transportError = (method: string, cause: unknown): TransportError => {
   rethrowDefects(cause)
+  if (isSdkArgumentError(cause)) throw cause
   return TransportError.fromUnknown(method, cause)
 }
 
@@ -150,9 +182,18 @@ const transactionErrorLike = (cause: unknown): { readonly digest: string } | und
  */
 const simulationErrorLike = (
   cause: unknown
-): { readonly executionError: unknown; readonly message: string; readonly cause: unknown } | undefined => {
+): {
+  readonly executionError: SuiClientTypes.ExecutionError | undefined
+  readonly message: string
+  readonly cause: unknown
+} | undefined => {
   if (!(cause instanceof Error) || cause.name !== "SimulationError") return undefined
-  const record = cause as unknown as { readonly executionError?: unknown; readonly cause?: unknown }
+  // Another copy's `executionError` is the same wire shape; `executionReasonOf`
+  // decodes it and answers `UNKNOWN_REASON` for anything that is not.
+  const record = cause as unknown as {
+    readonly executionError?: SuiClientTypes.ExecutionError
+    readonly cause?: unknown
+  }
   return { executionError: record.executionError, message: cause.message, cause: record.cause }
 }
 
@@ -185,9 +226,12 @@ const simulationErrorLike = (
  */
 export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
   rethrowDefects(cause)
-  if (cause instanceof ObjectError) {
-    const objectId = asObjectId(cause.objectId)
-    switch (cause.reason) {
+  // Each class is recognised by `instanceof` first and by its shape second;
+  // only the shape path means a second copy of the SDK, so only it warns.
+  const object = cause instanceof ObjectError ? cause : fromCopy("ObjectError", objectErrorLike(cause))
+  if (object !== undefined) {
+    const objectId = asObjectId(object.objectId)
+    switch (object.reason) {
       case "notFound":
         return new ObjectNotFound({ objectId })
       case "deleted":
@@ -196,10 +240,16 @@ export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
         return new ObjectUnavailable({ objectId })
     }
   }
-  if (cause instanceof TransactionError) {
-    return new TransactionNotFound({ digest: asDigest(cause.digest) })
+  const transaction = cause instanceof TransactionError
+    ? cause
+    : fromCopy("TransactionError", transactionErrorLike(cause))
+  if (transaction !== undefined) {
+    return new TransactionNotFound({ digest: asDigest(transaction.digest) })
   }
-  if (cause instanceof SimulationError) {
+  const simulation = cause instanceof SimulationError
+    ? cause
+    : fromCopy("SimulationError", simulationErrorLike(cause))
+  if (simulation !== undefined) {
     // The SDK's resolve plugin simulates to choose a gas budget and wraps
     // *whatever went wrong* in a `SimulationError`, transport failures
     // included: a rejected fetch, a gRPC `UNAVAILABLE`, an HTTP 503. Only a
@@ -207,66 +257,38 @@ export const mapSdkError = (method: string, cause: unknown): SuiCoreError => {
     // abort on chain; the rest are the node being unreachable, and calling
     // those `SimulationFailed` loses both the status and the retryability a
     // caller needs.
-    if (cause.executionError === undefined) {
-      const transport = transportCauseOf(cause)
+    if (simulation.executionError === undefined) {
+      const transport = transportCauseOf(simulation)
       if (transport !== undefined) {
         return new TransportError({
           method,
           retryable: transport.retryable,
           ...(transport.status === undefined ? {} : { status: transport.status }),
-          cause: cause.cause ?? cause
+          cause: simulation.cause ?? cause
         })
       }
     }
     return new SimulationFailed({
-      reason:
-        cause.executionError === undefined ? UNKNOWN_REASON : executionReasonOf(cause.executionError),
-      message: cause.message
-    })
-  }
-  // Every `instanceof` above answered `false`. Either this is a genuine
-  // transport failure, or it is one of those same classes from a second copy of
-  // the SDK: try the shapes before giving up on the meaning.
-  const objectLike = objectErrorLike(cause)
-  if (objectLike !== undefined) {
-    reportDuplicateSdk("ObjectError")
-    const objectId = asObjectId(objectLike.objectId)
-    switch (objectLike.reason) {
-      case "notFound":
-        return new ObjectNotFound({ objectId })
-      case "deleted":
-        return new ObjectDeleted({ objectId })
-      default:
-        return new ObjectUnavailable({ objectId })
-    }
-  }
-  const transactionLike = transactionErrorLike(cause)
-  if (transactionLike !== undefined) {
-    reportDuplicateSdk("TransactionError")
-    return new TransactionNotFound({ digest: asDigest(transactionLike.digest) })
-  }
-  const simulationLike = simulationErrorLike(cause)
-  if (simulationLike !== undefined) {
-    reportDuplicateSdk("SimulationError")
-    if (simulationLike.executionError === undefined) {
-      const transport = transportCauseOf({ cause: simulationLike.cause })
-      if (transport !== undefined) {
-        return new TransportError({
-          method,
-          retryable: transport.retryable,
-          ...(transport.status === undefined ? {} : { status: transport.status }),
-          cause: simulationLike.cause ?? cause
-        })
-      }
-    }
-    return new SimulationFailed({
-      reason: simulationLike.executionError === undefined
+      reason: simulation.executionError === undefined
         ? UNKNOWN_REASON
-        : executionReasonOf(simulationLike.executionError as SuiClientTypes.ExecutionError),
-      message: simulationLike.message
+        : executionReasonOf(simulation.executionError),
+      message: simulation.message,
+      ...(simulation.executionError?.command === undefined
+        ? {}
+        : { command: simulation.executionError.command })
     })
   }
   return transportError(method, cause)
+}
+
+/**
+ * An SDK class recognised by shape rather than by `instanceof`, which means a
+ * second copy of the SDK is loaded: warn once, and answer the value unchanged.
+ * Never fails.
+ */
+const fromCopy = <A>(what: string, found: A | undefined): A | undefined => {
+  if (found !== undefined) reportDuplicateSdk(what)
+  return found
 }
 
 /**
@@ -336,15 +358,87 @@ export const readSchedule = Schedule.min([
 
 const MAX_READ_ATTEMPTS = 5
 
-const retryReads = <A, E extends { readonly _tag: string }, R>(
-  effect: Effect.Effect<A, E, R>
-): Effect.Effect<A, E, R> =>
-  Effect.retry(effect, {
-    schedule: readSchedule,
-    times: MAX_READ_ATTEMPTS - 1,
-    while: (error: E) =>
-      error._tag === "TransportError" && (error as unknown as TransportError).retryable
-  })
+/** How long one read attempt may take when the layer does not say: thirty seconds. */
+export const DEFAULT_REQUEST_TIMEOUT: Duration.Duration = Duration.seconds(30)
+
+const isRetryableRead = (error: unknown): boolean =>
+  Predicate.hasProperty(error, "_tag") &&
+  error._tag === "TransportError" &&
+  (error as TransportError).retryable
+
+/**
+ * The retry policy one read runs under: `custom` when the layer was given one
+ * (it decides delays and when to stop), otherwise {@link readSchedule} for at
+ * most five attempts — and in both cases only while the failure is a retryable
+ * `TransportError`. Every retry is logged at debug level with the method, the
+ * attempt and the failure, so a slow read is visible instead of silent.
+ */
+const readPolicy = (
+  method: string,
+  custom: Schedule.Schedule<unknown, unknown> | undefined
+): Schedule.Schedule<unknown, unknown> =>
+  Schedule.while(
+    custom ?? readSchedule,
+    ({ attempt, input }) =>
+      isRetryableRead(input) && (custom !== undefined || attempt <= MAX_READ_ATTEMPTS - 1)
+  ).pipe(
+    Schedule.tap(({ attempt, input }) =>
+      Effect.logDebug(`SuiCore.${method}: retrying a retryable read failure`).pipe(
+        Effect.annotateLogs({
+          "sui.method": method,
+          "sui.attempt": attempt,
+          "sui.error": input instanceof Error ? input.message : String(input)
+        }),
+        Effect.andThen(Metrics.increment(Metrics.readRetries, { method, status: statusOf(input) }))
+      )
+    )
+  )
+
+/** The `status` attribute of a retried failure: its transport status, or `none`. */
+const statusOf = (input: unknown): string =>
+  Predicate.hasProperty(input, "status") && typeof input.status === "string" ? input.status : "none"
+
+/**
+ * The default read policy for `method`: what `SuiCoreService.readPolicy`
+ * answers on a layer built without `readRetry`, and what to use when a
+ * hand-built mock has no `readPolicy`. Internal.
+ */
+export const defaultReadPolicy = (method: string): Schedule.Schedule<unknown, unknown> =>
+  readPolicy(method, undefined)
+
+/**
+ * How the read tier behaves: the per-attempt request timeout and the retry
+ * schedule. Every field is optional; the defaults are the spec's.
+ *
+ * @since 0.4.0
+ */
+export interface SuiCoreReadOptions {
+  /**
+   * How long **one attempt** of a read may take before it is abandoned — its
+   * request cancelled through the `AbortSignal` — and counted as a retryable
+   * `TransportError { status: "DEADLINE_EXCEEDED" }`, which the retry policy
+   * then retries like any other. Defaults to thirty seconds; `"Infinity"`
+   * turns it off.
+   *
+   * This is what stops a node that accepts the connection and never answers
+   * from hanging a program forever, the layer's own `getChainIdentifier`
+   * included. It is not the gRPC client's `timeout`, which only sets a
+   * `grpc-timeout` header the server may ignore. It does not apply to
+   * `executeTransaction` and `signAndExecuteTransaction` (`Tx.submit` has its
+   * own `SubmitConfig.executeTimeout`), `waitForTransaction` (which takes its
+   * own `timeout`) or `use`.
+   */
+  readonly requestTimeout?: Duration.Input
+  /**
+   * The schedule a read is retried on, replacing the default (jittered
+   * exponential from 250 ms, capped at 10 s, five attempts in all). It sees
+   * every failure but is only consulted while the failure is a retryable
+   * `TransportError`; it decides the delays and when to stop, so give it a
+   * limit (`Schedule.recurs`, `Schedule.during`) unless retrying forever is
+   * meant.
+   */
+  readonly readRetry?: Schedule.Schedule<unknown, unknown>
+}
 
 type ObjectInclude = SuiClientTypes.ObjectInclude
 type TransactionInclude = SuiClientTypes.TransactionInclude
@@ -363,6 +457,37 @@ export type VersionedObject =
     readonly previousTransaction: string | undefined
   }
   | { readonly _tag: "Absent"; readonly reason: string }
+
+/**
+ * What a node says about itself: the chain, where its ledger head is, and — the
+ * part a reconciler or an indexer needs — how far back its history reaches.
+ * Mirrors gRPC `LedgerService.GetServiceInfo`; every field is optional because
+ * the proto's are.
+ *
+ * @since 0.4.0
+ */
+export interface ServiceInfo {
+  /** The chain identifier (genesis checkpoint digest). */
+  readonly chainId?: string
+  /** The chain's human name (`mainnet`, `testnet`, …). */
+  readonly chain?: string
+  /** The current epoch. */
+  readonly epoch?: bigint
+  /** The latest checkpoint the node has executed. */
+  readonly checkpointHeight?: bigint
+  /** That checkpoint's timestamp, in milliseconds since the epoch. */
+  readonly timestampMs?: number
+  /**
+   * The oldest checkpoint whose data (transactions, events) the node still
+   * serves. A pruning node moves this forward: a transaction older than it
+   * answers `NOT_FOUND`, and a cursor older than it answers `OUT_OF_RANGE`.
+   */
+  readonly lowestAvailableCheckpoint?: bigint
+  /** The oldest checkpoint whose object versions the node still serves. */
+  readonly lowestAvailableCheckpointObjects?: bigint
+  /** The node's software version. */
+  readonly server?: string
+}
 
 /**
  * The mechanical tier: one member per `SuiClientTypes.TransportMethods` key,
@@ -465,6 +590,20 @@ export interface SuiCoreService {
     options: { readonly objectId: string; readonly version: string | bigint }
   ) => Effect.Effect<VersionedObject, TransportError>
 
+  /**
+   * What the node says about itself, including the lowest checkpoint it still
+   * serves — which is how a caller tells a pruned history from a missing
+   * transaction. Not a `TransportMethods` member: it reaches gRPC
+   * `LedgerService.GetServiceInfo` directly (or a client's own
+   * `getServiceInfo`, which is how a test double provides it).
+   *
+   * Fails with: `TransportError` — `status: "UNIMPLEMENTED"`, not retryable,
+   * on a transport that has no such call.
+   *
+   * @since 0.4.0
+   */
+  readonly getServiceInfo: () => Effect.Effect<ServiceInfo, TransportError>
+
   /** Polls until a digest is visible. Fails with: `TransactionNotFound`, `TransportError`. */
   readonly waitForTransaction: <Include extends TransactionInclude = {}>(
     options: SuiClientTypes.WaitForTransactionOptions<Include>
@@ -556,6 +695,24 @@ export interface SuiCoreService {
   readonly use: <A>(
     run: (client: ClientWithCoreApi, signal: AbortSignal) => Promise<A>
   ) => Effect.Effect<A, SuiCoreError>
+
+  /**
+   * The retry schedule this client's reads run under, for a read made outside
+   * its members — `Tx.build` retries the SDK resolver's own reads on it. It is
+   * `SuiCoreReadOptions.readRetry` when the layer was given one and the
+   * default otherwise (jittered exponential from 250 ms, capped at 10 s, five
+   * attempts in all); in both cases it only continues while the failure is a
+   * retryable `TransportError`, and every retry is logged at debug level and
+   * counted in `sui_effect_core_read_retries_total` under `method`.
+   *
+   * Use it as `Effect.retry(effect, core.readPolicy("myRead"))`. Optional
+   * only so a hand-built `Layer.mock(SuiCore, ...)` need not supply it; every
+   * layer this package builds has it, and `Tx.build` falls back to the
+   * default policy when it is absent.
+   *
+   * @since 0.4.0
+   */
+  readonly readPolicy?: (method: string) => Schedule.Schedule<unknown, unknown>
 }
 
 /**
@@ -574,20 +731,28 @@ export interface SuiCoreService {
  * ```
  */
 export class SuiCore extends Context.Service<SuiCore, SuiCoreService>()("@unconfirmed/sui-effect/SuiCore") {
-  /** Wraps a client the caller already built and configured. */
-  static readonly layerFromClient = (client: ClientWithCoreApi): Layer.Layer<SuiCore> =>
-    Layer.succeed(SuiCore, makeFromClient(client))
+  /**
+   * Wraps a client the caller already built and configured; `options` sets the
+   * read tier's request timeout and retry schedule. Never fails.
+   */
+  static readonly layerFromClient = (
+    client: ClientWithCoreApi,
+    options?: SuiCoreReadOptions
+  ): Layer.Layer<SuiCore> => Layer.succeed(SuiCore, makeFromClient(client, options))
 
-  /** Builds a `SuiGrpcClient` and wraps it. */
+  /** Builds a `SuiGrpcClient` and wraps it. Never fails. */
   static readonly layerGrpc = (options: SuiGrpcLayerOptions): Layer.Layer<SuiCore> =>
-    Layer.sync(SuiCore, () => makeFromClient(makeGrpcClient(options)))
+    Layer.sync(SuiCore, () => makeFromClient(makeGrpcClient(options), options))
 
   /**
-   * Reads `SUI_NETWORK` (required, no default) and `SUI_RPC_URL` (optional,
-   * defaulted from {@link defaultGrpcUrl} for the four known networks).
+   * Reads `SUI_NETWORK` (required, no default), `SUI_RPC_URL` (optional,
+   * defaulted from {@link defaultGrpcUrl} for the four known networks) and
+   * `SUI_RPC_TIMEOUT` (optional, a duration such as `30 seconds` or
+   * `Infinity`; the per-attempt `requestTimeout`, thirty seconds when unset).
    *
-   * The layer fails with `ConfigError` when `SUI_NETWORK` is missing, or when
-   * it names a network with no built-in URL and `SUI_RPC_URL` is not set.
+   * Fails with: `ConfigError` (the layer) when `SUI_NETWORK` is missing, when
+   * it names a network with no built-in URL and `SUI_RPC_URL` is not set, or
+   * when `SUI_RPC_TIMEOUT` is not a duration.
    */
   static readonly layerConfig: Layer.Layer<SuiCore, Config.ConfigError> = Layer.effect(
     SuiCore,
@@ -605,15 +770,29 @@ export class SuiCore extends Context.Service<SuiCore, SuiCoreService>()("@unconf
             : Config.succeed(fallback)
         })
       )
-      return makeFromClient(makeGrpcClient({ network, baseUrl }))
+      const requestTimeout = yield* Config.option(Config.Duration("SUI_RPC_TIMEOUT"))
+      const options: SuiGrpcLayerOptions = {
+        network,
+        baseUrl,
+        ...(Option.isSome(requestTimeout) ? { requestTimeout: requestTimeout.value } : {})
+      }
+      return makeFromClient(makeGrpcClient(options), options)
     })
   )
 }
 
-/** Options for {@link SuiCore.layerGrpc}, mirroring `SuiGrpcClientOptions`. */
-export interface SuiGrpcLayerOptions {
+/**
+ * Options for {@link SuiCore.layerGrpc}: `SuiGrpcClientOptions`, plus the read
+ * tier's {@link SuiCoreReadOptions}.
+ */
+export interface SuiGrpcLayerOptions extends SuiCoreReadOptions {
   readonly network: SuiClientTypes.Network
   readonly baseUrl: string
+  /**
+   * The SDK's own `timeout`, in milliseconds: a `grpc-timeout` header on each
+   * call, which a server is free to ignore. To bound how long a read can
+   * actually take, use `requestTimeout`.
+   */
   readonly timeout?: number
   readonly mvr?: SuiClientTypes.MvrOptions
 }
@@ -737,15 +916,113 @@ const readObjectAtVersion = async (
   }
 }
 
+/** The gRPC service-info call, duck-typed so it compiles against every SDK in the peer range. */
+interface ServiceInfoCapable {
+  readonly getServiceInfo: (
+    input: object,
+    options: { readonly abort: AbortSignal }
+  ) => PromiseLike<{
+    readonly response: {
+      readonly chainId?: string
+      readonly chain?: string
+      readonly epoch?: bigint
+      readonly checkpointHeight?: bigint
+      readonly timestamp?: { readonly seconds: bigint; readonly nanos: number }
+      readonly lowestAvailableCheckpoint?: bigint
+      readonly lowestAvailableCheckpointObjects?: bigint
+      readonly server?: string
+    }
+  }>
+}
+
+const serviceOf = (client: ClientWithCoreApi): ServiceInfoCapable | undefined => {
+  const ledger = (client as { readonly ledgerService?: unknown }).ledgerService
+  return typeof (ledger as { readonly getServiceInfo?: unknown } | undefined)?.getServiceInfo === "function"
+    ? ledger as ServiceInfoCapable
+    : undefined
+}
+
+/** A client's own `getServiceInfo(signal)`: how a test double answers. */
+interface DirectServiceInfo {
+  readonly getServiceInfo: (options: { readonly signal: AbortSignal }) => Promise<ServiceInfo>
+}
+
+const hasDirectServiceInfo = (client: unknown): client is DirectServiceInfo =>
+  typeof (client as { readonly getServiceInfo?: unknown }).getServiceInfo === "function"
+
+const readServiceInfo = async (client: ClientWithCoreApi, signal: AbortSignal): Promise<ServiceInfo> => {
+  const ledger = serviceOf(client)
+  if (ledger !== undefined) {
+    const { response } = await ledger.getServiceInfo({}, { abort: signal })
+    const ts = response.timestamp
+    return {
+      ...(response.chainId === undefined ? {} : { chainId: response.chainId }),
+      ...(response.chain === undefined ? {} : { chain: response.chain }),
+      ...(response.epoch === undefined ? {} : { epoch: response.epoch }),
+      ...(response.checkpointHeight === undefined ? {} : { checkpointHeight: response.checkpointHeight }),
+      ...(ts === undefined ? {} : { timestampMs: Number(ts.seconds) * 1000 + Math.floor(ts.nanos / 1e6) }),
+      ...(response.lowestAvailableCheckpoint === undefined
+        ? {}
+        : { lowestAvailableCheckpoint: response.lowestAvailableCheckpoint }),
+      ...(response.lowestAvailableCheckpointObjects === undefined
+        ? {}
+        : { lowestAvailableCheckpointObjects: response.lowestAvailableCheckpointObjects }),
+      ...(response.server === undefined ? {} : { server: response.server })
+    }
+  }
+  if (hasDirectServiceInfo(client)) return client.getServiceInfo({ signal })
+  throw new ServiceInfoUnimplemented()
+}
+
+/** Thrown by {@link readServiceInfo} on a transport with no service-info call. */
+class ServiceInfoUnimplemented extends Error {
+  constructor() {
+    super("this transport has no GetServiceInfo call")
+  }
+}
+
 /**
  * Wraps a client object into the service. Exported so `SuiExtension.fromService`
  * and tests can build the same implementation over any `ClientWithCoreApi`.
  */
-export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
+export const makeFromClient = (
+  client: ClientWithCoreApi,
+  options?: SuiCoreReadOptions
+): SuiCoreService => {
+  const requestTimeout = Duration.fromInputUnsafe(options?.requestTimeout ?? DEFAULT_REQUEST_TIMEOUT)
+  const bounded = Duration.isFinite(requestTimeout)
+  const readRetry = options?.readRetry
+
+  /**
+   * One attempt, bounded by the request timeout. Interrupting the attempt
+   * aborts its `AbortSignal`, so the SDK request is cancelled rather than left
+   * running; the timeout itself is a retryable `TransportError`.
+   */
+  const attempt = <A, E>(method: string, effect: Effect.Effect<A, E>): Effect.Effect<A, E | TransportError> =>
+    bounded
+      ? Effect.timeoutOrElse(effect, {
+        duration: requestTimeout,
+        orElse: () =>
+          Metrics.increment(Metrics.requestTimeouts, { method }).pipe(
+            Effect.andThen(Effect.fail(
+              new TransportError({
+                method,
+                retryable: true,
+                status: "DEADLINE_EXCEEDED",
+                cause: `no answer within ${Duration.format(requestTimeout)} (requestTimeout)`
+              })
+            ))
+          )
+      })
+      : effect
+
+  /** A read: bounded attempts, retried under the read policy. */
+  const retryReads = <A, E>(method: string, effect: Effect.Effect<A, E>): Effect.Effect<A, E | TransportError> =>
+    Effect.retry(attempt(method, effect), readPolicy(method, readRetry))
+
   // Every member below is an `Effect.fn("SuiCore.<method>")`, so the span is
   // named after the method and `call` does not add one of its own.
   const call = <A, E>(
-    _method: string,
     run: (core: ClientWithCoreApi["core"], signal: AbortSignal) => Promise<A>,
     onError: (cause: unknown) => E
   ): Effect.Effect<A, E> =>
@@ -758,7 +1035,17 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
     method: string,
     run: (core: ClientWithCoreApi["core"], signal: AbortSignal) => Promise<A>,
     onError: (cause: unknown) => E
-  ): Effect.Effect<A, E> => retryReads(call(method, run, onError))
+  ): Effect.Effect<A, E | TransportError> => retryReads(method, call(run, onError))
+
+  /**
+   * A read with no request timeout, for the one read that is a wait by
+   * design: `waitForTransaction` polls for up to its own `timeout`.
+   */
+  const readUnbounded = <A, E extends { readonly _tag: string }>(
+    method: string,
+    run: (core: ClientWithCoreApi["core"], signal: AbortSignal) => Promise<A>,
+    onError: (cause: unknown) => E
+  ): Effect.Effect<A, E> => Effect.retry(call(run, onError), readPolicy(method, readRetry))
 
   /**
    * The attribute every span this client makes carries, known at construction.
@@ -879,7 +1166,6 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
     ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransportError> {
       yield* Effect.annotateCurrentSpan({ "sui.signature_count": options.signatures.length })
       return yield* call(
-        "executeTransaction",
         (core, signal) => core.executeTransaction({ ...options, signal }),
         onlyTransportError("executeTransaction")
       )
@@ -888,7 +1174,6 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
       options: SuiClientTypes.SignAndExecuteTransactionOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransportError> {
       return yield* call(
-        "signAndExecuteTransaction",
         (core, signal) => core.signAndExecuteTransaction({ ...options, signal }),
         onlyTransportError("signAndExecuteTransaction")
       )
@@ -897,6 +1182,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
       options: { readonly objectId: string; readonly version: string | bigint }
     ): Effect.fn.Return<VersionedObject, TransportError> {
       return yield* retryReads(
+        "getObjectAtVersion",
         Effect.tryPromise({
           try: (signal) =>
             readObjectAtVersion(client, options.objectId, BigInt(options.version), signal),
@@ -904,11 +1190,31 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         })
       )
     }),
+    getServiceInfo: Effect.fn("SuiCore.getServiceInfo", spanOptions)(function*(): Effect.fn.Return<
+      ServiceInfo,
+      TransportError
+    > {
+      return yield* retryReads(
+        "getServiceInfo",
+        Effect.tryPromise({
+          try: (signal) => readServiceInfo(client, signal),
+          catch: (cause) =>
+            cause instanceof ServiceInfoUnimplemented
+              ? new TransportError({
+                method: "getServiceInfo",
+                retryable: false,
+                status: "UNIMPLEMENTED",
+                cause: cause.message
+              })
+              : transportError("getServiceInfo", cause)
+        })
+      )
+    }),
     waitForTransaction: Effect.fn("SuiCore.waitForTransaction", spanOptions)(function*<Include extends TransactionInclude = {}>(
       options: SuiClientTypes.WaitForTransactionOptions<Include>
     ): Effect.fn.Return<SuiClientTypes.TransactionResult<Include>, TransactionLookupError> {
       yield* Effect.annotateCurrentSpan({ "sui.digest": options.digest })
-      return yield* read(
+      return yield* readUnbounded(
         "waitForTransaction",
         (core, signal) => core.waitForTransaction({ ...options, signal }),
         transactionError("waitForTransaction")
@@ -1054,6 +1360,7 @@ export const makeFromClient = (client: ClientWithCoreApi): SuiCoreService => {
         try: (signal) => run(client, signal),
         catch: (cause) => mapSdkError("use", cause)
       })
-    })
+    }),
+    readPolicy: (method) => readPolicy(method, readRetry)
   }
 }

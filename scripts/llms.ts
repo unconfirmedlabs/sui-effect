@@ -1,7 +1,8 @@
 /**
- * Generates `LLMS.md`: the whole public surface of sui-effect, with every
- * exported symbol's signature and the error union its JSDoc states, followed by
- * every example in the repository verbatim.
+ * Generates `LLMS.md`: a hand-written "start here" head (`docs/llms-head.md`,
+ * with its recipes and its index filled in), then the whole public surface of
+ * sui-effect, with every exported symbol's signature and the error union its
+ * JSDoc states, followed by every example in the repository verbatim.
  *
  * It is mechanical on purpose. Signatures come from the emitted `.d.ts` in
  * `dist/` through the TypeScript compiler API, and prose comes from the JSDoc
@@ -34,10 +35,53 @@ const WORKED_EXAMPLE_FILES = [
   "src/errors.ts",
   "src/Escrow.ts",
   "src/upstream.ts",
-  "src/extension.ts",
-  "test/escrow.test.ts",
-  "package.json"
+  "src/extension.ts"
 ]
+
+/**
+ * Template files named by path rather than printed: the test suite alone is a
+ * sixth of this document, and the template ships inside the package, so an
+ * agent can open them from `node_modules` without a checkout.
+ */
+const WORKED_EXAMPLE_REFERENCED = [
+  "test/escrow.test.ts",
+  "test/durable-object.test.ts",
+  "recipes/durable-object.ts",
+  "package.json",
+  "scripts/check-package.ts"
+]
+
+/** The hand-written head, with `<!-- recipe: path -->` and `<!-- index -->` filled in. */
+const HEAD = "docs/llms-head.md"
+
+/**
+ * The relative `src/` imports a recipe file uses, spelled as the package
+ * subpaths a consumer writes. A recipe is a file in this repository so that it
+ * is typechecked and tested; this is the only change made to it on the way
+ * into `LLMS.md`.
+ */
+const SUBPATH_OF_SOURCE: ReadonlyArray<readonly [string, string]> = [
+  ["src/index.ts", "@unconfirmed/sui-effect"],
+  ["src/tx.ts", "@unconfirmed/sui-effect/tx"],
+  ["src/journal.ts", "@unconfirmed/sui-effect/journal"],
+  ["src/extension.ts", "@unconfirmed/sui-effect/extension"],
+  ["src/script.ts", "@unconfirmed/sui-effect/script"],
+  ["src/testing.ts", "@unconfirmed/sui-effect/testing"]
+]
+
+/**
+ * One recipe file with its imports rewritten. Throws when a relative import is
+ * left over, which would be a recipe no consumer can paste.
+ */
+export const recipeOf = (path: string, source: string): string => {
+  let text = source
+  for (const [file, subpath] of SUBPATH_OF_SOURCE) {
+    text = text.replace(new RegExp(`"(?:\\.\\./)+${file.replace(".", "\\.")}"`, "g"), () => `"${subpath}"`)
+  }
+  const relative = /from "\.{1,2}\/[^"]*"/.exec(text)
+  if (relative !== null) throw new Error(`${path}: ${relative[0]} has no package subpath`)
+  return text.trimEnd()
+}
 
 /**
  * How every type in this file is rendered.
@@ -129,13 +173,20 @@ const declaredFieldsOf = (
 /** The declared fields of a class, for classes whose emitted body is empty. */
 const fieldsOf = (
   symbol: ts.Symbol,
-  declaration: ts.Declaration,
+  declaration: ts.ClassDeclaration,
   checker: ts.TypeChecker
 ): string | undefined => {
   const declared = declaredFieldsOf(symbol, declaration, checker)
+  // A class with a body and no schema is an ordinary class: its body is the
+  // whole story. Only a schema class has fields the body does not show.
+  if (declared === undefined && declaration.members.length > 0) return undefined
+  const inBody = new Set(
+    declaration.members.flatMap((member) => member.name === undefined ? [] : [member.name.getText()])
+  )
   const instance = checker.getDeclaredTypeOfSymbol(symbol)
   const properties = instance.getProperties().filter((property) => {
     const name = property.getName()
+    if (inBody.has(name)) return false
     if (declared !== undefined) return declared.has(name)
     // `__@iterator@302` and friends are how the emitter spells symbol-keyed
     // members; they are Effect machinery, not fields.
@@ -145,27 +196,41 @@ const fieldsOf = (
   if (properties.length === 0) return undefined
   return properties
     .map((property) =>
-      `  readonly ${property.getName()}: ${
+      `  readonly ${property.getName()}${(property.flags & ts.SymbolFlags.Optional) !== 0 ? "?" : ""}: ${
         // The field itself is indented by two, so its own lines follow it.
-        typeTextOf(property, declaration, checker).split("\n").join("\n  ")
-      }`
+        fieldTypeTextOf(property, declaration, checker).split("\n").join("\n  ")
+      };`
     )
     .join("\n")
 }
 
 /**
- * The emitted declaration without its `private` members.
+ * The emitted text of a class without its `private` members, **and the JSDoc
+ * above each one**.
  *
  * `Executed` is a `Schema.Class` with private helpers, and the emitter writes
- * them into the `.d.ts` as `private typeOf;` — a name with no type and no
- * meaning to a caller, which is worse than nothing in a document whose whole
- * job is the public surface. Never fails.
+ * them into the `.d.ts` as `private typeOf;` under their JSDoc — a name with no
+ * type and no meaning to a caller. Dropping only the line left the comment
+ * orphaned over the next public member, which then read as if it said
+ * something else. A member's full start includes its leading trivia, so
+ * cutting from there removes the comment with it. Never fails.
  */
-const withoutPrivateMembers = (text: string): string =>
-  text
-    .split("\n")
-    .filter((line) => !/^\s*private\s/.test(line))
-    .join("\n")
+const withoutPrivateMembers = (declaration: ts.ClassDeclaration): string => {
+  const start = declaration.getStart()
+  let text = declaration.getText()
+  const cuts = declaration.members
+    .filter((member) =>
+      ts.canHaveModifiers(member) &&
+      (ts.getModifiers(member) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.PrivateKeyword)
+    )
+    .map((member) => [member.getFullStart() - start, member.getEnd() - start] as const)
+    .reverse()
+  for (const [from, to] of cuts) text = text.slice(0, from) + text.slice(to)
+  return text
+}
+
+/** Where a class body opens, in the declaration's own text: just past its `{`. */
+const bodyOpenOf = (declaration: ts.ClassDeclaration): number => declaration.members.pos - declaration.getStart()
 
 /** Past this, a one-line type is broken across lines the way the emitter does. */
 const MAX_INLINE_TYPE = 200
@@ -232,6 +297,58 @@ const indented = (text: string): string => {
   return out
 }
 
+/**
+ * The object-shaped schemas `@unconfirmed/sui-effect` exports, by the name a
+ * caller writes for what they decode to. Filled by `renderApi` before anything
+ * is printed.
+ */
+const namedSchemaTypes: Array<{ readonly name: string; readonly type: ts.Type }> = []
+
+const sameType = (checker: ts.TypeChecker, left: ts.Type, right: ts.Type): boolean =>
+  checker.isTypeAssignableTo(left, right) && checker.isTypeAssignableTo(right, left)
+
+/**
+ * A field's type by the exported schema name it decodes to, when it is one.
+ *
+ * The emitter inlines every nested schema into a class's `X_base`, so
+ * `Executed.effects` would otherwise print as the whole `TransactionEffects`
+ * structure — two hundred lines with the field names lost in them. A type
+ * equal to an exported schema's decoded type is that schema's name; an array
+ * of one, or a union containing one, is spelled with it. Anything else is the
+ * checker's full text.
+ */
+const fieldTypeTextOf = (
+  symbol: ts.Symbol,
+  declaration: ts.Declaration,
+  checker: ts.TypeChecker
+): string => {
+  const nameOf = (type: ts.Type): string | undefined =>
+    namedSchemaTypes.find((entry) => sameType(checker, entry.type, type))?.name
+  const spell = (type: ts.Type): string | undefined => {
+    const named = nameOf(type)
+    if (named !== undefined) return named
+    if (checker.isArrayType(type)) {
+      const [element] = checker.getTypeArguments(type as ts.TypeReference)
+      const inner = element === undefined ? undefined : spell(element)
+      return inner === undefined ? undefined : `ReadonlyArray<${inner}>`
+    }
+    if (type.isUnion()) {
+      // An optional field's `undefined` is already said by its `?`.
+      const optional = (symbol.flags & ts.SymbolFlags.Optional) !== 0
+      const parts = type.types
+        .filter((member) => !(optional && (member.flags & ts.TypeFlags.Undefined) !== 0))
+        .map((member) => ({ member, named: spell(member) }))
+      if (parts.every((part) => part.named === undefined)) return undefined
+      return parts
+        .map((part) => part.named ?? withBrandNames(checker.typeToString(part.member, declaration, TYPE_FLAGS)))
+        .join(" | ")
+    }
+    return undefined
+  }
+  const type = checker.getTypeOfSymbolAtLocation(symbol, declaration)
+  return spell(type) ?? typeTextOf(symbol, declaration, checker)
+}
+
 /** The type of one symbol, untruncated and with branded aliases named. */
 const typeTextOf = (
   symbol: ts.Symbol,
@@ -266,15 +383,47 @@ const decodesTo = (type: string): string =>
 const signatureOf = (
   symbol: ts.Symbol,
   declaration: ts.Declaration,
+  checker: ts.TypeChecker,
+  exportedName: string
+): string => asExported(rawSignatureOf(symbol, declaration, checker), declaration, exportedName)
+
+/**
+ * A signature spelled with the name it is exported under.
+ *
+ * `SuiSchema.decode` is `decodeContent as decode` and `SuiSchema.matchesType`
+ * is `typeMatches as matchesType`; the heading says the exported name, and a
+ * declaration under it that says the other one reads as a different function.
+ * Only the first occurrence — the declared name — is rewritten.
+ */
+const asExported = (text: string, declaration: ts.Declaration, exportedName: string): string => {
+  const name = ts.getNameOfDeclaration(declaration)
+  if (name === undefined || !ts.isIdentifier(name)) return text
+  const declared = name.getText()
+  if (declared === exportedName) return text
+  return text.replace(new RegExp(`\\b${declared}\\b`), () => exportedName)
+}
+
+const rawSignatureOf = (
+  symbol: ts.Symbol,
+  declaration: ts.Declaration,
   checker: ts.TypeChecker
 ): string => {
-  const text = withoutPrivateMembers(withBrandNames(declaration.getText()))
-  if (ts.isClassDeclaration(declaration) && declaration.members.length === 0) {
-    // A `Schema.TaggedError` class has an empty body and an extends clause the
-    // emitter names `X_base`, so the fields are only visible on the type.
+  if (ts.isClassDeclaration(declaration)) {
+    // A `Schema.Class` / `Schema.TaggedError` extends a base the emitter names
+    // `X_base`, so the fields it was defined with are only visible on the type
+    // — and a body (`get message()`, the accessors on `Executed`) does not
+    // change that. They are written at the top of the body.
+    const body = withoutPrivateMembers(declaration)
     const fields = fieldsOf(symbol, declaration, checker)
-    return fields === undefined ? text : `${text.replace(/\s*{\s*}$/, "")} {\n${fields}\n}`
+    const open = bodyOpenOf(declaration)
+    const text = fields === undefined
+      ? body
+      : declaration.members.length === 0
+      ? `${body.replace(/\s*{\s*}$/, "")} {\n${fields}\n}`
+      : `${body.slice(0, open)}\n${fields.replace(/^ {2}/gm, "    ")}${body.slice(open)}`
+    return withoutLinks(withBrandNames(text))
   }
+  const text = withoutLinks(withBrandNames(declaration.getText()))
   if (!ts.isVariableDeclaration(declaration)) return text
   const statement = declaration.parent.parent
   const prefix = ts.isVariableStatement(statement) ? "declare const " : ""
@@ -313,29 +462,54 @@ const docOfDeclaration = (declaration: ts.Declaration): string =>
     .join("\n\n")
     .trim()
 
+/** `{@link X}` is for an IDE, not for a reader of plain markdown. */
+const withoutLinks = (text: string): string => text.replace(/\{@link\s+([^}]+)\}/g, "`$1`")
+
+const FAILS_WITH = /Fails with:[\s\S]*?(?:\.\s*$|\.\n|\.$)/m
+
 /**
- * The "Fails with: …" sentence every public function's JSDoc carries, or the
- * "Never fails." it carries instead, as one line.
+ * A "never fails" sentence in any of the spellings the sources use: the bare
+ * "Never fails.", and the qualified "Never fails; …", "Never fails, except …",
+ * "Never fails to build; …", "Otherwise never fails: …". It runs to the first
+ * period followed by whitespace, so a dotted name like `Tx.run` inside it does
+ * not end it.
  */
-const errorsOf = (doc: string): string | undefined => {
-  const fails = /Fails with:[\s\S]*?(?:\.\s*$|\.\n|\.$)/m.exec(doc)
-  if (fails !== null) return fails[0].replace(/\s+/g, " ").trim()
-  // The period is required. `fromService` says "Never fails, except a `warm`
-  // registration, which throws ...", and printing **Never fails.** under it
-  // contradicted the paragraph directly above.
-  return /Never fails\./.test(doc) ? "Never fails." : undefined
+const NEVER_FAILS = /(?:Otherwise never|Never) fails\b[\s\S]*?\.(?=\s|$)/
+
+/**
+ * The error sentence every public function's JSDoc carries — "Fails with: …",
+ * or one of the "never fails" spellings — as one line, whole.
+ *
+ * A qualified sentence is printed whole rather than as a bare **Never fails.**:
+ * `fromService` says "Never fails, except a `warm` registration …", and the
+ * bare form under it would contradict the paragraph directly above.
+ */
+export const errorsOf = (doc: string): string | undefined => {
+  const found = FAILS_WITH.exec(doc) ?? NEVER_FAILS.exec(doc)
+  return found === null ? undefined : withoutLinks(found[0].replace(/\s+/g, " ").trim())
 }
 
+/**
+ * Where a JSDoc's prose ends: the first block tag. Only a known tag counts,
+ * so a prose line that happens to start with `@` — a scoped package name —
+ * does not cut the summary short.
+ */
+const FIRST_TAG = /\n@(?:example|since|deprecated|param|returns|throws|see|remarks|internal|template)\b/
+
 /** The JSDoc without the error sentence, which is printed on its own. */
-const summaryOf = (doc: string): string => {
-  const withoutErrors = doc.replace(/Fails with:[\s\S]*?(?:\.\s*$|\.\n|\.$)/m, "").trim()
-  // A bare trailing "Never fails." is printed on its own as the error line;
-  // leaving it in the prose too said it twice. "Never fails: …" and
-  // "Never fails; …" carry more than the line does and stay.
-  const withoutNeverFails = withoutErrors.replace(/\s*Never fails\.(?=\s*$)/, "").trim()
-  const withoutExamples = withoutNeverFails.split("\n@")[0] ?? withoutNeverFails
-  // `{@link X}` is for an IDE, not for a reader of plain markdown.
-  return withoutExamples.replace(/\{@link\s+([^}]+)\}/g, "`$1`").trim()
+export const summaryOf = (doc: string): string => {
+  const sentence = FAILS_WITH.exec(doc) ?? NEVER_FAILS.exec(doc)
+  // The space that followed the sentence goes with it, so the prose after it on
+  // the same line does not start with one.
+  const withoutErrors = sentence === null
+    ? doc
+    : doc.slice(0, sentence.index) + doc.slice(sentence.index + sentence[0].length).replace(/^[ \t]+/, "")
+  // A bare trailing "Never fails." beside a "Fails with:" sentence says the
+  // same thing twice; drop it too.
+  const withoutNeverFails = withoutErrors.replace(/\s*Never fails\.(?=\s*$)/, "")
+  const tag = FIRST_TAG.exec(withoutNeverFails)
+  const prose = tag === null ? withoutNeverFails : withoutNeverFails.slice(0, tag.index)
+  return withoutLinks(prose.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n")).trim()
 }
 
 /**
@@ -384,21 +558,74 @@ const renderSymbol = (
   }
   rendered.set(declaration, subpath)
 
-  const doc = docOfDeclaration(declaration)
-  const summary = summaryOf(doc)
-  const errors = errorsOf(doc)
-  const lines = [
-    `${"#".repeat(depth)} \`${symbol.getName()}\` (${kindOf(declaration)})`,
-    "",
-    "```ts",
-    signatureOf(target, declaration, checker),
-    "```",
-    ""
-  ]
-  if (summary !== "") lines.push(summary, "")
-  if (errors !== undefined) lines.push(`**${errors}**`, "")
+  const shown = shownDeclarations(target, checker)
+  const lines = [`${"#".repeat(depth)} \`${symbol.getName()}\` (${kindsOf(shown)})`, ""]
+  for (const group of groupsOf(shown)) {
+    lines.push(
+      "```ts",
+      group.map((member) => signatureOf(target, member, checker, symbol.getName())).join("\n"),
+      "```",
+      ""
+    )
+    // Overloads usually share one comment; print each distinct one once.
+    const docs = [...new Set(group.map(docOfDeclaration).filter((doc) => doc !== ""))]
+    for (const doc of docs) {
+      const summary = summaryOf(doc)
+      const errors = errorsOf(doc)
+      if (summary !== "") lines.push(summary, "")
+      if (errors !== undefined) lines.push(`**${errors}**`, "")
+    }
+  }
   return lines.join("\n")
 }
+
+/**
+ * A type declaration that only names what a schema value next to it decodes
+ * to — `type Digest = typeof Digest.Type`, `interface Coin extends
+ * CoinSchemaType {}` — and so says nothing the schema's own entry does not.
+ */
+const isSchemaAlias = (declaration: ts.Declaration): boolean =>
+  (ts.isTypeAliasDeclaration(declaration) && /^typeof [\w$]+\.Type$/.test(declaration.type.getText())) ||
+  (ts.isInterfaceDeclaration(declaration) && declaration.members.length === 0)
+
+/**
+ * Every declaration a name has, in source order, except a schema's redundant
+ * type alias.
+ *
+ * Printing only the first one is how `SuiError`, `FakeOutcome`, `Signer` and
+ * `Signed` used to lose half of themselves: each is a type **and** a value
+ * under one name, and whichever the emitter wrote first hid the other — the
+ * `SuiError` helpers, the `FakeOutcome` constructors, the `Signer` namespace
+ * and the `Signed` schema had no entry at all.
+ */
+const shownDeclarations = (target: ts.Symbol, checker: ts.TypeChecker): ReadonlyArray<ts.Declaration> => {
+  const all = target.declarations ?? []
+  const hasSchemaValue = all.some((declaration) =>
+    ts.isVariableDeclaration(declaration) &&
+    checker.getTypeOfSymbolAtLocation(target, declaration).getProperty("Type") !== undefined
+  )
+  return hasSchemaValue && all.length > 1 ? all.filter((declaration) => !isSchemaAlias(declaration)) : all
+}
+
+/**
+ * Declarations grouped the way they are printed: consecutive declarations of
+ * one kind share a block, so a function's overloads read as one signature set
+ * (they used to render only the first), and an interface and the const beside
+ * it are two blocks with their own comments.
+ */
+const groupsOf = (declarations: ReadonlyArray<ts.Declaration>): ReadonlyArray<ReadonlyArray<ts.Declaration>> => {
+  const groups: Array<Array<ts.Declaration>> = []
+  for (const declaration of declarations) {
+    const last = groups[groups.length - 1]
+    if (last !== undefined && kindOf(last[0]!) === kindOf(declaration)) last.push(declaration)
+    else groups.push([declaration])
+  }
+  return groups
+}
+
+/** The heading's kind: `const`, or `interface + const` for a name that is both. */
+const kindsOf = (declarations: ReadonlyArray<ts.Declaration>): string =>
+  [...new Set(declarations.map(kindOf))].join(" + ")
 
 /**
  * The emitted declarations this generator reads, or the first one that is
@@ -420,7 +647,20 @@ export const missingDeclaration = (): string | undefined => {
   return undefined
 }
 
-const renderApi = (): string => {
+/** One line per exported name: the subpath index in the head. */
+type IndexLine = { readonly name: string; readonly summary: string }
+
+/**
+ * The first sentence of a summary, on one line. A period inside a dotted name
+ * (`Tx.run`) does not end it; a period followed by whitespace does.
+ */
+const firstSentence = (summary: string): string => {
+  const flat = summary.replace(/\s+/g, " ").trim()
+  const end = /\.(?=\s|$)/.exec(flat)
+  return end === null ? flat : flat.slice(0, end.index + 1)
+}
+
+const renderApi = (): { readonly api: string; readonly index: string } => {
   const files = SUBPATHS.map((subpath) => subpath.file)
   const missing = missingDeclaration()
   if (missing !== undefined) {
@@ -438,7 +678,23 @@ const renderApi = (): string => {
     }
   })
   const checker = program.getTypeChecker()
+  namedSchemaTypes.length = 0
+  const root = program.getSourceFile(SUBPATHS[0]!.file)
+  const rootSymbol = root === undefined ? undefined : checker.getSymbolAtLocation(root)
+  for (const exported of rootSymbol === undefined ? [] : checker.getExportsOfModule(rootSymbol)) {
+    const target = (exported.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(exported) : exported
+    const value = target.declarations?.find(ts.isVariableDeclaration)
+    if (value === undefined) continue
+    const decoded = checker.getTypeOfSymbolAtLocation(target, value).getProperty("Type")
+    if (decoded === undefined) continue
+    const type = checker.getTypeOfSymbolAtLocation(decoded, value)
+    // Brands are spelled by `withBrandNames`; only structures need a name.
+    if ((type.flags & ts.TypeFlags.Object) !== 0 || type.isUnion()) {
+      namedSchemaTypes.push({ name: exported.getName(), type })
+    }
+  }
   const sections: Array<string> = []
+  const indexSections: Array<string> = []
   const printed: Rendered = new Map()
   for (const subpath of SUBPATHS) {
     const source = program.getSourceFile(subpath.file)
@@ -446,10 +702,24 @@ const renderApi = (): string => {
     const moduleSymbol = checker.getSymbolAtLocation(source)
     const moduleDoc = moduleSymbol === undefined ? "" : summaryOf(docOf(moduleSymbol, checker))
     const exports = moduleSymbol === undefined ? [] : checker.getExportsOfModule(moduleSymbol)
-    const rendered = [...exports]
+    const sorted = [...exports]
       .sort((left, right) => (left.getName() < right.getName() ? -1 : left.getName() > right.getName() ? 1 : 0))
+    // Read before rendering: `renderSymbol` records where each declaration was
+    // first printed, and the index has to know that from the state before.
+    const lines = sorted.map((symbol) => indexLineOf(symbol, checker, printed, subpath.name))
+    const rendered = sorted
       .map((symbol) => renderSymbol(symbol, checker, 3, printed, subpath.name))
       .filter((section): section is string => section !== undefined)
+    indexSections.push(
+      [
+        `### \`${subpath.name}\``,
+        "",
+        ...lines
+          .filter((line): line is IndexLine => line !== undefined)
+          .map(({ name, summary }) => `- \`${name}\`${summary === "" ? "" : ` — ${summary}`}`),
+        ""
+      ].join("\n")
+    )
     sections.push(
       [
         `## \`${subpath.name}\``,
@@ -461,7 +731,41 @@ const renderApi = (): string => {
       ].join("\n")
     )
   }
-  return sections.join("\n")
+  return { api: sections.join("\n"), index: indexSections.join("\n") }
+}
+
+/** The index line of one exported name, read off the same declaration `renderSymbol` prints. */
+const indexLineOf = (
+  symbol: ts.Symbol,
+  checker: ts.TypeChecker,
+  printed: Rendered,
+  subpath: string
+): IndexLine | undefined => {
+  const target = (symbol.flags & ts.SymbolFlags.Alias) !== 0
+    ? checker.getAliasedSymbol(symbol)
+    : symbol
+  const declaration = target.declarations?.[0]
+  if (declaration === undefined) return undefined
+  const name = symbol.getName()
+  if (ts.isSourceFile(declaration)) return { name, summary: "a namespace; its members are listed under it below." }
+  const first = printed.get(declaration)
+  if (first !== undefined && first !== subpath) return { name, summary: `re-exported from \`${first}\`.` }
+  const documented = shownDeclarations(target, checker).map(docOfDeclaration).find((doc) => doc !== "") ?? ""
+  return { name, summary: withoutLinks(firstSentence(summaryOf(documented))) }
+}
+
+/** `docs/llms-head.md` with its recipes quoted and its index filled in. */
+const renderHead = (index: string): string => {
+  const head = readFileSync(HEAD, "utf8")
+  if (!head.includes("<!-- index -->")) throw new Error(`${HEAD} has no <!-- index --> marker`)
+  return head
+    .replace(/<!-- recipe: ([^ ]+) -->/g, (_, path: string) =>
+      ["```ts", recipeOf(path, readFileSync(path, "utf8")), "```"].join("\n"))
+    // A function, never a replacement string: the index is JSDoc prose, and a
+    // "$`" in it (the `ExtensionFace` summary says "`$`-prefixed") would paste
+    // in everything before the marker — the whole head, a second time.
+    .replace("<!-- index -->", () => index.trimEnd())
+    .trimEnd()
 }
 
 const listFiles = (dir: string): ReadonlyArray<string> =>
@@ -482,29 +786,15 @@ const renderFiles = (paths: ReadonlyArray<string>): string =>
 
 /** The whole file, as a string, so a test can compare it with what is committed. */
 export const render = (): string => {
-  const head = [
-    "# @unconfirmed/sui-effect for agents",
-    "",
-    "This file is generated by `bun scripts/llms.ts` from the emitted type",
-    "declarations and the JSDoc in `src/`, plus every example in the repository.",
-    "Do not edit it by hand; a test fails when it is stale.",
-    "",
-    "@unconfirmed/sui-effect is an opinionated Effect v4 layer over `@mysten/sui`. Two client",
-    "tiers (`SuiCore` mirrors the SDK, `Sui` makes the decisions), a closed error",
-    "union on every function, the transaction lifecycle as functions with typed",
-    "outcomes, and an in-memory fake so every test runs with no network.",
-    "",
-    "`AGENTS.md` has the invariants, `README.md` the tour, `docs/extensions.md` the",
-    "contract for building an extension package on top of it.",
-    "",
-    "# API",
-    ""
-  ].join("\n")
+  const { api, index } = renderApi()
   const examples = EXAMPLE_DIRS.flatMap(listFiles)
   const worked = WORKED_EXAMPLE_FILES.map((file) => `${WORKED_EXAMPLE}/${file}`)
   return [
-    head,
-    renderApi(),
+    renderHead(index),
+    "",
+    "# API",
+    "",
+    api,
     "# Examples",
     "",
     "Every file below is typechecked, and each one is exercised by a test against",
@@ -514,7 +804,10 @@ export const render = (): string => {
     "# The extension worked example",
     "",
     "`examples/extension-template/` is a complete, copyable extension package, and",
-    "the source of every code block in `docs/extensions.md`.",
+    "the source of every code block in `docs/extensions.md`. It ships inside this",
+    "package (`node_modules/@unconfirmed/sui-effect/examples/extension-template/`).",
+    "Its source files are below; these are in the template too and are not",
+    `reprinted here: ${WORKED_EXAMPLE_REFERENCED.map((file) => `\`${file}\``).join(", ")}.`,
     "",
     renderFiles(worked)
   ].join("\n")

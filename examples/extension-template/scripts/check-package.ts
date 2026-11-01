@@ -14,7 +14,11 @@
  * package has after `bun install`. Only when neither is there does it fall back
  * to the sui-effect repository two directories up, which is how it runs inside
  * that repository with no install of its own. Keep the script when you copy;
- * you should not have to rewrite it.
+ * you should not have to rewrite it: it names none of the template's exports.
+ * It reads every subpath of the `exports` map from `package.json`, imports the
+ * matching `src/` file to learn what that subpath exports, and requires the
+ * packed `dist/` to export the same names, each defined — so renaming
+ * `Escrow` to your service, or adding a subpath, needs no edit here.
  */
 import { $ } from "bun"
 import { existsSync, readFileSync } from "node:fs"
@@ -95,7 +99,11 @@ try {
   // for reasons that have nothing to do with the package.
   const consumer = join(work, "consumer")
   const modules = join(consumer, "node_modules")
-  const name = JSON.parse(readFileSync(join(template, "package.json"), "utf8")).name as string
+  const manifest = JSON.parse(readFileSync(join(template, "package.json"), "utf8")) as {
+    readonly name: string
+    readonly exports?: Record<string, string | { readonly import?: string }>
+  }
+  const name = manifest.name
   const [scope, bare] = name.startsWith("@") ? name.split("/") : [undefined, name]
   const installed = join(modules, ...(scope === undefined ? [bare!] : [scope, bare!]))
   await mkdir(scope === undefined ? modules : join(modules, scope), { recursive: true })
@@ -126,13 +134,30 @@ try {
     join(consumer, "package.json"),
     JSON.stringify({ name: "consumer", private: true, type: "module" }, null, 2)
   )
+  // What each subpath must export, read off the source the build compiles:
+  // `./dist/x.js` in the exports map is `./src/x.ts` here.
+  const expected: Record<string, ReadonlyArray<string>> = {}
+  for (const [subpath, target] of Object.entries(manifest.exports ?? {})) {
+    const entry = typeof target === "string" ? target : (target as { readonly import?: string }).import
+    if (entry === undefined) continue
+    const source = join(template, entry.replace(/^\.\/dist\//, "src/").replace(/\.js$/, ".ts"))
+    if (!existsSync(source)) fail(`exports["${subpath}"] is ${entry}, but there is no ${source} to build it from`)
+    const names = Object.keys(await import(source)).sort()
+    if (names.length === 0) fail(`${source} exports no values`)
+    expected[subpath === "." ? name : `${name}${subpath.slice(1)}`] = names
+  }
+  if (Object.keys(expected).length === 0) fail(`package.json has no "exports" to check`)
+  await writeFile(join(consumer, "expected.json"), JSON.stringify(expected, null, 2))
   await writeFile(
     join(consumer, "consume.ts"),
     [
-      `import { Escrow, escrow, receiptType } from "${name}"`,
-      `if (typeof Escrow.layerTest !== "function") throw new Error("Escrow.layerTest is missing")`,
-      `if (typeof escrow !== "function") throw new Error("the registration factory is missing")`,
-      `if (!receiptType("0x2").endsWith("::escrow::Receipt")) throw new Error("receiptType is wrong")`,
+      `import { readFileSync } from "node:fs"`,
+      `const expected: Record<string, ReadonlyArray<string>> = JSON.parse(readFileSync(new URL("./expected.json", import.meta.url), "utf8"))`,
+      `for (const [specifier, names] of Object.entries(expected)) {`,
+      `  const loaded: Record<string, unknown> = await import(specifier)`,
+      `  const missing = names.filter((key) => loaded[key] === undefined)`,
+      `  if (missing.length > 0) throw new Error(\`\${specifier} does not export \${missing.join(", ")}\`)`,
+      `}`,
       `console.log("ok")`,
       ""
     ].join("\n")

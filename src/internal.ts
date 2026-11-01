@@ -12,12 +12,15 @@
 export { bcs, decodeContent, expectedTypeOf, typeMatches } from "./domain/bcs.ts"
 export { decodePayload, digestOf, SuiErrorSchema } from "./domain/errors.ts"
 export { EXECUTE_INCLUDE, fromTransactionResult } from "./domain/executed.ts"
+export * as Metrics from "./domain/metrics.ts"
 export { executionReasonOf, makeSuiObject } from "./domain/schemas.ts"
 export { fromSimulationResult, OBJECT_INCLUDE, SIMULATE_INCLUDE } from "./services/Sui.ts"
 export {
   DefectMarker,
+  defaultReadPolicy,
   makeFromClient,
   mapSdkError,
   readSchedule,
   RETRYABLE_GRPC_STATUSES
 } from "./services/SuiCore.ts"
+export { fromRedactedSecret } from "./services/Signer.ts"

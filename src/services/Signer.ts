@@ -9,7 +9,7 @@
  *
  * @since 0.1.0
  */
-import type { Keypair, Signer as SdkSigner } from "@mysten/sui/cryptography"
+import type { Keypair, Signer as SdkSigner, SignatureScheme } from "@mysten/sui/cryptography"
 import { decodeSuiPrivateKey, SUI_PRIVATE_KEY_PREFIX } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
@@ -19,8 +19,16 @@ import { Config, ConfigProvider, Effect, Redacted, Schema } from "effect"
 import { SigningError } from "../domain/errors.ts"
 import { Signature, SuiAddress } from "../domain/schemas.ts"
 
-/** The signature schemes a {@link Signer} built by this module can carry. */
-export type SignatureScheme = "ED25519" | "Secp256k1" | "Secp256r1" | "MultiSig" | "ZkLogin" | "Passkey"
+/**
+ * The signature schemes a {@link Signer} can carry: the SDK's own
+ * `SignatureScheme` from `@mysten/sui/cryptography`, re-exported rather than
+ * copied, so a scheme the SDK adds is a scheme a `Signer` can name.
+ *
+ * It is exactly as wide as the installed SDK: `"MLDSA65"` is a member from
+ * `@mysten/sui` 2.36 on and absent before, where the SDK can neither produce
+ * nor verify such a signature.
+ */
+export type { SignatureScheme }
 
 /**
  * A credential: who it signs as, how, and the two things it can sign.
@@ -66,7 +74,7 @@ const SDK_SIGNER_MEMBERS = [
  * Wraps any `@mysten/sui/cryptography` `Signer`.
  *
  * The SDK's `Signer` is the base class every credential extends: `Keypair` and
- * its three schemes, but also a Ledger signer, a wallet adapter's signer, a KMS
+ * its four schemes, but also a Ledger signer, a wallet adapter's signer, a KMS
  * signer — anything that can `toSuiAddress`, `getKeyScheme`, `signTransaction`
  * and `signPersonalMessage`. Nothing here needs the secret, so nothing here
  * needs a keypair, and the `Signer` this returns exposes no secret material
@@ -140,8 +148,27 @@ export const fromSdkSigner = (keypair: SdkSigner): Signer => {
  */
 export const fromKeypair = (keypair: Keypair): Signer => fromSdkSigner(keypair)
 
-/** Builds the keypair class the scheme flag of a Bech32 secret key names. */
-const keypairOf = (parsed: { scheme: string; secretKey: Uint8Array }): Keypair | undefined => {
+/**
+ * Builds the keypair class the scheme flag of a Bech32 secret key names.
+ *
+ * `MLDSA65Keypair` is imported on demand rather than statically: its subpath
+ * (`@mysten/sui/keypairs/mldsa65`) first shipped in `@mysten/sui` 2.36, and the
+ * peer range still admits 2.28, where a static import would fail to load this
+ * whole package. On an SDK that old `decodeSuiPrivateKey` never answers
+ * `"MLDSA65"`, so the import is reached only where it exists. The specifier is
+ * a variable so the declaration does not have to resolve on an older SDK
+ * either (the CI SDK matrix typechecks against 2.30).
+ */
+const MLDSA65_MODULE = "@mysten/sui/keypairs/mldsa65"
+
+/** The one member of `@mysten/sui/keypairs/mldsa65` this module uses. */
+interface MLDSA65Module {
+  readonly MLDSA65Keypair: { readonly fromSecretKey: (secretKey: Uint8Array) => Keypair }
+}
+
+const keypairOf = async (
+  parsed: { scheme: string; secretKey: Uint8Array }
+): Promise<Keypair | undefined> => {
   switch (parsed.scheme) {
     case "ED25519":
       return Ed25519Keypair.fromSecretKey(parsed.secretKey)
@@ -149,6 +176,10 @@ const keypairOf = (parsed: { scheme: string; secretKey: Uint8Array }): Keypair |
       return Secp256k1Keypair.fromSecretKey(parsed.secretKey)
     case "Secp256r1":
       return Secp256r1Keypair.fromSecretKey(parsed.secretKey)
+    case "MLDSA65": {
+      const module: MLDSA65Module = await import(MLDSA65_MODULE)
+      return module.MLDSA65Keypair.fromSecretKey(parsed.secretKey)
+    }
     default:
       return undefined
   }
@@ -174,7 +205,7 @@ const HEX_SEED = /^(?:0x)?[0-9a-fA-F]{64}$/
 
 /**
  * The keypair a configured secret names: a Bech32 `suiprivkey1…` for whichever
- * of the three schemes its flag carries, or a **32-byte hex seed**, which has
+ * of the four schemes its flag carries, or a **32-byte hex seed**, which has
  * no scheme flag and is therefore read as Ed25519.
  *
  * Hex is here because that is how a raw seed comes out of a secret manager, a
@@ -183,7 +214,7 @@ const HEX_SEED = /^(?:0x)?[0-9a-fA-F]{64}$/
  * application code — which is the one place the decoded bytes should never
  * appear. `undefined` when the text is neither.
  */
-const keypairFromSecret = (value: string): Keypair | undefined => {
+const keypairFromSecret = async (value: string): Promise<Keypair | undefined> => {
   const text = value.trim()
   if (text.startsWith(SUI_PRIVATE_KEY_PREFIX)) return keypairOf(decodeSuiPrivateKey(text))
   if (HEX_SEED.test(text)) return Ed25519Keypair.fromSecretKey(fromHex(text))
@@ -195,15 +226,16 @@ const keypairFromSecret = (value: string): Keypair | undefined => {
  *
  * Two spellings, told apart by the text itself:
  *
- * - a **Bech32 `suiprivkey1…`**, whose flag names one of the three schemes;
+ * - a **Bech32 `suiprivkey1…`**, whose flag names one of the four schemes (`ED25519`, `Secp256k1`, `Secp256r1`, `MLDSA65`);
  * - a **32-byte hex seed** (64 hex characters, `0x` optional), which carries no
  *   scheme and is read as **Ed25519** — the default every Sui tool uses for a
  *   raw seed. This is what a secret manager or another language's SDK hands
  *   over, and reading it here is what keeps `fromHex` and the decoded bytes out
  *   of application code.
  *
- * The key is read with `Config.Redacted`, and the decoded bytes never leave
- * this function. Neither does anything derived from them: the failure carries
+ * The key is read with `Config.Redacted`, which is wiped
+ * (`Redacted.wipeUnsafe`) as soon as it has been decoded, and the decoded
+ * bytes never leave this function. Neither does anything derived from them: the failure carries
  * one fixed sentence and no `cause`, because the decoder's own message quotes
  * the input it rejected.
  *
@@ -214,25 +246,43 @@ const keypairFromSecret = (value: string): Keypair | undefined => {
 export const fromConfig = (
   name = "SUI_PRIVATE_KEY"
 ): Effect.Effect<Signer, Config.ConfigError> =>
-  Config.Redacted(name).pipe(
-    Effect.flatMap((redacted) =>
-      Effect.try({
-        try: () => {
-          const keypair = keypairFromSecret(Redacted.value(redacted))
-          if (keypair === undefined) {
-            throw new Error("unsupported key scheme")
-          }
-          return fromKeypair(keypair)
-        },
-        // No `cause`: it would carry the decoder's message, and the decoder's
-        // message carries the key.
-        catch: () =>
-          new Config.ConfigError(
-            new ConfigProvider.SourceError({ message: `${name} ${KEY_ERROR}` })
-          )
-      })
-    )
-  )
+  Config.Redacted(name).pipe(Effect.flatMap((redacted) => fromRedactedSecret(redacted, name)))
+
+/**
+ * The body of {@link fromConfig}: the signer a redacted secret names, with
+ * the `Redacted` wiped (`Redacted.wipeUnsafe`) once it has been decoded, on
+ * success and failure alike. Internal; exported through `src/internal.ts` so
+ * the wipe is testable.
+ *
+ * Fails with: `ConfigError` (the one fixed sentence, naming `name`).
+ */
+export const fromRedactedSecret = (
+  redacted: Redacted.Redacted<string>,
+  name: string
+): Effect.Effect<Signer, Config.ConfigError> =>
+  Effect.tryPromise({
+    try: async () => {
+      let keypair: Keypair | undefined
+      try {
+        keypair = await keypairFromSecret(Redacted.value(redacted))
+      } finally {
+        // The text is decoded; nothing reads it again. Dropping it from the
+        // redacted registry means a stray reference to this `Redacted` (a log
+        // of the config, a captured closure) can no longer be unwrapped.
+        Redacted.wipeUnsafe(redacted)
+      }
+      if (keypair === undefined) {
+        throw new Error("unsupported key scheme")
+      }
+      return fromKeypair(keypair)
+    },
+    // No `cause`: it would carry the decoder's message, and the decoder's
+    // message carries the key.
+    catch: () =>
+      new Config.ConfigError(
+        new ConfigProvider.SourceError({ message: `${name} ${KEY_ERROR}` })
+      )
+  })
 
 /**
  * A fresh Ed25519 credential that exists only for this process. For tests,

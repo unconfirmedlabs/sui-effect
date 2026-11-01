@@ -94,11 +94,23 @@ const coinObject = {
   content: new Uint8Array()
 }
 
+/** The sponsor's own gas coin, for coin-paid sponsorship. */
+const sponsorCoin = {
+  ...coin,
+  objectId: PADDED("c02"),
+  owner: { $kind: "AddressOwner", AddressOwner: sponsor.address }
+} as unknown as SuiClientTypes.Coin
+/** A coin `other` owns, for the paths where it pays for gas. */
+const otherCoin = { ...coin, objectId: PADDED("c03"), owner: otherOwner } as unknown as SuiClientTypes.Coin
+
 const baseScript = {
   chainId: CHAIN_ID,
   clockTimestampMs: CLOCK_MS,
   objects: [escrow(3n)],
-  coins: [coin]
+  coins: [coin],
+  // Gas for the sponsored paths comes from an address balance, which
+  // `Tx.build` checks covers the budget before anything is signed.
+  balances: [{ coinType: "0x2::sui::SUI", balance: "1000000000", coinBalance: "0", addressBalance: "1000000000" }]
 }
 
 /** A transaction that consumes the escrow object, so it has one owned input. */
@@ -273,14 +285,19 @@ describe("Tx.build", () => {
     if (error._tag === "SimulationFailed") expect(error.reason.$kind).toBe("MoveAbort")
   })
 
-  test("refuses a gas budget over the configured maximum", async () => {
+  test("refuses a gas budget over the configured maximum with PolicyDenied", async () => {
     const error = await run(
       Tx.build(claim, { sender: SENDER }).pipe(
         Effect.flip,
         SubmitConfig.with({ maxGasBudget: Mist.make(1n) })
       )
     )
-    expect(error._tag).toBe("BuildError")
+    // A configured limit refusing the transaction is a policy decision, and it
+    // reads as one: both numbers, and which setting refused.
+    expect(error._tag).toBe("PolicyDenied")
+    if (error._tag !== "PolicyDenied") return
+    expect(error.rule).toBe("maxGasBudget")
+    expect(error.message).toBe("the gas budget 50000000 MIST exceeds SubmitConfig.maxGasBudget 1 MIST")
   })
 
   test("a recipe that throws is a BuildError", async () => {
@@ -597,10 +614,63 @@ describe("Tx.run", () => {
     expect(calls.filter((method) => method === "executeTransaction")).toHaveLength(1)
   })
 
-  test("two sponsored runs with one gas owner serialize, even for different senders", async () => {
+  test("two coin-paid sponsored runs with one gas owner serialize, even for different senders", async () => {
     // The coins being spent belong to the gas owner, so the gas owner is the
     // address that has to be locked. Locking only the sender would let both
-    // runs pick the sponsor's one coin.
+    // runs pick the sponsor's one coin. (`Tx.sponsored` pays from an address
+    // balance instead and selects no coins; that case is not serialized.)
+    const order = await run(
+      Effect.gen(function*() {
+        const gate = yield* Deferred.make<void>()
+        const inside = yield* Deferred.make<void>()
+        const order: Array<string> = []
+        let held = false
+        const config: SubmitConfigService = {
+          ...SubmitConfig.defaults,
+          preflight: () =>
+            Effect.gen(function*() {
+              if (held) return
+              held = true
+              yield* Deferred.succeed(inside, undefined)
+              yield* Deferred.await(gate)
+            })
+        }
+        const start = (name: string, who: typeof signer) =>
+          Effect.forkChild(
+            Tx.run(claim, {
+              signer: who,
+              gasOwner: sponsor.address,
+              sponsor
+            }).pipe(
+              Effect.tap(() => Effect.sync(() => order.push(name))),
+              Effect.provideService(SubmitConfig, config)
+            )
+          )
+        const first = yield* start("first", signer)
+        yield* Deferred.await(inside)
+        const second = yield* start("second", other)
+        yield* TestClock.adjust("1 second")
+        expect(order).toEqual([])
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.join(first)
+        yield* Fiber.join(second)
+        return order
+      }),
+      {
+        ...baseScript,
+        coins: [coin, sponsorCoin],
+        simulate: [FakeOutcome.succeed()],
+        execute: [executed]
+      }
+    )
+    expect(order).toEqual(["first", "second"])
+  })
+
+  test("address-balance sponsored runs with one gas owner do not wait for each other", async () => {
+    // `Tx.sponsored` sets an empty gas payment: no coin is selected, so there
+    // is nothing for two runs to race over and the sponsor's lock is not
+    // taken. Before 0.4.0 the second run waited for the first, which made one
+    // sponsor serving twenty senders as slow as twenty sequential runs.
     const order = await run(
       Effect.gen(function*() {
         const gate = yield* Deferred.make<void>()
@@ -631,38 +701,37 @@ describe("Tx.run", () => {
         const first = yield* start("first", signer)
         yield* Deferred.await(inside)
         const second = yield* start("second", other)
-        yield* TestClock.adjust("1 second")
-        expect(order).toEqual([])
+        yield* Fiber.join(second)
+        // The second run finished while the first still held its own lock.
+        expect(order).toEqual(["second"])
         yield* Deferred.succeed(gate, undefined)
         yield* Fiber.join(first)
-        yield* Fiber.join(second)
         return order
       }),
-      { ...baseScript, simulate: [FakeOutcome.succeed()], execute: [executed] }
+      {
+        ...baseScript,
+        simulate: [FakeOutcome.succeed(), FakeOutcome.succeed()],
+        execute: [executed, executed]
+      }
     )
-    expect(order).toEqual(["first", "second"])
+    expect(order).toEqual(["second", "first"])
   })
 
   test("sender and gas owner are locked in a fixed order, so two runs cannot deadlock", async () => {
-    // Each run needs both addresses. Taking them in whatever order the
-    // arguments arrived would let one run hold A waiting for B while the other
-    // holds B waiting for A; ascending address order is what rules that out.
+    // Each run needs both addresses (coin-paid sponsorship: the gas owner's
+    // coins are selected). Taking them in whatever order the arguments arrived
+    // would let one run hold A waiting for B while the other holds B waiting
+    // for A; ascending address order is what rules that out.
     const done = await run(
       Effect.gen(function*() {
-        const left = Tx.run(
-          Tx.sponsored({ sender: signer.address, gasOwner: other.address })(claim),
-          { signer, gasOwner: other.address, sponsor: other }
-        )
-        const right = Tx.run(
-          Tx.sponsored({ sender: other.address, gasOwner: signer.address })(claim),
-          { signer: other, gasOwner: signer.address, sponsor: signer }
-        )
+        const left = Tx.run(claim, { signer, gasOwner: other.address, sponsor: other })
+        const right = Tx.run(claim, { signer: other, gasOwner: signer.address, sponsor: signer })
         const first = yield* Effect.forkChild(left)
         const second = yield* Effect.forkChild(right)
         yield* TestClock.adjust("1 second")
         return [yield* Fiber.join(first), yield* Fiber.join(second)].length
       }),
-      { ...baseScript, execute: [executed] }
+      { ...baseScript, coins: [coin, otherCoin], execute: [executed] }
     )
     expect(done).toBe(2)
   })
@@ -906,6 +975,9 @@ describe("Tx.reconcile", () => {
         // The coin has to be a readable object as well as a listed coin, so
         // that reconcile can see its version move.
         objects: [escrow(3n), coinObject],
+        // The sender pays gas with that coin, so it has no address balance to
+        // pay from instead.
+        balances: [{ owner: SENDER, coinType: "0x2::sui::SUI", balance: "0", coinBalance: "0", addressBalance: "0" }],
         getTransaction: [FakeOutcome.notFound()],
         transactions: consumedBySomeoneElse(COIN_ID, coin.type, 2n)
       }

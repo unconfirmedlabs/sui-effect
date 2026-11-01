@@ -64,7 +64,7 @@ describe("SuiExtension.fromService", () => {
     const demo = client()
     expect(await demo.status()).toBe("ready")
     expect(await demo.claim("0x1")).toBe("claimed 0x1")
-    await demo.dispose()
+    await demo.$dispose()
   })
 
   test("a rejection is the original tagged error instance", async () => {
@@ -73,7 +73,7 @@ describe("SuiExtension.fromService", () => {
     expect(error).toBeInstanceOf(EscrowClosed)
     expect((error as EscrowClosed)._tag).toBe("EscrowClosed")
     expect((error as EscrowClosed).outcome).toBe("not_applied")
-    await demo.dispose()
+    await demo.$dispose()
   })
 
   test("Stream members become AsyncIterables, before and after the first call", async () => {
@@ -85,7 +85,7 @@ describe("SuiExtension.fromService", () => {
     const again: Array<number> = []
     for await (const event of demo.events) again.push(event)
     expect(again).toEqual([1, 2, 3])
-    await demo.dispose()
+    await demo.$dispose()
   })
 
   test("nested namespaces are mapped recursively", async () => {
@@ -94,14 +94,14 @@ describe("SuiExtension.fromService", () => {
     const ids: Array<string> = []
     for await (const id of demo.escrow.ids) ids.push(id)
     expect(ids).toEqual(["a", "b"])
-    await demo.dispose()
+    await demo.$dispose()
   })
 
   test("non-function values pass through once the runtime is up", async () => {
     const demo = client()
     await demo.status()
     expect(demo.chainId).toBe(CHAIN_ID)
-    await demo.dispose()
+    await demo.$dispose()
   })
 
   test("the runtime is built once and lazily", async () => {
@@ -123,7 +123,7 @@ describe("SuiExtension.fromService", () => {
     await demo.status()
     await demo.status()
     expect(built).toBe(1)
-    await demo.dispose()
+    await demo.$dispose()
   })
 
   test("the registration has the name $extend will use", () => {
@@ -148,7 +148,7 @@ describe("SuiExtension.fromService", () => {
     const error = await demo.status().then(() => undefined, (cause: unknown) => cause)
     expect(error).toBe(broken)
     expect(error).toBeInstanceOf(EscrowClosed)
-    await demo.dispose()
+    await demo.$dispose()
   })
 
   test("the registered property is typed, with no cast and no undefined", () => {
@@ -160,9 +160,9 @@ describe("SuiExtension.fromService", () => {
     // the extended client's type rather than an index signature — which is
     // what `noUncheckedIndexedAccess` used to widen with `undefined`. The
     // assignment is the assertion: it does not compile otherwise.
-    const api: PromiseFace<Demo["Service"]> & { readonly dispose: () => Promise<void> } =
+    const api: PromiseFace<Demo["Service"]> & { readonly $dispose: () => Promise<void> } =
       extended.demo
-    expect(typeof api.dispose).toBe("function")
+    expect(typeof api.$dispose).toBe("function")
   })
 
   test("dispose is not final: the next call builds a fresh runtime", async () => {
@@ -181,10 +181,10 @@ describe("SuiExtension.fromService", () => {
       fake.client
     )
     expect(await demo.status()).toBe("ready")
-    await demo.dispose()
+    await demo.$dispose()
     expect(await demo.status()).toBe("ready")
     expect(built).toBe(2)
-    await demo.dispose()
+    await demo.$dispose()
   })
 
   test("registering twice gives two independent runtimes", async () => {
@@ -208,8 +208,8 @@ describe("SuiExtension.fromService", () => {
     // Two layer builds, so two copies of whatever the layer holds. Register
     // once per client and keep the extended client.
     expect(built).toBe(2)
-    await first.dispose()
-    await second.dispose()
+    await first.$dispose()
+    await second.$dispose()
   })
 })
 
@@ -281,13 +281,14 @@ describe("SuiExtension.fromService: synchronous members", () => {
     await api.$dispose()
   })
 
-  test("$ready is idempotent and dispose is still its old name", async () => {
+  test("$ready is idempotent and the bare name dispose is not reserved", async () => {
     const api = syncClient()
     await api.$ready()
     await api.$ready()
     expect(api.packageId).toBe("0xabc")
-    expect(api.dispose).toBe(api.$dispose)
-    await api.dispose()
+    expect("dispose" in api).toBe(false)
+    expect(Object.keys(api)).toEqual(expect.arrayContaining(["$ready", "$dispose"]))
+    await api.$dispose()
   })
 
   test("warm builds the runtime inside register, so nothing has to be awaited", () => {

@@ -17,7 +17,12 @@ import {
   normalizeSuiAddress
 } from "@mysten/sui/utils"
 
-const normalizeStructTagSafe = (value: string): string => {
+/**
+ * `normalizeStructTag`, or the value unchanged when it does not parse as a
+ * struct tag (a primitive such as `u64`, or plain nonsense the check after it
+ * rejects). The one copy: `bcs.ts` imports it from here. Never fails.
+ */
+export const normalizeStructTagSafe = (value: string): string => {
   try {
     return normalizeStructTag(value)
   } catch {
@@ -26,29 +31,116 @@ const normalizeStructTagSafe = (value: string): string => {
 }
 
 /**
+ * What a hex id may look like **before** it is padded: an optional `0x`, then
+ * one to 64 hex digits. The empty string and a bare `0x` are not ids, although
+ * `normalizeSuiAddress` pads both to the zero address — which is how an empty
+ * CLI argument used to decode to `0x000…000` and receive funds.
+ */
+const SHORT_HEX_ID = /^(0x)?[0-9a-fA-F]{1,64}$/
+
+/** The only spelling the strict decoders take: an optional `0x` and exactly 64 hex digits. */
+const FULL_HEX_ID = /^(0x)?[0-9a-fA-F]{64}$/
+
+/**
+ * The pipeline every 32-byte hex id shares: refuse what is not a hex id at all
+ * (`""`, `"0x"`, non-hex), normalize with `normalizeSuiAddress` on decode,
+ * check with `isValidSuiAddress`. The caller brands it (`Schema.brand` needs a
+ * literal): `SuiAddress` and `ObjectId` differ only in brand and wording.
+ *
+ * `strict` is the user-input variant: exactly 64 hex digits, so a truncated
+ * paste is refused instead of being padded into a different, valid id.
+ */
+const hexId = (identifier: string, description: string, expected: string, strict = false) =>
+  Schema.String.annotate({ identifier, description }).pipe(
+    Schema.check(
+      Schema.makeFilter((value: string) =>
+        (strict ? FULL_HEX_ID : SHORT_HEX_ID).test(value)
+          ? undefined
+          : strict
+          ? `${expected}: exactly 64 hex digits, with or without 0x`
+          : expected
+      )
+    )
+    // Again after the check, which is the node that reports a non-string (see
+    // `Digest`).
+  ).annotate({ identifier, description }).pipe(
+    Schema.decode({
+      decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
+      encode: SchemaGetter.passthrough()
+    }),
+    Schema.check(
+      Schema.makeFilter((value: string) => isValidSuiAddress(value) ? undefined : expected)
+    )
+  )
+
+/**
+ * The pipeline every struct-tag-like string shares: normalize with
+ * `normalizeStructTag` on decode (leaving what does not parse for the check to
+ * reject), check with `isValidStructTag`. The caller brands it. `StructTag` and
+ * `CoinType` differ only in brand and wording.
+ */
+const structTagLike = (identifier: string, description: string, expected: string) =>
+  Schema.String.annotate({ identifier, description }).pipe(
+    Schema.decode({
+      decode: SchemaGetter.transform(normalizeStructTagSafe),
+      encode: SchemaGetter.passthrough()
+    }),
+    Schema.check(
+      Schema.makeFilter((value: string) => isValidStructTag(value) ? undefined : expected)
+    )
+  )
+
+/**
  * A 32-byte Sui account address, normalized to the padded lowercase `0x` form on
  * decode. Rejects anything `isValidSuiAddress` rejects with a `SchemaError`.
  *
- * `SuiAddress.make(value)` is the branding constructor: it **validates without
- * decoding**, so it takes the padded 32-byte spelling and nothing else —
- * `SuiAddress.make("0x1")` throws. `SuiAddress.normalize("0x1")` is the one
- * that accepts every spelling a human writes, because it decodes first.
+ * **Decoding pads.** `Schema.decodeUnknownEffect(SuiAddress)` takes every
+ * spelling the SDK takes — `"0x2"`, `"2"`, an unpadded or mixed-case hex
+ * string — and left-pads it to 64 digits, so a truncated 60-digit paste decodes
+ * to a *different, valid* address. It refuses `""`, a bare `"0x"` and anything
+ * that is not hex. For an address a human typed — a CLI argument, a form field,
+ * a recipient — decode with {@link SuiAddress.Strict} instead, which takes
+ * exactly 64 hex digits and nothing shorter.
+ *
+ * The three ways in:
+ *
+ * - `SuiAddress.make(value)` brands: it **validates without decoding**, so it
+ *   takes the padded 32-byte spelling and nothing else — `SuiAddress.make("0x1")`
+ *   throws. For a value already in canonical form.
+ * - `SuiAddress.normalize(value)` decodes (pads) and brands, throwing a
+ *   `SchemaError`. For literals and configuration a caller controls, such as
+ *   `"0x2"`.
+ * - `Schema.decodeUnknownEffect(SuiAddress)` / `(SuiAddress.Strict)` for a value
+ *   from outside, with the failure in the error channel.
  */
-const SuiAddressSchema = Schema.String.annotate({
-  identifier: "SuiAddress",
-  description: "A 32-byte Sui account address in the padded lowercase 0x form"
-}).pipe(
-  Schema.decode({
-    decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
-    encode: SchemaGetter.passthrough()
-  }),
-  Schema.check(
-    Schema.makeFilter((value: string) =>
-      isValidSuiAddress(value) ? undefined : "Expected a 32-byte Sui address"
-    )
-  ),
-  Schema.brand("SuiAddress")
-)
+const SuiAddressSchema = hexId(
+  "SuiAddress",
+  "A 32-byte Sui account address in the padded lowercase 0x form",
+  "Expected a 32-byte Sui address"
+).pipe(Schema.brand("SuiAddress"))
+
+/**
+ * {@link SuiAddress} for user input: an optional `0x` and **exactly** 64 hex
+ * digits, lowercased. Nothing is padded, so `""`, `"0x"`, `"0x2"` and a
+ * truncated paste are refused instead of becoming the zero address or somebody
+ * else's. The decoded value is the same `SuiAddress` brand.
+ *
+ * @since 0.4.0
+ *
+ * @example
+ * ```ts
+ * import { Schema } from "effect"
+ * import { SuiAddress } from "@unconfirmed/sui-effect"
+ *
+ * const recipient = Schema.decodeUnknownEffect(SuiAddress.Strict)(process.argv[2])
+ * ```
+ */
+const SuiAddressStrict = hexId(
+  "SuiAddress",
+  "A 32-byte Sui account address, exactly 64 hex digits",
+  "Expected a 32-byte Sui address",
+  true
+).pipe(Schema.brand("SuiAddress"))
 
 /**
  * A branded {@link SuiAddress} from **any** spelling the SDK accepts: `"0x1"`,
@@ -59,7 +151,8 @@ const SuiAddressSchema = Schema.String.annotate({
  * `isValidSuiAddress`, which only the padded 32-byte form passes, so
  * `SuiAddress.make("0x1")` throws while `"0x1"` is what every deployment
  * document, every CLI flag and every human writes. `normalize` runs the
- * schema's own decode — `normalizeSuiAddress` — and then the check.
+ * schema's own decode — `normalizeSuiAddress` — and then the check. It pads, so
+ * it is not for an address a human typed: that is {@link SuiAddress.Strict}.
  *
  * **It throws a `SchemaError`** — `Schema.isSchemaError(error)` is the guard —
  * whose `.issue` is the structured schema issue and whose `.message` is the
@@ -84,34 +177,44 @@ const normalizeSuiAddressValue: (input: string) => typeof SuiAddressSchema.Type 
   SuiAddressSchema
 )
 
-/** The schema, plus {@link normalizeSuiAddressValue} as `SuiAddress.normalize`. */
+/**
+ * A 32-byte Sui account address in the padded lowercase `0x` form: the schema
+ * (which pads on decode), plus `SuiAddress.normalize` for a shorthand spelling
+ * such as `"0x2"` and `SuiAddress.Strict` for user input.
+ */
 export const SuiAddress = Object.assign(SuiAddressSchema, {
-  normalize: normalizeSuiAddressValue
+  normalize: normalizeSuiAddressValue,
+  Strict: SuiAddressStrict
 })
 export type SuiAddress = typeof SuiAddressSchema.Type
 
 /**
- * A 32-byte object id. Same encoding rules as {@link SuiAddress}; the brand is
- * separate so an address cannot be passed where an object id is expected.
+ * A 32-byte object id. Same encoding rules as {@link SuiAddress} — decoding
+ * pads, and refuses `""` and a bare `"0x"` — and the brand is separate so an
+ * address cannot be passed where an object id is expected.
  *
- * `ObjectId.make` validates without decoding; `ObjectId.normalize` decodes
- * first and is what takes `"0x6"`.
+ * `ObjectId.make` validates without decoding (padded form only);
+ * `ObjectId.normalize` decodes first and is what takes `"0x6"`;
+ * `ObjectId.Strict` is the exactly-64-digit decoder for an id a human typed.
  */
-const ObjectIdSchema = Schema.String.annotate({
-  identifier: "ObjectId",
-  description: "A 32-byte Sui object id in the padded lowercase 0x form"
-}).pipe(
-  Schema.decode({
-    decode: SchemaGetter.transform((value: string) => normalizeSuiAddress(value)),
-    encode: SchemaGetter.passthrough()
-  }),
-  Schema.check(
-    Schema.makeFilter((value: string) =>
-      isValidSuiAddress(value) ? undefined : "Expected a 32-byte Sui object id"
-    )
-  ),
-  Schema.brand("ObjectId")
-)
+const ObjectIdSchema = hexId(
+  "ObjectId",
+  "A 32-byte Sui object id in the padded lowercase 0x form",
+  "Expected a 32-byte Sui object id"
+).pipe(Schema.brand("ObjectId"))
+
+/**
+ * {@link ObjectId} for user input: an optional `0x` and exactly 64 hex digits,
+ * never padded. The twin of {@link SuiAddress.Strict}.
+ *
+ * @since 0.4.0
+ */
+const ObjectIdStrict = hexId(
+  "ObjectId",
+  "A 32-byte Sui object id, exactly 64 hex digits",
+  "Expected a 32-byte Sui object id",
+  true
+).pipe(Schema.brand("ObjectId"))
 
 /**
  * A branded {@link ObjectId} from any spelling the SDK accepts, decoding first
@@ -122,7 +225,8 @@ const ObjectIdSchema = Schema.String.annotate({
  * schema issue and whose `.message` is the formatted line, because it is
  * `Schema.decodeSync`; `.make` throws a plain `Error` with the issue in
  * `cause`. So it is for literals and configuration a caller controls; anything
- * from outside goes through `Schema.decodeUnknownEffect(ObjectId)`.
+ * from outside goes through `Schema.decodeUnknownEffect(ObjectId)` (or
+ * `ObjectId.Strict` when a human typed it).
  *
  * @since 0.1.1
  *
@@ -137,11 +241,25 @@ const normalizeObjectIdValue: (input: string) => typeof ObjectIdSchema.Type = Sc
   ObjectIdSchema
 )
 
-/** The schema, plus {@link normalizeObjectIdValue} as `ObjectId.normalize`. */
-export const ObjectId = Object.assign(ObjectIdSchema, { normalize: normalizeObjectIdValue })
+/**
+ * A 32-byte Sui object id in the padded lowercase `0x` form: the schema (which
+ * pads on decode), plus `ObjectId.normalize` for a shorthand spelling such as
+ * `"0x6"` and `ObjectId.Strict` for user input.
+ */
+export const ObjectId = Object.assign(ObjectIdSchema, {
+  normalize: normalizeObjectIdValue,
+  Strict: ObjectIdStrict
+})
 export type ObjectId = typeof ObjectIdSchema.Type
 
-/** A base58 transaction digest. Not normalized; rejected when not 32 bytes. */
+/**
+ * A base58 transaction digest. Not normalized — a digest has one spelling —
+ * and rejected when it is not 32 bytes.
+ *
+ * `Digest.make(value)` brands a value already known to be a digest (it
+ * validates and throws); `Schema.decodeUnknownEffect(Digest)` is for one from
+ * outside. There is no `normalize`, because there is nothing to normalize.
+ */
 export const Digest = Schema.String.annotate({
   identifier: "Digest",
   description: "A base58 32-byte transaction digest"
@@ -164,41 +282,87 @@ export type Digest = typeof Digest.Type
 /**
  * A fully qualified Move struct tag, normalized with `normalizeStructTag` on
  * decode so `0x2::sui::SUI` and its padded form compare equal.
+ *
+ * `StructTag.make(value)` **validates without normalizing**: it brands
+ * `"0x2::coin::Coin"` as given, unpadded. `StructTag.normalize(value)` decodes
+ * (pads every address in the tag) and brands, throwing a `SchemaError` on
+ * something that is not a struct tag. Every `Sui` read that takes a type also
+ * takes a plain string and normalizes it itself, so neither is needed there.
  */
-export const StructTag = Schema.String.annotate({
-  identifier: "StructTag",
-  description: "A fully qualified Move struct tag, normalized"
-}).pipe(
-  Schema.decode({
-    decode: SchemaGetter.transform(normalizeStructTagSafe),
-    encode: SchemaGetter.passthrough()
-  }),
-  Schema.check(
-    Schema.makeFilter((value: string) =>
-      isValidStructTag(value) ? undefined : "Expected a fully qualified Move struct tag"
-    )
-  ),
-  Schema.brand("StructTag")
-)
-export type StructTag = typeof StructTag.Type
+const StructTagSchema = structTagLike(
+  "StructTag",
+  "A fully qualified Move struct tag, normalized",
+  "Expected a fully qualified Move struct tag"
+).pipe(Schema.brand("StructTag"))
 
-/** A coin type: a struct tag used as the type argument of `0x2::coin::Coin`. */
-export const CoinType = Schema.String.annotate({
-  identifier: "CoinType",
-  description: "A struct tag used as the type argument of 0x2::coin::Coin"
-}).pipe(
-  Schema.decode({
-    decode: SchemaGetter.transform(normalizeStructTagSafe),
-    encode: SchemaGetter.passthrough()
-  }),
-  Schema.check(
-    Schema.makeFilter((value: string) =>
-      isValidStructTag(value) ? undefined : "Expected a fully qualified Move coin type"
-    )
-  ),
-  Schema.brand("CoinType")
+/**
+ * A branded, normalized {@link StructTag} from any spelling: `"0x2::coin::Coin"`
+ * becomes `"0x000…002::coin::Coin"`. Throws a `SchemaError`
+ * (`Schema.isSchemaError`) on a string that is not a struct tag, because it is
+ * `Schema.decodeSync`; a value from outside goes through
+ * `Schema.decodeUnknownEffect(StructTag)`.
+ *
+ * @since 0.4.0
+ */
+const normalizeStructTagValue: (input: string) => typeof StructTagSchema.Type = Schema.decodeSync(
+  StructTagSchema
 )
-export type CoinType = typeof CoinType.Type
+
+/**
+ * A fully qualified Move struct tag in normalized form: the schema, plus
+ * `StructTag.normalize` for any spelling.
+ */
+export const StructTag = Object.assign(StructTagSchema, { normalize: normalizeStructTagValue })
+export type StructTag = typeof StructTagSchema.Type
+
+/**
+ * A coin type: a struct tag used as the type argument of `0x2::coin::Coin`
+ * (`0x2::sui::SUI`, not `0x2::coin::Coin<0x2::sui::SUI>`).
+ *
+ * Same rules as {@link StructTag}: `CoinType.make` validates without
+ * normalizing (`CoinType.make("0x2::sui::SUI")` stays unpadded),
+ * `CoinType.normalize` pads and brands, and `CoinType.SUI` is SUI's coin type
+ * in normalized form. Every `Sui` read and `Executed.balanceChange` take a plain
+ * string too, and compare under the one Move type rule.
+ */
+const CoinTypeSchema = structTagLike(
+  "CoinType",
+  "A struct tag used as the type argument of 0x2::coin::Coin",
+  "Expected a fully qualified Move coin type"
+).pipe(Schema.brand("CoinType"))
+
+/**
+ * A branded, normalized {@link CoinType} from any spelling. Throws a
+ * `SchemaError` on a string that is not a struct tag, because it is
+ * `Schema.decodeSync`.
+ *
+ * @since 0.4.0
+ *
+ * @example
+ * ```ts
+ * import { CoinType } from "@unconfirmed/sui-effect"
+ *
+ * const usdc = CoinType.normalize(`${USDC_PACKAGE}::usdc::USDC`)
+ * ```
+ */
+const normalizeCoinTypeValue: (input: string) => typeof CoinTypeSchema.Type = Schema.decodeSync(
+  CoinTypeSchema
+)
+
+/**
+ * A coin type in normalized form: the schema, plus `CoinType.normalize` for any
+ * spelling and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
+ */
+export const CoinType = Object.assign(CoinTypeSchema, {
+  normalize: normalizeCoinTypeValue,
+  /**
+   * SUI's coin type, `0x000…002::sui::SUI`, normalized and branded.
+   *
+   * @since 0.4.0
+   */
+  SUI: normalizeCoinTypeValue("0x2::sui::SUI")
+})
+export type CoinType = typeof CoinTypeSchema.Type
 
 /**
  * The `type` field of an object envelope. Almost always a struct tag, but gRPC
@@ -328,6 +492,60 @@ type BalanceType = typeof Balance.Type
  * into its structure. Structurally identical to the type alias it replaces.
  */
 export interface Balance extends BalanceType {}
+
+/**
+ * A coin object. Mirrors `SuiClientTypes.Coin`: `type` is the full object type
+ * (`0x2::coin::Coin<T>`), `balance` the coin's value in its smallest unit.
+ *
+ * @since 0.4.0
+ */
+export const Coin = Schema.Struct({
+  objectId: ObjectId,
+  version: Version,
+  digest: Schema.String,
+  owner: Owner,
+  type: StructTag,
+  balance: Mist
+}).annotate({
+  identifier: "Coin",
+  description: "A coin object"
+})
+type CoinSchemaType = typeof Coin.Type
+/**
+ * The decoded shape of {@link Coin}.
+ *
+ * Declared as an interface rather than as `typeof Coin.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface Coin extends CoinSchemaType {}
+
+/**
+ * The metadata of a coin type. Mirrors `SuiClientTypes.CoinMetadata`: `id` is
+ * the metadata object's id, `null` when the node does not report one.
+ *
+ * @since 0.4.0
+ */
+export const CoinMetadata = Schema.Struct({
+  id: Schema.NullOr(ObjectId),
+  decimals: Schema.Finite.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))),
+  name: Schema.String,
+  symbol: Schema.String,
+  description: Schema.String,
+  iconUrl: Schema.NullOr(Schema.String)
+}).annotate({
+  identifier: "CoinMetadata",
+  description: "The metadata of a coin type"
+})
+type CoinMetadataType = typeof CoinMetadata.Type
+/**
+ * The decoded shape of {@link CoinMetadata}.
+ *
+ * Declared as an interface rather than as `typeof CoinMetadata.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface CoinMetadata extends CoinMetadataType {}
 
 /** The BCS-encoded name of a dynamic field. Mirrors `SuiClientTypes.DynamicFieldName`. */
 export const DynamicFieldName = Schema.Struct({
@@ -480,6 +698,33 @@ export const Event = Schema.Struct({
 export type Event = typeof Event.Type
 
 /**
+ * An event read from a listing, with its place in the ledger. Mirrors
+ * `SuiClientTypes.EventEntry`: an {@link Event} plus the checkpoint that
+ * contains the emitting transaction (`null` where the transport does not say),
+ * that transaction's digest, and the event's index in its list.
+ *
+ * @since 0.4.0
+ */
+export const EventEntry = Schema.Struct({
+  ...Event.fields,
+  checkpoint: Schema.NullOr(Schema.BigIntFromString),
+  transactionDigest: Digest,
+  eventIndex: Schema.Finite.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)))
+}).annotate({
+  identifier: "EventEntry",
+  description: "An event read from a listing, with its place in the ledger"
+})
+type EventEntryType = typeof EventEntry.Type
+/**
+ * The decoded shape of {@link EventEntry}.
+ *
+ * Declared as an interface rather than as `typeof EventEntry.Type` so the name
+ * survives into `.d.ts`, editor hover and `LLMS.md` instead of being expanded
+ * into its structure. Structurally identical to the type alias it replaces.
+ */
+export interface EventEntry extends EventEntryType {}
+
+/**
  * Where a Move abort happened. Mirrors `SuiClientTypes.MoveLocation`.
  *
  * `package` stays a plain string because the node may report a location for a
@@ -510,6 +755,10 @@ export type CleverError = typeof CleverError.Type
  * discriminant, with two differences: `abortCode` is decoded to `bigint`, and
  * the shared `message` and `command` fields live on the error class that
  * carries the reason rather than being repeated in every variant.
+ *
+ * The one exception is `Unknown`, which keeps `message` and `command`: it has
+ * no payload of its own, and the node's sentence is the only place the real
+ * kind (`InsufficientCoinBalance`, `FunctionNotFound`, ...) is written down.
  */
 export const ExecutionReason = Schema.Union([
   Schema.Struct({
@@ -573,7 +822,26 @@ export const ExecutionReason = Schema.Union([
       objectId: Schema.String
     })
   }),
-  Schema.Struct({ $kind: Schema.Literal("Unknown") })
+  Schema.Struct({
+    $kind: Schema.Literal("Unknown"),
+    /**
+     * The node's own sentence, which is the only detail an `Unknown` has: the
+     * SDK reports every kind it has no structured variant for —
+     * `InsufficientCoinBalance`, `InsufficientGas`, `FunctionNotFound`,
+     * `ArityMismatch`, a verifier error — as `Unknown` with the kind and the
+     * command in `message` (`"InsufficientCoinBalance in command 0"`). Absent
+     * when the source carried none.
+     *
+     * @since 0.4.0
+     */
+    message: Schema.optionalKey(Schema.String),
+    /**
+     * The index of the command that failed, when the node named one.
+     *
+     * @since 0.4.0
+     */
+    command: Schema.optionalKey(Schema.Finite)
+  })
 ]).pipe(Schema.toTaggedUnion("$kind"))
 export type ExecutionReason = typeof ExecutionReason.Type
 
@@ -687,7 +955,7 @@ const NullableU64 = Schema.NullOr(U64)
  * is a `u32` on the wire, so anything outside `[0, 2^32)` is a schema issue
  * rather than bytes the validator will reject later.
  */
-const Nonce = Schema.Finite.pipe(
+export const Nonce = Schema.Finite.pipe(
   Schema.check(Schema.isInt(), Schema.isBetween({ minimum: 0, maximum: U32_MAX }))
 )
 
@@ -747,6 +1015,14 @@ export const SignedTransaction = Schema.Struct({
   bytes: Schema.Uint8ArrayFromBase64,
   signatures: Schema.Array(Signature),
   sender: SuiAddress,
+  /**
+   * The address that pays for gas, present only when it is not the sender:
+   * the party whose second signature a sponsored transaction carries. Read out
+   * of the bytes, so it is what was signed rather than what was intended.
+   *
+   * @since 0.4.0
+   */
+  gasOwner: Schema.optionalKey(SuiAddress),
   expiration: Schema.optionalKey(TransactionExpiration),
   /**
    * The chain identifier the bytes were built against, recorded by `Tx.build`
@@ -782,22 +1058,34 @@ export interface SignedTransaction extends SignedTransactionType {}
  * by more than `SubmitConfig.expiryMargin` — around a `getTransaction` miss,
  * twice. `"inputConsumed"`: a **different** transaction's own effects report
  * that it took an object these bytes pinned at exactly the version they pinned.
+ * `"refused"`: the node refused the first send outright (gRPC `INVALID_ARGUMENT`).
  *
  * Shared by `NotApplied` and by the journal entry that records it, so the two
  * cannot drift.
  */
-export const NotAppliedEvidence = Schema.Literals(["expired", "inputConsumed"])
+export const NotAppliedEvidence = Schema.Literals(["expired", "inputConsumed", "refused"])
 export type NotAppliedEvidence = typeof NotAppliedEvidence.Type
 
 /**
  * A transaction built into bytes and ready to sign, with the expiration the
  * builder settled on recorded so `Tx.reconcile` can decide, later and without
  * the builder, whether the transaction can still land.
+ *
+ * Every field but `chain` is read back out of `bytes`. Bytes that arrived from
+ * somewhere else — a sponsor handed a sender's transaction — become a `Built`
+ * through `Tx.fromBytes`, never by hand: a hand-built value that leaves out
+ * `expiration` or `chain` silently disables the expiry rule and the chain guard
+ * `Tx.reconcile` depends on.
  */
 export const Built = Schema.Struct({
   digest: Digest,
   bytes: Schema.Uint8ArrayFromBase64,
   sender: SuiAddress,
+  /**
+   * The address that pays for gas, present only when it is not the sender.
+   * Read out of the bytes, so a gas owner a recipe set itself (`Tx.sponsored`
+   * does) is recorded as well as one passed to `Tx.build`.
+   */
   gasOwner: Schema.optionalKey(SuiAddress),
   expiration: Schema.optionalKey(TransactionExpiration),
   /** The chain identifier `Tx.build` was run against. See `SignedTransaction.chain`. */
@@ -958,6 +1246,12 @@ export type CommandResult = typeof CommandResult.Type
 /**
  * The result of a successful simulation, with the fixed include set `Sui` asks
  * for: effects, events, balance changes, object types and command results.
+ *
+ * `gasPaymentMocked` mirrors the SDK field of the same name: `true` when the
+ * simulated transaction had no gas payment, so the node ran it on a mocked gas
+ * coin — gas costs and logic are exercised, but anything drawn from `tx.gas`
+ * was funded by the mock, not the sender. `false` when gas was paid with real
+ * coins or from the sender's address balance.
  */
 export const Simulation = Schema.Struct({
   digest: Digest,
@@ -965,7 +1259,8 @@ export const Simulation = Schema.Struct({
   events: Schema.Array(Event),
   balanceChanges: Schema.Array(BalanceChange),
   objectTypes: Schema.Record(Schema.String, Schema.String),
-  commandResults: Schema.Array(CommandResult)
+  commandResults: Schema.Array(CommandResult),
+  gasPaymentMocked: Schema.Boolean
 }).annotate({
   identifier: "Simulation",
   description: "The result of a successful simulation"
@@ -980,14 +1275,23 @@ type SimulationType = typeof Simulation.Type
  */
 export interface Simulation extends SimulationType {}
 
-const UNKNOWN_REASON = ExecutionReason.cases.Unknown.make({ $kind: "Unknown" })
-
 /**
  * Decodes the SDK's `ExecutionError` into an {@link ExecutionReason}, falling
  * back to `Unknown` when the node reports a variant this version does not
- * model. Never fails.
+ * model. Either way an `Unknown` keeps the node's `message` and `command`,
+ * which are all it has. Never fails.
  */
 export const executionReasonOf = (error: SuiClientTypes.ExecutionError): ExecutionReason => {
   const decoded = Schema.decodeUnknownOption(ExecutionReason)(error)
-  return decoded._tag === "Some" ? decoded.value : UNKNOWN_REASON
+  if (decoded._tag === "Some") return decoded.value
+  const record = error as { readonly message?: unknown; readonly command?: unknown }
+  return ExecutionReason.cases.Unknown.make({
+    $kind: "Unknown",
+    ...(typeof record.message === "string" && record.message.length > 0
+      ? { message: record.message }
+      : {}),
+    ...(typeof record.command === "number" && Number.isFinite(record.command)
+      ? { command: record.command }
+      : {})
+  })
 }

@@ -15,14 +15,22 @@
  * @since 0.1.0
  */
 import type { ClientWithCoreApi, SuiClientRegistration } from "@mysten/sui/client"
+import { normalizeSuiAddress } from "@mysten/sui/utils"
 import type { Context } from "effect"
-import { Effect, Layer, ManagedRuntime, Stream } from "effect"
+import { Effect, Layer, ManagedRuntime, Option, Semaphore, Stream } from "effect"
 import type { TransportError } from "../domain/errors.ts"
 import { ExtensionNotReady, NetworkMismatch } from "../domain/errors.ts"
+import type { SuiAddress } from "../domain/schemas.ts"
 import { KNOWN_CHAIN_IDS } from "../domain/schemas.ts"
+import type { JournalService } from "./Journal.ts"
+import { Journal } from "./Journal.ts"
+import type { SubmitConfigOverrides } from "./SubmitConfig.ts"
+import { SubmitConfig } from "./SubmitConfig.ts"
 import type { Sui, SuiLayerOptions } from "./Sui.ts"
 import { Sui as SuiService } from "./Sui.ts"
 import { SuiCore } from "./SuiCore.ts"
+import type { Reconciled } from "./Tx.ts"
+import { reconcileAll } from "./Tx.ts"
 
 /**
  * A member the Promise face must pass through **whole**, however it is typed.
@@ -106,6 +114,19 @@ interface CodecLike {
 type FaceLeaf = LeafBrand | Uint8Array | Date | Promise<unknown> | ReadonlyArray<unknown> | CodecLike
 
 /**
+ * What an `Effect` member's success becomes at the Promise boundary: an
+ * `Option<A>` is `A | undefined`, everything else is itself.
+ *
+ * A Promise consumer has no `Option` and should not need one: a member that
+ * answers `Option.none()` where absence is normal resolves to `undefined`, and
+ * `Option.some(a)` resolves to `a`. Distributive, so `Option<A> | B` is
+ * `A | undefined | B`. Stream items are not unwrapped.
+ *
+ * @since 0.4.0
+ */
+export type FaceValue<A> = A extends Option.Option<infer B> ? B | undefined : A
+
+/**
  * The Promise face of a service interface.
  *
  * An `Effect` member becomes a zero-argument method returning a Promise, a
@@ -113,6 +134,10 @@ type FaceLeaf = LeafBrand | Uint8Array | Date | Promise<unknown> | ReadonlyArray
  * `Stream` member becomes an `AsyncIterable`, a nested object of members is
  * mapped the same way (platform SDKs namespace their surface as
  * `client.miso.protocol.*`), and anything else passes through untouched.
+ *
+ * **An `Option` result is `A | undefined`** ({@link FaceValue}): `Effect<Option<A>>`
+ * is `Promise<A | undefined>`, in the type and at runtime, so one service can
+ * return `Option` to its Effect callers and `undefined` to its Promise ones.
  *
  * **A synchronous member stays synchronous**: a recipe builder
  * `(p: Params) => Recipe` is still `(p: Params) => Recipe` here, and a plain
@@ -149,11 +174,11 @@ type FaceLeaf = LeafBrand | Uint8Array | Date | Promise<unknown> | ReadonlyArray
  */
 export type PromiseFace<S> = {
   readonly [K in keyof S]: S[K] extends Stream.Stream<infer A, infer _E, infer _R> ? AsyncIterable<A>
-    : S[K] extends Effect.Effect<infer A, infer _E2, infer _R2> ? () => Promise<A>
+    : S[K] extends Effect.Effect<infer A, infer _E2, infer _R2> ? () => Promise<FaceValue<A>>
     : S[K] extends (...args: infer Args) => Stream.Stream<infer A, infer _E3, infer _R3>
       ? (...args: Args) => AsyncIterable<A>
     : S[K] extends (...args: infer Args) => Effect.Effect<infer A, infer _E4, infer _R4>
-      ? (...args: Args) => Promise<A>
+      ? (...args: Args) => Promise<FaceValue<A>>
     : S[K] extends FaceLeaf ? S[K]
     : S[K] extends (...args: ReadonlyArray<never>) => unknown ? S[K]
     : S[K] extends object ? PromiseFace<S[K]>
@@ -180,8 +205,19 @@ export interface ExtensionFace {
    * the next call builds a fresh one.
    */
   readonly $dispose: () => Promise<void>
-  /** The name `$dispose` had first. The same function. */
-  readonly dispose: () => Promise<void>
+  /**
+   * `Tx.reconcileAll()` over this registration's runtime: settles every entry
+   * the journal in force (the one {@link SuiExtensionOptions.journal} gave, or
+   * the in-memory default) still holds unresolved, and answers what each one
+   * turned out to be. The startup call for a Promise consumer with a durable
+   * journal.
+   *
+   * Rejects with `JournalError` when the journal cannot be read, and with
+   * whatever the layer fails with when the runtime cannot be built.
+   *
+   * @since 0.4.0
+   */
+  readonly $reconcileAll: () => Promise<ReadonlyArray<Reconciled>>
 }
 
 /** What `fromService` needs to know beyond the service key itself. */
@@ -263,10 +299,29 @@ export interface SuiExtensionOptions<Self, E, Name extends string = string> {
    * client neither loses the check nor duplicates it.
    */
   readonly warm?: { readonly chainId?: string }
+  /**
+   * Lifecycle overrides for every member call on this registration, the
+   * `SubmitConfig.layer` of a Promise consumer: `maxGasBudget`, `resubmit`,
+   * `executeTimeout: "10 seconds"` and the rest. Provided under the
+   * extension's layer and to every call.
+   *
+   * @since 0.4.0
+   */
+  readonly submit?: SubmitConfigOverrides
+  /**
+   * The journal every member call on this registration records submissions
+   * in, instead of the process-wide in-memory default — a durable one from
+   * `@unconfirmed/sui-effect/journal` (`makeKeyValueStore(store)`) for a
+   * consumer that must survive a restart. `$reconcileAll()` settles what it
+   * holds.
+   *
+   * @since 0.4.0
+   */
+  readonly journal?: JournalService
 }
 
 /** The names the face adds to every service, which a member cannot shadow. */
-const RESERVED = ["$ready", "$dispose", "dispose"] as const
+const RESERVED = ["$ready", "$dispose", "$reconcileAll"] as const
 
 const isEffect = (value: unknown): value is Effect.Effect<unknown, unknown, unknown> =>
   typeof value === "object" && value !== null && Effect.isEffect(value)
@@ -277,6 +332,58 @@ const isStream = (value: unknown): value is Stream.Stream<unknown, unknown, unkn
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null &&
   (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+
+/**
+ * The sender locks every Promise-face registration uses, **process-wide** and
+ * keyed by address alone.
+ *
+ * A sender lock exists so that two transactions from one address cannot pick
+ * the same gas coin — which on a real network is equivocation, and locks the
+ * coin until the epoch ends. The shared base below is keyed by client and
+ * chain id, so two registrations that disagree about the chain id (a `warm`
+ * one that pinned it and a lazy one that reads it), or two clients pointed at
+ * one node, would otherwise hold two lock maps and race. Serializing one
+ * address across unrelated clients costs throughput, never correctness.
+ *
+ * Reference counted: an entry lives while someone holds or waits for it.
+ * Keyed on the normalized spelling, so the upper- and lower-case spellings of
+ * one address (both valid `SuiAddress` brands) share one semaphore.
+ */
+const FACE_LOCKS = new Map<string, { readonly semaphore: Semaphore.Semaphore; holders: number }>()
+
+const faceSenderLock = (address: SuiAddress) =>
+  Effect.fn("Sui.withSenderLock")(function*<A, E, R>(
+    effect: Effect.Effect<A, E, R>
+  ): Effect.fn.Return<A, E, R> {
+    yield* Effect.annotateCurrentSpan({ "sui.sender": address })
+    const key = normalizeSuiAddress(address)
+    return yield* Effect.acquireUseRelease(
+      Effect.sync(() => {
+        let entry = FACE_LOCKS.get(key)
+        if (entry === undefined) {
+          entry = { semaphore: Semaphore.makeUnsafe(1), holders: 0 }
+          FACE_LOCKS.set(key, entry)
+        }
+        entry.holders += 1
+        return entry
+      }),
+      (entry) => Semaphore.withPermits(entry.semaphore, 1)(effect),
+      (entry) =>
+        Effect.sync(() => {
+          entry.holders -= 1
+          if (entry.holders === 0 && FACE_LOCKS.get(key) === entry) FACE_LOCKS.delete(key)
+        })
+    )
+  })
+
+/** `Sui` with its sender lock replaced by the process-wide {@link FACE_LOCKS}. */
+const withFaceLocks: Layer.Layer<Sui, never, Sui> = Layer.effect(
+  SuiService,
+  Effect.gen(function*() {
+    const sui = yield* SuiService
+    return { ...sui, withSenderLock: faceSenderLock }
+  })
+)
 
 /**
  * The base `Sui` + `SuiCore` over one client, shared by every registration on
@@ -413,11 +520,11 @@ interface Bridge {
 /**
  * The placeholder a **cold** member call returns.
  *
- * It is a real `Promise` subclass — `instanceof Promise` holds, and `bun:test`'s
- * `expect(...).rejects` recognises it — that also implements
- * `Symbol.asyncIterator`, because until the runtime exists nothing knows
- * whether the member was an `Effect` (a Promise) or a `Stream` (an
- * `AsyncIterable`). `Symbol.species` is `Promise`, so `.then`, `.catch` and
+ * It is a real `Promise` subclass — `instanceof Promise` holds — that also
+ * implements `Symbol.asyncIterator`, because until the runtime exists nothing
+ * knows whether the member was an `Effect` (a Promise) or a `Stream` (an
+ * `AsyncIterable`). The caller gets it wrapped in a callable `Proxy` (below),
+ * whose `typeof` is `"function"`. `Symbol.species` is `Promise`, so `.then`, `.catch` and
  * `.finally` produce plain Promises rather than more of these.
  */
 class ColdCall<A> extends Promise<A> {
@@ -426,31 +533,120 @@ class ColdCall<A> extends Promise<A> {
   }
 }
 
+/** The key Node's and Bun's `util.inspect` (and so `console.log`) look for. */
+const INSPECT = Symbol.for("nodejs.util.inspect.custom")
+
 /**
- * The cold placeholder, with its rejection **pre-handled**.
+ * The cold placeholder, with its rejection **pre-handled**, and **callable**.
  *
  * A cold call that nobody awaits — `client.ext.doThing()` as a statement —
  * still rejects with `ExtensionNotReady`, and an unhandled rejection aborts the
  * process under Bun and Node. Attaching a no-op `catch` marks it handled
  * without changing what `await` does: the caller's own `await` still throws.
- * Never fails.
+ *
+ * It is a `Proxy` over a function, because until the runtime exists nothing
+ * knows whether the member was a recipe builder — `tx.createFor(name, to)`,
+ * typed as returning a `Recipe` — and a `Recipe` is applied: `recipe(tx)`. So
+ * applying the placeholder throws `ExtensionNotReady` naming the member,
+ * rather than `TypeError: recipe is not a function`. Everything else reads
+ * through to the real `ColdCall` Promise: `then`/`catch`/`finally` are its
+ * own, `instanceof Promise` holds (the prototype is `ColdCall.prototype`), and
+ * `Symbol.asyncIterator` is the cold iteration. `typeof` is `"function"`.
+ * `applied` gets the arguments, so a placeholder that really is a function
+ * (`face.m.bind(null, id)`) can answer the call. Never fails.
  */
 const coldCall = (
   settled: Promise<unknown>,
-  iterate: () => AsyncGenerator<unknown, void, undefined>
+  iterate: () => AsyncGenerator<unknown, void, undefined>,
+  applied: (args: ReadonlyArray<unknown>) => unknown,
+  label: string
 ): Promise<unknown> & AsyncIterable<unknown> => {
   const placeholder = new ColdCall<unknown>((resolve, reject) => {
     settled.then(resolve, reject)
   })
   // Handled, so an un-awaited cold call is a no-op rather than a process abort.
   void placeholder.catch(() => {})
-  Object.defineProperty(placeholder, Symbol.asyncIterator, {
-    value: iterate,
-    enumerable: false,
-    configurable: true
-  })
-  return placeholder as Promise<unknown> & AsyncIterable<unknown>
+  // A **bound** function: callable and constructible like a plain one, but
+  // with no own `prototype`. A plain function's `prototype` is
+  // non-configurable, so the `has` trap below answering `false` for it is a
+  // Proxy-invariant `TypeError` on `"prototype" in coldCall`.
+  const target = function coldCall() {}.bind(null)
+  return new Proxy(target, {
+    apply: (_target, _this, args: ReadonlyArray<unknown>) => applied(args),
+    construct: (_target, args: ReadonlyArray<unknown>) => {
+      applied(args)
+      throw new TypeError(`${label} is not a constructor`)
+    },
+    getPrototypeOf: () => ColdCall.prototype,
+    has: (_target, key) => key === Symbol.asyncIterator || Reflect.has(placeholder, key),
+    get: (_target, key) => {
+      if (key === Symbol.asyncIterator) return iterate
+      if (key === INSPECT) return () => `ColdCall<${label}>`
+      const value: unknown = Reflect.get(placeholder, key, placeholder)
+      return typeof value === "function" ? value.bind(placeholder) : value
+    }
+  }) as unknown as Promise<unknown> & AsyncIterable<unknown>
 }
+
+/**
+ * The names a cold placeholder refuses outright, because reading one means
+ * the caller took the placeholder for a **value** — a string, a number — and
+ * no namespace of members plausibly has a member by that name.
+ *
+ * A namespace member is read the same way a property of a value is
+ * (`client.ext.protocol` and `client.ext.packageId.length` are both one `get`),
+ * so the cold face cannot tell them apart in general. These are the names
+ * where it can: `packageId.length`, `packageId.startsWith("0x")`,
+ * `amount.toFixed(2)` throw `ExtensionNotReady` naming the value, instead of
+ * answering a placeholder that is truthy and says nothing.
+ *
+ * `call`, `apply` and `bind` are **not** here: a placeholder is a function
+ * too, and `face.claim.bind(null, id)` (a React `onClick`, a debounce) has to
+ * work cold the way `face.claim(id)` does. See `functionMethod` below.
+ */
+const VALUE_ONLY = new Set<string>([
+  "length",
+  "startsWith",
+  "endsWith",
+  "toLowerCase",
+  "toUpperCase",
+  "toLocaleLowerCase",
+  "toLocaleUpperCase",
+  "trim",
+  "trimStart",
+  "trimEnd",
+  "padStart",
+  "padEnd",
+  "charAt",
+  "charCodeAt",
+  "codePointAt",
+  "substring",
+  "substr",
+  "indexOf",
+  "lastIndexOf",
+  "localeCompare",
+  "toFixed",
+  "toPrecision",
+  "toExponential",
+  "toString",
+  "toLocaleString",
+  "valueOf",
+  "toJSON",
+  "constructor",
+  "hasOwnProperty",
+  "isPrototypeOf",
+  "propertyIsEnumerable"
+])
+
+/** The `Function.prototype` methods a cold placeholder answers as a function would. */
+type FunctionMethod = "call" | "apply" | "bind"
+
+const isFunctionMethod = (key: string): key is FunctionMethod =>
+  key === "call" || key === "apply" || key === "bind"
+
+/** The runtime half of {@link FaceValue}. */
+const faceValue = (value: unknown): unknown =>
+  Option.isOption(value) ? Option.getOrUndefined(value) : value
 
 const mapMember = (value: unknown, bridge: Bridge): unknown => {
   // A marked leaf is a value, whatever it looks like: the one way an extension
@@ -483,7 +679,10 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  * id and the extension's own layer is built on the first call and shared by
  * every call after it. The `Sui` and `SuiCore` underneath are shared with every
  * other registration on that client that names the same chain id — one
- * transport, one chain identity and one sender-lock map. A rejection carries
+ * transport and one chain identity — and the sender lock is **process-wide**:
+ * every registration, on every client, takes the same lock per address, so a
+ * warm and a lazy registration (or two clients) cannot race one gas coin. A
+ * rejection carries
  * the original tagged error instance, so a Promise consumer can still switch on
  * `_tag`.
  *
@@ -517,22 +716,32 @@ const mapMember = (value: unknown, bridge: Bridge): unknown => {
  *   long-lived page wants (a disposed extension is usable again after a
  *   reconnect) and it does mean a `$dispose()` that races an in-flight call can
  *   leave the caller's Promise rejected while a new runtime starts behind it.
- *   Dispose when the consumer is done, not between calls. `dispose()` is the
- *   same function under the name it had first.
+ *   Dispose when the consumer is done, not between calls.
  * - **Each `register` is independent.** Registering the same extension on two
  *   clients — or twice on one — gives two runtimes, two layer builds and two
  *   copies of whatever the layer holds (a cache, a connection). Register once
  *   per client and keep the extended client.
  *
- * **A cold call is a real `Promise`.** The placeholder a member call returns
- * before the runtime exists is a `Promise` subclass that also implements
- * `Symbol.asyncIterator`, so `instanceof Promise` holds and `bun:test`'s
- * `expect(...).rejects` recognises it. Its rejection is **pre-handled** (a
- * no-op `catch` is attached at creation), so a cold call nobody awaits —
+ * **A cold call is a callable Promise.** The placeholder a member call returns
+ * before the runtime exists is a `Proxy` over a function whose prototype is a
+ * `Promise` subclass that also implements `Symbol.asyncIterator`:
+ * `instanceof Promise` holds, `await` and `then` work, iteration works, and
+ * applying it — a cold recipe builder's result used as `recipe(tx)` — throws
+ * `ExtensionNotReady` naming the member. `typeof` is `"function"`, so
+ * `bun:test`'s `expect(...).rejects`, which wants a native Promise, takes
+ * `Promise.resolve(cold)`. Its rejection is **pre-handled** (a no-op `catch`
+ * is attached at creation), so a cold call nobody awaits —
  * `client.ext.doThing()` as a statement — cannot abort the process with an
  * unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
  *
- * Never fails, except a `warm` registration. A warm registration builds the
+ * **A cold value placeholder refuses value-only use.** A plain value member
+ * read before the runtime exists throws `ExtensionNotReady` on the names only
+ * a value has (`.length`, `.startsWith`, `toString`, `valueOf`, `toJSON`, …),
+ * on spread and on string conversion, and prints as
+ * `<ExtensionNotReady ext.member>`.
+ *
+ * Never fails, except that a `warm` registration throws any failure of its
+ * layer synchronously out of `register`. A warm registration builds the
  * **whole layer** synchronously inside `register`, so **any** failure of that
  * layer — a missing deployment for the network, a configuration error, a
  * `NetworkMismatch`, not only an asynchronous step or an unknown chain
@@ -582,11 +791,15 @@ export const fromService = <Self, Shape, E, const Name extends string>(
           // `Sui` and `SuiCore` over the very client `$extend` was called on, so
           // the extension and the consumer share one transport, one chain-id
           // check and one sender-lock map.
-          (knownChainId === undefined
-            ? SuiService.layerNoDepsWith(options.sui ?? {})
-            : SuiService.layerNoDepsPinned(knownChainId)).pipe(
-              Layer.provideMerge(SuiCore.layerFromClient(client))
-            )
+          // The sender lock is the process-wide one, whatever the key.
+          withFaceLocks.pipe(
+            Layer.provide(
+              knownChainId === undefined
+                ? SuiService.layerNoDepsWith(options.sui ?? {})
+                : SuiService.layerNoDepsPinned(knownChainId)
+            ),
+            Layer.provideMerge(SuiCore.layerFromClient(client))
+          )
       )
 
     const baseOf = (): BaseLayer => {
@@ -594,15 +807,33 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       return knownChainId === undefined ? entry.shared : assertedBase(entry, knownChainId)
     }
 
+    /**
+     * The registration's own lifecycle references, `submit` and `journal`,
+     * under the extension's layer (so its build sees them) and in the runtime
+     * (so every call does).
+     */
+    const references: Layer.Layer<never> = Layer.mergeAll(
+      options.submit === undefined ? Layer.empty : SubmitConfig.layer(options.submit),
+      options.journal === undefined ? Layer.empty : Layer.succeed(Journal, options.journal)
+    )
+
+    const runtimeLayer = (base: BaseLayer) =>
+      options.layer.pipe(Layer.provideMerge(Layer.merge(base, references)))
+
     const runtimeOf = (): Runtime => {
-      if (runtime === undefined) {
-        runtime = ManagedRuntime.make(options.layer.pipe(Layer.provideMerge(baseOf())))
-      }
+      // A warm registration re-warms (see `ensureWarm`) rather than building a
+      // lazy runtime: a lazy one here would be replaced by the next member
+      // read's re-warm, which is how `$reconcileAll()` after `$dispose()` used
+      // to leak a runtime.
+      if (runtime === undefined) ensureWarm()
+      if (runtime === undefined) runtime = ManagedRuntime.make(runtimeLayer(baseOf()))
       return runtime
     }
 
     const bridge: Bridge = {
-      runPromise: (effect) => runtimeOf().runPromise(effect as Effect.Effect<never, never, never>),
+      // An `Option` is `A | undefined` at the Promise boundary (`FaceValue`).
+      runPromise: (effect) =>
+        runtimeOf().runPromise(effect as Effect.Effect<never, never, never>).then(faceValue) as never,
       iterate: <A>(stream: Stream.Stream<A, unknown, never>): AsyncIterable<A> => ({
         async *[Symbol.asyncIterator]() {
           const context = await runtimeOf().context()
@@ -630,10 +861,12 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       // and `getChainIdentifier` is a round trip. It is the same base object a
       // lazy registration on this chain joins.
       const base = baseEntry().shared
-      const warmRuntime: Runtime = ManagedRuntime.make(
-        options.layer.pipe(Layer.provideMerge(base))
-      )
+      const warmRuntime: Runtime = ManagedRuntime.make(runtimeLayer(base))
+      // A runtime this replaces (a lazy one, or a warm build that threw) is
+      // released, not dropped: dropped, it would pin the shared base forever.
+      const previous = runtime
       runtime = warmRuntime
+      if (previous !== undefined) void previous.dispose()
       instance = warmRuntime.runSync(service as unknown as Effect.Effect<Shape, never, Self>)
     }
 
@@ -659,43 +892,102 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         for (const key of path) current = (current as Record<string, unknown>)[key]
         return current
       }
-      const node = (...args: ReadonlyArray<unknown>) => {
-        const settled = at().then((member) => {
-          const mapped = mapMember(member, bridge)
-          if (typeof mapped !== "function") {
-            // The member was a plain value, and the caller used it as a
-            // function because nothing knew what it was yet.
-            throw notReady(path)
-          }
-          const result = (mapped as (...a: ReadonlyArray<unknown>) => unknown)(...args)
-          // A member that returns an `Effect` or a `Stream` is typed as
-          // Promise-returning or as an `AsyncIterable`, so answering with
-          // either is the truth. A member that returns anything else is typed
-          // as **synchronous**, and a Promise of its value is not the value:
-          // say so instead of handing back something the type says cannot be
-          // awaited.
-          if (result instanceof Promise) return result
-          if (typeof result === "object" && result !== null && Symbol.asyncIterator in result) {
-            return result
-          }
-          throw notReady(path)
-        })
-        // Both faces at once, because until the runtime exists nothing knows
-        // which one this member has. `PromiseFace` types an `Effect`-returning
-        // method as `Promise` and a `Stream`-returning one as `AsyncIterable`;
-        // a bare Promise of an `AsyncIterable` satisfies neither `for await`
-        // nor the declared type, which is what a cold Stream call used to hand
-        // back. So the returned value is a **real `Promise`** and an async
-        // iterable: awaited it is the Promise, iterated it awaits the runtime
-        // and then delegates to the real stream.
-        return coldCall(settled, async function*() {
-          const value = await settled
-          if (typeof value !== "object" || value === null || !(Symbol.asyncIterator in value)) {
-            throw notReady(path)
-          }
-          yield* value as AsyncIterable<unknown>
-        })
+      /**
+       * Calls the resolved member at `at` with `args`, as the cold call of it.
+       *
+       * A member that returns an `Effect` or a `Stream` is typed as
+       * Promise-returning or as an `AsyncIterable`, so answering with either
+       * is the truth. A member that returns anything else is typed as
+       * **synchronous**, and a Promise of its value is not the value: say so
+       * instead of handing back something the type says cannot be awaited.
+       */
+      const invoke = (
+        member: unknown,
+        args: ReadonlyArray<unknown>,
+        at: ReadonlyArray<string>
+      ): unknown => {
+        const mapped = mapMember(member, bridge)
+        if (typeof mapped !== "function") {
+          // The member was a plain value, and the caller used it as a
+          // function because nothing knew what it was yet.
+          throw notReady(at)
+        }
+        const result = (mapped as (...a: ReadonlyArray<unknown>) => unknown)(...args)
+        if (result instanceof Promise) return result
+        if (typeof result === "object" && result !== null && Symbol.asyncIterator in result) {
+          return result
+        }
+        throw notReady(at)
       }
+      // Both faces at once, because until the runtime exists nothing knows
+      // which one this member has. `PromiseFace` types an `Effect`-returning
+      // method as `Promise` and a `Stream`-returning one as `AsyncIterable`; a
+      // bare Promise of an `AsyncIterable` satisfies neither `for await` nor
+      // the declared type, which is what a cold Stream call used to hand back.
+      // So the returned value is a **real `Promise`** and an async iterable:
+      // awaited it is the Promise, iterated it awaits the runtime and then
+      // delegates to the real stream.
+      const cold = (
+        settled: Promise<unknown>,
+        at: ReadonlyArray<string>,
+        applied: (args: ReadonlyArray<unknown>) => unknown = () => {
+          throw notReady(at)
+        }
+      ) =>
+        coldCall(
+          settled,
+          async function*() {
+            const value = await settled
+            if (typeof value !== "object" || value === null || !(Symbol.asyncIterator in value)) {
+              throw notReady(at)
+            }
+            yield* value as AsyncIterable<unknown>
+          },
+          applied,
+          label
+        )
+      const node = (...args: ReadonlyArray<unknown>) => cold(at().then((member) => invoke(member, args, path)), path)
+      /**
+       * `node.call`, `node.apply`, `node.bind`, cold.
+       *
+       * Nothing knows yet whether `path` is a function — then these are
+       * `Function.prototype`'s, and `face.claim.bind(null, id)` must work the
+       * way `face.claim(id)` does — or a namespace with a member of that name
+       * (`face.coupons.apply(code)`). So the answer is decided once the
+       * member is resolved: a function gets the `Function.prototype` method,
+       * a namespace gets its own member called with these arguments. A cold
+       * `bind` is also callable at once: applied, it is the cold call of
+       * `path` with the bound arguments first.
+       */
+      const functionMethod = (key: FunctionMethod) => (...args: ReadonlyArray<unknown>) => {
+        const settled = at().then((member) => {
+          if (typeof mapMember(member, bridge) !== "function") {
+            return invoke((member as Record<string, unknown>)[key], args, [...path, key])
+          }
+          switch (key) {
+            case "call":
+              return invoke(member, args.slice(1), path)
+            case "apply": {
+              const spread = args[1]
+              return invoke(member, spread === undefined || spread === null ? [] : Array.from(spread as ArrayLike<unknown>), path)
+            }
+            case "bind": {
+              const bound = args.slice(1)
+              const mapped = mapMember(member, bridge) as (...a: ReadonlyArray<unknown>) => unknown
+              return (...rest: ReadonlyArray<unknown>) => mapped(...bound, ...rest)
+            }
+          }
+        })
+        return key === "bind"
+          ? cold(settled, [...path, key], (rest) => node(...args.slice(1), ...rest))
+          : cold(settled, [...path, key])
+      }
+      const label = `${options.name}.${path.join(".")}`
+      // Inspectors that read the proxy's target rather than its traps (Bun's
+      // `console.log` does) still see what this is.
+      const rendered = `<ExtensionNotReady ${label}>`
+      Object.defineProperty(node, "name", { value: rendered, configurable: true })
+      Object.defineProperty(node, INSPECT, { value: () => rendered, configurable: true })
       // Every synchronous use of a placeholder — a plain value read as a
       // string, a number, a JSON payload — lands on one of these, and each one
       // says the same thing: the runtime does not exist yet.
@@ -703,7 +995,7 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         throw notReady(path)
       }
       return new Proxy(node, {
-        get: (target, key) => {
+        get: (_target, key) => {
           if (key === Symbol.asyncIterator) {
             return async function*() {
               const member = await at()
@@ -712,20 +1004,26 @@ export const fromService = <Self, Shape, E, const Name extends string>(
             }
           }
           // Every synchronous use lands on one of these: a coercion, a
-          // `JSON.stringify`, or an `await` of what the type says is a value.
+          // `JSON.stringify`, a spread, an `await` of what the type says is a
+          // value, or a name only a value has (`packageId.length`).
           if (
-            key === Symbol.toPrimitive || key === "toJSON" || key === "valueOf" ||
-            key === "then"
+            key === Symbol.toPrimitive || key === Symbol.iterator || key === "then" ||
+            (typeof key === "string" && VALUE_ONLY.has(key))
           ) {
             return guard()
           }
-          if (typeof key !== "string") return Reflect.get(target, key)
+          // `console.log(packageId)` shows what it is, not `[Function: node]`.
+          if (key === INSPECT) return () => rendered
+          if (key === Symbol.toStringTag) return "ExtensionNotReady"
+          if (typeof key !== "string") return undefined
+          if (isFunctionMethod(key)) return functionMethod(key)
           return lazy([...path, key])
         }
       })
     }
 
     const ready = async (): Promise<void> => {
+      ensureWarm()
       await resolve()
     }
 
@@ -757,9 +1055,15 @@ export const fromService = <Self, Shape, E, const Name extends string>(
       if (instance === undefined && options.warm !== undefined) warmUp(options.warm)
     }
 
+    const reconcile = (): Promise<ReadonlyArray<Reconciled>> => {
+      ensureWarm()
+      return runtimeOf().runPromise(reconcileAll())
+    }
+
     const own = (key: string): unknown => {
       if (key === "$ready") return ready
-      if (key === "$dispose" || key === "dispose") return dispose
+      if (key === "$dispose") return dispose
+      if (key === "$reconcileAll") return reconcile
       return undefined
     }
 
@@ -768,6 +1072,11 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         if (typeof key !== "string") return undefined
         const reserved = own(key)
         if (reserved !== undefined) return reserved
+        // The face is never a Promise. Answering a lazy node for `then` made
+        // `await client.ext` (an `async` function returning the face,
+        // `Promise.resolve(face)`) call it, build the runtime, and never
+        // settle.
+        if (key === "then") return undefined
         ensureWarm()
         if (instance !== undefined) {
           const member = (instance as Record<string, unknown>)[key]
@@ -776,7 +1085,7 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         return lazy([key])
       },
       has: (_target, key) => {
-        if (key === "$ready" || key === "$dispose" || key === "dispose") return true
+        if ((RESERVED as ReadonlyArray<string | symbol>).includes(key)) return true
         ensureWarm()
         return instance !== undefined && typeof key === "string" && key in (instance as object)
       },
@@ -784,9 +1093,7 @@ export const fromService = <Self, Shape, E, const Name extends string>(
         ensureWarm(),
         instance === undefined
           ? [...RESERVED]
-          // A `Proxy` refuses duplicate keys, so a service member that happens
-          // to be called `dispose` must not be listed twice.
-          : [...new Set([...Object.keys(instance as object), ...RESERVED])]
+          : [...Object.keys(instance as object), ...RESERVED]
       ),
       getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true })
     }) as PromiseFace<Shape> & ExtensionFace

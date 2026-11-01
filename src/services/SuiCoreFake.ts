@@ -11,24 +11,29 @@
  *
  * @since 0.1.0
  */
-import { bcs } from "@mysten/sui/bcs"
+import { bcs, TypeTagSerializer } from "@mysten/sui/bcs"
 import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
 import { Inputs, TransactionDataBuilder } from "@mysten/sui/transactions"
 import { parseSerializedSignature } from "@mysten/sui/cryptography"
 import { publicKeyFromRawBytes } from "@mysten/sui/verify"
-import type { TransactionPlugin } from "@mysten/sui/transactions"
+import type { Argument, TransactionPlugin } from "@mysten/sui/transactions"
 import {
+  deriveDynamicFieldID,
+  fromBase58,
+  fromBase64,
+  fromHex,
   normalizeStructTag,
   normalizeSuiAddress,
   SUI_CLOCK_OBJECT_ID,
   SUI_TYPE_ARG,
-  toBase58
+  toBase58,
+  toHex
 } from "@mysten/sui/utils"
 import { Context, Effect, Layer, Option, Result, Schema } from "effect"
 import { typeMatches } from "../domain/bcs.ts"
-import { ExecutionReason } from "../domain/schemas.ts"
-import type { SuiCoreService } from "./SuiCore.ts"
+import { Digest, ExecutionReason } from "../domain/schemas.ts"
+import type { SuiCoreReadOptions, SuiCoreService } from "./SuiCore.ts"
 import { DefectMarker, makeFromClient, SuiCore } from "./SuiCore.ts"
 
 /** The BCS layout of `0x2::clock::Clock`. */
@@ -40,12 +45,61 @@ export const ClockBcs = bcs.struct("Clock", {
 /** The Move type of the Clock object. */
 export const CLOCK_TYPE = "0x2::clock::Clock"
 
-/** A deterministic base58 32-byte digest, for fixtures. */
-export const fakeDigest = (seed: number): string => {
+/**
+ * A deterministic base58 32-byte digest, for fixtures, already branded as a
+ * {@link Digest} so it compares with `executed.digest` and fills any field
+ * typed `Digest` without a cast. Never fails.
+ */
+export const fakeDigest = (seed: number): Digest => {
   const bytes = new Uint8Array(32)
   bytes[0] = (seed % 255) + 1
   bytes[31] = 7
-  return toBase58(bytes)
+  return Digest.make(toBase58(bytes))
+}
+
+/**
+ * A gas coin for {@link FakeScript.coins}, in the SDK's `SuiClientTypes.Coin`
+ * shape, with the fields a fixture rarely cares about filled in: `coinType`
+ * defaults to SUI, `version` to 1 and `digest` to a {@link fakeDigest}. `owner`
+ * is an address; the coin is `AddressOwner`-owned by it. Never fails.
+ *
+ * @since 0.4.0
+ *
+ * @example
+ * ```ts
+ * import { fakeCoin, layerTest } from "@unconfirmed/sui-effect/testing"
+ *
+ * const layer = layerTest({
+ *   coins: [fakeCoin({ objectId: "0xc01", owner: signer.address, balance: 1_000_000_000n })]
+ * })
+ * ```
+ */
+export const fakeCoin = (options: {
+  readonly objectId: string
+  readonly owner: string
+  readonly balance: bigint
+  readonly coinType?: string
+  readonly version?: bigint
+  readonly digest?: string
+}): SuiClientTypes.Coin => ({
+  objectId: normalizeSuiAddress(options.objectId),
+  version: (options.version ?? 1n).toString(),
+  digest: options.digest ?? fakeDigest(Number((options.version ?? 1n) % 200n) + 40),
+  owner: addressOwner(options.owner),
+  type: `0x2::coin::Coin<${options.coinType ?? SUI_TYPE_ARG}>`,
+  balance: options.balance.toString()
+})
+
+/**
+ * An event in a scripted execution: the SDK's `SuiClientTypes.Event` with
+ * `json` **optional**, because the library's own {@link Event} treats it as
+ * the node's rendering and never reads it. Leave it out; give it only to test
+ * code that reads `event.json` off a listing.
+ *
+ * @since 0.4.0
+ */
+export type FakeEvent = Omit<SuiClientTypes.Event, "json"> & {
+  readonly json?: SuiClientTypes.Event["json"]
 }
 
 /** An object the fake serves. */
@@ -103,11 +157,22 @@ export interface FakeChange {
 
 /** What a scripted success returns. Everything is optional and defaulted. */
 export interface FakeExecution {
+  /**
+   * The transaction's digest. Leave it out for an `execute` outcome: the fake
+   * derives the digest from the bytes it was handed, as a node does, and an
+   * execute scripted with a **different** digest dies naming both. Give it for
+   * a `simulate` of an unbuilt transaction, for a transaction scripted by
+   * digest, or for a `getTransaction` answer.
+   */
   readonly digest?: string
   readonly created?: ReadonlyArray<FakeChange>
   readonly mutated?: ReadonlyArray<FakeChange>
   readonly deleted?: ReadonlyArray<FakeChange>
-  readonly events?: ReadonlyArray<SuiClientTypes.Event>
+  /**
+   * The events the execution emitted. `json` may be left out (see
+   * {@link FakeEvent}); `bcs` is what `Executed.eventsOf` decodes.
+   */
+  readonly events?: ReadonlyArray<FakeEvent>
   readonly balanceChanges?: ReadonlyArray<SuiClientTypes.BalanceChange>
   /**
    * The per-command results a simulation reports.
@@ -122,13 +187,29 @@ export interface FakeExecution {
   readonly gasUsed?: SuiClientTypes.GasCostSummary
   readonly checkpoint?: string
   readonly timestampMs?: number
+  /**
+   * The sender `listTransactions`' `sender` filter matches, for a transaction
+   * scripted by digest (`FakeScript.transactions`). A transaction the fake
+   * executed takes its sender from its bytes, and this is ignored.
+   *
+   * @since 0.4.0
+   */
+  readonly sender?: string
+  /**
+   * The Move calls, as `package::module::function`, that `listTransactions`'
+   * `function` filter matches, for a transaction scripted by digest. A
+   * transaction the fake executed takes them from its bytes' commands.
+   *
+   * @since 0.4.0
+   */
+  readonly moveCalls?: ReadonlyArray<string>
 }
 
 /** One scripted outcome of a call. The last entry of a script repeats forever. */
 export type FakeOutcome =
   | { readonly _tag: "succeed"; readonly value: FakeExecution }
   | { readonly _tag: "failWith"; readonly reason: SuiClientTypes.ExecutionError; readonly value: FakeExecution }
-  | { readonly _tag: "transportError"; readonly status: string }
+  | { readonly _tag: "transportError"; readonly status: string; readonly message?: string }
   | { readonly _tag: "notFound" }
   | { readonly _tag: "timeoutThen"; readonly found: boolean }
 
@@ -193,8 +274,14 @@ export const FakeOutcome = {
     reason: SuiClientTypes.ExecutionError | ExecutionReason,
     value: FakeExecution = {}
   ): FakeOutcome => ({ _tag: "failWith", reason: executionErrorOf(reason), value }),
-  /** The call rejects with a gRPC status, as `RpcError` would. */
-  transportError: (status: string): FakeOutcome => ({ _tag: "transportError", status }),
+  /**
+   * The call rejects with a gRPC status, as `RpcError` would. `message` is the
+   * node's text, for a test about what a refusal *says* — a validator's
+   * "already locked by a different transaction" is a `FAILED_PRECONDITION`
+   * whose message names the conflicting digest.
+   */
+  transportError: (status: string, message?: string): FakeOutcome =>
+    message === undefined ? { _tag: "transportError", status } : { _tag: "transportError", status, message },
   /** The call rejects the way a missing transaction does. */
   notFound: (): FakeOutcome => ({ _tag: "notFound" }),
   /**
@@ -210,6 +297,15 @@ export const FakeOutcome = {
  *
  * `owner` is the address this balance belongs to. Left out, the entry answers
  * for **any** owner, which is what every script written before 0.1.2 assumed.
+ *
+ * Since 0.4.0 `addressBalance` is a **seed**, not a constant: it is the
+ * starting value of the fake's address balance for that owner and coin type,
+ * which an execution then moves (gas paid from the balance, `FundsWithdrawal`
+ * debits, `send_funds` deposits) and `SuiTest.setAddressBalance` replaces. An
+ * owner-specific entry seeds its owner; otherwise the first owner-less entry of
+ * the coin type seeds every owner. `coinBalance` is served as written, and
+ * `balance` is served as `balance - addressBalance + <current address balance>`,
+ * so an entry nothing has touched comes back verbatim.
  *
  * @since 0.1.2
  */
@@ -234,13 +330,23 @@ export interface FakeScript {
   /** The gas budget the resolve plugin sets when a transaction has none. */
   readonly gasBudget?: bigint
   /**
-   * The balances `getBalance` and `listBalances` serve.
+   * The balances `getBalance` and `listBalances` serve, and the seeds of the
+   * fake's **address balances**.
    *
    * Keyed by **owner and coin type**: an entry with an `owner` answers only for
    * that address, and one without answers for any, which is what a script
-   * written before 0.1.2 meant. A `getBalance` for an owner and coin type no
-   * entry names answers zero, the way a node does for an address that holds
-   * none of that coin.
+   * written before 0.1.2 meant. An owner-specific entry wins over an owner-less
+   * one of the same coin type.
+   *
+   * Since 0.4.0 the fake keeps one address balance per owner and coin type,
+   * seeded lazily from the entry's `addressBalance` (0 when no entry names the
+   * type) and moved by every execution it settles (see {@link FakeBalance}).
+   * For an owner and coin type no entry names, `coinBalance` is the sum of the
+   * owner's coins of that type in the fake's coin set and `balance` is that
+   * plus the address balance — so an address that holds none of the coin
+   * answers zero, the way a node does. `listBalances` serves the matching
+   * entries, then every coin type the owner holds coins of or has a non-zero
+   * address balance in that no entry names.
    */
   readonly balances?: ReadonlyArray<FakeBalance>
   /**
@@ -268,10 +374,49 @@ export interface FakeScript {
    * @since 0.1.1
    */
   readonly coinMetadata?: Readonly<Record<string, SuiClientTypes.CoinMetadata>>
+  /**
+   * The dynamic fields of each parent, keyed by parent id.
+   *
+   * An entry of `$kind: "DynamicObject"` is a dynamic **object** field:
+   * `getDynamicObjectField` finds it by the key's own type and bytes (or by
+   * the `0x2::dynamic_object_field::Wrapper<…>` of that type, which is how a
+   * node lists it) and serves the object its `childId` names from the object
+   * map.
+   */
   readonly dynamicFields?: Readonly<Record<string, ReadonlyArray<SuiClientTypes.DynamicFieldEntry>>>
+  /**
+   * The value `getDynamicField` serves for an entry of {@link dynamicFields},
+   * keyed by that entry's **`fieldId`** (not by the parent, and not by the
+   * key). `type` is the value's Move type and `bcs` its BCS bytes — what
+   * `sui.getDynamicField(parent, name, { schema })` decodes. An entry with no
+   * value here is served with empty bytes and its own `valueType`, which
+   * decodes only as an empty layout. Dynamic **object** fields do not use it:
+   * their value is the object `childId` names in the object map.
+   */
   readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>
   /** How many items a list method returns per page. Defaults to 50. */
   readonly pageSize?: number
+  /**
+   * How many ledger items one `listEvents` or `listTransactions` request
+   * **examines**, matching or not. Unset, a request scans as far as it needs.
+   *
+   * This is the gRPC server's scan bound: with a filter that matches rarely, a
+   * page can come back short — even empty — with `hasNextPage: true`, and
+   * continuing from `endCursor` still makes progress. Set it to prove a
+   * consumer paginates on `hasNextPage` rather than on the item count.
+   *
+   * @since 0.4.0
+   */
+  readonly scanLimit?: number
+  /**
+   * The SuiNS names the fake knows, name to target address.
+   * `resolveNameServiceAddress` answers `null` for a name the record does not
+   * hold, and `defaultNameServiceName` answers the **first** name that targets
+   * the address, or `null`. Unscripted, both die naming themselves.
+   *
+   * @since 0.4.0
+   */
+  readonly names?: Readonly<Record<string, string>>
   /**
    * The epoch `getCurrentSystemState` reports. Defaults to
    * {@link DEFAULT_EPOCH}.
@@ -285,11 +430,19 @@ export interface FakeScript {
   readonly epoch?: bigint
   readonly simulate?: ReadonlyArray<FakeOutcome>
   /**
-   * What the resolve plugin's budget simulation does during
-   * `transaction.build({ client })`. Empty (the default) means the plugin sets
-   * the budget from `gasBudget` without simulating, which is what most tests
-   * want; scripting `failWith` here is how a test makes `Tx.build` fail with
-   * `SimulationFailed` the way a real node's resolver does.
+   * What the resolve plugin's budget simulation answers during
+   * `transaction.build({ client })` — which `Tx.build` always reaches, since
+   * it sets no budget up front.
+   *
+   * The resolver simulates whenever the transaction has no gas budget yet, and
+   * that call is **always recorded** as a `simulateTransaction` with
+   * `resolver: true`, scripted or not. It is answered by this script when it
+   * has entries, else by the ordered {@link simulate} script (so
+   * `simulate: [FakeOutcome.failWith(...)]` surfaces through `Tx.build` too),
+   * else not at all, and the budget comes from {@link gasBudget}. Script
+   * `failWith` here to make `Tx.build` fail with `SimulationFailed` without
+   * touching the `simulate` script a later `Tx.verify` or `preflight` reads;
+   * `timeoutThen` blocks the build until it is interrupted.
    */
   readonly buildSimulate?: ReadonlyArray<FakeOutcome>
   readonly execute?: ReadonlyArray<FakeOutcome>
@@ -310,6 +463,49 @@ export interface FakeScript {
    * `NotApplied { inputConsumed }` rule.
    */
   readonly transactions?: Readonly<Record<string, FakeOutcome>>
+  /**
+   * How long `waitForTransaction` takes to see a transaction this fake
+   * executed, in **real** milliseconds, or `"never"`: the wait does not settle
+   * until the caller's `AbortSignal` fires (a `SubmitConfig.visibilityTimeout`
+   * on a `TestClock`, or an interruption). Unset, a transaction is visible the
+   * moment it executes.
+   *
+   * This is how a test reaches the window between "the node answered the
+   * execute" and "the transaction is visible to reads" — the window `Tx.submit`
+   * spends in its visibility wait, where an interrupt or a timeout must not
+   * lose the `Executed` it already has. Change it mid-test with
+   * `SuiTest.setVisibilityDelay`.
+   *
+   * @since 0.4.0
+   */
+  readonly visibilityDelay?: number | "never"
+  /**
+   * The history the node still holds, served through `client.ledgerService`
+   * the way a gRPC node serves `GetServiceInfo.lowestAvailableCheckpoint` and
+   * `GetEpoch.firstCheckpoint`.
+   *
+   * `Tx.reconcile` reads it before it calls a `getTransaction` miss evidence
+   * of expiry: a node that has pruned into a transaction's validity window
+   * misses transactions that did apply. `firstCheckpoints` is keyed by epoch;
+   * an epoch it does not name answers `NOT_FOUND`, the way a node that pruned
+   * the epoch does. Unscripted, the client has no `ledgerService` at all, which
+   * is what a JSON-RPC or GraphQL transport looks like.
+   *
+   * @since 0.4.0
+   */
+  readonly ledger?: {
+    readonly lowestAvailableCheckpoint?: bigint
+    readonly firstCheckpoints?: Readonly<Record<string, bigint>>
+  }
+  /**
+   * The read options the fake's `SuiCore` is built with — what
+   * `SuiCore.layerGrpc(..., { readRetry, requestTimeout })` would be given —
+   * so a test can prove a read, or `Tx.build`'s resolver retry, runs under a
+   * custom `readRetry`. Unscripted, the defaults.
+   *
+   * @since 0.4.0
+   */
+  readonly readOptions?: SuiCoreReadOptions
 }
 
 /** One call the fake received, in order. */
@@ -347,10 +543,32 @@ export interface SuiCoreFakeState {
   /** Moves the epoch `getCurrentSystemState` reports. */
   readonly setEpoch: (epoch: bigint) => Effect.Effect<void>
   /**
+   * Replaces {@link FakeScript.visibilityDelay}; `undefined` makes executed
+   * transactions visible at once again.
+   *
+   * @since 0.4.0
+   */
+  readonly setVisibilityDelay: (delay: number | "never" | undefined) => Effect.Effect<void>
+  /**
    * Teaches the fake about one transaction **by digest**, the way
    * `FakeScript.transactions` does for a script written up front.
    */
   readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void>
+  /**
+   * Replaces the fake's address balance of one owner in one coin type (a full
+   * coin type, e.g. `0x2::sui::SUI`). Never fails.
+   *
+   * @since 0.4.0
+   */
+  readonly setAddressBalance: (owner: string, coinType: string, amount: bigint) => Effect.Effect<void>
+  /**
+   * The fake's current address balance of one owner in one coin type: the
+   * value an execution or `setAddressBalance` last wrote, else the scripted
+   * seed, else 0. Never fails.
+   *
+   * @since 0.4.0
+   */
+  readonly readAddressBalance: (owner: string, coinType: string) => Effect.Effect<bigint>
   /** Replaces the remaining scripted outcomes of a method. */
   readonly setOutcomes: (
     method: "simulate" | "execute" | "getTransaction" | "buildSimulate" | "getObject",
@@ -372,9 +590,16 @@ interface Mutable {
    */
   history: Map<string, Map<string, string | undefined>>
   coins: Array<SuiClientTypes.Coin>
+  /**
+   * The address balance of each owner in each coin type, keyed
+   * `<normalized owner>|<normalized coin type>`. A key that is absent has its
+   * scripted seed (or 0); once written, the value here wins.
+   */
+  addressBalances: Map<string, bigint>
   deleted: Set<string>
   clockTimestampMs: bigint
   epoch: bigint
+  visibilityDelay: number | "never" | undefined
   calls: Array<RecordedCall>
   aborted: number
   cursors: {
@@ -395,6 +620,14 @@ interface Mutable {
   knownTransactions: Map<string, SettledTransaction>
   /** What the node says about a transaction asked for by digest. */
   byDigest: Map<string, FakeOutcome>
+  /**
+   * Every transaction the ledger holds, in ledger order: those scripted by
+   * digest first, then each recorded or executed one as it lands. This is what
+   * `listTransactions` and `listEvents` page through.
+   */
+  ledger: Array<string>
+  /** The sender and Move calls of each executed transaction, read off its bytes. */
+  executedMeta: Map<string, { readonly sender?: string; readonly moveCalls: ReadonlyArray<string> }>
 }
 
 /** What a settled call produced, kept so `getTransaction` can serve it again. */
@@ -409,6 +642,31 @@ const DEFAULT_GAS: SuiClientTypes.GasCostSummary = {
   storageCost: "2000000",
   storageRebate: "980000",
   nonRefundableStorageFee: "20000"
+}
+
+/** The accumulator root a coin reservation ref's object id is derived under. */
+const ACCUMULATOR_ROOT_ID = normalizeSuiAddress("0xacc")
+const ACCUMULATOR_KEY_TYPE_TAG = TypeTagSerializer.parseFromStr(
+  "0x2::accumulator::Key<0x2::balance::Balance<0x2::sui::SUI>>"
+)
+/** The byte a coin reservation digest repeats from offset 12. */
+const COIN_RESERVATION_MAGIC = 0xac
+
+/** Whether a payment ref is a coin reservation (version 0, magic digest tail). */
+const isReservationRef = (ref: { readonly version: string | number; readonly digest: string }): boolean => {
+  if (String(ref.version) !== "0") return false
+  try {
+    const bytes = fromBase58(ref.digest)
+    return bytes.length === 32 && bytes.slice(12).every((byte) => byte === COIN_RESERVATION_MAGIC)
+  } catch {
+    return false
+  }
+}
+
+/** The amount a coin reservation ref reserves: its digest's first eight bytes, u64 LE. */
+const reservedAmountOf = (ref: { readonly digest: string }): bigint => {
+  const bytes = fromBase58(ref.digest)
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(0, true)
 }
 
 const addressOwner = (address: string): SuiClientTypes.ObjectOwner => ({
@@ -478,6 +736,33 @@ const toCommandResult = (
   returnValues: result.returnValues ?? [],
   mutatedReferences: result.mutatedReferences ?? []
 })
+
+/**
+ * What a node reports as `gasPaymentMocked` for the transaction it was asked
+ * to simulate: `true` when the transaction carries no gas payment at all (an
+ * unbuilt recipe), or an empty one with no expiration — nothing could pay, so
+ * the node mocks a gas coin. An empty payment **with** an expiration is the
+ * address-balance form (`Tx.sponsored`, `gaslessStablecoinTransfer`), and a
+ * non-empty one is real coins: both `false`. Bytes the SDK cannot read answer
+ * `false`. Never throws.
+ */
+const gasPaymentMockedOf = (transaction: Uint8Array | { getData(): unknown }): boolean => {
+  try {
+    const data = (transaction instanceof Uint8Array
+      ? TransactionDataBuilder.fromBytes(transaction)
+      : transaction.getData()) as {
+        readonly gasData: { readonly payment?: ReadonlyArray<unknown> | null }
+        readonly expiration?: unknown
+      }
+    const payment = data.gasData.payment
+    if (payment === null || payment === undefined) return true
+    if (payment.length > 0) return false
+    return data.expiration === null || data.expiration === undefined ||
+      (data.expiration as { readonly $kind?: string }).$kind === "None"
+  } catch {
+    return false
+  }
+}
 
 const commandResultsOf = (
   execution: FakeExecution
@@ -583,8 +868,8 @@ const sameBytes = (left: Uint8Array | undefined, right: Uint8Array | undefined):
   return true
 }
 
-const rpcError = (status: string): Error => {
-  const error = new Error(`fake transport error: ${status}`)
+const rpcError = (status: string, message?: string): Error => {
+  const error = new Error(message ?? `fake transport error: ${status}`)
   Object.assign(error, { code: status, name: "RpcError" })
   return error
 }
@@ -606,6 +891,19 @@ export class FakeUnimplemented extends Error {
   }
 }
 
+/**
+ * Thrown, and re-thrown as a defect, when a script asks the fake for something
+ * no node would do — an execute answered with a digest that is not the bytes'
+ * own. A broken fixture, not a failing test.
+ */
+class FakeScriptError extends Error {
+  readonly [DefectMarker] = true
+  constructor(message: string) {
+    super(`SuiCoreFake: ${message}`)
+    this.name = "FakeScriptError"
+  }
+}
+
 const unimplemented = (method: string): never => {
   throw new FakeUnimplemented(method)
 }
@@ -613,8 +911,8 @@ const unimplemented = (method: string): never => {
 /**
  * The in-memory `SuiCore`.
  *
- * Three things about it that a test has to know, because they are not visible
- * from the outside:
+ * What a test has to know about it, because none of it is visible from the
+ * outside:
  *
  * - **Its `client` implements `$extend`.** `SuiCoreFakeState.client` is a
  *   `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` gives a
@@ -623,7 +921,9 @@ const unimplemented = (method: string): never => {
  * - **`listOwnedObjects` filters like a node.** The `type` option goes through
  *   the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
  *   instantiation of a generic rather than only its own spelling.
- * - **`getDynamicField` matches on `name.type` *and* `name.bcs`.** An entry
+ * - **`getDynamicField` matches on `name.type` *and* `name.bcs`**, the type
+ *   under the same `typeMatches` rule, so a short and a padded spelling of one
+ *   key type are the same key. An entry
  *   scripted without `bcs` still matches any key of its type, which is what a
  *   test that only cares about the type wants; two entries of one type on one
  *   parent are told apart by their bytes, so a test can prove which key encoding
@@ -640,6 +940,20 @@ const unimplemented = (method: string): never => {
  *   needs when it follows a pinned object's `previousTransaction` to find out
  *   which version the consuming transaction took. `FakeChange.inputVersion` is
  *   how a test says which version that was.
+ * - **An execute's digest is the bytes' own.** The fake derives it with
+ *   `TransactionDataBuilder.getDigestFromBytes`, the way a node does, and an
+ *   execute outcome scripted with a different `digest` is a broken fixture: the
+ *   call dies saying so rather than handing `Tx.submit` another transaction.
+ * - **It models address balances** (since 0.4.0): one per owner and coin type,
+ *   seeded from `FakeScript.balances` and set with `SuiTest.setAddressBalance`.
+ *   The resolver pays gas from it the way the SDK does, an execution it cannot
+ *   fund is refused with `INVALID_ARGUMENT` like a node refuses it, and a
+ *   settled execution moves it (gas, `FundsWithdrawal`, `send_funds`) — see
+ *   `applyBalanceEffects` for exactly which shapes it follows without Move.
+ * - **Visibility is instant unless scripted.** `FakeScript.visibilityDelay`
+ *   (or `SuiTest.setVisibilityDelay`) holds `waitForTransaction` for an executed
+ *   transaction, which is how a test reaches the window after the execute
+ *   answered and before `Tx.submit` returns.
  *
  * @example
  * ```ts
@@ -688,9 +1002,11 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
       objects,
       history,
       coins: [...(script.coins ?? [])],
+      addressBalances: new Map(),
       deleted: new Set(),
       clockTimestampMs: script.clockTimestampMs ?? 1_700_000_000_000n,
       epoch: script.epoch ?? DEFAULT_EPOCH,
+      visibilityDelay: script.visibilityDelay,
       calls: [],
       aborted: 0,
       cursors: { simulate: 0, execute: 0, getTransaction: 0, buildSimulate: 0, getObject: 0 },
@@ -703,7 +1019,9 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
       },
       pendingDigests: new Map(),
       knownTransactions: new Map(),
-      byDigest: new Map(Object.entries(script.transactions ?? {}))
+      byDigest: new Map(Object.entries(script.transactions ?? {})),
+      ledger: Object.keys(script.transactions ?? {}),
+      executedMeta: new Map()
     })
   })
 
@@ -857,6 +1175,9 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     return object
   }
 
+  /** The scripted execution the last `execute` outcome applied, for its `FakeChange`s. */
+  let lastExecution: FakeExecution | undefined
+
   const applyOutcome = async (
     outcome: FakeOutcome,
     method: "simulate" | "execute" | "getTransaction",
@@ -865,13 +1186,14 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   ): Promise<SettledTransaction> => {
     switch (outcome._tag) {
       case "transportError":
-        throw rpcError(outcome.status)
+        throw rpcError(outcome.status, outcome.message)
       case "notFound":
         throw new TransactionError("notFound", digest)
       case "timeoutThen":
         return unimplemented("timeoutThen is handled before applyOutcome")
       case "failWith": {
         const resolved = outcome.value.digest ?? digest
+        if (method === "execute") lastExecution = outcome.value
         if (method === "simulate") {
           throw new SimulationError(`Transaction resolution failed: ${outcome.reason.message}`, {
             executionError: outcome.reason
@@ -890,6 +1212,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       case "succeed": {
         const resolved = outcome.value.digest ?? digest
         if (method === "execute") {
+          lastExecution = outcome.value
           for (const change of [
             ...(outcome.value.created ?? []),
             ...(outcome.value.mutated ?? [])
@@ -953,6 +1276,33 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     return signal instanceof AbortSignal ? signal : undefined
   }
 
+  /**
+   * The scripted wait before an executed transaction is visible: nothing,
+   * a real-time delay that the caller's signal cuts short, or a wait that only
+   * the signal ends.
+   */
+  const visibility = async (options: unknown): Promise<void> => {
+    const delay = state.visibilityDelay
+    if (delay === undefined || delay === 0) return
+    if (delay === "never") {
+      await pending<never>("waitForTransaction (visibilityDelay: \"never\")", options)
+      return
+    }
+    const signal = signalOf(options)
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, delay)
+      signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer)
+          state.aborted += 1
+          reject(abortError())
+        },
+        { once: true }
+      )
+    })
+  }
+
   const pending = async <A>(method: string, options: unknown): Promise<A> => {
     const signal = signalOf(options)
     if (signal === undefined) {
@@ -971,9 +1321,27 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     method: "simulate" | "execute" | "getTransaction",
     digest: string,
     options: unknown,
-    executingPayment: ReadonlyArray<string> = []
+    executingPayment: ReadonlyArray<string> = [],
+    derivedFromBytes = false
   ): Promise<SettledTransaction> => {
     const outcome = next(method) ?? unimplemented(METHOD_NAMES[method])
+    if (
+      derivedFromBytes &&
+      (outcome._tag === "succeed" || outcome._tag === "failWith") &&
+      outcome.value.digest !== undefined &&
+      outcome.value.digest !== digest
+    ) {
+      // A network derives the digest from the bytes; no node answers an
+      // execute of these bytes with another transaction's digest. Serving the
+      // scripted one made a test of `Tx.submit` pass on an `Executed` for a
+      // transaction it never sent.
+      throw new FakeScriptError(
+        `${METHOD_NAMES[method]}: the script answers digest ${outcome.value.digest}, but` +
+          ` the bytes it was handed have digest ${digest}. A node derives the digest from` +
+          " the bytes: leave `digest` out of an execute outcome, or script the transaction" +
+          " you mean by digest with `FakeScript.transactions`."
+      )
+    }
     if (outcome._tag === "timeoutThen") {
       state.pendingDigests.set(digest, outcome.found)
       return pending<never>(method, options)
@@ -986,29 +1354,120 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       ? { $kind: "FailedTransaction", FailedTransaction: result.transaction }
       : { $kind: "Transaction", Transaction: result.transaction }
 
-  /** Whether two coin types name the same coin, comparing normalized tags. */
-  const sameCoinType = (left: string, right: string): boolean => {
-    if (left === right) return true
+  /** A coin type in its normalized spelling, or as given when it does not parse. */
+  const normalizeCoinType = (coinType: string): string => {
     try {
-      return normalizeStructTag(left) === normalizeStructTag(right)
+      return normalizeStructTag(coinType)
     } catch {
-      return false
+      return coinType
     }
   }
 
+  const balanceKey = (owner: string, coinType: string): string =>
+    `${normalizeSuiAddress(owner)}|${normalizeCoinType(coinType)}`
+
   /**
-   * The balances this owner has, with the owner stripped: an entry that names
-   * no owner answers for everyone, which is what a pre-0.1.2 script meant.
+   * The scripted entry that answers for this owner and coin type: an entry that
+   * names the owner wins over an owner-less one, which answers for everyone.
+   */
+  const scriptedBalanceOf = (owner: string, coinType: string): FakeBalance | undefined => {
+    const address = normalizeSuiAddress(owner)
+    const type = normalizeCoinType(coinType)
+    const entries = script.balances ?? []
+    return entries.find((entry) =>
+      entry.owner !== undefined && normalizeSuiAddress(entry.owner) === address &&
+      normalizeCoinType(entry.coinType) === type
+    ) ?? entries.find((entry) => entry.owner === undefined && normalizeCoinType(entry.coinType) === type)
+  }
+
+  /** The current address balance: written state, else the scripted seed, else 0. */
+  const addressBalanceOf = (owner: string, coinType: string): bigint => {
+    const written = state.addressBalances.get(balanceKey(owner, coinType))
+    if (written !== undefined) return written
+    const seed = scriptedBalanceOf(owner, coinType)?.addressBalance
+    try {
+      return seed === undefined ? 0n : BigInt(seed)
+    } catch {
+      // A fixture that scripts a malformed balance to test the decode boundary.
+      return 0n
+    }
+  }
+
+  const setAddressBalanceOf = (owner: string, coinType: string, amount: bigint): void => {
+    state.addressBalances.set(balanceKey(owner, coinType), amount)
+  }
+
+  /** Moves an address balance by `delta`, never below zero. */
+  const adjustAddressBalance = (owner: string, coinType: string, delta: bigint): void => {
+    const next = addressBalanceOf(owner, coinType) + delta
+    setAddressBalanceOf(owner, coinType, next < 0n ? 0n : next)
+  }
+
+  /**
+   * The balance `getBalance` serves: a scripted entry with its address balance
+   * swapped for the current one, or the owner's coins plus its address balance.
+   */
+  const balanceOf = (owner: string, coinType: string): SuiClientTypes.Balance => {
+    const addressBalance = addressBalanceOf(owner, coinType)
+    const scripted = scriptedBalanceOf(owner, coinType)
+    if (scripted !== undefined) {
+      const { owner: _owner, ...balance } = scripted
+      // Untouched, the entry is served verbatim — malformed fields included,
+      // which is how a test reaches the decode boundary.
+      if (!state.addressBalances.has(balanceKey(owner, coinType))) return balance
+      return {
+        ...balance,
+        balance: (BigInt(scripted.balance) - BigInt(scripted.addressBalance) + addressBalance).toString(),
+        addressBalance: addressBalance.toString()
+      }
+    }
+    const coinBalance = coinsOf(owner, coinType).reduce((sum, coin) => sum + BigInt(coin.balance), 0n)
+    return {
+      coinType,
+      balance: (coinBalance + addressBalance).toString(),
+      coinBalance: coinBalance.toString(),
+      addressBalance: addressBalance.toString()
+    }
+  }
+
+  /** `T` out of a `0x2::coin::Coin<T>` object type, normalized, or `undefined`. */
+  const coinTypeOfCoin = (type: string): string | undefined => {
+    if (!isCoin(type)) return undefined
+    const normalized = normalizeStructTag(type)
+    return normalized.slice(normalized.indexOf("<") + 1, normalized.lastIndexOf(">"))
+  }
+
+  /**
+   * Every balance this owner has, the way `listBalances` serves them: the
+   * scripted entries that answer for it (one per coin type), then each coin
+   * type it has a non-zero address balance in or holds coins of that no entry
+   * names.
    */
   const balancesOf = (owner: string): ReadonlyArray<SuiClientTypes.Balance> => {
     const address = normalizeSuiAddress(owner)
-    const matching: Array<SuiClientTypes.Balance> = []
+    const seen = new Set<string>()
+    const out: Array<SuiClientTypes.Balance> = []
+    const add = (coinType: string): void => {
+      const type = normalizeCoinType(coinType)
+      if (seen.has(type)) return
+      seen.add(type)
+      out.push(balanceOf(address, coinType))
+    }
     for (const entry of script.balances ?? []) {
       if (entry.owner !== undefined && normalizeSuiAddress(entry.owner) !== address) continue
-      const { owner: _owner, ...balance } = entry
-      matching.push(balance)
+      add(entry.coinType)
     }
-    return matching
+    for (const [key, amount] of state.addressBalances) {
+      const [keyOwner, type] = key.split("|") as [string, string]
+      if (keyOwner === address && amount !== 0n) add(type)
+    }
+    for (const coin of state.coins) {
+      if (coin.owner.$kind !== "AddressOwner") continue
+      if (normalizeSuiAddress(coin.owner.AddressOwner) !== address) continue
+      const type = coinTypeOfCoin(coin.type)
+      if (type !== undefined) add(type)
+    }
+    return out
   }
 
   const coinsOf = (
@@ -1028,17 +1487,126 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     })
   }
 
+  /** Whether any command reads `tx.gas`, the SDK's `transactionUsesGasCoin`. */
+  const usesGasCoinOf = (data: TransactionDataBuilder): boolean => {
+    let uses = false
+    data.mapArguments((argument) => {
+      if (argument.$kind === "GasCoin") uses = true
+      return argument
+    })
+    return uses
+  }
+
+  /** One `FundsWithdrawal` input: who it draws from, in which coin type, how much. */
+  interface Withdrawal {
+    readonly source: string
+    readonly coinType: string
+    readonly amount: bigint
+  }
+
+  /**
+   * Every `FundsWithdrawal` input with a `MaxAmountU64` reservation, with its
+   * source resolved the way the SDK resolves it: `Sender` is the sender,
+   * `Sponsor` the gas owner (or the sender), `SenderAllowance` its funder.
+   */
+  const withdrawalsOf = (data: TransactionDataBuilder): ReadonlyArray<Withdrawal> => {
+    const out: Array<Withdrawal> = []
+    for (const input of data.inputs) {
+      if (input.$kind !== "FundsWithdrawal") continue
+      const withdrawal = input.FundsWithdrawal
+      if (withdrawal.reservation.$kind !== "MaxAmountU64") continue
+      // Spelled out so it typechecks on SDKs before allowances (2.30), whose
+      // `withdrawFrom` has no `SenderAllowance`.
+      const from: {
+        readonly Sender?: unknown
+        readonly SenderAllowance?: { readonly funder: string }
+      } = withdrawal.withdrawFrom
+      const source = from.SenderAllowance
+        ? from.SenderAllowance.funder
+        : from.Sender
+        ? data.sender
+        : data.gasData.owner ?? data.sender
+      if (source === null || source === undefined) continue
+      out.push({
+        source: normalizeSuiAddress(source),
+        coinType: normalizeCoinType(withdrawal.typeArg.Balance),
+        amount: BigInt(withdrawal.reservation.MaxAmountU64)
+      })
+    }
+    return out
+  }
+
+  /** The SUI the transaction withdraws from `payer`'s address balance. */
+  const suiWithdrawalsFrom = (data: TransactionDataBuilder, payer: string): bigint => {
+    const address = normalizeSuiAddress(payer)
+    const sui = normalizeCoinType(SUI_TYPE_ARG)
+    return withdrawalsOf(data)
+      .filter((withdrawal) => withdrawal.source === address && withdrawal.coinType === sui)
+      .reduce((sum, withdrawal) => sum + withdrawal.amount, 0n)
+  }
+
+  /**
+   * A coin reservation ref, the SDK's `createCoinReservationRef`: version `0`,
+   * a digest of the amount (u64 LE), the epoch (u32 LE) and twenty `0xAC`
+   * bytes, and the owner's SUI accumulator field id XOR the chain identifier
+   * (left as the field id when the chain id is not 32 base58 bytes).
+   */
+  const coinReservationRef = (
+    amount: bigint,
+    owner: string
+  ): { objectId: string; version: string; digest: string } => {
+    const field = fromHex(
+      deriveDynamicFieldID(
+        ACCUMULATOR_ROOT_ID,
+        ACCUMULATOR_KEY_TYPE_TAG,
+        bcs.Address.serialize(normalizeSuiAddress(owner)).toBytes()
+      ).slice(2)
+    )
+    let chain: Uint8Array | undefined
+    try {
+      chain = fromBase58(chainId)
+    } catch {
+      chain = undefined
+    }
+    const id = new Uint8Array(32)
+    for (let index = 0; index < 32; index++) {
+      id[index] = (field[index] ?? 0) ^ (chain?.length === 32 ? (chain[index] ?? 0) : 0)
+    }
+    const digest = new Uint8Array(32)
+    const view = new DataView(digest.buffer)
+    view.setBigUint64(0, amount, true)
+    view.setUint32(8, Number(state.epoch & 0xffffffffn), true)
+    digest.fill(COIN_RESERVATION_MAGIC, 12)
+    return { objectId: `0x${toHex(id)}`, version: "0", digest: toBase58(digest) }
+  }
+
   /**
    * The fake's stand-in for the transport's resolve plugin, so
    * `transaction.build({ client })` works with no network.
    *
    * It fills the gas price from the scripted reference gas price, the gas
    * budget from `script.gasBudget` (default 50 MIST-per-unit times the price),
-   * gas payment from the scripted coins the payer owns when it is unset (an
-   * explicit `[]` is left alone, the way a sponsored transaction wants it), and
    * resolves every `UnresolvedObject` input from the object map, choosing a
-   * shared, immutable or owned reference from the stored owner. Everything else
-   * — argument normalization, BCS layout, validation — is the SDK's own
+   * shared, immutable or owned reference from the stored owner, and — when the
+   * payment is unset — chooses it the way the SDK core resolver's
+   * `setGasPayment` does, over the fake's balances (since 0.4.0). The payer is
+   * the gas owner, else the sender:
+   *
+   * - `[]` (the address balance pays) when the budget is zero, or when no
+   *   command reads `tx.gas` and the payer's SUI address balance covers the
+   *   budget plus the SUI its `FundsWithdrawal` inputs draw from the payer;
+   * - otherwise the payer's SUI coins that are not inputs of the transaction,
+   *   preceded — for a `tx.gas` user whose address balance exceeds those
+   *   withdrawals — by a coin reservation ref for the difference (version `0`,
+   *   the SDK's digest layout and object-id derivation, the fake's epoch);
+   * - and with neither coins nor a reservation it throws the SDK's own
+   *   `"No valid gas coins found for the transaction."`, which `Tx.build`
+   *   reports as a `BuildError`.
+   *
+   * An explicit payment, `[]` included, is left alone, the way a sponsored
+   * transaction wants it; a transaction with no sender and no gas owner gets
+   * `[]`. Unlike the SDK, it never sets an expiration: `Tx.build` does. Everything
+   * else — argument normalization, BCS layout, validation — is the SDK's own
    * `TransactionDataBuilder`.
    *
    * It does not run Move, so it cannot resolve an `UnresolvedPure` whose type
@@ -1066,29 +1634,38 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     // surfaces through `Tx.build` as the `SimulationFailed` a node would give.
     // With neither, the resolver sets the budget from `script.gasBudget` and
     // the recorded call is the only trace.
-    record("simulateTransaction", {
-      transaction: undefined,
-      checks: "enabled",
-      resolver: true,
-      signal: lastSignal
-    })
-    const budgetOutcome = state.scripts.buildSimulate.length > 0
-      ? next("buildSimulate")
-      : state.scripts.simulate.length > 0
-      ? next("simulate")
-      : undefined
-    if (budgetOutcome !== undefined) {
-      if (budgetOutcome._tag === "timeoutThen") {
-        // Never settles until the build is interrupted, which is exactly what a
-        // resolver's in-flight simulate does.
-        if (lastSignal === undefined) {
-          return unimplemented(
-            "buildSimulate timeoutThen (no AbortSignal reached the resolver; build through Tx.build)"
-          )
+    //
+    // It mirrors the SDK's **core** resolver, which every non-gRPC transport
+    // uses: that resolver simulates only inside `setGasBudget`, which returns
+    // at once when the budget is already set. So a preset budget means no
+    // resolver simulate here either, and `Tx.build`'s own explicit simulate is
+    // what the harness records — which is how a test sees that "building
+    // always simulates" holds on a transport whose resolver does not.
+    if (!options.onlyTransactionKind && !transactionData.gasData.budget) {
+      record("simulateTransaction", {
+        transaction: undefined,
+        checks: "enabled",
+        resolver: true,
+        signal: lastSignal
+      })
+      const budgetOutcome = state.scripts.buildSimulate.length > 0
+        ? next("buildSimulate")
+        : state.scripts.simulate.length > 0
+        ? next("simulate")
+        : undefined
+      if (budgetOutcome !== undefined) {
+        if (budgetOutcome._tag === "timeoutThen") {
+          // Never settles until the build is interrupted, which is exactly what
+          // a resolver's in-flight simulate does.
+          if (lastSignal === undefined) {
+            return unimplemented(
+              "buildSimulate timeoutThen (no AbortSignal reached the resolver; build through Tx.build)"
+            )
+          }
+          await waitForAbort(lastSignal)
         }
-        await waitForAbort(lastSignal)
+        await applyOutcome(budgetOutcome, "simulate", fakeDigest(state.calls.length + 200))
       }
-      await applyOutcome(budgetOutcome, "simulate", fakeDigest(state.calls.length + 200))
     }
     if (!options.onlyTransactionKind) {
       if (!transactionData.gasData.price) {
@@ -1132,14 +1709,37 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         const owned = input.Object?.ImmOrOwnedObject ?? input.Object?.Receiving
         if (owned !== undefined) inputIds.add(normalizeSuiAddress(owned.objectId))
       }
-      const coins = payer === null
+      const coins = payer === null || payer === undefined
         ? []
         : coinsOf(payer).filter((coin) => !inputIds.has(normalizeSuiAddress(coin.objectId)))
-      transactionData.gasData.payment = coins.map((coin) => ({
+      const refs = coins.map((coin) => ({
         objectId: coin.objectId,
         version: coin.version,
         digest: coin.digest
       }))
+      if (payer === null || payer === undefined) {
+        // Nobody to pay: what the fake has always answered, rather than the
+        // SDK's "a gas owner or sender must be set".
+        transactionData.gasData.payment = []
+      } else {
+        // The SDK core resolver's `setGasPayment`, over the fake's balances.
+        const budget = BigInt(transactionData.gasData.budget ?? 0)
+        const usesGasCoin = usesGasCoinOf(transactionData)
+        const withdrawals = suiWithdrawalsFrom(transactionData, payer)
+        const addressBalance = addressBalanceOf(payer, SUI_TYPE_ARG)
+        if (budget === 0n || (!usesGasCoin && addressBalance >= budget + withdrawals)) {
+          transactionData.gasData.payment = []
+        } else if (usesGasCoin && addressBalance - withdrawals > 0n) {
+          transactionData.gasData.payment = [
+            coinReservationRef(addressBalance - withdrawals, payer),
+            ...refs
+          ]
+        } else if (refs.length === 0) {
+          throw new Error("No valid gas coins found for the transaction.")
+        } else {
+          transactionData.gasData.payment = refs
+        }
+      }
     }
     await proceed()
   }
@@ -1234,14 +1834,358 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     }
   }
 
+  /** The bytes as transaction data, or `undefined` for a fixture that is not one. */
+  const dataOfBytes = (bytes: Uint8Array): TransactionDataBuilder | undefined => {
+    try {
+      return TransactionDataBuilder.fromBytes(bytes)
+    } catch {
+      return undefined
+    }
+  }
+
+  /** A coin type the way a node's message spells it: `0x2::sui::SUI` for SUI. */
+  const displayCoinType = (coinType: string): string =>
+    normalizeCoinType(coinType) === normalizeCoinType(SUI_TYPE_ARG) ? "0x2::sui::SUI" : coinType
+
+  /** A node's own refusal: an `RpcError` carrying `INVALID_ARGUMENT` and the node's text. */
+  const refuseLikeNode = (message: string): never => {
+    throw rpcError("INVALID_ARGUMENT", message)
+  }
+
+  const insufficient = (coinType: string, address: string, required: bigint, available: bigint): never =>
+    refuseLikeNode(
+      `Invalid withdraw reservation: Insufficient address balance of coin type ${displayCoinType(coinType)}` +
+        ` for address ${address}: the transaction requires ${required} but only ${available} is available`
+    )
+
+  /**
+   * Refuses, the way a node does, an execution its balances cannot fund: an
+   * empty gas payment the payer's SUI address balance does not cover (budget
+   * plus the SUI it withdraws from the payer), a coin reservation in the
+   * payment whose amount plus the SUI the bytes withdraw from the payer is more
+   * than the payer's SUI address balance **now** (a reservation is the
+   * resolver's read of the whole balance at build time, so any spend that
+   * lands between its build and its send makes it stale, and a node refuses it
+   * at submit with the same "Invalid withdraw reservation" text), a
+   * `FundsWithdrawal` its source's balance does not cover, and an empty
+   * payment with neither an
+   * address-owned input nor a `ValidDuring`/`Validity` expiration (nothing
+   * would stop it replaying).
+   */
+  const refuseUnfunded = (data: TransactionDataBuilder): void => {
+    const payment = data.gasData.payment ?? []
+    const budget = BigInt(data.gasData.budget ?? 0)
+    const payer = data.gasData.owner ?? data.sender
+    const withdrawals = withdrawalsOf(data)
+    if (payment.length === 0 && budget > 0n && payer !== null && payer !== undefined) {
+      const required = budget + suiWithdrawalsFrom(data, payer)
+      const available = addressBalanceOf(payer, SUI_TYPE_ARG)
+      if (available < required) insufficient(SUI_TYPE_ARG, normalizeSuiAddress(payer), required, available)
+    }
+    const reservation = payment.find(isReservationRef)
+    if (reservation !== undefined && payer !== null && payer !== undefined) {
+      const required = reservedAmountOf(reservation) + suiWithdrawalsFrom(data, payer)
+      const available = addressBalanceOf(payer, SUI_TYPE_ARG)
+      if (available < required) insufficient(SUI_TYPE_ARG, normalizeSuiAddress(payer), required, available)
+    }
+    const reserved = new Map<string, Withdrawal>()
+    for (const withdrawal of withdrawals) {
+      const key = balanceKey(withdrawal.source, withdrawal.coinType)
+      const total = reserved.get(key)
+      reserved.set(key, { ...withdrawal, amount: (total?.amount ?? 0n) + withdrawal.amount })
+    }
+    for (const total of reserved.values()) {
+      const available = addressBalanceOf(total.source, total.coinType)
+      if (available < total.amount) insufficient(total.coinType, total.source, total.amount, available)
+    }
+    if (payment.length === 0) {
+      const owned = data.inputs.some((input) =>
+        input.Object?.ImmOrOwnedObject !== undefined || input.Object?.Receiving !== undefined
+      )
+      const kind = data.expiration?.$kind
+      if (!owned && kind !== "ValidDuring" && kind !== "Validity") {
+        refuseLikeNode(
+          "Transactions must either have address-owned inputs, or a ValidDuring expiration with at most two epochs of validity"
+        )
+      }
+    }
+  }
+
+  /** What one argument holds, as far as the fake can follow it without Move. */
+  interface Tracked {
+    readonly kind: "coin" | "balance" | "withdrawal"
+    readonly coinType: string
+    amount: bigint
+    /** The input coin this value is, which is deleted when it is consumed. */
+    readonly coinId?: string
+    /** Whether this is `tx.gas`. */
+    readonly gas?: boolean
+  }
+
+  const SUI_FRAMEWORK = normalizeSuiAddress("0x2")
+
+  /**
+   * Moves balances for a transaction the fake just settled, for the shapes it
+   * can follow without running Move:
+   *
+   * - the net gas charge (computation + storage − rebate of the effects it
+   *   returned) comes off the payer's SUI address balance when the payment is
+   *   empty or holds a coin reservation; this is all a **failed** execution does;
+   * - each `FundsWithdrawal` comes off its source's balance of its type;
+   * - `0x2::coin::send_funds<T>` / `0x2::balance::send_funds<T>` deposit what
+   *   flowed into them into the recipient's balance of `T`: an input coin, the
+   *   gas coin (the payment coins' total plus any reservation, less the gas
+   *   charge — a gas coin with a reservation in it moves the reservation off the
+   *   payer's balance instead of the gas charge), a `SplitCoins` amount,
+   *   `redeem_funds`, `into_balance`/`from_balance`, `zero` and `MergeCoins` of
+   *   those;
+   * - a consumed input coin (sent, merged in, `into_balance`, `destroy_zero`) is
+   *   deleted from the coin set, and a consumed gas coin deletes every payment
+   *   coin — unless a scripted `FakeChange` mutated it, which wins.
+   *
+   * It does **not** rewrite the balance of a coin that was split from or merged
+   * into: those come from the script (`FakeChange.balance`), as before.
+   */
+  const applyBalanceEffects = (
+    data: TransactionDataBuilder,
+    settled: SettledTransaction,
+    before: ReadonlyArray<SuiClientTypes.Coin>,
+    execution: FakeExecution | undefined
+  ): void => {
+    const effects = settled.transaction.effects as SuiClientTypes.TransactionEffects | undefined
+    const gasUsed = effects?.gasUsed ?? DEFAULT_GAS
+    const netGas = BigInt(gasUsed.computationCost) + BigInt(gasUsed.storageCost) -
+      BigInt(gasUsed.storageRebate)
+    const payment = data.gasData.payment ?? []
+    const reservation = payment.find(isReservationRef)
+    const reserved = reservation === undefined ? 0n : reservedAmountOf(reservation)
+    const paymentCoinIds = payment
+      .filter((ref) => !isReservationRef(ref))
+      .map((ref) => normalizeSuiAddress(ref.objectId))
+    const payer = data.gasData.owner ?? data.sender
+    const fromAddressBalance = payment.length === 0 || reservation !== undefined
+    const sui = normalizeCoinType(SUI_TYPE_ARG)
+    if (settled.failed) {
+      if (fromAddressBalance && payer) adjustAddressBalance(payer, sui, -netGas)
+      return
+    }
+    for (const withdrawal of withdrawalsOf(data)) {
+      adjustAddressBalance(withdrawal.source, withdrawal.coinType, -withdrawal.amount)
+    }
+
+    const coinsBefore = new Map(before.map((coin) => [normalizeSuiAddress(coin.objectId), coin]))
+    const values = new Map<string, Tracked>()
+    const consumedCoins = new Set<string>()
+    let gasConsumed = false
+    const deposits: Array<{ readonly recipient: string; readonly coinType: string; readonly amount: bigint }> = []
+
+    const keyOf = (argument: Argument): string | undefined => {
+      switch (argument.$kind) {
+        case "GasCoin":
+          return "gas"
+        case "Input":
+          return `input:${argument.Input}`
+        case "Result":
+          return `result:${argument.Result}:0`
+        case "NestedResult":
+          return `result:${argument.NestedResult[0]}:${argument.NestedResult[1]}`
+        default:
+          return undefined
+      }
+    }
+
+    const valueOf = (argument: Argument | undefined): Tracked | undefined => {
+      if (argument === undefined) return undefined
+      const key = keyOf(argument)
+      if (key === undefined) return undefined
+      const known = values.get(key)
+      if (known !== undefined) return known
+      let value: Tracked | undefined
+      if (argument.$kind === "GasCoin") {
+        const coins = paymentCoinIds.reduce(
+          (sum, id) => sum + BigInt(coinsBefore.get(id)?.balance ?? "0"),
+          0n
+        )
+        const amount = coins + reserved - netGas
+        value = { kind: "coin", coinType: sui, amount: amount < 0n ? 0n : amount, gas: true }
+      } else if (argument.$kind === "Input") {
+        const input = data.inputs[argument.Input]
+        const owned = input?.Object?.ImmOrOwnedObject
+        if (owned !== undefined) {
+          const id = normalizeSuiAddress(owned.objectId)
+          const coin = coinsBefore.get(id)
+          const coinType = coin === undefined ? undefined : coinTypeOfCoin(coin.type)
+          if (coin !== undefined && coinType !== undefined) {
+            value = { kind: "coin", coinType, amount: BigInt(coin.balance), coinId: id }
+          }
+        } else if (input?.$kind === "FundsWithdrawal" && input.FundsWithdrawal.reservation.$kind === "MaxAmountU64") {
+          value = {
+            kind: "withdrawal",
+            coinType: normalizeCoinType(input.FundsWithdrawal.typeArg.Balance),
+            amount: BigInt(input.FundsWithdrawal.reservation.MaxAmountU64)
+          }
+        }
+      }
+      if (value !== undefined) values.set(key, value)
+      return value
+    }
+
+    const consume = (argument: Argument | undefined): void => {
+      const value = valueOf(argument)
+      if (value === undefined) return
+      if (value.coinId !== undefined) consumedCoins.add(value.coinId)
+      if (value.gas === true) gasConsumed = true
+      value.amount = 0n
+    }
+
+    const pureOf = (argument: Argument | undefined): Uint8Array | undefined => {
+      if (argument === undefined || argument.$kind !== "Input") return undefined
+      const bytes = data.inputs[argument.Input]?.Pure?.bytes
+      return bytes === undefined ? undefined : fromBase64(bytes)
+    }
+
+    const u64Of = (argument: Argument | undefined): bigint | undefined => {
+      const bytes = pureOf(argument)
+      if (bytes === undefined) return undefined
+      try {
+        return BigInt(bcs.u64().parse(bytes))
+      } catch {
+        return undefined
+      }
+    }
+
+    const addressOf = (argument: Argument | undefined): string | undefined => {
+      const bytes = pureOf(argument)
+      if (bytes === undefined) return undefined
+      try {
+        return normalizeSuiAddress(bcs.Address.parse(bytes))
+      } catch {
+        return undefined
+      }
+    }
+
+    data.commands.forEach((command, index) => {
+      const result = (nested: number, value: Tracked): void => {
+        values.set(`result:${index}:${nested}`, value)
+      }
+      switch (command.$kind) {
+        case "SplitCoins": {
+          const source = valueOf(command.SplitCoins.coin)
+          command.SplitCoins.amounts.forEach((amountArgument, nested) => {
+            const amount = u64Of(amountArgument)
+            if (source === undefined || amount === undefined) return
+            source.amount = source.amount > amount ? source.amount - amount : 0n
+            result(nested, { kind: "coin", coinType: source.coinType, amount })
+          })
+          return
+        }
+        case "MergeCoins": {
+          const destination = valueOf(command.MergeCoins.destination)
+          for (const sourceArgument of command.MergeCoins.sources) {
+            const source = valueOf(sourceArgument)
+            if (destination !== undefined && source !== undefined) destination.amount += source.amount
+            consume(sourceArgument)
+          }
+          return
+        }
+        case "MoveCall": {
+          const call = command.MoveCall
+          let framework = false
+          try {
+            framework = normalizeSuiAddress(call.package) === SUI_FRAMEWORK
+          } catch {
+            framework = false
+          }
+          if (!framework) return
+          const typeArgument = call.typeArguments[0]
+          const coinType = typeArgument === undefined ? undefined : normalizeCoinType(typeArgument)
+          const name = `${call.module}::${call.function}`
+          const first = call.arguments[0]
+          switch (name) {
+            case "coin::redeem_funds":
+            case "balance::redeem_funds": {
+              const withdrawal = valueOf(first)
+              if (withdrawal === undefined) return
+              result(0, {
+                kind: call.module === "coin" ? "coin" : "balance",
+                coinType: coinType ?? withdrawal.coinType,
+                amount: withdrawal.amount
+              })
+              return
+            }
+            case "coin::into_balance":
+            case "coin::from_balance": {
+              const value = valueOf(first)
+              if (value === undefined) return
+              const amount = value.amount
+              consume(first)
+              result(0, {
+                kind: call.function === "into_balance" ? "balance" : "coin",
+                coinType: coinType ?? value.coinType,
+                amount
+              })
+              return
+            }
+            case "coin::zero":
+            case "balance::zero":
+              if (coinType !== undefined) {
+                result(0, { kind: call.module === "coin" ? "coin" : "balance", coinType, amount: 0n })
+              }
+              return
+            case "coin::send_funds":
+            case "balance::send_funds": {
+              const value = valueOf(first)
+              const recipient = addressOf(call.arguments[1])
+              if (value !== undefined && recipient !== undefined) {
+                deposits.push({ recipient, coinType: coinType ?? value.coinType, amount: value.amount })
+              }
+              consume(first)
+              return
+            }
+            case "coin::destroy_zero":
+              consume(first)
+              return
+            default:
+              return
+          }
+        }
+        default:
+          return
+      }
+    })
+
+    if (fromAddressBalance && payer) {
+      // A gas coin that carried a reservation and was sent away took the
+      // reservation with it, and the gas charge came out of the coin.
+      adjustAddressBalance(payer, sui, gasConsumed && reservation !== undefined ? -reserved : -netGas)
+    }
+    for (const deposit of deposits) {
+      if (deposit.amount !== 0n) adjustAddressBalance(deposit.recipient, deposit.coinType, deposit.amount)
+    }
+    if (gasConsumed) for (const id of paymentCoinIds) consumedCoins.add(id)
+    const scripted = new Set(
+      (execution?.mutated ?? []).map((change) => normalizeSuiAddress(change.objectId))
+    )
+    if (consumedCoins.size > 0) {
+      state.coins = state.coins.filter((coin) => {
+        const id = normalizeSuiAddress(coin.objectId)
+        return !consumedCoins.has(id) || scripted.has(id)
+      })
+    }
+  }
+
   /** The digest of the bytes that were handed to us, as the network derives it. */
-  const digestOfBytes = (bytes: Uint8Array): string => {
+  const derivedDigestOf = (bytes: Uint8Array): string | undefined => {
     try {
       return TransactionDataBuilder.getDigestFromBytes(bytes)
     } catch {
-      return fakeDigest(state.calls.length + 1)
+      return undefined
     }
   }
+
+  /** The same, with a stand-in for bytes that are not a transaction (a unit-test fixture). */
+  const digestOfBytes = (bytes: Uint8Array): string =>
+    derivedDigestOf(bytes) ?? fakeDigest(state.calls.length + 1)
 
   /**
    * The scripted read failure for this `getObject` call, if a script asked for
@@ -1254,7 +2198,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     if (outcome === undefined) return
     switch (outcome._tag) {
       case "transportError":
-        throw rpcError(outcome.status)
+        throw rpcError(outcome.status, outcome.message)
       case "notFound":
         throw new ObjectError("notFound", `object ${options.objectId} does not exist`, {
           reason: "notFound",
@@ -1265,6 +2209,180 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         return
       default:
         return
+    }
+  }
+
+  const appendToLedger = (digest: string): void => {
+    if (!state.ledger.includes(digest)) state.ledger.push(digest)
+  }
+
+  /** The sender and Move calls a set of bytes names, for the ledger filters. */
+  const metaOfBytes = (
+    bytes: Uint8Array
+  ): { readonly sender?: string; readonly moveCalls: ReadonlyArray<string> } => {
+    try {
+      const data = TransactionDataBuilder.fromBytes(bytes)
+      const moveCalls: Array<string> = []
+      for (const command of data.commands) {
+        if (command.$kind !== "MoveCall") continue
+        const call = command.MoveCall
+        moveCalls.push(`${call.package}::${call.module}::${call.function}`)
+      }
+      return {
+        ...(data.sender === null || data.sender === undefined ? {} : { sender: data.sender }),
+        moveCalls
+      }
+    } catch {
+      return { moveCalls: [] }
+    }
+  }
+
+  /**
+   * One transaction of the ledger as the node would list it, or `undefined`
+   * for a digest whose scripted outcome is not a transaction (a transport
+   * failure, a miss, a pending timeout).
+   */
+  interface LedgerTransaction {
+    readonly digest: string
+    readonly settled: SettledTransaction
+    readonly sender: string | undefined
+    readonly moveCalls: ReadonlyArray<string>
+  }
+
+  const ledgerTransactions = async (): Promise<ReadonlyArray<LedgerTransaction>> => {
+    const out: Array<LedgerTransaction> = []
+    for (const digest of state.ledger) {
+      const scripted = state.byDigest.get(digest)
+      if (scripted !== undefined) {
+        if (scripted._tag !== "succeed" && scripted._tag !== "failWith") continue
+        out.push({
+          digest,
+          settled: await applyOutcome(scripted, "getTransaction", digest),
+          sender: scripted.value.sender,
+          moveCalls: scripted.value.moveCalls ?? []
+        })
+        continue
+      }
+      const known = state.knownTransactions.get(digest)
+      if (known === undefined) continue
+      const meta = state.executedMeta.get(digest)
+      out.push({
+        digest,
+        settled: known,
+        sender: meta?.sender,
+        moveCalls: meta?.moveCalls ?? []
+      })
+    }
+    return out
+  }
+
+  /** Whether a `::`-path names the same package (and module, and member) as another. */
+  const pathMatches = (filter: string, path: string): boolean => {
+    const wanted = filter.split("::")
+    const actual = path.split("::")
+    if (wanted.length > actual.length) return false
+    return wanted.every((part, index) => {
+      const other = actual[index] as string
+      if (index > 0) return part === other
+      try {
+        return normalizeSuiAddress(part) === normalizeSuiAddress(other)
+      } catch {
+        return part === other
+      }
+    })
+  }
+
+  const sameAddress = (left: string, right: string | undefined): boolean =>
+    right !== undefined && normalizeSuiAddress(left) === normalizeSuiAddress(right)
+
+  const transactionMatches = (
+    filter: SuiClientTypes.TransactionFilter | undefined,
+    transaction: LedgerTransaction
+  ): boolean => {
+    if (filter === undefined) return true
+    if (filter.sender !== undefined) return sameAddress(filter.sender, transaction.sender)
+    if (filter.function !== undefined) {
+      const wanted = filter.function
+      return transaction.moveCalls.some((call) => pathMatches(wanted, call))
+    }
+    return true
+  }
+
+  const eventMatches = (
+    filter: SuiClientTypes.EventFilter | undefined,
+    event: SuiClientTypes.Event
+  ): boolean => {
+    if (filter === undefined) return true
+    if (filter.sender !== undefined) return sameAddress(filter.sender, event.sender)
+    if (filter.emitModule !== undefined) {
+      return pathMatches(filter.emitModule, `${event.packageId}::${event.module}`)
+    }
+    if (filter.eventType !== undefined) {
+      // `package::module` names every event type defined in that module; a
+      // longer path is a type, compared under the one Move type rule.
+      return filter.eventType.split("::").length === 2
+        ? pathMatches(filter.eventType, event.eventType)
+        : typeMatches(filter.eventType, event.eventType)
+    }
+    return true
+  }
+
+  /**
+   * One page of a ledger listing, the way the SDK's `listEvents` and
+   * `listTransactions` page: `after` reads ascending from strictly after a
+   * cursor, `before` descending from strictly before one, and neither reads
+   * from the start in `order`. A cursor is the item's ledger position. At most
+   * `scanLimit` items are examined per request, so a page may be short or empty
+   * with `hasNextPage: true`; its `endCursor` is then the last position
+   * examined, so continuing from it still makes progress.
+   */
+  const ledgerPage = <A>(
+    items: ReadonlyArray<A>,
+    matches: (item: A) => boolean,
+    options: {
+      readonly limit?: number
+      readonly after?: string | null
+      readonly before?: string | null
+      readonly order?: "ascending" | "descending"
+    }
+  ): {
+    items: ReadonlyArray<A>
+    hasNextPage: boolean
+    startCursor: string | null
+    endCursor: string | null
+  } => {
+    const descending = options.before !== undefined && options.before !== null
+      ? true
+      : options.after !== undefined && options.after !== null
+      ? false
+      : options.order === "descending"
+    const step = descending ? -1 : 1
+    let position = descending
+      ? (options.before === undefined || options.before === null
+        ? items.length - 1
+        : Number(options.before) - 1)
+      : (options.after === undefined || options.after === null ? 0 : Number(options.after) + 1)
+    const limit = options.limit ?? pageSize
+    const scanLimit = script.scanLimit ?? Number.POSITIVE_INFINITY
+    const found: Array<A> = []
+    let first: number | undefined
+    let last: number | undefined
+    let examined = 0
+    while (position >= 0 && position < items.length && found.length < limit && examined < scanLimit) {
+      const item = items[position] as A
+      examined += 1
+      last = position
+      if (matches(item)) {
+        if (first === undefined) first = position
+        found.push(item)
+      }
+      position += step
+    }
+    return {
+      items: found,
+      hasNextPage: position >= 0 && position < items.length,
+      startCursor: first === undefined ? null : String(first),
+      endCursor: last === undefined ? null : String(last)
     }
   }
 
@@ -1329,7 +2447,10 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       const parent = normalizeSuiAddress(options.parentId)
       const entry = (script.dynamicFields?.[parent] ?? []).find(
         (field) =>
-          field.name.type === options.name.type && sameBytes(field.name.bcs, options.name.bcs)
+          // The one Move type rule, so `0x2::object::ID` and its padded
+          // spelling name the same key type.
+          typeMatches(options.name.type, field.name.type) &&
+          sameBytes(field.name.bcs, options.name.bcs)
       )
       if (entry === undefined) {
         throw new ObjectError("notFound", "dynamic field not found", {
@@ -1355,15 +2476,26 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     getDynamicObjectField: async (options: SuiClientTypes.GetDynamicObjectFieldOptions) => {
       record("getDynamicObjectField", options)
-      return unimplemented("getDynamicObjectField")
+      const parent = normalizeSuiAddress(options.parentId)
+      const wrapped = `0x2::dynamic_object_field::Wrapper<${options.name.type}>`
+      const entry = (script.dynamicFields?.[parent] ?? []).find(
+        (field) =>
+          field.$kind === "DynamicObject" &&
+          (typeMatches(options.name.type, field.name.type) ||
+            typeMatches(wrapped, field.name.type)) &&
+          sameBytes(field.name.bcs, options.name.bcs)
+      )
+      if (entry === undefined || entry.childId === undefined) {
+        throw new ObjectError("notFound", "dynamic object field not found", {
+          reason: "notFound",
+          objectId: parent
+        })
+      }
+      return { object: toSdkObject(lookup(entry.childId), options.include) }
     },
     getBalance: async (options: SuiClientTypes.GetBalanceOptions) => {
       record("getBalance", options)
-      const coinType = options.coinType ?? SUI_TYPE_ARG
-      const balance = balancesOf(options.owner).find((item) => sameCoinType(item.coinType, coinType))
-      return {
-        balance: balance ?? { coinType, balance: "0", coinBalance: "0", addressBalance: "0" }
-      }
+      return { balance: balanceOf(options.owner, options.coinType ?? SUI_TYPE_ARG) }
     },
     listBalances: async (options: SuiClientTypes.ListBalancesOptions) => {
       record("listBalances", options)
@@ -1401,7 +2533,8 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     },
     executeTransaction: async (options: SuiClientTypes.ExecuteTransactionOptions) => {
       record("executeTransaction", options)
-      const digest = digestOfBytes(options.transaction)
+      const derived = derivedDigestOf(options.transaction)
+      const digest = derived ?? fakeDigest(state.calls.length + 1)
       assertSignatures(options.transaction, options.signatures ?? [])
       const known = state.knownTransactions.get(digest)
       if (known !== undefined) {
@@ -1412,8 +2545,24 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         // replay idempotency untestable.
         return asResult(known)
       }
-      const settled = await settle("execute", digest, options, paymentOfBytes(options.transaction))
+      // Balances are checked and moved only for bytes the fake can read, and
+      // only here — a replay of a known digest above moves nothing. A refusal
+      // throws before anything is settled or recorded as known.
+      const data = derived === undefined ? undefined : dataOfBytes(options.transaction)
+      if (data !== undefined) refuseUnfunded(data)
+      const before = [...state.coins]
+      lastExecution = undefined
+      const settled = await settle(
+        "execute",
+        digest,
+        options,
+        paymentOfBytes(options.transaction),
+        derived !== undefined
+      )
+      if (data !== undefined) applyBalanceEffects(data, settled, before, lastExecution)
       state.knownTransactions.set(digest, settled)
+      appendToLedger(digest)
+      state.executedMeta.set(digest, metaOfBytes(options.transaction))
       return asResult(settled)
     },
     signAndExecuteTransaction: async (
@@ -1433,7 +2582,10 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       // `Tx.submit` makes after a successful execute must not consume the
       // `getTransaction` script a reconcile test set up.
       const known = state.knownTransactions.get(digest)
-      if (known !== undefined) return asResult(known)
+      if (known !== undefined) {
+        await visibility(options)
+        return asResult(known)
+      }
       return asResult(await settle("getTransaction", digest, options))
     },
     simulateTransaction: async (options: SuiClientTypes.SimulateTransactionOptions) => {
@@ -1442,15 +2594,52 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         ? digestOfBytes(options.transaction)
         : fakeDigest(state.calls.length + 100)
       const result = await settle("simulate", digest, options)
-      return { ...asResult(result), commandResults: result.commandResults }
+      return {
+        ...asResult(result),
+        commandResults: result.commandResults,
+        gasPaymentMocked: gasPaymentMockedOf(options.transaction)
+      }
     },
     listTransactions: async (options: SuiClientTypes.ListTransactionsOptions) => {
       record("listTransactions", options)
-      return unimplemented("listTransactions")
+      const transactions = await ledgerTransactions()
+      const result = ledgerPage(
+        transactions,
+        (transaction) => transactionMatches(options.filter, transaction),
+        options
+      )
+      return {
+        transactions: result.items.map((transaction) => asResult(transaction.settled)),
+        hasNextPage: result.hasNextPage,
+        startCursor: result.startCursor,
+        endCursor: result.endCursor
+      } as unknown as SuiClientTypes.ListTransactionsResponse
     },
     listEvents: async (options: SuiClientTypes.ListEventsOptions) => {
       record("listEvents", options)
-      return unimplemented("listEvents")
+      const entries: Array<SuiClientTypes.EventEntry> = []
+      for (const transaction of await ledgerTransactions()) {
+        const { checkpoint } = transaction.settled.transaction
+        // The fake's transactions always carry every include, events among them.
+        const events = (transaction.settled.transaction.events ?? []) as ReadonlyArray<
+          SuiClientTypes.Event
+        >
+        events.forEach((event, eventIndex) => {
+          entries.push({
+            ...event,
+            checkpoint: checkpoint ?? null,
+            transactionDigest: transaction.digest,
+            eventIndex
+          })
+        })
+      }
+      const result = ledgerPage(entries, (entry) => eventMatches(options.filter, entry), options)
+      return {
+        events: [...result.items],
+        hasNextPage: result.hasNextPage,
+        startCursor: result.startCursor,
+        endCursor: result.endCursor
+      }
     },
     getReferenceGasPrice: async (options?: SuiClientTypes.GetReferenceGasPriceOptions) => {
       record("getReferenceGasPrice", options)
@@ -1480,11 +2669,17 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       options: SuiClientTypes.ResolveNameServiceAddressOptions
     ) => {
       record("resolveNameServiceAddress", options)
-      return unimplemented("resolveNameServiceAddress")
+      if (script.names === undefined) return unimplemented("resolveNameServiceAddress")
+      const target = script.names[options.name]
+      return { address: target === undefined ? null : normalizeSuiAddress(target) }
     },
     defaultNameServiceName: async (options: SuiClientTypes.DefaultNameServiceNameOptions) => {
       record("defaultNameServiceName", options)
-      return unimplemented("defaultNameServiceName")
+      if (script.names === undefined) return unimplemented("defaultNameServiceName")
+      const named = Object.entries(script.names).find(([, target]) =>
+        sameAddress(options.address, target)
+      )
+      return { data: { name: named === undefined ? null : named[0] } }
     },
     mvr: {
       resolvePackage: async (options: SuiClientTypes.MvrResolvePackageOptions) => {
@@ -1535,11 +2730,37 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     }
   }
 
+  const ledger = script.ledger
+  // The two `LedgerService` calls `Tx.reconcile` makes, in the `UnaryCall`
+  // shape the gRPC client returns (`{ response: Promise<…> }`).
+  const ledgerService = ledger === undefined ? undefined : {
+    getServiceInfo: (input: unknown) => {
+      record("getServiceInfo", input)
+      return {
+        response: Promise.resolve(
+          ledger.lowestAvailableCheckpoint === undefined
+            ? {}
+            : { lowestAvailableCheckpoint: ledger.lowestAvailableCheckpoint }
+        )
+      }
+    },
+    getEpoch: (input: { readonly epoch?: bigint }) => {
+      record("getEpoch", input)
+      const first = input.epoch === undefined ? undefined : ledger.firstCheckpoints?.[String(input.epoch)]
+      return {
+        response: first === undefined
+          ? Promise.reject(rpcError("NOT_FOUND", `epoch ${String(input.epoch)} is not available`))
+          : Promise.resolve({ epoch: { epoch: input.epoch, firstCheckpoint: first } })
+      }
+    }
+  }
+
   const client: ClientWithCoreApi = {
     network: script.network ?? "localnet",
     cache: undefined,
     core,
     tryGetPastObject,
+    ...(ledgerService === undefined ? {} : { ledgerService }),
     // The SDK's registration mechanism, implemented so an extension's derived
     // Promise face can be tested exactly the way a consumer writes it:
     // `client.$extend(myExtension())` — variadic, and chainable, because the
@@ -1566,7 +2787,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   } as unknown as ClientWithCoreApi
 
   return {
-    core: makeFromClient(client),
+    core: makeFromClient(client, script.readOptions),
     client,
     calls: Effect.sync(() => [...state.calls]),
     aborted: Effect.sync(() => state.aborted),
@@ -1597,10 +2818,20 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       Effect.sync(() => {
         state.epoch = epoch
       }),
+    setVisibilityDelay: (delay) =>
+      Effect.sync(() => {
+        state.visibilityDelay = delay
+      }),
     recordTransaction: (digest, outcome) =>
       Effect.sync(() => {
         state.byDigest.set(digest, outcome)
+        appendToLedger(digest)
       }),
+    setAddressBalance: (owner, coinType, amount) =>
+      Effect.sync(() => {
+        setAddressBalanceOf(owner, coinType, amount)
+      }),
+    readAddressBalance: (owner, coinType) => Effect.sync(() => addressBalanceOf(owner, coinType)),
     setOutcomes: (method, outcomes) =>
       Effect.sync(() => {
         state.scripts = { ...state.scripts, [method]: outcomes }

@@ -33,7 +33,7 @@ Four rounds between the proposer (this session) and an adversarial reviewer agen
 
 ## Round 4: mechanics and convergence
 
-- Per-sender lock lives in the `Sui` layer as a `PartitionedSemaphore` and spans build through submit, because gas-coin selection happens at build.
+- Per-sender lock lives in the `Sui` layer as a `PartitionedSemaphore` and spans build through submit, because gas-coin selection happens at build. *(Correction, 0.4.0: `PartitionedSemaphore` is one shared permit pool with per-key fairness, not per-key exclusion — with one permit it would serialize every sender behind every other. What shipped, and is right, is `RcMap<address, Semaphore(1)>`; DESIGN §3.)*
 - `Script.run` uses a built-in runner with no platform dependency and exports `Script.exitCode` for consumers on `BunRuntime.runMain`.
 - Retry after not applied is a documented idiom wrapping the whole block, never an API.
 - Four spec items were left to the proposer and decided in `DESIGN.md`: peer floor `@mysten/sui ^2.28`; `Sui.getTransaction` fails with `ExecutionFailed` on historical failures; `view` defaults to result 0 of the last command with explicit overrides; the durable journal layer does no network work at build and `Tx.reconcileAll` is an explicit call.

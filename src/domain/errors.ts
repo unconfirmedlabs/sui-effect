@@ -5,7 +5,7 @@
  *
  * @since 0.1.0
  */
-import { Effect, Predicate, Result, Schema, SchemaIssue } from "effect"
+import { Effect, Option, Predicate, Result, Schema, SchemaIssue } from "effect"
 import {
   Digest,
   ExecutionReason,
@@ -231,6 +231,14 @@ export class DecodeError extends Schema.TaggedError<DecodeError>()("DecodeError"
   objectId: Schema.optionalKey(ObjectId),
   expectedType: Schema.optionalKey(Schema.String),
   /**
+   * The Move type the value actually had, on a `kind: "type"` failure — the
+   * other half of the mismatch `expectedType` names. Absent on every other
+   * kind, and on a `"type"` failure from a producer that did not know it.
+   *
+   * @since 0.4.0
+   */
+  actualType: Schema.optionalKey(Schema.String),
+  /**
    * Which boundary failed. See {@link DecodeKind}.
    *
    * @since 0.1.2
@@ -320,10 +328,18 @@ const decodeIssues = (
     message: issue.message
   }))
 
-/** Simulation reported an execution failure. No gas was charged. */
+/**
+ * Simulation reported an execution failure. No gas was charged.
+ *
+ * `message` is the SDK's own sentence; `command` is the index of the command
+ * that failed, when the node named one — the same field `ExecutionFailed`
+ * carries, so the two describe one abort the same way.
+ */
 export class SimulationFailed extends Schema.TaggedError<SimulationFailed>()("SimulationFailed", {
   reason: ExecutionReason,
-  message: Schema.String
+  message: Schema.String,
+  /** @since 0.4.0 */
+  command: Schema.optionalKey(Schema.Finite)
 }) {}
 
 /** The transaction was applied on chain and failed. Gas was charged. */
@@ -561,10 +577,37 @@ const OutcomeSchema = Schema.Literals(["applied", "not_applied", "unknown"])
 
 const isHasOutcome = Schema.is(Schema.Struct({ outcome: OutcomeSchema }))
 
-const hasOutcome = (error: unknown): error is HasOutcome => isHasOutcome(error)
+/**
+ * `run()`, or `fallback` when it throws.
+ *
+ * Every helper on {@link SuiError} is documented "Never fails" and takes
+ * `unknown`, and a value from outside can throw from anywhere: a getter, a
+ * Proxy trap (a revoked Proxy throws from `Array.isArray`), a `toString`, a
+ * taxonomy tag on an object without the tag's fields. The helpers read such a
+ * value through this, so the worst they answer is a tag-shaped line, `false`,
+ * `none` or `"unknown"`, never an exception.
+ */
+const totally = <A>(run: () => A, fallback: () => A): A => {
+  try {
+    return run()
+  } catch {
+    return fallback()
+  }
+}
 
-const isRetryable = (error: SuiError): boolean =>
-  error._tag === "TransportError" ? error.retryable : false
+const hasOutcome = (error: unknown): error is HasOutcome => totally(() => isHasOutcome(error), () => false)
+
+const tagOf = (error: unknown): string | undefined =>
+  totally(() => {
+    const tag = Predicate.isObject(error) ? error["_tag"] : undefined
+    return typeof tag === "string" ? tag : undefined
+  }, () => undefined)
+
+const isRetryable = (error: unknown): boolean =>
+  totally(
+    () => tagOf(error) === "TransportError" && (error as TransportError).retryable === true,
+    () => false
+  )
 
 /**
  * Every tag the taxonomy owns, so a foreign tag can be told from one of ours.
@@ -580,6 +623,10 @@ const TAXONOMY_TAGS: ReadonlySet<string> = new Set(
 
 /**
  * What a failure says about the transaction it came from.
+ *
+ * Takes **any** value — a `SuiError`, an extension's error, a `SchemaError`, a
+ * `ConfigError`, whatever a Promise rejected with — so a `catch (e: unknown)`
+ * needs no cast.
  *
  * An error that declares its own `outcome` is honoured first, which is how an
  * extension puts its failures on the same axis. Otherwise a tag the taxonomy
@@ -597,14 +644,19 @@ const TAXONOMY_TAGS: ReadonlySet<string> = new Set(
  * leave the default everywhere a submission may already be on the wire.
  * {@link isTaxonomy} answers the same question a level lower: is this even one
  * of ours?
+ *
+ * Never fails.
  */
 const outcome = (
-  error: SuiError | HasOutcome,
+  error: unknown,
   options?: { readonly phase?: OutcomePhase }
 ): Outcome => {
-  if (hasOutcome(error)) return error.outcome
-  const tag = (error as { readonly _tag?: unknown })._tag
-  if (typeof tag !== "string" || !TAXONOMY_TAGS.has(tag)) {
+  if (hasOutcome(error)) {
+    const declared = totally((): Outcome | undefined => error.outcome, () => undefined)
+    if (declared !== undefined) return declared
+  }
+  const tag = tagOf(error)
+  if (tag === undefined || !TAXONOMY_TAGS.has(tag)) {
     // Before anything was sent, an unclassifiable failure still means nothing
     // reached the chain; after, it means exactly nothing.
     return options?.phase === "pre-submit" ? "not_applied" : "unknown"
@@ -632,13 +684,68 @@ const formatTarget = (reason: ExecutionReason): string => {
   return parts.length === 0 ? "" : ` ${parts.join("::")}`
 }
 
-const describeReason = (reason: ExecutionReason): string =>
+/** Move constant types whose rendered value reads as itself, not as text. */
+const UNQUOTED_CONSTANT_TYPE = /^(u8|u16|u32|u64|u128|u256|bool|address)$/
+
+/**
+ * A clever error's value as it reads in a line: quoted when it is text (a
+ * `vector<u8>` constant, or one whose type the node did not say), bare when it
+ * is a number, a bool or an address.
+ */
+const formatCleverValue = (value: string, constantType: string | undefined): string =>
+  constantType !== undefined && UNQUOTED_CONSTANT_TYPE.test(constantType)
+    ? value
+    : JSON.stringify(value)
+
+/**
+ * The Move abort part of a line.
+ *
+ * A **clever error** (`#[error] const EEmptyBody: vector<u8> = b"..."`) reads
+ * `ECONST "value" (line N)`, plus `code N` when the constant declared one with
+ * `#[error(code = N)]`. Its raw `abortCode` is a packed integer that encodes
+ * the constant's location and means nothing to a reader, so it is left out. A
+ * plain `abort N` reads `code N`, plus `(line N)` when the node knew it.
+ */
+const describeMoveAbort = (
+  value: Extract<ExecutionReason, { readonly $kind: "MoveAbort" }>
+): string => {
+  const abort = value.MoveAbort
+  const clever = abort.cleverError
+  const line = clever?.lineNumber === undefined ? "" : ` (line ${clever.lineNumber})`
+  if (clever?.constantName !== undefined) {
+    const rendered = clever.value === undefined
+      ? ""
+      : ` ${formatCleverValue(clever.value, clever.constantType)}`
+    const code = clever.errorCode === undefined ? "" : ` code ${clever.errorCode}`
+    return `MoveAbort${formatTarget(value)} ${clever.constantName}${rendered}${line}${code}`
+  }
+  return `MoveAbort${formatTarget(value)} code ${abort.abortCode}${line}`
+}
+
+/** The prefix the SDK's resolver puts on every simulation it wraps. */
+const RESOLUTION_PREFIX = /^Transaction resolution failed:\s*/
+
+/**
+ * The sentence an `Unknown` reason is described by: its own `message`, else
+ * the carrying error's, minus the resolver's prefix. `undefined` when neither
+ * says anything.
+ */
+const unknownSentence = (
+  reason: ExecutionReason,
+  fallback: string | undefined
+): string | undefined => {
+  const own = reason.$kind === "Unknown" ? reason.message : undefined
+  for (const candidate of [own, fallback]) {
+    if (candidate === undefined) continue
+    const trimmed = oneLine(candidate.replace(RESOLUTION_PREFIX, ""))
+    if (trimmed.length > 0) return trimmed
+  }
+  return undefined
+}
+
+const describeReason = (reason: ExecutionReason, fallback?: string): string =>
   ExecutionReason.match(reason, {
-    MoveAbort: (value) => {
-      const clever = value.MoveAbort.cleverError?.constantName
-      const suffix = clever === undefined ? "" : ` (${clever})`
-      return `MoveAbort${formatTarget(value)} code ${value.MoveAbort.abortCode}${suffix}`
-    },
+    MoveAbort: describeMoveAbort,
     SizeError: (value) =>
       `SizeError ${value.SizeError.name} ${value.SizeError.size} of ${value.SizeError.maxSize}`,
     CommandArgumentError: (value) =>
@@ -653,55 +760,280 @@ const describeReason = (reason: ExecutionReason): string =>
       `CongestedObjects ${value.CongestedObjects.objects.join(", ")}`,
     ObjectIdError: (value) =>
       `ObjectIdError ${value.ObjectIdError.name ?? ""} ${value.ObjectIdError.objectId}`.trim(),
-    Unknown: () => "Unknown"
+    // The SDK reports every kind it has no variant for as `Unknown`, with the
+    // real kind only in the sentence: print the sentence, not the word.
+    Unknown: (value) => unknownSentence(value, fallback) ?? "Unknown"
   })
 
 /**
- * The one line of a `cause` worth printing next to a tag: an `Error`'s message,
- * a tagged error's own `describe` line, a string as itself. `undefined` when
- * there is nothing readable, so `describe` prints nothing rather than
+ * The reason plus ` in command N`, which `SimulationFailed` and
+ * `ExecutionFailed` share so one abort reads the same whether it was caught
+ * before or after the send. The command is not repeated when the sentence of
+ * an `Unknown` already names it (`"InsufficientCoinBalance in command 0"`).
+ */
+const describeFailure = (
+  reason: ExecutionReason,
+  command: number | undefined,
+  fallback?: string
+): string => {
+  const line = describeReason(reason, fallback)
+  const at = command ?? (reason.$kind === "Unknown" ? reason.command : undefined)
+  if (at === undefined) return line
+  const suffix = ` in command ${at}`
+  return line.includes(suffix) ? line : `${line}${suffix}`
+}
+
+/** The longest cause line `describe` prints before cutting it short. */
+const MAX_CAUSE_LENGTH = 1000
+
+/** A string on one line: every run of whitespace, newlines included, is one space. */
+const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim()
+
+const clip = (text: string): string =>
+  text.length <= MAX_CAUSE_LENGTH ? text : `${text.slice(0, MAX_CAUSE_LENGTH - 1)}…`
+
+/**
+ * The one line of a `cause` worth printing next to a tag: a tagged error's own
+ * `describe` line, an `Error`'s message (after its name, when the name says
+ * something — `TypeError: undefined is not an object`), a string as itself.
+ * Always one line and never longer than {@link MAX_CAUSE_LENGTH}. `undefined`
+ * when there is nothing readable, so `describe` prints nothing rather than
  * `[object Object]`.
  */
 const causeLine = (cause: unknown): string | undefined => {
+  const line = rawCauseLine(cause)
+  if (line === undefined) return undefined
+  const flat = oneLine(line)
+  return flat.length === 0 ? undefined : clip(flat)
+}
+
+/**
+ * The objects whose line is being read right now.
+ *
+ * Reading a foreign error's line reads its `.message`, and an extension error
+ * that does what the house classes do — `override get message() { return
+ * SuiError.describe(this) }` — calls straight back in; so does a cyclic
+ * `cause` chain. A value met again while its own line is being read answers
+ * its tag, which is what turns that recursion into a one-line answer instead
+ * of a stack overflow.
+ */
+const READING = new WeakSet<object>()
+
+const rawCauseLine = (cause: unknown): string | undefined => {
   if (cause === undefined || cause === null) return undefined
   if (typeof cause === "string") return cause.length === 0 ? undefined : cause
   if (typeof cause !== "object") return undefined
+  if (READING.has(cause)) return tagOf(cause)
+  READING.add(cause)
+  try {
+    return readCauseLine(cause)
+  } catch {
+    return tagOf(cause)
+  } finally {
+    READING.delete(cause)
+  }
+}
+
+const readCauseLine = (cause: object): string | undefined => {
+  const tag = tagOf(cause)
+  if (tag !== undefined && TAXONOMY_TAGS.has(tag)) return describeTaxonomySafely(cause as SuiError)
+  if (tag === "ConfigError") return describeConfigError(cause)
   const message = (cause as { readonly message?: unknown }).message
-  if (typeof message === "string" && message.length > 0) return message
-  const tag = (cause as { readonly _tag?: unknown })._tag
-  if (typeof tag === "string") return tag
+  if (typeof message === "string" && message.length > 0) {
+    // A JS error's name is worth keeping (`TypeError`, `ValiError`); a
+    // transport's (`RpcError`, with its status already in the message) and a
+    // tagged error's (already its own line) are not.
+    const name = cause instanceof Error ? cause.name : undefined
+    const plain = name !== undefined && name !== "Error" && tag === undefined &&
+      !("code" in cause) && !("status" in cause) && !message.startsWith(name)
+    return plain ? `${name}: ${message}` : message
+  }
+  if (tag !== undefined) return tag
   if (cause instanceof Error && cause.name.length > 0) return cause.name
   return undefined
 }
 
 /**
- * One actionable line for a failure.
- *
- * **It accepts a foreign error too**, the way {@link outcome} and {@link toJson}
- * do: an extension's own `Schema.TaggedError`, or any object carrying a `_tag`.
- * A tag the taxonomy owns gets the taxonomy's wording; anything else gets its
- * own `message` after the tag, or the bare tag when there is nothing readable —
- * never `undefined`, which is what a `switch` with no default used to return
- * for a foreign tag while the signature promised a `string`. A wrapper script
- * that prints one line per failure should not have to know whose error it is
- * holding.
+ * The environment variable a config path is read from: the segments joined by
+ * `_`, which is how `ConfigProvider.fromEnv` — the provider a script runs
+ * under — spells `["TIPJAR", "PACKAGE_ID"]`.
  */
-const describe = (error: SuiError | { readonly _tag: string }): string => {
-  if (!TAXONOMY_TAGS.has(error._tag)) {
-    const line = causeLine(error)
-    return line === undefined || line === error._tag ? error._tag : `${error._tag}: ${line}`
+const envName = (path: ReadonlyArray<PropertyKey>): string =>
+  path.map((segment) => String(segment)).join("_")
+
+/**
+ * Walks a config `SchemaIssue` to its leaves, as `missing NAME` or
+ * `NAME: message` items.
+ *
+ * Under a `ConfigProvider` every leaf value is a string, so an `InvalidType` at
+ * a path — `Expected string`, `Expected object` — means **nothing was there**,
+ * and a `MissingKey` says so outright. An `Expected object` for a struct is
+ * expanded into the struct's own keys, which is what turns
+ * `Expected object at ["TIPJAR"]` into `missing TIPJAR_PACKAGE_ID`. Anything
+ * else (a filter, an encoding) is a value that was there and was wrong.
+ */
+const configItems = (
+  issue: SchemaIssue.Issue,
+  path: ReadonlyArray<PropertyKey>,
+  out: Array<string>
+): void => {
+  switch (issue._tag) {
+    case "Pointer":
+      return configItems(issue.issue, [...path, ...issue.path], out)
+    case "Composite":
+    case "AnyOf":
+      for (const inner of issue.issues) configItems(inner, path, out)
+      return
+    case "MissingKey":
+      out.push(`missing ${envName(path)}`)
+      return
+    case "InvalidType": {
+      const ast = issue.ast
+      if (ast._tag === "Objects" && ast.propertySignatures.length > 0) {
+        for (const property of ast.propertySignatures) {
+          if (property.type.context?.isOptional === true) continue
+          out.push(`missing ${envName([...path, property.name])}`)
+        }
+        return
+      }
+      out.push(`missing ${envName(path)}`)
+      return
+    }
+    default: {
+      const message = standardIssues(issue).issues.map((item) => item.message).join("; ")
+      out.push(`${envName(path)}: ${message.length === 0 ? "invalid" : message}`)
+    }
   }
-  return describeTaxonomy(error as SuiError)
 }
+
+/**
+ * Effect's `ConfigError` on one line that names the variable: `missing
+ * SUI_NETWORK`, `TIPJAR_PACKAGE_ID: Expected a value with a length of at least
+ * 3`. Its own `message` is the `SchemaError` rendering, two lines with the path
+ * as a JSON array. A `ConfigError` over a provider failure (`SourceError`)
+ * keeps that failure's message.
+ */
+const describeConfigError = (error: object): string => {
+  const cause = (error as { readonly cause?: unknown }).cause
+  if (Schema.isSchemaError(cause)) {
+    const items: Array<string> = []
+    configItems(cause.issue, [], items)
+    if (items.length > 0) return items.join(", ")
+  }
+  const line = Predicate.isObject(cause) ? rawCauseLine(cause) : undefined
+  return line ?? "the configuration did not load"
+}
+
+/** What {@link describe} may be told. */
+export interface DescribeOptions {
+  /**
+   * `false` drops the leading tag, for a caller that prints it in a column of
+   * its own (`ExecutionFailed MoveAbort ...` becomes `MoveAbort ...`). Default
+   * `true`.
+   */
+  readonly tag?: boolean
+}
+
+/**
+ * One actionable line for a failure — **any** failure.
+ *
+ * It takes `unknown`, the way {@link outcome}, {@link toJson} and
+ * {@link isTaxonomy} do, so a Promise `catch` needs no cast. A tag the taxonomy
+ * owns gets the taxonomy's wording; Effect's `ConfigError` names the variable
+ * (`ConfigError missing SUI_NETWORK`); any other tagged value gets its own
+ * `message` after the tag, or the bare tag when there is nothing readable; an
+ * `Error` gets its name and message; anything else its `String`. The line is
+ * always one line — a cause's newlines are folded — and never `undefined`.
+ *
+ * What it prints, per tag, is chosen so the line alone says what to do next:
+ * a Move abort names its constant, value and line (never the packed clever
+ * code), an `Unknown` reason prints the node's sentence
+ * (`SimulationFailed InsufficientCoinBalance in command 0`), a `BuildError`,
+ * `SigningError`, `JournalError` or `SubmissionUnknown` appends its cause's
+ * line, and nothing ever prints transaction bytes.
+ *
+ * `{ tag: false }` drops the leading tag. Never fails.
+ */
+const describe = (error: unknown, options?: DescribeOptions): string => {
+  const tag = tagOf(error)
+  const line = totally(() => describeAny(error, tag), () => tag ?? stringOf(error))
+  if (options?.tag !== false || tag === undefined) return line
+  if (line === tag) return line
+  for (const separator of [": ", " "]) {
+    if (line.startsWith(`${tag}${separator}`)) return line.slice(tag.length + separator.length)
+  }
+  return line
+}
+
+/**
+ * `String(value)`, for a value whose `toString` may throw or not exist (a
+ * null-prototype object): then `Object.prototype.toString`, then
+ * `"UnknownError"`.
+ */
+const stringOf = (value: unknown): string =>
+  totally(
+    () => oneLine(String(value)),
+    () => totally(() => Object.prototype.toString.call(value), () => "UnknownError")
+  )
+
+const describeAny = (error: unknown, tag: string | undefined): string => {
+  if (tag !== undefined && TAXONOMY_TAGS.has(tag)) return describeTaxonomySafely(error as SuiError)
+  if (tag === "ConfigError") {
+    if (Predicate.isObject(error) && READING.has(error)) return tag
+    READING.add(error as object)
+    try {
+      return `ConfigError ${oneLine(describeConfigError(error as object))}`
+    } finally {
+      READING.delete(error as object)
+    }
+  }
+  if (tag !== undefined) {
+    const line = causeLine(error)
+    return line === undefined || line === tag ? tag : `${tag}: ${line}`
+  }
+  return causeLine(error) ?? (totally(() => error instanceof Error, () => false)
+    ? (error as Error).name
+    : stringOf(error))
+}
+
+/** ` (cause)`-style tail: `: <line>` when there is a line worth printing. */
+const withCause = (head: string, cause: unknown): string => {
+  const line = causeLine(cause)
+  return line === undefined || head.endsWith(line) ? head : `${head}: ${line}`
+}
+
+/**
+ * A `SubmissionUnknown`'s line: its digest and its cause, which is where
+ * `Tx.submit` folds the last execute failure.
+ */
+const describeSubmissionUnknown = (error: SubmissionUnknown): string =>
+  withCause(`SubmissionUnknown ${error.digest}`, error.cause)
+
+const describeDecodeError = (error: DecodeError): string => {
+  if (error.kind === "type" && error.actualType !== undefined) {
+    const subject = error.objectId === undefined ? "the value" : `object ${error.objectId}`
+    const expected = error.expectedType === undefined ? "" : `, expected ${error.expectedType}`
+    return `DecodeError type: ${subject} is ${error.actualType}${expected}`
+  }
+  return oneLine(`DecodeError ${error.kind} ${error.expectedType ?? ""} ${error.objectId ?? ""} ${error.issue}`)
+}
+
+/**
+ * {@link describeTaxonomy}, or the bare tag when the value carries a taxonomy
+ * tag without the fields the tag promises (`{ _tag: "ExecutionFailed" }`).
+ */
+const describeTaxonomySafely = (error: SuiError): string =>
+  totally(() => describeTaxonomy(error), () => tagOf(error) ?? "UnknownError")
 
 const describeTaxonomy = (error: SuiError): string => {
   switch (error._tag) {
-    case "TransportError": {
-      const cause = causeLine(error.cause)
-      return `TransportError ${error.method}${error.status === undefined ? "" : ` ${error.status}`}${
-        error.retryable ? " (retryable)" : ""
-      }${cause === undefined ? "" : `: ${cause}`}`
-    }
+    case "TransportError":
+      return withCause(
+        `TransportError ${error.method}${error.status === undefined ? "" : ` ${error.status}`}${
+          error.retryable ? " (retryable)" : ""
+        }`,
+        error.cause
+      )
     case "ObjectNotFound":
     case "ObjectDeleted":
     case "ObjectUnavailable":
@@ -711,29 +1043,23 @@ const describeTaxonomy = (error: SuiError): string => {
     case "NetworkMismatch":
       return `NetworkMismatch expected ${error.expected} but the node reported ${error.actual}`
     case "DecodeError":
-      return `DecodeError ${error.kind} ${error.expectedType ?? ""} ${error.objectId ?? ""} ${error.issue}`
-        .replace(/\s+/g, " ")
-        .trim()
+      return describeDecodeError(error)
     case "SimulationFailed":
-      return `SimulationFailed ${describeReason(error.reason)}`
+      return `SimulationFailed ${describeFailure(error.reason, error.command, error.message)}`
     case "ExecutionFailed":
-      return `ExecutionFailed ${describeReason(error.reason)}${
-        error.command === undefined ? "" : ` in command ${error.command}`
-      }`
-    case "SubmissionUnknown": {
-      const cause = causeLine(error.cause)
-      return `SubmissionUnknown ${error.digest}${cause === undefined ? "" : `: ${cause}`}`
-    }
+      return `ExecutionFailed ${describeFailure(error.reason, error.command)}`
+    case "SubmissionUnknown":
+      return describeSubmissionUnknown(error)
     case "NotApplied":
       return `NotApplied ${error.digest} (${error.evidence})`
     case "SigningError":
-      return "SigningError"
+      return withCause("SigningError", error.cause)
     case "BuildError":
-      return `BuildError ${error.message}`
+      return withCause(oneLine(`BuildError ${error.message}`), error.cause)
     case "PolicyDenied":
-      return `PolicyDenied ${error.rule}: ${error.message}`
+      return oneLine(`PolicyDenied ${error.rule}: ${error.message}`)
     case "JournalError":
-      return "JournalError"
+      return withCause("JournalError", error.cause)
     case "UnexpectedEffects":
       return `UnexpectedEffects ${error.digest} expected ${error.expected} but found ${error.found.length}`
     case "GraphQLUnavailable":
@@ -781,11 +1107,7 @@ const withOutcome = (
   json: Record<string, unknown>
 ): Record<string, unknown> => {
   if ("outcome" in json) return json
-  const value = (error as { readonly outcome?: unknown })?.outcome
-  return typeof value === "string" && (value === "applied" || value === "not_applied" ||
-      value === "unknown")
-    ? { ...json, outcome: value }
-    : json
+  return hasOutcome(error) ? { ...json, outcome: error.outcome } : json
 }
 
 /**
@@ -808,13 +1130,15 @@ const withMessage = (
 }
 
 /**
- * The JSON an operator or a log line gets for a failure.
+ * The JSON an operator or a log line gets for a failure — **any** failure.
  *
  * A tag in the taxonomy encodes through {@link SuiErrorSchema}. **Anything
  * else that is a `Schema.TaggedError` encodes through its own schema**, which
  * is how an extension's errors serialize with their fields rather than arriving
- * as a bare `{ _tag, message }`. Only a value that is neither falls back to
- * that.
+ * as a bare `{ _tag, message }`. A value that is neither falls back to that
+ * pair: a tagged value keeps its tag, an `Error` uses its `name`, and anything
+ * else is `{ _tag: "UnknownError", message: String(value) }`. Takes `unknown`,
+ * so a Promise `catch` needs no cast.
  *
  * **`outcome` is always there when the error declares one**, including the
  * usual case where it is a class field rather than a schema field: it is read
@@ -831,25 +1155,54 @@ const withMessage = (
  *
  * Never fails.
  */
-const toJson = (error: SuiError | { readonly _tag: string }): Record<string, unknown> => {
-  const encoded = encode(error)
-  if (Result.isSuccess(encoded)) {
-    return withMessage(
-      withOutcome(error, encoded.success as Record<string, unknown>),
-      () => describe(error as SuiError)
-    )
+const toJson = (error: unknown): Record<string, unknown> => {
+  const tag = tagOf(error)
+  const fallback = (): Record<string, unknown> => ({
+    _tag: tag ?? "UnknownError",
+    message: tag === undefined ? describe(error) : describe(error, { tag: false })
+  })
+  if (!totally(() => Predicate.isObject(error), () => true)) return totally(() => toJsonOf(error, tag), fallback)
+  const object = error as object
+  // A `message` getter that calls `toJson(this)` comes straight back here.
+  if (SERIALIZING.has(object)) return { _tag: tag ?? "UnknownError", message: tag ?? "UnknownError" }
+  SERIALIZING.add(object)
+  try {
+    return totally(() => toJsonOf(error, tag), fallback)
+  } finally {
+    SERIALIZING.delete(object)
   }
-  const own = encodeThroughOwnSchema(error)
+}
+
+/** The objects {@link toJson} is serializing right now; see {@link READING}. */
+const SERIALIZING = new WeakSet<object>()
+
+const toJsonOf = (error: unknown, tag: string | undefined): Record<string, unknown> => {
+  if (tag !== undefined && TAXONOMY_TAGS.has(tag)) {
+    const encoded = encode(error)
+    if (Result.isSuccess(encoded)) {
+      return withMessage(
+        withOutcome(error, encoded.success as Record<string, unknown>),
+        () => describe(error)
+      )
+    }
+  }
+  const own = tag === undefined ? undefined : encodeThroughOwnSchema(error)
   if (own !== undefined) {
     return withMessage(withOutcome(error, own), () => {
       const value = (error as { readonly message?: unknown }).message
       return typeof value === "string" && value.length > 0 ? value : undefined
     })
   }
-  const message = TAXONOMY_TAGS.has(error._tag)
-    ? describe(error as SuiError)
-    : causeLine(error) ?? error._tag
-  return withOutcome(error, { _tag: error._tag, message })
+  if (tag !== undefined) {
+    const message = TAXONOMY_TAGS.has(tag) || tag === "ConfigError"
+      ? describe(error, { tag: false })
+      : causeLine(error) ?? tag
+    return withOutcome(error, { _tag: tag, message })
+  }
+  if (error instanceof Error) {
+    return withOutcome(error, { _tag: error.name, message: describe(error) })
+  }
+  return withOutcome(error, { _tag: "UnknownError", message: describe(error) })
 }
 
 /**
@@ -862,14 +1215,180 @@ const toJson = (error: SuiError | { readonly _tag: string }): Record<string, unk
  * @since 0.1.2
  */
 const isTaxonomy = (error: unknown): error is SuiError => {
-  const tag = (error as { readonly _tag?: unknown })?._tag
-  return typeof tag === "string" && TAXONOMY_TAGS.has(tag)
+  const tag = tagOf(error)
+  return tag !== undefined && TAXONOMY_TAGS.has(tag)
+}
+
+/**
+ * The digest of the transaction a failure refers to, when it has one:
+ * `TransactionNotFound`, `ExecutionFailed`, `SubmissionUnknown`, `NotApplied`
+ * and `UnexpectedEffects` carry one; every other value, taxonomy or not,
+ * answers `undefined`. Takes `unknown`, so it can be pointed at an extension
+ * error's `cause` without narrowing first. Never fails.
+ *
+ * @since 0.4.0
+ */
+export const digestOf = (error: unknown): Digest | undefined => {
+  if (!isTaxonomy(error)) return undefined
+  switch (error._tag) {
+    case "TransactionNotFound":
+    case "ExecutionFailed":
+    case "SubmissionUnknown":
+    case "NotApplied":
+    case "UnexpectedEffects":
+      return totally((): Digest | undefined => error.digest, () => undefined)
+    default:
+      return undefined
+  }
+}
+
+/**
+ * A Move abort, read off a `SimulationFailed` or an `ExecutionFailed` into the
+ * fields a caller matches on.
+ *
+ * - `module`, `function`, `package`: where it aborted, when the node said.
+ *   **After an upgrade `package` is the id of the latest version** of the
+ *   package, not the one the type was first published under, so match on
+ *   `module` and `constant` (or `code`) rather than on `package`.
+ * - `code`: the code as the Move source wrote it — `N` in `abort N` and
+ *   `assert!(cond, N)`, and the declared `#[error(code = N)]` of a clever
+ *   error. For a clever error with no declared code it is the raw
+ *   `abortCode`, a packed integer: match on `constant` instead.
+ * - `abortCode`: always the raw code the VM reported.
+ * - `constant`, `message`, `line`: a clever error's constant name, its
+ *   rendered value, and the source line of the abort.
+ * - `command`: the index of the command that aborted.
+ *
+ * @since 0.4.0
+ */
+export interface MoveAbortInfo {
+  readonly package?: string
+  readonly module?: string
+  readonly function?: string
+  readonly code: bigint
+  readonly abortCode: bigint
+  readonly constant?: string
+  readonly message?: string
+  readonly line?: number
+  readonly command?: number
+}
+
+/**
+ * The {@link MoveAbortInfo} a failure is, if it is one: `Option.some` for a
+ * `SimulationFailed` or an `ExecutionFailed` whose reason is `MoveAbort`,
+ * `Option.none` for anything else — any value at all. Never fails.
+ *
+ * @example
+ * ```ts
+ * import { SuiError } from "@unconfirmed/sui-effect"
+ * import { Option } from "effect"
+ *
+ * declare const error: unknown
+ * const abort = SuiError.moveAbort(error)
+ * if (Option.isSome(abort) && abort.value.module === "board") {
+ *   console.log(abort.value.constant, abort.value.line)
+ * }
+ * ```
+ *
+ * @since 0.4.0
+ */
+const moveAbort = (error: unknown): Option.Option<MoveAbortInfo> =>
+  totally(() => readMoveAbort(error), () => Option.none())
+
+const readMoveAbort = (error: unknown): Option.Option<MoveAbortInfo> => {
+  const tag = tagOf(error)
+  if (tag !== "SimulationFailed" && tag !== "ExecutionFailed") return Option.none()
+  const failure = error as SimulationFailed | ExecutionFailed
+  const reason = failure.reason
+  if (reason?.$kind !== "MoveAbort") return Option.none()
+  const { abortCode, location, cleverError } = reason.MoveAbort
+  return Option.some({
+    ...(location?.package === undefined ? {} : { package: location.package }),
+    ...(location?.module === undefined ? {} : { module: location.module }),
+    ...(location?.functionName === undefined ? {} : { function: location.functionName }),
+    code: cleverError?.errorCode !== undefined
+      ? BigInt(cleverError.errorCode)
+      : abortCode,
+    abortCode,
+    ...(cleverError?.constantName === undefined ? {} : { constant: cleverError.constantName }),
+    ...(cleverError?.value === undefined ? {} : { message: cleverError.value }),
+    ...(cleverError?.lineNumber === undefined ? {} : { line: cleverError.lineNumber }),
+    ...(failure.command === undefined ? {} : { command: failure.command })
+  })
+}
+
+/**
+ * What {@link isMoveAbort} matches on. Every field given must match; none given
+ * matches every Move abort. `package` is compared as an address (padding and
+ * case do not matter) — but see {@link MoveAbortInfo}: after an upgrade the node
+ * names the **latest** package id, so prefer `module` plus `constant` or
+ * `code`.
+ *
+ * @since 0.4.0
+ */
+export interface MoveAbortMatch {
+  readonly package?: string
+  readonly module?: string
+  readonly function?: string
+  readonly constant?: string
+  readonly code?: number | bigint
+}
+
+const normalizeHex = (value: string): string =>
+  value.toLowerCase().replace(/^0x/, "").replace(/^0+/, "")
+
+/**
+ * Whether a failure is a Move abort, and — given a {@link MoveAbortMatch} —
+ * the one you mean: `SuiError.isMoveAbort(e, { module: "tipjar", constant:
+ * "EWrongCap" })`. Narrows to `SimulationFailed | ExecutionFailed`, so the
+ * usual next step is mapping it to an extension's own error. Takes any value.
+ * Never fails.
+ *
+ * @example
+ * ```ts
+ * import { SuiError } from "@unconfirmed/sui-effect"
+ *
+ * declare const error: unknown
+ * if (SuiError.isMoveAbort(error, { module: "board", code: 1 })) {
+ *   // error is SimulationFailed | ExecutionFailed
+ * }
+ * ```
+ *
+ * @since 0.4.0
+ */
+const isMoveAbort = (
+  error: unknown,
+  match?: MoveAbortMatch
+): error is SimulationFailed | ExecutionFailed => {
+  const found = moveAbort(error)
+  if (Option.isNone(found)) return false
+  const abort = found.value
+  if (match === undefined) return true
+  return totally(() => matchesAbort(abort, match), () => false)
+}
+
+const matchesAbort = (abort: MoveAbortInfo, match: MoveAbortMatch): boolean => {
+  if (
+    match.package !== undefined &&
+    (abort.package === undefined || normalizeHex(abort.package) !== normalizeHex(match.package))
+  ) return false
+  if (match.module !== undefined && abort.module !== match.module) return false
+  if (match.function !== undefined && abort.function !== match.function) return false
+  if (match.constant !== undefined && abort.constant !== match.constant) return false
+  if (match.code !== undefined) {
+    // `BigInt(1.5)` throws a RangeError: a code that is not an integer matches
+    // no abort.
+    if (typeof match.code === "number" && !Number.isInteger(match.code)) return false
+    if (abort.code !== BigInt(match.code)) return false
+  }
+  return true
 }
 
 /**
  * The helpers every repo hand-rolls: is this worth retrying, did the
  * transaction land, is it even one of ours, what does an operator need to read,
- * and what goes in a log.
+ * what goes in a log, which transaction is it about, and which Move abort was
+ * it. Every one takes `unknown`.
  *
  * For *branching* on a failure, the taxonomy is a flat tagged union, so
  * `Effect.catchTags({ ObjectNotFound: ..., TransportError: ... })` in the error
@@ -882,19 +1401,8 @@ export const SuiError = {
   isTaxonomy,
   outcome,
   describe,
-  toJson
+  toJson,
+  digestOf,
+  moveAbort,
+  isMoveAbort
 } as const
-
-/** The digest of the transaction a failure refers to, when it has one. */
-export const digestOf = (error: SuiError): Digest | undefined => {
-  switch (error._tag) {
-    case "TransactionNotFound":
-    case "ExecutionFailed":
-    case "SubmissionUnknown":
-    case "NotApplied":
-    case "UnexpectedEffects":
-      return error.digest
-    default:
-      return undefined
-  }
-}

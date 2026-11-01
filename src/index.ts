@@ -12,16 +12,19 @@
  * @since 0.1.0
  */
 
-/** The closed error taxonomy and its four helpers. */
+/** The closed error taxonomy and its helpers. */
 export {
   BuildError,
   DecodeError,
   DecodeKind,
+  type DescribeOptions,
   ExecutionFailed,
   ExtensionNotReady,
   GraphQLUnavailable,
   type HasOutcome,
   JournalError,
+  type MoveAbortInfo,
+  type MoveAbortMatch,
   NetworkMismatch,
   NotApplied,
   ObjectDeleted,
@@ -46,6 +49,8 @@ export {
   Built,
   ChangedObject,
   CleverError,
+  Coin,
+  CoinMetadata,
   CoinType,
   CommandResult,
   Digest,
@@ -53,6 +58,7 @@ export {
   DynamicFieldEntry,
   DynamicFieldName,
   Event,
+  EventEntry,
   ExecutionReason,
   ExecutionStatus,
   GasCostSummary,
@@ -64,6 +70,7 @@ export {
   maxTimestampMsOf,
   MoveLocation,
   Network,
+  Nonce,
   NotAppliedEvidence,
   ObjectEnvelope,
   ObjectId,
@@ -85,8 +92,10 @@ export {
 /** A transaction that reached the chain, with accessors over its effects. */
 export {
   type ChangedRef,
+  EXECUTE_INCLUDE,
   Executed,
   objectRefOf,
+  type Published,
   type SdkObjectRef,
   sdkRefOf
 } from "./domain/executed.ts"
@@ -94,20 +103,29 @@ export {
 /** The opinionated tier. */
 export {
   type BatchItemError,
+  type DecodedDynamicField,
+  type EventFilter,
   type GetObjectError,
+  type ListOptions,
+  type ListOrder,
+  type ListPage,
   type Recipe,
   Sui,
   type SuiLayerOptions,
-  type SuiService
+  type SuiService,
+  type TailOptions,
+  type TransactionFilter
 } from "./services/Sui.ts"
 
 /** The mechanical tier. */
 export {
   defaultGrpcUrl,
   type ObjectLookupError,
+  type ServiceInfo,
   type SimulationLookupError,
   SuiCore,
   type SuiCoreError,
+  type SuiCoreReadOptions,
   type SuiCoreService,
   type SuiGrpcLayerOptions,
   type TransactionLookupError,
