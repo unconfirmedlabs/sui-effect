@@ -360,3 +360,56 @@ describe("exit codes for key and keystore refusals (0.5.0)", () => {
     expect(Object.keys(SuiError.toJson(new KeystoreError({ reason: "wrongPassword", message: "no" })))).not.toContain("exitCode")
   })
 })
+
+describe("Keystore: iteration bounds agree between seal and open (0.5.0)", () => {
+  test("every constructor refuses a count open would refuse, or that is not an integer", () => {
+    for (const iterations of [999, 1_500.5, 10_000_001, Number.NaN]) {
+      expect(() => Keystore.make({ iterations })).toThrow(RangeError)
+    }
+    for (const iterations of [10_000_001, 600_000.5]) {
+      expect(() => Keystore.layer({ iterations })).toThrow(RangeError)
+    }
+    expect(() => Keystore.make({ iterations: 1_000 })).not.toThrow()
+    expect(() => Keystore.make({ iterations: 10_000_000 })).not.toThrow()
+    expect(() => Keystore.layer({ iterations: 10_000_000 })).not.toThrow()
+  })
+
+  test("changePassword never replaces a working record with one that does not open", async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, "crypto")
+    const real = globalThis.crypto
+    const result = await run(Effect.gen(function*() {
+      const keystore = yield* Keystore
+      yield* keystore.importSecretKey(new Uint8Array(32).fill(9), password)
+      const address = (yield* keystore.list)[0]?.address ?? ADDRESS
+      const before = yield* raw(address)
+      // A WebCrypto whose encrypt output does not verify: the re-seal is broken.
+      const subtle = {
+        importKey: real.subtle.importKey.bind(real.subtle),
+        deriveBits: real.subtle.deriveBits.bind(real.subtle),
+        digest: real.subtle.digest.bind(real.subtle),
+        decrypt: real.subtle.decrypt.bind(real.subtle),
+        encrypt: async (...args: Parameters<SubtleCrypto["encrypt"]>) => {
+          const out = new Uint8Array(await real.subtle.encrypt(...args))
+          out[0] = (out[0] ?? 0) ^ 1
+          return out.buffer
+        }
+      }
+      Object.defineProperty(globalThis, "crypto", {
+        value: { subtle, getRandomValues: real.getRandomValues.bind(real) },
+        configurable: true,
+        writable: true
+      })
+      const refused = yield* Effect.flip(keystore.changePassword(address, password, wrong)).pipe(
+        Effect.ensuring(Effect.sync(() => {
+          if (original !== undefined) Object.defineProperty(globalThis, "crypto", original)
+        }))
+      )
+      const after = yield* raw(address)
+      const signer = yield* keystore.unlock(address, password)
+      return { refused, before, after, signer, address }
+    }))
+    expect(result.refused._tag).toBe("KeystoreError")
+    expect(result.after).toBe(result.before)
+    await verifies(result.signer, result.address)
+  })
+})

@@ -128,4 +128,9 @@ describe("Keystore.sealer as the zkLogin SecretSealer", () => {
     expect(Keystore.sealer).toBe(sealer)
     expect(() => sealer(PASSWORD, { iterations: 1_000 })).toThrow(RangeError)
   })
+
+  test("refuses more iterations than unseal accepts, so it never seals an unopenable blob", () => {
+    expect(() => sealer(PASSWORD, { iterations: 10_000_001 })).toThrow(RangeError)
+    expect(() => sealer(PASSWORD, { iterations: 10_000_000 })).not.toThrow()
+  })
 })

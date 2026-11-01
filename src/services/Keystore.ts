@@ -71,9 +71,25 @@ export const DEFAULT_ITERATIONS = 600_000
 /** The fewest iterations `Keystore.layer` accepts for a new seal. @since 0.5.0 */
 export const MIN_LAYER_ITERATIONS = 100_000
 
-/** Outside `[1 000, 10 000 000]` a stored record is refused as `corrupt` (a downgrade, or a denial of service). */
+/**
+ * Outside `[1 000, 10 000 000]` a stored record is refused as `corrupt` (a
+ * downgrade, or a denial of service), so no constructor seals outside it.
+ */
 const MIN_STORED_ITERATIONS = 1_000
 const MAX_STORED_ITERATIONS = 10_000_000
+
+/**
+ * Throws a `RangeError` unless `iterations` is an integer in
+ * `[floor, MAX_STORED_ITERATIONS]`: a count that seals records `open` would
+ * refuse is a configuration mistake, caught where the keystore is built.
+ */
+const checkIterations = (who: string, iterations: number, floor: number): void => {
+  if (!Number.isSafeInteger(iterations) || iterations < floor || iterations > MAX_STORED_ITERATIONS) {
+    throw new RangeError(
+      `${who}: iterations must be an integer in [${floor}, ${MAX_STORED_ITERATIONS}], got ${iterations}`
+    )
+  }
+}
 
 /** The `KeyValueStore` key prefix every record is stored under, by default. @since 0.5.0 */
 export const DEFAULT_PREFIX = "sui-effect/keystore/"
@@ -146,8 +162,9 @@ export interface KeystoreOptions {
   readonly prefix?: string
   /**
    * PBKDF2-SHA256 iterations for records sealed from now on (existing records
-   * keep their own until `changePassword`). Default {@link DEFAULT_ITERATIONS};
-   * `Keystore.layer` refuses fewer than {@link MIN_LAYER_ITERATIONS}.
+   * keep their own until `changePassword`). Default {@link DEFAULT_ITERATIONS}.
+   * An integer of at most 10 000 000; `Keystore.layer` refuses fewer than
+   * {@link MIN_LAYER_ITERATIONS}, `Keystore.make` fewer than 1 000.
    */
   readonly iterations?: number
 }
@@ -221,7 +238,10 @@ export interface KeystoreService {
   readonly remove: (address: SuiAddress) => Effect.Effect<void, KeystoreError>
   /**
    * Re-seals one account under a new password, with a fresh salt and IV and
-   * the layer's current iteration count.
+   * the layer's current iteration count. The new record is opened under the
+   * new password (one more PBKDF2 derivation) before it is written, so a
+   * re-seal that does not open never replaces the stored record; that failure
+   * is `corrupt` and leaves the store as it was.
    *
    * Fails with: `KeystoreError` (`wrongPassword`, `invalidPassword`,
    * `notFound`, `corrupt`, `unsupported`, `unavailable`, `storage`).
@@ -411,7 +431,11 @@ const open = (record: SealedKey, password: Redacted.Redacted<string>): Effect.Ef
     const address = record.address
     const iterations = record.kdf.iterations
     if (iterations < MIN_STORED_ITERATIONS || iterations > MAX_STORED_ITERATIONS) {
-      return yield* keystoreError("corrupt", `the record names ${iterations} PBKDF2 iterations, outside [1000, 10000000]`, address)
+      return yield* keystoreError(
+        "corrupt",
+        `the record names ${iterations} PBKDF2 iterations, outside [${MIN_STORED_ITERATIONS}, ${MAX_STORED_ITERATIONS}]`,
+        address
+      )
     }
     const salt = yield* decode64("salt", record.kdf.salt, address)
     const iv = yield* decode64("iv", record.cipher.iv, address)
@@ -469,20 +493,24 @@ const heldOf = (record: SealedKey, plaintext: Uint8Array): Effect.Effect<HeldKey
   })
 
 /**
- * The keystore over the `KeyValueStore` in context, with no floor on
- * `iterations` (that is `Keystore.layer`'s check). For `Keystore.layer` and
- * for applications that build their own layer.
+ * The keystore over the `KeyValueStore` in context, for `Keystore.layer` and
+ * for applications that build their own layer. Its floor on `iterations` is
+ * 1 000, the fewest a stored record may name (`Keystore.layer`'s is
+ * {@link MIN_LAYER_ITERATIONS}); the ceiling is 10 000 000 for both.
  *
- * Never fails.
+ * **Throws** a `RangeError` when `options.iterations` is not an integer in
+ * `[1 000, 10 000 000]`: those counts would seal records `unlock` refuses.
+ * The effect never fails.
  *
  * @since 0.5.0
  */
 export const make = (
   options?: KeystoreOptions
-): Effect.Effect<KeystoreService, never, KeyValueStore.KeyValueStore> =>
-  Effect.gen(function*() {
+): Effect.Effect<KeystoreService, never, KeyValueStore.KeyValueStore> => {
+  const iterations = options?.iterations ?? DEFAULT_ITERATIONS
+  checkIterations("Keystore.make", iterations, MIN_STORED_ITERATIONS)
+  return Effect.gen(function*() {
     const store = KeyValueStore.prefix(yield* KeyValueStore.KeyValueStore, options?.prefix ?? DEFAULT_PREFIX)
-    const iterations = options?.iterations ?? DEFAULT_ITERATIONS
     const writes = yield* Semaphore.make(1)
 
     const read = (address: SuiAddress): Effect.Effect<SealedKey, KeystoreError> =>
@@ -514,12 +542,16 @@ export const make = (
         return record
       })
 
-    const write = (record: SealedKey): Effect.Effect<void, KeystoreError> =>
+    const encode = (record: SealedKey): Effect.Effect<string, KeystoreError> =>
       encodeSealed(record).pipe(
-        Effect.orDie,
-        Effect.flatMap((json) => store.set(record.address, json)),
-        Effect.mapError(storageError(record.address))
+        Effect.mapError(() => keystoreError("corrupt", `the record of ${record.address} does not encode`, record.address))
       )
+
+    const putRaw = (address: SuiAddress, json: string): Effect.Effect<void, KeystoreError> =>
+      store.set(address, json).pipe(Effect.mapError(storageError(address)))
+
+    const write = (record: SealedKey): Effect.Effect<void, KeystoreError> =>
+      Effect.flatMap(encode(record), (json) => putRaw(record.address, json))
 
     /** Seals a held key as a new record, refusing an address already stored. */
     const add = (
@@ -652,7 +684,23 @@ export const make = (
             // Proves the plaintext is the address's key before re-sealing it.
             wipeHeldKey(yield* heldOf(record, plaintext))
             const { check: _check, cipher: _cipher, ciphertext: _ciphertext, kdf: _kdf, version: _version, ...meta } = record
-            yield* write(yield* seal(meta, plaintext, newPassword, iterations))
+            const json = yield* encode(yield* seal(meta, plaintext, newPassword, iterations))
+            // The new record must open, through the path `unlock` takes, before
+            // it replaces the old one: a re-seal that does not open would
+            // destroy the only copy of the key.
+            const unopenable = (cause: KeystoreError) =>
+              new KeystoreError({
+                reason: "corrupt",
+                message: `the re-sealed record of ${address} does not open under the new password; the stored record is unchanged`,
+                address,
+                cause
+              })
+            const resealed = yield* decodeRecord(json, address).pipe(Effect.mapError(unopenable))
+            const reopened = yield* open(resealed, newPassword).pipe(Effect.mapError(unopenable))
+            const same = sameBytes(reopened, plaintext)
+            reopened.fill(0)
+            if (!same) return yield* unopenable(keystoreError("corrupt", "the re-sealed plaintext differs", address))
+            yield* putRaw(address, json)
           })))
       }),
 
@@ -680,6 +728,7 @@ export const make = (
     }
     return service
   })
+}
 
 const SEALER_AAD_DOMAIN = "sui-effect/keystore/sealer/v1"
 
@@ -734,8 +783,9 @@ const asSigningError = (error: KeystoreError): SigningError =>
  * one when the person unlocks and drop it when they lock. Each `seal` and
  * `unseal` costs one PBKDF2 derivation.
  *
- * **Throws** a `RangeError` when `options.iterations` is not an integer of at
- * least {@link MIN_LAYER_ITERATIONS}, `Keystore.layer`'s floor. Its members
+ * **Throws** a `RangeError` when `options.iterations` is not an integer from
+ * {@link MIN_LAYER_ITERATIONS} to 10 000 000, `Keystore.layer`'s bounds
+ * (`unseal` refuses a blob naming more than 10 000 000). Its members
  * fail with: `SigningError` — `reason: "locked"` for a wrong password,
  * `reason: "unavailable"` without WebCrypto, and no reason for an empty
  * password, an empty secret or a blob that was edited, moved or is not one.
@@ -765,11 +815,7 @@ export const sealer = (
   options?: { readonly iterations?: number }
 ): SecretSealer => {
   const iterations = options?.iterations ?? DEFAULT_ITERATIONS
-  if (!Number.isSafeInteger(iterations) || iterations < MIN_LAYER_ITERATIONS) {
-    throw new RangeError(
-      `Keystore.sealer: iterations must be an integer of at least ${MIN_LAYER_ITERATIONS}, got ${iterations}`
-    )
-  }
+  checkIterations("Keystore.sealer", iterations, MIN_LAYER_ITERATIONS)
   return {
     seal: Effect.fn("Keystore.seal")(function*(secret: Redacted.Redacted<Uint8Array>, aad: Uint8Array) {
       return yield* Effect.gen(function*() {
@@ -804,7 +850,10 @@ export const sealer = (
         )
         const stored = record.kdf.iterations
         if (stored < MIN_STORED_ITERATIONS || stored > MAX_STORED_ITERATIONS) {
-          return yield* keystoreError("corrupt", `the sealed secret names ${stored} PBKDF2 iterations, outside [1000, 10000000]`)
+          return yield* keystoreError(
+            "corrupt",
+            `the sealed secret names ${stored} PBKDF2 iterations, outside [${MIN_STORED_ITERATIONS}, ${MAX_STORED_ITERATIONS}]`
+          )
         }
         const salt = yield* decode64("salt", record.kdf.salt, undefined)
         const iv = yield* decode64("iv", record.cipher.iv, undefined)
@@ -841,7 +890,8 @@ export class Keystore extends Context.Service<Keystore, KeystoreService>()(
 ) {
   /**
    * The service over the `KeyValueStore` in context, for an application that
-   * builds its own layer. No floor on `iterations`. Never fails.
+   * builds its own layer. **Throws** a `RangeError` for `iterations` that is
+   * not an integer in `[1 000, 10 000 000]`; the effect never fails.
    */
   static readonly make = make
 
@@ -852,19 +902,15 @@ export class Keystore extends Context.Service<Keystore, KeystoreService>()(
    * The keystore over the `KeyValueStore` in context. Builds without reading
    * anything.
    *
-   * **Throws** a `RangeError` when `options.iterations` is not an integer of at
-   * least {@link MIN_LAYER_ITERATIONS} — a configuration mistake that would
-   * make every record cheap to brute-force. Otherwise never fails.
+   * **Throws** a `RangeError` when `options.iterations` is not an integer from
+   * {@link MIN_LAYER_ITERATIONS} to 10 000 000 — fewer would make every
+   * record cheap to brute-force, more would seal records `unlock` refuses.
+   * Otherwise never fails.
    */
   static readonly layer = (
     options?: KeystoreOptions
   ): Layer.Layer<Keystore, never, KeyValueStore.KeyValueStore> => {
-    const iterations = options?.iterations
-    if (iterations !== undefined && (!Number.isSafeInteger(iterations) || iterations < MIN_LAYER_ITERATIONS)) {
-      throw new RangeError(
-        `Keystore.layer: iterations must be an integer of at least ${MIN_LAYER_ITERATIONS}, got ${iterations}`
-      )
-    }
+    checkIterations("Keystore.layer", options?.iterations ?? DEFAULT_ITERATIONS, MIN_LAYER_ITERATIONS)
     return Layer.effect(Keystore, make(options))
   }
 
