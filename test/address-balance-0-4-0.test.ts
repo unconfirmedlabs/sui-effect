@@ -494,6 +494,37 @@ describe("Tx.foldCoins", () => {
     expect(outcome.payment).toBe(0)
   })
 
+  test("stops at the batch that fails, keeps the ones before it, and a second call folds only the rest", async () => {
+    const coins = Array.from({ length: 4 }, (_, index) => suiCoin(index + 1, 2_000_000_000n))
+    const outcome = await run(
+      Effect.gen(function*() {
+        const failed = yield* Effect.flip(Tx.foldCoins({ signer, maxCoinsPerTransaction: 2 }))
+        const left = yield* Stream.runCollect((yield* SuiNs).streamCoins(SENDER))
+        const again = yield* Tx.foldCoins({ signer, maxCoinsPerTransaction: 2 })
+        const after = (yield* Stream.runCollect((yield* SuiNs).streamCoins(SENDER))).length
+        return { failed, left: left.map((coin) => coin.objectId), again, after }
+      }),
+      {
+        ...baseScript,
+        objects: [],
+        coins,
+        balances: [],
+        execute: [
+          FakeOutcome.succeed(),
+          FakeOutcome.failWith({ $kind: "MoveAbort", MoveAbort: { abortCode: 3n } }),
+          FakeOutcome.succeed()
+        ]
+      }
+    )
+    expect(outcome.failed._tag).toBe("ExecutionFailed")
+    // The first batch (the two largest, ties in listing order) folded; the second did not.
+    expect(outcome.left.length).toBe(2)
+    expect(outcome.again.plan.batches.length).toBe(1)
+    expect(outcome.again.plan.batches[0]!.coins.map((coin) => coin.objectId)).toEqual(outcome.left)
+    expect(outcome.again.executed.length).toBe(1)
+    expect(outcome.after).toBe(0)
+  })
+
   test("an owner with no coins answers an empty plan and runs nothing", async () => {
     const result = await run(Tx.foldCoins({ signer }), { ...baseScript, coins: [] })
     expect(result.plan.batches).toEqual([])
