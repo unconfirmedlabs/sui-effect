@@ -18,12 +18,22 @@ export type ExpirationPolicy = "validDuring" | "epoch" | "none"
  *
  * - `"whenPinned"` (the default): for **every build**, and on through signing,
  *   `onSigned` and submission **only when the built bytes pin a versioned
- *   object** — an owned or receiving input, or a gas coin. Bytes that pin
- *   nothing (gas from an address balance; pure, shared and `FundsWithdrawal`
- *   inputs) release it before signing, so address-balance transactions from
- *   one sender are sent and awaited concurrently.
+ *   object or carry a gas payment** — an owned or receiving input, a gas coin,
+ *   or a coin reservation. A coin reservation is what a recipe that uses
+ *   `tx.gas` gets when its payer has an address balance, and it reserves the
+ *   payer's **whole** SUI balance as of the build: a spend landing before it is
+ *   sent makes the node refuse it. So it holds the lock, and a run that uses
+ *   `tx.gas` first waits, before it builds, for the lock-free runs in flight on
+ *   its payer. Bytes that pin nothing (an empty payment, gas drawn from the
+ *   address balance at execution; pure, shared and `FundsWithdrawal` inputs)
+ *   release it before signing, so address-balance transactions from one sender
+ *   are sent and awaited concurrently.
  * - `"always"`: from build through submit on every run, the rule before 0.4.0.
  * - `"never"`: no lock at all.
+ *
+ * A config provided directly rather than through `SubmitConfig.with` may still
+ * hold the pre-0.4.0 boolean or another value: `Tx.run` reads `true` as
+ * `"always"`, `false` as `"never"`, and anything else as `"always"`.
  *
  * @since 0.4.0
  */

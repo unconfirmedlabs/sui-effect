@@ -1861,8 +1861,14 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
   /**
    * Refuses, the way a node does, an execution its balances cannot fund: an
    * empty gas payment the payer's SUI address balance does not cover (budget
-   * plus the SUI it withdraws from the payer), a `FundsWithdrawal` its
-   * source's balance does not cover, and an empty payment with neither an
+   * plus the SUI it withdraws from the payer), a coin reservation in the
+   * payment whose amount plus the SUI the bytes withdraw from the payer is more
+   * than the payer's SUI address balance **now** (a reservation is the
+   * resolver's read of the whole balance at build time, so any spend that
+   * lands between its build and its send makes it stale, and a node refuses it
+   * at submit with the same "Invalid withdraw reservation" text), a
+   * `FundsWithdrawal` its source's balance does not cover, and an empty
+   * payment with neither an
    * address-owned input nor a `ValidDuring`/`Validity` expiration (nothing
    * would stop it replaying).
    */
@@ -1873,6 +1879,12 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     const withdrawals = withdrawalsOf(data)
     if (payment.length === 0 && budget > 0n && payer !== null && payer !== undefined) {
       const required = budget + suiWithdrawalsFrom(data, payer)
+      const available = addressBalanceOf(payer, SUI_TYPE_ARG)
+      if (available < required) insufficient(SUI_TYPE_ARG, normalizeSuiAddress(payer), required, available)
+    }
+    const reservation = payment.find(isReservationRef)
+    if (reservation !== undefined && payer !== null && payer !== undefined) {
+      const required = reservedAmountOf(reservation) + suiWithdrawalsFrom(data, payer)
       const available = addressBalanceOf(payer, SUI_TYPE_ARG)
       if (available < required) insufficient(SUI_TYPE_ARG, normalizeSuiAddress(payer), required, available)
     }

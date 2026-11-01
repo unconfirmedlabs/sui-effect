@@ -149,12 +149,19 @@ package did not. Several signatures and one stored shape change; read
   `false` is `"never"`.
 - **The sender lock defaults to `"whenPinned"`.** `Tx.run` holds it for every
   build, and through signing, `onSigned` and submission only when the built
-  bytes pin an owned or receiving input or a gas coin. Address-balance runs
+  bytes pin an owned or receiving input or carry a gas payment ref (a gas coin,
+  or the coin reservation a `tx.gas` user paying from a balance gets: it
+  reserves the payer's whole balance as of the build, so such a run also waits,
+  under the lock, for the lock-free runs in flight on its payer before it
+  builds). Address-balance runs
   from one sender are no longer serialized through submission (on localnet ten
   `Tx.sendFunds` runs took 1,044 ms against 8,069 ms under `"always"`), and a
   sponsored run with no owned input holds no lock past its build. Lock-free
-  runs can together overdraw a balance: the overdrawing one executes as
-  `ExecutionFailed` (`InsufficientFundsForWithdraw`, no gas charged).
+  runs can together overdraw a balance, gas budgets counted in full: a
+  shortfall already there at submission is a node refusal (`INVALID_ARGUMENT`,
+  journaled `NotApplied { evidence: "refused" }`), one that arises in flight
+  executes the overdrawing run as `ExecutionFailed`
+  (`InsufficientFundsForWithdraw`, no gas charged).
 - **The explicit-empty-payment check counts withdrawals and expirations.** An
   explicit empty gas payment (`Tx.sponsored`, `gasPayment:
   "requireAddressBalance"`) now needs the payer's SUI address balance to cover
@@ -353,8 +360,8 @@ package did not. Several signatures and one stored shape change; read
   seeded from `FakeScript.balances[].addressBalance`;
   `SuiTest.setAddressBalance(owner, amount, coinType?)` sets one and
   `SuiTest.addressBalance(owner, coinType?)` reads it. Like a node, the fake
-  refuses with `INVALID_ARGUMENT` an empty payment or a withdrawal the balance
-  cannot cover and empty-payment bytes with no owned input and no `ValidDuring`
+  refuses with `INVALID_ARGUMENT` an empty payment, a coin reservation or a
+  withdrawal the balance cannot cover and empty-payment bytes with no owned input and no `ValidDuring`
   expiration.
 - `test/live.localnet.test.ts`, behind `SUI_LOCALNET=1`: folding a faucet
   account to zero coins, concurrent sends from one sender, a sponsor's balance

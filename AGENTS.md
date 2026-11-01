@@ -226,13 +226,16 @@ fresh `Transaction` before any lock is taken, so a gas owner it sets
 paid with coins** — an empty payment selects no coin, so one sponsor can pay for
 many senders concurrently. **The lock is `whenPinned`** (`SubmitConfig.lockSender`
 default): every build runs under it, and signing, `onSigned` and submission stay
-under it only when the bytes pin an owned/receiving input or a gas coin (a
-coin-reservation ref pins nothing); otherwise it is released before signing, so
-address-balance transactions from one sender run concurrently (span attribute
-`sui.sender_lock`: `held`, `build`, `none`). Lock-free runs can overdraw a
-balance — the overdrawing one executes as `ExecutionFailed`
-(`InsufficientFundsForWithdraw`, no gas) — so a spend-to-zero flow sets
-`"always"`. `Tx.submit` waits for visibility before returning, and so before
+under it only when the bytes pin an owned/receiving input or carry any gas
+payment ref — a gas coin **or a coin reservation**, which reserves the payer's
+whole balance as of the build, so a `tx.gas` run also waits, under the lock, for
+the lock-free runs in flight on its payer before it builds; otherwise it is
+released before signing, so address-balance transactions from one sender run
+concurrently (span attribute `sui.sender_lock`: `held`, `build`, `none`).
+Lock-free runs can overdraw a balance (budgets count in full) — refused at
+submission when the shortfall is already there, else the overdrawing one
+executes as `ExecutionFailed` (`InsufficientFundsForWithdraw`, no gas) — so a
+spend-to-zero flow sets `"always"`. `Tx.submit` waits for visibility before returning, and so before
 releasing a lock it holds.
 
 `NotApplied` needs evidence that is checked twice: `"expired"` is
@@ -288,7 +291,7 @@ Every failure is one flat tag; there is no error inheritance.
 | `NetworkMismatch` | The node is on another chain than the layer was built for. |
 | `DecodeError` | BCS content or a schema boundary did not decode. `kind` is `"type"` (tag mismatch, nothing parsed; `actualType` says what it was), `"bytes"` (BCS parse or trailing bytes) or `"shape"` (a domain schema). Every producer sets it; consumers branch on it, never on `issue`. |
 | `SimulationFailed` | Simulation reported an execution failure. No gas charged. Carries `command` when the node named one. |
-| `ExecutionFailed` | Applied on chain and failed. Gas charged. |
+| `ExecutionFailed` | Applied on chain and failed. Gas charged (none for `InsufficientFundsForWithdraw`, an overdrawn balance). |
 | `SubmissionUnknown` | Bytes may have been sent; the outcome is unknown. Carries the signed bytes, unless it came from reconciling a bare digest. |
 | `NotApplied` | Provably never applied. `expired`: the expiry window was observed closed and the transaction missing, twice, `reconcileRecheck` apart. `inputConsumed`: a **different** transaction's own effects report `inputVersion` equal to the version the bytes pinned. `refused`: the node refused the first send outright (`INVALID_ARGUMENT`), or a `submitVia` sender error declared `not_applied`. An input that merely moved on is not evidence. |
 | `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` / `UnexpectedEffects` | Signing; building (including resolver refusals and an address balance below the budget); preflight policy and the gas ceiling (`rule: "maxGasBudget"`); the journal; and effects that did not contain what was expected. |

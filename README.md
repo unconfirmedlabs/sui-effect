@@ -350,7 +350,10 @@ at the same version. Bytes that pin nothing — gas from the address balance,
 inputs that are pure values, shared objects or balance withdrawals — cannot
 race anything once they exist, so under the default, `"whenPinned"`, `Tx.run`
 takes the lock for **every build** and keeps it through signing and submission
-only when the built bytes pin something; address-balance transactions from one
+only when the built bytes pin something (an owned input, a gas coin, or a coin
+reservation — the whole balance a `tx.gas` user's gas is drawn from, which is
+why such a run also waits for the lock-free runs in flight before it builds);
+address-balance transactions from one
 sender are signed, sent and awaited concurrently (on localnet ten
 `Tx.sendFunds` runs from one sender took 1,044 ms, against 8,069 ms under
 `"always"`). The span attribute `sui.sender_lock` says which happened (`"held"`
@@ -359,7 +362,10 @@ submit on every run; `"never"` takes none. `true` and `false` are still accepted
 and mean `"always"` and `"never"`.
 
 **Lock-free runs can overdraw.** Two of them can together withdraw more than
-the balance holds; the node executes the one that overdraws as a failure
+the balance holds, gas budgets counted in full. When the shortfall is there as
+the bytes are submitted the node refuses them (`INVALID_ARGUMENT`, a
+`TransportError`, journaled `NotApplied { evidence: "refused" }`); when it
+arises in flight the node executes the one that overdraws as a failure
 (`InsufficientFundsForWithdraw`, no gas charged), which is `ExecutionFailed`. A
 flow that spends a balance down to zero sets `lockSender: "always"`, as above.
 
@@ -577,7 +583,7 @@ no error inheritance to match on.
 | `NetworkMismatch` | `expected`, `actual` | The node is on another chain than the layer was built for |
 | `DecodeError` | `objectId?`, `expectedType?`, `actualType?`, `kind`, `issue` | BCS content or a schema boundary did not decode. `kind` is `"type"` (the Move type was not the one expected — nothing was parsed, and the one a caller may answer with a 404), `"bytes"` (the BCS parse failed: a layout mismatch, never safe to swallow) or `"shape"` (a domain schema refused a parsed or JSON value). Branch on `kind`, never on `issue`, whose wording changes between releases |
 | `SimulationFailed` | `reason`, `message`, `command?` | Simulation reported an execution failure. No gas charged |
-| `ExecutionFailed` | `digest`, `reason`, `command?`, `effects` | Applied on chain and failed. Gas charged |
+| `ExecutionFailed` | `digest`, `reason`, `command?`, `effects` | Applied on chain and failed. Gas charged (none for `InsufficientFundsForWithdraw`, an overdrawn balance) |
 | `SubmissionUnknown` | `digest`, `signed?`, `cause` | Bytes may have been sent; the outcome is unknown. Carries them, unless it came from reconciling a bare digest |
 | `NotApplied` | `digest`, `evidence: "expired" \| "inputConsumed" \| "refused"` | Provably never applied, and never will be. `refused` is a node's `INVALID_ARGUMENT` on the first send, or a `submitVia` sender error that declared `not_applied` |
 | `SigningError` | `cause` | A signer refused or failed |

@@ -22,7 +22,7 @@ import { fromBase58, normalizeStructTag, normalizeSuiAddress, SUI_TYPE_ARG } fro
 
 /** The shape `Transaction#setExpiration` accepts, which the SDK does not export. */
 type SdkExpiration = NonNullable<Parameters<Transaction["setExpiration"]>[0]>
-import { Clock, DateTime, Duration, Effect, Option, Result, Schema } from "effect"
+import { Clock, DateTime, Duration, Effect, Option, Result, Schema, Scope, Semaphore } from "effect"
 import {
   BuildError,
   ExecutionFailed,
@@ -62,7 +62,7 @@ import type { Signer } from "./Signer.ts"
 import type { FoldPlan } from "./Fold.ts"
 import { fold, planFold, sendFunds } from "./Fold.ts"
 import { forgetEntry, recordEntry } from "./RunRecord.ts"
-import type { SubmitConfigService } from "./SubmitConfig.ts"
+import type { LockSenderPolicy, SubmitConfigService } from "./SubmitConfig.ts"
 import { SubmitConfig } from "./SubmitConfig.ts"
 import type { Recipe } from "./Sui.ts"
 import { Sui } from "./Sui.ts"
@@ -628,17 +628,138 @@ const suiWithdrawalsFrom = (data: TransactionDataBuilder, payer: string): bigint
 }
 
 /**
- * Whether bytes pin a versioned object: an owned or receiving input, or a gas
- * coin (a coin reservation is not one). This is what decides, under
- * `lockSender: "whenPinned"`, whether `Tx.run` keeps the sender lock through
- * signing and submission. Bytes this version cannot read answer `true`, which
- * keeps the lock. Never fails.
+ * Whether, under `lockSender: "whenPinned"`, `Tx.run` keeps the sender lock
+ * through signing and submission for these bytes: they have an owned or
+ * receiving input, or **any** gas payment — a coin, or a coin reservation.
+ *
+ * A coin reservation is not a pinned *reference* (reconcile leaves it out, see
+ * {@link gasPaymentOf}), but it is not harmless either: the resolver gives a
+ * `tx.gas` user whose payer has an address balance a reservation of that
+ * **whole** balance as read at build time. A spend from the balance that lands
+ * after the build makes it stale, and the node refuses it at submit
+ * (`INVALID_ARGUMENT`, "Invalid withdraw reservation"); one in flight beside it
+ * makes one of the two execute as `InsufficientFundsForWithdraw`. So only an
+ * empty payment — gas from the balance, drawn at execution — releases the lock.
+ * Bytes this version cannot read answer `true`, which keeps the lock. Never
+ * fails.
  */
-const pinsAnything = (bytes: Uint8Array): boolean =>
+const keepsSenderLock = (bytes: Uint8Array): boolean =>
   Option.match(dataOfBytes(bytes), {
     onNone: () => true,
-    onSome: (data) => ownedInputsOf(data).length > 0 || gasPaymentOf(data).length > 0
+    onSome: (data) => ownedInputsOf(data).length > 0 || (data.gasData.payment ?? []).length > 0
   })
+
+/**
+ * `SubmitConfig.lockSender` as one of the three policies, whatever was
+ * provided. `SubmitConfig.with` maps the pre-0.4.0 booleans, but a config
+ * provided directly (`Effect.provideService`), a JavaScript caller or a value
+ * stored before 0.4.0 can still hold `true` / `false` or something else:
+ * `true` is `"always"`, `false` is `"never"`, and anything unrecognized is
+ * `"always"`, the safe one. Never fails.
+ */
+const lockSenderPolicyOf = (value: unknown): LockSenderPolicy => {
+  if (value === "whenPinned" || value === "always" || value === "never") return value
+  if (value === false) return "never"
+  return "always"
+}
+
+/**
+ * The lock-free `Tx.run`s in flight on one address, as permits taken from a
+ * semaphore with {@link IN_FLIGHT_PERMITS} of them, and how many runs hold a
+ * reference to this entry (so an idle address is dropped).
+ */
+interface InFlight {
+  readonly semaphore: Semaphore.Semaphore
+  refs: number
+}
+
+/**
+ * Permits per address: one per lock-free run, all of them to drain. Far more
+ * than any process has runs in flight.
+ */
+const IN_FLIGHT_PERMITS = Number.MAX_SAFE_INTEGER
+
+/**
+ * The in-flight registries, one per sender-lock map. Keyed by the
+ * `withSenderLock` function itself, which every spread of one `Sui` shares
+ * (and which `SuiExtension`'s process-wide face lock shares across clients),
+ * so every `Tx.run` that serializes on the same locks sees the same runs in
+ * flight. A `WeakMap`, so a dropped `Sui` takes its registry with it.
+ */
+const IN_FLIGHT = new WeakMap<object, Map<string, InFlight>>()
+
+const inFlightRegistryOf = (key: object): Map<string, InFlight> => {
+  let registry = IN_FLIGHT.get(key)
+  if (registry === undefined) {
+    registry = new Map()
+    IN_FLIGHT.set(key, registry)
+  }
+  return registry
+}
+
+/**
+ * A reference to `address`'s in-flight entry until the scope closes, creating
+ * it on first use. The last reference out deletes it, so a sponsor serving
+ * thousands of senders holds entries only for the ones with a run in flight.
+ */
+const inFlightEntry = (
+  registry: Map<string, InFlight>,
+  address: string
+): Effect.Effect<InFlight, never, Scope.Scope> => {
+  const key = normalizeSuiAddress(address)
+  return Effect.acquireRelease(
+    Effect.sync(() => {
+      let entry = registry.get(key)
+      if (entry === undefined) {
+        entry = { semaphore: Semaphore.makeUnsafe(IN_FLIGHT_PERMITS), refs: 0 }
+        registry.set(key, entry)
+      }
+      entry.refs += 1
+      return entry
+    }),
+    (entry) =>
+      Effect.sync(() => {
+        entry.refs -= 1
+        if (entry.refs === 0 && registry.get(key) === entry) registry.delete(key)
+      })
+  )
+}
+
+/**
+ * Registers a lock-free run as in flight on each address until the scope
+ * closes. Each step adds its own release to the scope as it acquires —
+ * `acquireRelease` and `takeScoped` both do so in one uninterruptible step —
+ * so success, failure and interruption all return the permit. Never fails.
+ */
+const registerInFlight = (
+  registry: Map<string, InFlight>,
+  addresses: ReadonlyArray<string>
+): Effect.Effect<void, never, Scope.Scope> =>
+  Effect.forEach(
+    [...new Set(addresses.map((address) => normalizeSuiAddress(address)))],
+    (address) => Effect.flatMap(inFlightEntry(registry, address), (entry) => entry.semaphore.takeScoped(1)),
+    { discard: true }
+  )
+
+/**
+ * Waits until no lock-free run is in flight on `address`: takes every permit
+ * and gives them straight back. Called with the build locks held, so a run on
+ * this address cannot register in the meantime through its own build; one paid
+ * by this address for another sender (`Tx.sponsored`, which takes only the
+ * sender's lock) can, and is then simply not waited for. An interrupted wait
+ * leaves the queue, so nothing leaks. Never fails.
+ */
+const drainInFlight = (registry: Map<string, InFlight>, address: string): Effect.Effect<void> =>
+  Effect.suspend(() =>
+    registry.has(normalizeSuiAddress(address))
+      ? Effect.scoped(
+        Effect.flatMap(
+          inFlightEntry(registry, address),
+          (entry) => entry.semaphore.withPermits(IN_FLIGHT_PERMITS)(Effect.void)
+        )
+      )
+      : Effect.void
+  )
 
 /**
  * The statuses with which a node refuses to **resolve** a transaction: the
@@ -1222,8 +1343,11 @@ export const cosign = Effect.fn("Tx.cosign")(function*(
  * owner's coins are then selected under its sender lock). `Tx.foldCoins` with
  * the sponsor's signer deposits its coins.
  *
- * A sponsored transaction with no owned input pins nothing, so `Tx.run` sends
- * it without holding either party's lock past the build.
+ * A sponsored transaction with no owned input pins nothing — its payment is
+ * empty, so it carries no coin and no coin reservation — and `Tx.run` sends it
+ * without holding either party's lock past the build. It is in flight on both
+ * parties until it settles, so the sponsor's own `tx.gas` runs wait for it
+ * before they build (one that starts building first is not stopped by it).
  *
  * Never fails; the recipe it returns throws only if the recipe it wraps does,
  * which `Tx.build` reports as `BuildError`.
@@ -2754,14 +2878,35 @@ const assertSponsor = (
  * one of them will fail on chain. Under `SubmitConfig.lockSender: "whenPinned"`
  * (the default) `Tx.run` holds the sender lock for **every build**, and on
  * through signing and submission **only when the built bytes pin** an owned or
- * receiving input or a gas coin. Bytes that pin nothing — gas from an address
- * balance, inputs that are pure values, shared objects or withdrawals — are
- * signed and sent with the lock released, so address-balance transactions from
- * one sender run concurrently, serialized only for the length of a build. The
- * span attribute `sui.sender_lock` says which happened (`"held"`, `"build"`).
- * `"always"` holds the lock from build through submit on every run (the rule
- * before 0.4.0), `"never"` takes none. This is the whole reason to prefer
- * `Tx.run` over calling the steps separately.
+ * receiving input or carry any gas payment — a gas coin **or a coin
+ * reservation**. Bytes that pin nothing — an empty payment (gas from an address
+ * balance, drawn at execution), inputs that are pure values, shared objects or
+ * withdrawals — are signed and sent with the lock released, so address-balance
+ * transactions from one sender run concurrently, serialized only for the length
+ * of a build. The span attribute `sui.sender_lock` says which happened
+ * (`"held"`, `"build"`; `"none"` under `"never"`). `"always"` holds the lock
+ * from build through submit on every run (the rule before 0.4.0), `"never"`
+ * takes none. This is the whole reason to prefer `Tx.run` over calling the
+ * steps separately.
+ *
+ * **A coin reservation reserves the payer's whole SUI address balance as of the
+ * build.** That is what the resolver gives a recipe that uses `tx.gas` when its
+ * payer has an address balance (on an account with no SUI coins, the payment is
+ * the reservation alone). Any spend from that balance landing between the build
+ * and the send makes the node refuse it at submit (`INVALID_ARGUMENT`, "Invalid
+ * withdraw reservation", which escapes as `TransportError`), and one in flight
+ * beside it makes one of them execute as `InsufficientFundsForWithdraw`. So such
+ * a run holds the lock through submission, and a run whose recipe uses `tx.gas`
+ * first waits — holding its locks, before it builds — until no lock-free run is
+ * in flight on its payer (the gas owner when it is someone else, else the
+ * sender). A lock-free run counts as in flight on its sender and its gas owner
+ * from just before it releases the lock until it settles, fails or is
+ * interrupted. Residual: a reservation that appears only after the build — an
+ * SDK intent such as `tx.coin({ balance })` that fell back to splitting
+ * `tx.gas` — holds the lock but did not wait, and a sponsored address-balance
+ * run (which takes only its sender's lock) can still start drawing on its
+ * sponsor's balance while that sponsor's own `tx.gas` run builds. A flow that
+ * must never see either uses `lockSender: "always"`.
  *
  * Lock-free runs can together withdraw more than one balance holds; the node
  * then executes the one that overdraws as a failure (`InsufficientFundsForWithdraw`,
@@ -2897,7 +3042,7 @@ export const run = Effect.fn("Tx.run")(function*(
     ...(opts.gasOwner === undefined ? {} : { gasOwner: opts.gasOwner })
   })
   // Everything after the build, which is what `"whenPinned"` runs outside the
-  // lock when the bytes pin nothing.
+  // lock when the bytes pin nothing and pay from an empty payment.
   const finish = (built: Built) =>
     Effect.gen(function*() {
       const preflight = config.preflight
@@ -2923,7 +3068,7 @@ export const run = Effect.fn("Tx.run")(function*(
       effect
     )
 
-  switch (config.lockSender) {
+  switch (lockSenderPolicyOf(config.lockSender)) {
     case "never": {
       yield* Effect.annotateCurrentSpan({ "sui.sender_lock": "none" })
       return yield* Effect.flatMap(buildIt, finish)
@@ -2934,22 +3079,36 @@ export const run = Effect.fn("Tx.run")(function*(
     }
     case "whenPinned": {
       // Every build under the lock: whether the bytes will pin a coin or an
-      // owned object is known only once the resolver has chosen. The lock is
-      // kept through submission only when they do; bytes that pin nothing —
-      // address-balance gas, pure, shared and withdrawal inputs — cannot race
-      // another run, so they are signed and sent with the lock released.
-      const step = yield* withLocks(Effect.gen(function*() {
-        const built = yield* buildIt
-        if (pinsAnything(built.bytes)) {
-          return { _tag: "Executed" as const, executed: yield* finish(built) }
-        }
-        return { _tag: "Built" as const, built }
+      // owned object, or carry a coin reservation, is known only once the
+      // resolver has chosen. The lock is kept through submission only when
+      // they do; bytes with an empty payment and pure, shared and withdrawal
+      // inputs cannot race another run's build, so they are signed and sent
+      // with the lock released — and registered as in flight, so that a
+      // `tx.gas` run, whose reservation would take the whole balance as of its
+      // build, waits for them first.
+      const registry = inFlightRegistryOf(sui.withSenderLock)
+      const drainsPayer = usesGasCoin(tx)
+      // The scope the in-flight registration lives in: this one, not the one
+      // `Sui.withSenderLock` opens around its effect, which closes when the
+      // lock is released — exactly when the run starts being in flight.
+      return yield* Effect.scoped(Effect.gen(function*() {
+        const scope = yield* Effect.scope
+        const step = yield* withLocks(Effect.gen(function*() {
+          if (drainsPayer) yield* drainInFlight(registry, payer ?? sender)
+          const built = yield* buildIt
+          if (keepsSenderLock(built.bytes)) {
+            return { _tag: "Executed" as const, executed: yield* finish(built) }
+          }
+          // Still under the lock, so a drainer holding it cannot miss this run.
+          yield* Scope.provide(scope)(registerInFlight(registry, [sender, ...signersOfBytes(built.bytes)]))
+          return { _tag: "Built" as const, built }
+        }))
+        // On `Tx.run`'s own span: inside the lock the current span is
+        // `Sui.withSenderLock`'s.
+        yield* Effect.annotateCurrentSpan({ "sui.sender_lock": step._tag === "Executed" ? "held" : "build" })
+        if (step._tag === "Executed") return step.executed
+        return yield* finish(step.built)
       }))
-      // On `Tx.run`'s own span: inside the lock the current span is
-      // `Sui.withSenderLock`'s.
-      yield* Effect.annotateCurrentSpan({ "sui.sender_lock": step._tag === "Executed" ? "held" : "build" })
-      if (step._tag === "Executed") return step.executed
-      return yield* finish(step.built)
     }
   }
 })
@@ -3152,8 +3311,9 @@ export interface FoldResult {
  * for `signer.address`, then one {@link run} of {@link fold} per batch, in
  * order — SUI first, paying for its own fold, so a fresh account whose SUI is
  * all coins needs no address balance to start. Afterwards gas comes from the
- * balance, and transactions that pin nothing else run without holding the
- * sender lock past their build.
+ * balance, and transactions that pin nothing else and do not use `tx.gas` run
+ * without holding the sender lock past their build (one that uses `tx.gas` is
+ * paid with a reservation of the whole balance, which holds it).
  *
  * Each batch pins its coins, so it runs under the sender lock. It stops at the
  * first batch that fails, with that failure; the batches before it executed and
