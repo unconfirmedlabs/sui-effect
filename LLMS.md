@@ -4908,7 +4908,9 @@ zeroes the keypair's own copy where the SDK keeps one, and releases the
 keypair. Afterwards both members fail with `SigningError { reason:
 "locked" }`; there is no unlock — open the account again (`Keystore.unlock`,
 `Signer.fromMnemonic`) for a new signer. `lock` is idempotent and never
-fails.
+fails. A `lock` racing a signature cannot land mid-signature: the signature
+either answers by the real key (it was computed before the lock) or fails
+with `reason: "locked"`.
 
 A `LockableSigner` **is** a `Signer`: every function that takes a signer
 takes this one, and it carries no secret either — the keypair lives in a
@@ -6406,8 +6408,8 @@ owner with no coins answers an empty plan with nothing executed.
 shown and it is not re-planned — `coinType` and `maxCoinsPerTransaction` are
 then ignored — so what runs is exactly what was previewed; a coin in it that
 has moved since fails that batch's build with `BuildError`, as any pinned
-input does. A plan for another owner is a `BuildError` before anything
-runs. `approve` is `Tx.run`'s, once per batch, shown the batch beside the
+input does. A plan for another owner — the plan's or any batch's — is a
+`BuildError` before anything runs. `approve` is `Tx.run`'s, once per batch, shown the batch beside the
 prepared transaction: `foldMovement` of the two is what the fold
 moves from coins into the balance, which the simulation's balance changes
 alone do not show.
@@ -7621,6 +7623,13 @@ probabilities into a refusal. With no screen configured the claims check
 stands alone and the verdict is `Unscreened`. `SubmitConfig.preflight` is
 not run here; `Tx.run` runs it on the same simulate.
 
+**Whose transaction it is comes from the bytes.** The sender and gas owner
+the claims are checked for are the ones `built.bytes` name, and a value whose
+`digest`, `sender` or `gasOwner` field disagrees with its bytes (spread from
+another build, decoded from a queue) is refused as `intent.invalid`; a
+`built.simulation` is reused only when `Tx.build` made it in this process
+for the digest of these bytes.
+
 The answer is structurally a `Built`, so it goes straight to `Tx.sign`. The
 explicit lifecycle is not gated: `Tx.sign` takes any `Built`, so a caller
 assembling `build`/`sign`/`submit` by hand calls this itself.
@@ -7630,8 +7639,12 @@ the node had; a package that branches on a shared object, the clock or
 randomness can behave differently when the bytes land. The claims bound what
 was simulated, not what will execute.
 
+Gas is not counted because it is bounded: bytes whose budget is over
+`SubmitConfig.maxGasBudget` are refused (`maxGasBudget`) before the
+simulate, as `Tx.build` refuses them, whoever built them.
+
 Every refusal is a `PolicyDenied` whose `rule` says which check:
-`intent.invalid`, `intent.outflow`, `intent.recipient`, `intent.object`,
+`maxGasBudget`, `intent.invalid`, `intent.outflow`, `intent.recipient`, `intent.object`,
 `gate.unavailable`, `intent.injection`, `intent.vague`, `intent.effect`,
 `intent.claim`.
 
@@ -7735,8 +7748,11 @@ a spurious read and never a missing entry:
   entry, and clears the marker again (each clear a `has`, and a `remove`
   only when it exists). A crash after the first clear leaves an unmarked
   terminal entry, which the next listing reads once and marks.
-- a terminal `put` writes the entry, then the marker. A crash between them
-  leaves an unmarked terminal entry, read once and marked.
+- a terminal `put` writes the entry, then the marker, then reads the entry
+  back and removes the marker unless the read confirms a terminal entry —
+  so an unresolved `put` of the same digest from another writer that lands
+  between the two writes stays listed. A crash between the entry and the
+  marker leaves an unmarked terminal entry, read once and marked.
 - a listing that reads an unmarked terminal entry marks it, reads the entry
   again and takes the marker back if the entry is no longer terminal — the
   other half of the second clear above, so a listing racing a fresh `Signed`
@@ -7745,14 +7761,23 @@ a spurious read and never a missing entry:
 
 Nothing is read-modify-written: two fibers, two layer instances, two
 processes over one store do not lose each other's entries. Two writers that
-put the **same** digest at once still race, and the last `set` wins; the
-lifecycle never does that, because one submission is one fiber.
+put the **same** digest at once still race for the entry, and the last
+`set` wins; that happens when another context's `Tx.reconcileAll` writes
+`Unknown` (or re-sends) for a `Signed` entry this one is settling. A marker
+is never left over an unresolved entry by that race, **except** when the
+settling process dies (or its `remove` fails) between its marker write and
+its re-read while the other writer's whole `put` landed just before the
+marker write: then the entry is hidden from listings (never from `get`)
+until it is written again. Closing that needs a compare-and-set.
 
 **A store 0.4 wrote needs no migration.** It has entries and no markers, and
 an unmarked entry is always read, so the first listing is the 0.4 scan and
 marks every settled entry it finds; the second reads only the unresolved
-ones. Rolling back to 0.4 is safe: 0.4 reads only `entry:` keys and ignores
-the markers. **Running a 0.4 writer beside this one is not**, in one case: a
+ones. Rolling back to 0.4 is safe for 0.4: it reads only `entry:` keys and
+ignores the markers. **Rolling forward again is not, after 0.4 wrote**: a
+0.4 process that put an unresolved entry over a digest 0.5 had settled left
+0.5's marker in place, so delete every `settled:` key (or drain the journal
+with `Tx.reconcileAll` on 0.4) before a 0.5 process lists the store again. **Running a 0.4 writer beside this one is not**, in one case: a
 0.4 process that writes an unresolved entry over a digest this journal had
 settled leaves the marker in place, and the entry is hidden from
 `listUnresolved` (not from `get`). The lifecycle re-signs a settled digest
@@ -7921,7 +7946,8 @@ Re-exported from `@unconfirmed/sui-effect`.
 export declare class Keystore extends Keystore_base {
     /**
      * The service over the `KeyValueStore` in context, for an application that
-     * builds its own layer. No floor on `iterations`. Never fails.
+     * builds its own layer. **Throws** a `RangeError` for `iterations` that is
+     * not an integer in `[1 000, 10 000 000]`; the effect never fails.
      */
     static readonly make: (options?: KeystoreOptions) => Effect.Effect<KeystoreService, never, KeyValueStore.KeyValueStore>;
     /** See `sealer`: a `SecretSealer` (for `ZkLogin.save`/`load`) in the keystore's format. */
@@ -7932,9 +7958,10 @@ export declare class Keystore extends Keystore_base {
      * The keystore over the `KeyValueStore` in context. Builds without reading
      * anything.
      *
-     * **Throws** a `RangeError` when `options.iterations` is not an integer of at
-     * least `MIN_LAYER_ITERATIONS` — a configuration mistake that would
-     * make every record cheap to brute-force. Otherwise never fails.
+     * **Throws** a `RangeError` when `options.iterations` is not an integer from
+     * `MIN_LAYER_ITERATIONS` to 10 000 000 — fewer would make every
+     * record cheap to brute-force, more would seal records `unlock` refuses.
+     * Otherwise never fails.
      */
     static readonly layer: (options?: KeystoreOptions) => Layer.Layer<Keystore, never, KeyValueStore.KeyValueStore>;
     /**
@@ -8027,8 +8054,9 @@ export interface KeystoreOptions {
     readonly prefix?: string;
     /**
      * PBKDF2-SHA256 iterations for records sealed from now on (existing records
-     * keep their own until `changePassword`). Default `DEFAULT_ITERATIONS`;
-     * `Keystore.layer` refuses fewer than `MIN_LAYER_ITERATIONS`.
+     * keep their own until `changePassword`). Default `DEFAULT_ITERATIONS`.
+     * An integer of at most 10 000 000; `Keystore.layer` refuses fewer than
+     * `MIN_LAYER_ITERATIONS`, `Keystore.make` fewer than 1 000.
      */
     readonly iterations?: number;
 }
@@ -8043,8 +8071,9 @@ export interface KeystoreService {
     /**
      * Every account, oldest first. Reads no secret and needs no password.
      *
-     * Fails with: `KeystoreError` (`storage`; `corrupt` or `unsupported` when a
-     * record does not decode as a version this release reads).
+     * Fails with: `KeystoreError` (`storage`; `unsupported` when a record is a
+     * newer format version or names a KDF or cipher this release does not know,
+     * `corrupt` when it otherwise does not decode).
      */
     readonly list: Effect.Effect<ReadonlyArray<KeystoreAccount>, KeystoreError>;
     /**
@@ -8106,7 +8135,10 @@ export interface KeystoreService {
     readonly remove: (address: SuiAddress) => Effect.Effect<void, KeystoreError>;
     /**
      * Re-seals one account under a new password, with a fresh salt and IV and
-     * the layer's current iteration count.
+     * the layer's current iteration count. The new record is opened under the
+     * new password (one more PBKDF2 derivation) before it is written, so a
+     * re-seal that does not open never replaces the stored record; that failure
+     * is `corrupt` and leaves the store as it was.
      *
      * Fails with: `KeystoreError` (`wrongPassword`, `invalidPassword`,
      * `notFound`, `corrupt`, `unsupported`, `unavailable`, `storage`).
@@ -8174,8 +8206,11 @@ declare const SealedKey: Schema
 One sealed account as stored, version 1. Every byte field is standard
 base64; `createdAt` is epoch milliseconds from the Effect `Clock`.
 
-Only `label` is outside the AAD, so it is the one field that may be edited
-in place; every other edit makes the record `corrupt`.
+The AAD binds `address`, `scheme`, `source` and `path` (an absent `path`
+and `path: ""` are the same AAD); an edit to one of them, to the `iv` or to
+the ciphertext is `corrupt`. `label` and `createdAt` are outside it and may
+be edited in place. An edited `salt`, `iterations` or `check` derives a
+check value that does not match, so it reads as `wrongPassword`.
 
 ### `SealedSecret` (const)
 
@@ -8222,8 +8257,9 @@ The password is held by the sealer for as long as the sealer lives: make
 one when the person unlocks and drop it when they lock. Each `seal` and
 `unseal` costs one PBKDF2 derivation.
 
-**Throws** a `RangeError` when `options.iterations` is not an integer of at
-least `MIN_LAYER_ITERATIONS`, `Keystore.layer`'s floor. Its members
+**Throws** a `RangeError` when `options.iterations` is not an integer from
+`MIN_LAYER_ITERATIONS` to 10 000 000, `Keystore.layer`'s bounds
+(`unseal` refuses a blob naming more than 10 000 000). Its members
 fail with: `SigningError` — `reason: "locked"` for a wrong password,
 `reason: "unavailable"` without WebCrypto, and no reason for an empty
 password, an empty secret or a blob that was edited, moved or is not one.
