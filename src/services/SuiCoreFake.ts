@@ -665,6 +665,8 @@ interface Mutable {
   ledger: Array<string>
   /** The sender and Move calls of each executed transaction, read off its bytes. */
   executedMeta: Map<string, { readonly sender?: string; readonly moveCalls: ReadonlyArray<string> }>
+  /** The bytes of every transaction the fake executed, by digest: what a `bcs` include serves. */
+  executedBytes: Map<string, Uint8Array>
 }
 
 /** What a settled call produced, kept so `getTransaction` can serve it again. */
@@ -672,6 +674,8 @@ interface SettledTransaction {
   readonly transaction: SuiClientTypes.Transaction<SuiClientTypes.TransactionInclude>
   readonly failed: boolean
   readonly commandResults: ReadonlyArray<SuiClientTypes.CommandResult>
+  /** The scripted `FakeExecution.sender`, for a transaction the fake did not execute from bytes. */
+  readonly sender?: string
 }
 
 const DEFAULT_GAS: SuiClientTypes.GasCostSummary = {
@@ -855,6 +859,26 @@ const executionToTransaction = (
     transaction: undefined,
     bcs: undefined
   } as unknown as SuiClientTypes.Transaction<SuiClientTypes.TransactionInclude>
+}
+
+/**
+ * The smallest transaction data that names `sender`: an empty programmable
+ * transaction paid from the sender's balance. What a `bcs` include serves for
+ * a transaction scripted with a `sender` and no bytes.
+ */
+const transactionDataNaming = (sender: string): Uint8Array | undefined => {
+  try {
+    return bcs.TransactionData.serialize({
+      V1: {
+        kind: { ProgrammableTransaction: { inputs: [], commands: [] } },
+        sender,
+        gasData: { payment: [], owner: sender, price: "1000", budget: "1000000" },
+        expiration: { None: true }
+      }
+    }).toBytes()
+  } catch {
+    return undefined
+  }
 }
 
 /** A gRPC-shaped rejection, so `mapSdkError` reads `code` off it. */
@@ -1062,7 +1086,8 @@ const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
       knownTransactions: new Map(),
       byDigest: new Map(Object.entries(script.transactions ?? {})),
       ledger: Object.keys(script.transactions ?? {}),
-      executedMeta: new Map()
+      executedMeta: new Map(),
+      executedBytes: new Map()
     })
   })
 
@@ -1247,7 +1272,8 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
             resolved
           ),
           failed: true,
-          commandResults: commandResultsOf(outcome.value)
+          commandResults: commandResultsOf(outcome.value),
+          ...(outcome.value.sender === undefined ? {} : { sender: outcome.value.sender })
         }
       }
       case "succeed": {
@@ -1292,7 +1318,8 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
             resolved
           ),
           failed: false,
-          commandResults: commandResultsOf(outcome.value)
+          commandResults: commandResultsOf(outcome.value),
+          ...(outcome.value.sender === undefined ? {} : { sender: outcome.value.sender })
         }
       }
     }
@@ -1404,10 +1431,28 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     return applyOutcome(outcome, method, digest, executingPayment)
   }
 
-  const asResult = (result: SettledTransaction) =>
-    result.failed
-      ? { $kind: "FailedTransaction", FailedTransaction: result.transaction }
-      : { $kind: "Transaction", Transaction: result.transaction }
+  const bcsOfSettled = (result: SettledTransaction, sender = result.sender): Uint8Array | undefined => {
+    const executed = state.executedBytes.get(result.transaction.digest)
+    if (executed !== undefined) return executed
+    return sender === undefined ? undefined : transactionDataNaming(sender)
+  }
+
+  const asResult = (
+    result: SettledTransaction,
+    include?: { readonly bcs?: boolean } | undefined,
+    sender?: string
+  ) => {
+    // `bcs` is served only when asked for, as a node does: the bytes the fake
+    // executed, else — for a transaction scripted with a `sender` — minimal
+    // transaction data naming that sender, which is what the `Sui` tier reads.
+    const bytes = include?.bcs === true ? bcsOfSettled(result, sender ?? result.sender) : undefined
+    const transaction = bytes === undefined
+      ? result.transaction
+      : { ...result.transaction, bcs: bytes } as unknown as SettledTransaction["transaction"]
+    return result.failed
+      ? { $kind: "FailedTransaction", FailedTransaction: transaction }
+      : { $kind: "Transaction", Transaction: transaction }
+  }
 
   /** A coin type in its normalized spelling, or as given when it does not parse. */
   const normalizeCoinType = (coinType: string): string => {
@@ -2578,13 +2623,13 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       // script, which is about *this* transaction and not about that one.
       const recorded = state.byDigest.get(options.digest)
       if (recorded !== undefined && recorded._tag !== "timeoutThen") {
-        return asResult(await applyOutcome(recorded, "getTransaction", options.digest))
+        return asResult(await applyOutcome(recorded, "getTransaction", options.digest), options.include)
       }
       const known = state.knownTransactions.get(options.digest)
       if (known !== undefined && state.scripts.getTransaction.length === 0) {
-        return asResult(known)
+        return asResult(known, options.include)
       }
-      return asResult(await settle("getTransaction", options.digest, options))
+      return asResult(await settle("getTransaction", options.digest, options), options.include)
     },
     executeTransaction: async (options: SuiClientTypes.ExecuteTransactionOptions) => {
       record("executeTransaction", options)
@@ -2618,6 +2663,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       state.knownTransactions.set(digest, settled)
       appendToLedger(digest)
       state.executedMeta.set(digest, metaOfBytes(options.transaction))
+      state.executedBytes.set(digest, options.transaction)
       return asResult(settled)
     },
     signAndExecuteTransaction: async (
@@ -2639,9 +2685,9 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
       const known = state.knownTransactions.get(digest)
       if (known !== undefined) {
         await visibility(options)
-        return asResult(known)
+        return asResult(known, options.include)
       }
-      return asResult(await settle("getTransaction", digest, options))
+      return asResult(await settle("getTransaction", digest, options), options.include)
     },
     simulateTransaction: async (options: SuiClientTypes.SimulateTransactionOptions) => {
       record("simulateTransaction", options)
@@ -2664,7 +2710,10 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         options
       )
       return {
-        transactions: result.items.map((transaction) => asResult(transaction.settled)),
+        // A ledger entry scripted by digest names its sender on the entry.
+        transactions: result.items.map((transaction) =>
+          asResult(transaction.settled, options.include, transaction.sender)
+        ),
         hasNextPage: result.hasNextPage,
         startCursor: result.startCursor,
         endCursor: result.endCursor

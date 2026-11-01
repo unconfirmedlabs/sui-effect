@@ -526,6 +526,9 @@ describe.skipIf(!LOCALNET)("localnet, with SUI_LOCALNET=1", () => {
         expect(after).toEqual({ coinBalance: 0n, addressBalance: 0n })
         expect(await coinCount(signer.address, coinType)).toBe(0)
         expect(got.addressBalance).toBe(result.received)
+        // A read of it names its sender (0.5.0): read from the transaction's BCS.
+        const read = await local(Effect.flatMap(Sui, (sui) => sui.getTransaction(result.executed.digest)))
+        expect(read.sender).toBe(signer.address)
         return result
       }
 

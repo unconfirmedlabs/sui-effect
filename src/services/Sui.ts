@@ -44,7 +44,7 @@ import {
   TransactionNotFound,
   TransportError
 } from "../domain/errors.ts"
-import { EXECUTE_INCLUDE, Executed, fromTransactionResult, Simulation } from "../domain/executed.ts"
+import { EXECUTE_INCLUDE, Executed, fromTransactionResult, READ_INCLUDE, Simulation } from "../domain/executed.ts"
 import * as Metrics from "../domain/metrics.ts"
 import {
   Balance,
@@ -1426,7 +1426,7 @@ const makeSui = (
   const getTransaction = Effect.fn("Sui.getTransaction")(function*(
     digest: Digest
   ): Effect.fn.Return<Executed, ExecutionFailed | TransactionNotFound | TransportError> {
-    return yield* core.getTransaction({ digest, include: EXECUTE_INCLUDE }).pipe(
+    return yield* core.getTransaction({ digest, include: READ_INCLUDE }).pipe(
       Effect.flatMap(fromTransactionResult),
       Effect.catchTag("DecodeError", (error) => Effect.fail(decodeAsTransport("getTransaction")(error)))
     )
@@ -1693,7 +1693,7 @@ const makeSui = (
    * and the read (`None`), which a pruning node does within seconds of the head.
    */
   const readListed = (digest: string): Effect.Effect<Option.Option<TransactionItem>, TransportError> =>
-    core.getTransaction({ digest, include: EXECUTE_INCLUDE }).pipe(
+    core.getTransaction({ digest, include: READ_INCLUDE }).pipe(
       Effect.flatMap(fromTransactionResult),
       Effect.map((executed) => Option.some<TransactionItem>(Result.succeed(executed))),
       Effect.catchTag("ExecutionFailed", (failed) => Effect.succeed(Option.some<TransactionItem>(Result.fail(failed)))),
@@ -1740,7 +1740,7 @@ const makeSui = (
       .listTransactions({
         ...(filter === undefined ? {} : { filter }),
         ...ledgerCursor(order, cursor),
-        include: EXECUTE_INCLUDE
+        include: READ_INCLUDE
       })
       .pipe(
         Effect.flatMap((response) =>

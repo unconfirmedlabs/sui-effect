@@ -211,7 +211,7 @@ describe("streamTransactions", () => {
     }
   })
 
-  test("asks for the execute include set and filters with the SDK's TransactionFilter", async () => {
+  test("asks for the read include set (execute's plus bcs) and filters with the SDK's TransactionFilter", async () => {
     const [bySender, byFunction, byModule, calls] = await run(
       Effect.gen(function*() {
         const sui = yield* Sui
@@ -233,7 +233,9 @@ describe("streamTransactions", () => {
       effects: true,
       events: true,
       balanceChanges: true,
-      objectTypes: true
+      objectTypes: true,
+      // 0.5.0: the transaction's BCS bytes, which is where `Executed.sender` is read from.
+      bcs: true
     })
   })
 
