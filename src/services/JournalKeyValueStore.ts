@@ -1,12 +1,13 @@
 /**
  * The durable `Journal`, over `KeyValueStore` from `effect/persistence`.
  *
- * This is the only file in the package that imports `effect/persistence`
- * (`@stability unstable` upstream), and it is reachable only through the
- * `sui-effect/journal` subpath, so the core modules stay on stable Effect.
+ * It imports `effect/persistence` (`@stability unstable` upstream), as do
+ * `Keystore.ts` and the storage adapters, each reachable only through its own
+ * subpath (`sui-effect/journal`, `sui-effect/keystore`, `sui-effect/storage`),
+ * so the core modules never load it.
  *
- * Building the layer does no network work: it lists the store's entries and,
- * when asked to, refuses to start while any are unresolved. What
+ * Building the layer does no network work: it lists the store's unresolved
+ * entries and, when asked to, refuses to start while any are unresolved. What
  * to do about them is `Tx.reconcileAll`, which an application calls explicitly.
  *
  * @since 0.1.0
@@ -35,6 +36,16 @@ export interface JournalKeyValueStoreOptions {
 
 const ENTRY = "entry:"
 
+/**
+ * The settled marker: `settled:<digest>` exists only while `entry:<digest>`
+ * holds a terminal entry, and its value is that entry's tag. It is a
+ * **negative** index — it names what a listing may skip, never what it must
+ * read — so a missing marker costs one extra read and a marker can only hide
+ * an entry if it is wrong, which the write order below rules out but for
+ * one crash window (see {@link make}).
+ */
+const SETTLED = "settled:"
+
 const decodeEntry = Schema.decodeUnknownEffect(Schema.fromJsonString(JournalEntry))
 const encodeEntry = Schema.encodeEffect(Schema.fromJsonString(JournalEntry))
 
@@ -59,64 +70,164 @@ const viewOf = (
   prefix: string | undefined
 ): KeyValueStore.KeyValueStore => prefix === undefined ? store : KeyValueStore.prefix(store, prefix)
 
-/**
- * Every entry key under the view, read and decoded, `concurrency` at a time.
- * Anything that is not an entry key — another journal's keys when there is no
- * prefix, or the dead `index` key a 0.3 journal kept — is skipped, never read.
- */
-const readAll = (kv: KeyValueStore.KeyValueStore) =>
+const readEntry = (kv: KeyValueStore.KeyValueStore, digest: string) =>
+  kv.get(`${ENTRY}${digest}`).pipe(
+    Effect.mapError(journalError),
+    Effect.flatMap((raw) =>
+      raw === undefined
+        // Removed between `keys` and `get`, or a marker whose entry is gone:
+        // nothing to report.
+        ? Effect.succeed(Option.none<JournalEntry>())
+        : decodeEntry(raw).pipe(Effect.mapError(journalError), Effect.map(Option.some))
+    )
+  )
+
+/** Removes the settled marker if there is one: a read, and a write only when it exists. */
+const clearMarker = (kv: KeyValueStore.KeyValueStore, digest: string) =>
   Effect.gen(function*() {
-    const keys = yield* kv.keys.pipe(Effect.mapError(journalError))
+    const key = `${SETTLED}${digest}`
+    if (yield* kv.has(key)) yield* kv.remove(key)
+  }).pipe(Effect.mapError(journalError))
+
+/** The digests of every entry key and of every settled marker, from one `keys`. */
+const listKeys = (kv: KeyValueStore.KeyValueStore) =>
+  Effect.map(kv.keys.pipe(Effect.mapError(journalError)), (keys) => {
+    const entries: Array<string> = []
+    const settled = new Set<string>()
+    for (const key of keys) {
+      if (key.startsWith(ENTRY)) entries.push(key.slice(ENTRY.length))
+      else if (key.startsWith(SETTLED)) settled.add(key.slice(SETTLED.length))
+    }
+    return { entries, settled }
+  })
+
+/**
+ * Writes the settled marker for `entry`, then reads the entry again and takes
+ * the marker back unless that read **confirms** a terminal entry — it found
+ * an unresolved one, found none, or failed. The re-read is what keeps a
+ * concurrent `put` of an unresolved entry for the same digest (another tab,
+ * another extension context, another process) visible: that put clears the
+ * marker after its own write, so either it sees this marker and removes it,
+ * or this re-read sees its entry. Used by a terminal `put` and by a listing
+ * that found a settled entry with no marker.
+ *
+ * What it cannot cover: a process that dies after the marker write and
+ * before the re-read (or whose `remove` fails), while an unresolved `put` of
+ * the same digest from another writer landed wholly between the entry write
+ * and the marker write. Closing that needs a compare-and-set the
+ * `KeyValueStore` interface does not have.
+ *
+ * Fails with: `JournalError` (the marker write, or the `remove`).
+ */
+const settleMarker = (kv: KeyValueStore.KeyValueStore, entry: JournalEntry) =>
+  Effect.gen(function*() {
+    const key = `${SETTLED}${entry.digest}`
+    yield* kv.set(key, entry._tag).pipe(Effect.mapError(journalError))
+    const confirmed = yield* readEntry(kv, entry.digest).pipe(
+      Effect.map((again) => Option.isSome(again) && !isUnresolved(again.value)),
+      Effect.orElseSucceed(() => false)
+    )
+    if (!confirmed) yield* kv.remove(key).pipe(Effect.mapError(journalError))
+  })
+
+/**
+ * {@link settleMarker} for a settled entry a listing just read without a
+ * marker (a store 0.4 wrote, or a crash between a terminal entry and its
+ * marker). Best effort: a marker is an optimization, so a failure here fails
+ * nothing.
+ */
+const heal = (kv: KeyValueStore.KeyValueStore, entry: JournalEntry) => settleMarker(kv, entry).pipe(Effect.ignore)
+
+/**
+ * The entries that may be unresolved: every entry key without a settled
+ * marker, read and decoded. A settled one found here gets its marker, so the
+ * next listing skips it.
+ */
+const readUnmarked = (kv: KeyValueStore.KeyValueStore) =>
+  Effect.gen(function*() {
+    const { entries, settled } = yield* listKeys(kv)
     const read = yield* Effect.forEach(
-      keys.filter((key) => key.startsWith(ENTRY)),
-      (key) =>
-        kv.get(key).pipe(
-          Effect.mapError(journalError),
-          Effect.flatMap((raw) =>
-            raw === undefined
-              // Removed between `keys` and `get`: nothing to report.
-              ? Effect.succeed(Option.none<JournalEntry>())
-              : decodeEntry(raw).pipe(Effect.mapError(journalError), Effect.map(Option.some))
+      entries.filter((digest) => !settled.has(digest)),
+      (digest) =>
+        readEntry(kv, digest).pipe(
+          Effect.tap((entry) =>
+            Option.isSome(entry) && !isUnresolved(entry.value) ? heal(kv, entry.value) : Effect.void
           )
         ),
       { concurrency: READ_CONCURRENCY }
     )
-    return Arr.getSomes(read)
+    return Arr.getSomes(read).filter(isUnresolved)
   })
 
 /**
  * A journal backed by a `KeyValueStore`.
  *
- * Each entry is one key, `entry:<digest>`, holding the entry as JSON, and a
- * `put` is one `set` of that key. A terminal entry (`Executed`, `Failed`,
- * `NotApplied`) overwrites the unresolved one and stays, so a later `get`
- * still finds the answer.
+ * Each entry is one key, `entry:<digest>`, holding the entry as JSON. A
+ * terminal entry (`Executed`, `Failed`, `NotApplied`) overwrites the
+ * unresolved one and stays, so a later `get` still finds the answer.
  *
- * There is no index and no lock. `listUnresolved` enumerates the store with
- * `KeyValueStore.keys`, so the only thing a `put` writes is the entry itself:
- * no read-modify-write, nothing for two writers — two fibers, two layer
- * instances, two processes over one store — to lose between them, and no
- * crash between two writes to order around. Two writers that put the **same**
- * digest at once still race, and the last `set` wins; the lifecycle never does
- * that, because one submission is one fiber.
+ * **A settled marker beside each terminal entry.** `settled:<digest>` (value:
+ * the tag) exists only while the entry under that digest is terminal, and
+ * `listUnresolved` reads every entry key **except** the marked ones: one
+ * `keys` and one `get` per unresolved entry, however many settled ones the
+ * store keeps. The marker is a negative index — it says what may be skipped,
+ * never what must be read — so the write order is chosen to make a crash cost
+ * a spurious read and never a missing entry:
  *
- * **The cost is a scan.** `listUnresolved` reads every entry under the prefix,
- * terminal ones included (`keys` is O(n) in the prefix, and each entry is one
- * `get`, eight at a time). A journal that keeps every settled entry forever
- * makes startup recovery slower without bound; {@link pruneSettled} is how a
- * long-lived service keeps it short.
+ * - an unresolved `put` (`Signed`, `Unknown`) clears the marker, writes the
+ *   entry, and clears the marker again (each clear a `has`, and a `remove`
+ *   only when it exists). A crash after the first clear leaves an unmarked
+ *   terminal entry, which the next listing reads once and marks.
+ * - a terminal `put` writes the entry, then the marker, then reads the entry
+ *   back and removes the marker unless the read confirms a terminal entry —
+ *   so an unresolved `put` of the same digest from another writer that lands
+ *   between the two writes stays listed. A crash between the entry and the
+ *   marker leaves an unmarked terminal entry, read once and marked.
+ * - a listing that reads an unmarked terminal entry marks it, reads the entry
+ *   again and takes the marker back if the entry is no longer terminal — the
+ *   other half of the second clear above, so a listing racing a fresh `Signed`
+ *   for the same digest cannot leave it hidden. Marker writes during a listing
+ *   are best effort and never fail it.
  *
- * A store written by 0.3 or earlier also holds an `index` key, and reading
- * such a store needs no migration: the key is dead data here — never read,
- * never rewritten, never an error — left in place and no longer maintained.
- * **Rolling back to 0.3 is therefore not safe as is.** 0.3 lists unresolved
- * entries only through that index, so a `Signed` or `Unknown` entry this
- * journal wrote is invisible to a 0.3 `listUnresolved`, `Tx.reconcileAll` and
- * `onUnresolved: "fail"` (only `Tx.recorded(digest)` finds it), and a 0.3
- * reader cannot decode a `NotApplied { evidence: "refused" }` entry at all.
- * Before rolling back, or while 0.3 and 0.4 processes share a store, drain it
- * with `Tx.reconcileAll()` on 0.4 (or settle the entries by hand) and delete
- * the `"refused"` entries.
+ * Nothing is read-modify-written: two fibers, two layer instances, two
+ * processes over one store do not lose each other's entries. Two writers that
+ * put the **same** digest at once still race for the entry, and the last
+ * `set` wins; that happens when another context's `Tx.reconcileAll` writes
+ * `Unknown` (or re-sends) for a `Signed` entry this one is settling. A marker
+ * is never left over an unresolved entry by that race, **except** when the
+ * settling process dies (or its `remove` fails) between its marker write and
+ * its re-read while the other writer's whole `put` landed just before the
+ * marker write: then the entry is hidden from listings (never from `get`)
+ * until it is written again. Closing that needs a compare-and-set.
+ *
+ * **A store 0.4 wrote needs no migration.** It has entries and no markers, and
+ * an unmarked entry is always read, so the first listing is the 0.4 scan and
+ * marks every settled entry it finds; the second reads only the unresolved
+ * ones. Rolling back to 0.4 is safe for 0.4: it reads only `entry:` keys and
+ * ignores the markers. **Rolling forward again is not, after 0.4 wrote**: a
+ * 0.4 process that put an unresolved entry over a digest 0.5 had settled left
+ * 0.5's marker in place, so delete every `settled:` key (or drain the journal
+ * with `Tx.reconcileAll` on 0.4) before a 0.5 process lists the store again. **Running a 0.4 writer beside this one is not**, in one case: a
+ * 0.4 process that writes an unresolved entry over a digest this journal had
+ * settled leaves the marker in place, and the entry is hidden from
+ * `listUnresolved` (not from `get`). The lifecycle re-signs a settled digest
+ * only when the same bytes are submitted again; drain with `Tx.reconcileAll`
+ * and stop the 0.4 writers before mixing versions.
+ *
+ * A store written by 0.3 or earlier also holds an `index` key: dead data here
+ * — never read, never rewritten, never an error. **Rolling back to 0.3 is not
+ * safe as is.** 0.3 lists unresolved entries only through that index, so a
+ * `Signed` or `Unknown` entry this journal wrote is invisible to a 0.3
+ * `listUnresolved`, `Tx.reconcileAll` and `onUnresolved: "fail"` (only
+ * `Tx.recorded(digest)` finds it), and a 0.3 reader cannot decode a
+ * `NotApplied { evidence: "refused" }` entry at all. Before rolling back, or
+ * while 0.3 and later processes share a store, drain it with
+ * `Tx.reconcileAll()` (or settle the entries by hand) and delete the
+ * `"refused"` entries.
+ *
+ * `keys` is still O(n) in the prefix on every store, and some stores pay for
+ * it in values (`chrome.storage` without `getKeys`); {@link pruneSettled} is
+ * how a long-lived service keeps n short.
  *
  * Every member fails with `JournalError` and nothing else.
  */
@@ -129,16 +240,21 @@ export const make = (
   return {
     put: Effect.fn("Journal.put")(function*(entry: JournalEntry) {
       const json = yield* encodeEntry(entry).pipe(Effect.mapError(journalError))
-      yield* kv.set(`${ENTRY}${entry.digest}`, json).pipe(Effect.mapError(journalError))
+      const set = kv.set(`${ENTRY}${entry.digest}`, json).pipe(Effect.mapError(journalError))
+      if (isUnresolved(entry)) {
+        yield* clearMarker(kv, entry.digest)
+        yield* set
+        yield* clearMarker(kv, entry.digest)
+      } else {
+        yield* set
+        yield* settleMarker(kv, entry)
+      }
     }),
     get: Effect.fn("Journal.get")(function*(digest: Digest) {
-      const raw = yield* kv.get(`${ENTRY}${digest}`).pipe(Effect.mapError(journalError))
-      if (raw === undefined) return Option.none<JournalEntry>()
-      const entry = yield* decodeEntry(raw).pipe(Effect.mapError(journalError))
-      return Option.some(entry)
+      return yield* readEntry(kv, digest)
     }),
-    listUnresolved: readAll(kv).pipe(
-      Effect.map((entries) => entries.filter(isUnresolved).sort(oldestFirst)),
+    listUnresolved: readUnmarked(kv).pipe(
+      Effect.map((entries) => [...entries].sort(oldestFirst)),
       Effect.withSpan("Journal.listUnresolved")
     )
   }
@@ -149,8 +265,12 @@ export const make = (
  * answer was recorded strictly before `before`, and answers how many it
  * deleted. `Signed` and `Unknown` entries are never deleted, however old.
  *
- * This is what keeps {@link make}'s scan short in a service that runs for
- * months. After it, `Journal.get` and `Tx.recorded` answer `None` for a pruned
+ * `listUnresolved` reads only unmarked entries, but `keys` still enumerates
+ * every one, and some stores pay for that in values; this is what keeps the
+ * store short in a service that runs for months. It reads every entry itself
+ * (it deletes nothing on the strength of a marker alone), removes each pruned
+ * entry's marker before the entry, and removes markers whose entry is gone.
+ * After it, `Journal.get` and `Tx.recorded` answer `None` for a pruned
  * digest, so choose `before` older than anything you still look up by digest —
  * and older than any bytes you might still hand to `Tx.submit` again, because a
  * resubmission puts a fresh `Signed` entry that a concurrent prune of the same
@@ -181,12 +301,29 @@ export const pruneSettled = Effect.fn("Journal.pruneSettled")(function*(
 ) {
   const kv = viewOf(yield* KeyValueStore.KeyValueStore, options?.prefix)
   const cutoff = DateTime.toEpochMillis(before)
-  const settled = (yield* readAll(kv)).filter((entry) =>
-    !isUnresolved(entry) && stampOf(entry) < cutoff
+  // Every entry key, read and decoded; markers, other journals' keys and a
+  // 0.3 `index` key are never read.
+  const { entries, settled: markers } = yield* listKeys(kv)
+  const read = Arr.getSomes(
+    yield* Effect.forEach(entries, (digest) => readEntry(kv, digest), { concurrency: READ_CONCURRENCY })
   )
+  const settled = read.filter((entry) => !isUnresolved(entry) && stampOf(entry) < cutoff)
+  // The marker first: removing one can only make a listing read more, so a
+  // crash between the two leaves an unmarked settled entry, read once later.
   yield* Effect.forEach(
     settled,
-    (entry) => kv.remove(`${ENTRY}${entry.digest}`).pipe(Effect.mapError(journalError)),
+    (entry) =>
+      Effect.andThen(
+        kv.remove(`${SETTLED}${entry.digest}`),
+        kv.remove(`${ENTRY}${entry.digest}`)
+      ).pipe(Effect.mapError(journalError)),
+    { concurrency: READ_CONCURRENCY, discard: true }
+  )
+  // Markers whose entry is gone (a 0.4 prune of a store this journal marked).
+  const present = new Set(entries)
+  yield* Effect.forEach(
+    [...markers].filter((digest) => !present.has(digest)),
+    (digest) => kv.remove(`${SETTLED}${digest}`).pipe(Effect.mapError(journalError)),
     { concurrency: READ_CONCURRENCY, discard: true }
   )
   return settled.length

@@ -11,10 +11,12 @@
  *
  * @since 0.4.0
  */
-import type { Transaction } from "@mysten/sui/transactions"
+import type { Transaction, TransactionObjectArgument } from "@mysten/sui/transactions"
 import { normalizeStructTag } from "@mysten/sui/utils"
 import { Effect, Stream } from "effect"
+import { typeMatches } from "../domain/bcs.ts"
 import type { TransportError } from "../domain/errors.ts"
+import type { Executed, Simulation } from "../domain/executed.ts"
 import type { Coin, SuiAddress } from "../domain/schemas.ts"
 import { CoinType } from "../domain/schemas.ts"
 import type { Recipe } from "./Sui.ts"
@@ -133,8 +135,9 @@ const sumOf = (coins: ReadonlyArray<Coin>): bigint => coins.reduce((total, coin)
  * Other coin types fold with `gas: "auto"`, after every SUI batch, so the SUI
  * just folded pays for them.
  *
- * Preview a batch with `Tx.build(Tx.fold(batch), { sender })` and then
- * `Sui.simulate` of the bytes, with nothing signed.
+ * Preview a batch with `Tx.prepare(Tx.fold(batch), { sender })`, nothing
+ * signed, and read what it moves with {@link foldMovement}; pass the plan
+ * you previewed to `Tx.foldCoins({ plan, approve })` to run exactly it.
  *
  * Fails with: `TransportError`.
  *
@@ -298,4 +301,236 @@ export const sendFunds = (opts: {
       tx.pure.address(opts.recipient)
     ]
   })
+}
+
+/**
+ * What one fold moves, read off its simulation (or its execution):
+ * `consumed`, the batch's coins the effects delete, with the balances the plan
+ * read them at; `fromCoins`, their total; `toAddressBalance`, what the owner's
+ * address balance of the coin type gains; and `netChange`, the owner's net
+ * balance change, which is all `balanceChanges` reports.
+ *
+ * @since 0.5.0
+ */
+export interface FoldMovement {
+  readonly owner: SuiAddress
+  readonly coinType: CoinType
+  /** The batch's coins this fold consumes, at the versions and balances the plan read. */
+  readonly consumed: ReadonlyArray<Coin>
+  /** The batch's coins the effects do **not** consume. Empty for a fold that does what it says. */
+  readonly missing: ReadonlyArray<Coin>
+  /** The total of `consumed`, in the coin type's smallest unit. */
+  readonly fromCoins: bigint
+  /**
+   * What the owner's address balance of this coin type gains: `netChange +
+   * fromCoins`. For a SUI batch paying for itself, the coins less the net gas
+   * (more than the coins when the storage rebates exceed the gas).
+   */
+  readonly toAddressBalance: bigint
+  /** The owner's net balance change for the coin type, coins and balance together. */
+  readonly netChange: bigint
+  /**
+   * Whether `toAddressBalance` is exact: every coin of the batch is consumed,
+   * and the owner ends up with no coin object of this type created or
+   * mutated, so nothing but the address balance can hold the difference.
+   */
+  readonly exact: boolean
+}
+
+/**
+ * The coin → address-balance movement of one fold, which its balance changes
+ * do not show: a node nets them per address, so a fold of 1,000 SUI of coins
+ * reports only the gas (`+3,939,506` MIST on localnet, protocol 139, for five
+ * faucet coins whose storage rebate beat the gas), and the coins' balances are
+ * not in the effects at all — the coins are simply deleted, and the deposit is
+ * an accumulator write with no amount on it. So the movement is computed from
+ * what is known exactly: the batch's coins were pinned at the versions the plan
+ * read (`tx.objectRef`), so their balances are the plan's; the effects say
+ * which of them were consumed; and the owner's net balance change is the rest.
+ *
+ * For `simulation` pass `prepared.simulation` (`Tx.prepare(Tx.fold(batch),
+ * { sender })`, or what `Tx.foldCoins`' `approve` is shown), or the
+ * `Executed` the fold produced. Never fails.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { Tx, type Signer } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const signer: Signer
+ *
+ * const program = Effect.gen(function*() {
+ *   const plan = yield* Tx.planFold({ owner: signer.address })
+ *   return yield* Tx.foldCoins({
+ *     signer,
+ *     plan,
+ *     approve: (prepared, batch) => {
+ *       const moved = Tx.foldMovement(batch, prepared.simulation)
+ *       return Effect.log(`${moved.consumed.length} coins, +${moved.toAddressBalance} into the balance`)
+ *     }
+ *   })
+ * })
+ * ```
+ */
+export const foldMovement = (batch: FoldBatch, effects: Simulation | Executed): FoldMovement => {
+  const gone = new Set(effects.deleted().map((ref) => ref.id as string))
+  const consumed = batch.coins.filter((coin) => gone.has(coin.objectId))
+  const missing = batch.coins.filter((coin) => !gone.has(coin.objectId))
+  const fromCoins = sumOf(consumed)
+  const netChange = effects.balanceChange(batch.owner, batch.coinType)
+  const coinOfType = `0x2::coin::Coin<${batch.coinType}>`
+  const ownsCoin = (ref: { readonly type?: string; readonly owner?: { readonly $kind: string; readonly AddressOwner?: string } }) =>
+    ref.type !== undefined && typeMatches(coinOfType, ref.type) &&
+    ref.owner?.$kind === "AddressOwner" && ref.owner.AddressOwner === batch.owner
+  const kept = [...effects.created(), ...effects.mutated()].some(ownsCoin)
+  return {
+    owner: batch.owner,
+    coinType: batch.coinType,
+    consumed,
+    missing,
+    fromCoins,
+    toAddressBalance: netChange + fromCoins,
+    netChange,
+    exact: missing.length === 0 && !kept
+  }
+}
+
+/**
+ * What one {@link sendAll} sweep takes: the coins and the address balance of
+ * one coin type, as read just before the build, and how the transaction pays
+ * for gas. What `Tx.sendAll`'s `approve` is shown beside the prepared
+ * transaction, and what its answer reports.
+ *
+ * - `"coinReservation"` (SUI): gas is a reservation of the **whole** SUI
+ *   address balance, the coins are merged into that gas coin, and the gas
+ *   coin is deposited — what is left after gas is the recipient's.
+ * - `"coins"` (SUI): the coins are the gas payment (the first 256; the rest
+ *   are merged into the gas coin), the address balance is redeemed into a
+ *   coin and merged into it, and the gas coin is deposited.
+ * - `"auto"` (any other coin type): the coins are merged and deposited, the
+ *   balance is withdrawn and deposited, and SUI pays the gas, from wherever
+ *   the resolver finds it.
+ *
+ * @since 0.5.0
+ */
+export interface SendAllSweep {
+  readonly owner: SuiAddress
+  readonly recipient: SuiAddress
+  /** The coin type, normalized. */
+  readonly coinType: CoinType
+  /** The coin objects swept, largest first, at the versions read. */
+  readonly coins: ReadonlyArray<Coin>
+  /** The owner's address balance of the coin type as read: all of it is swept. */
+  readonly addressBalance: bigint
+  /** `coins` plus `addressBalance`, before gas. */
+  readonly amount: bigint
+  readonly gas: "coinReservation" | "coins" | "auto"
+}
+
+/** The most coin objects one sweep takes: the fold's limit, for the same reasons. */
+export const MAX_SWEEP_COINS = MAX_FOLD_COINS
+
+/**
+ * Reads what a sweep of `coinType` from `owner` takes and chooses its gas
+ * shape. SUI pays from whichever of the two holds more: the address balance
+ * (a coin reservation of all of it, which covers the budget unless the whole
+ * account is about as small as one) or the coins (the gas payment). Never
+ * builds anything.
+ *
+ * Fails with: `TransportError`.
+ */
+export const readSweep = Effect.fnUntraced(function*(opts: {
+  readonly owner: SuiAddress
+  readonly recipient: SuiAddress
+  readonly coinType: CoinType
+}): Effect.fn.Return<SendAllSweep, TransportError, Sui> {
+  const sui = yield* Sui
+  const coinType = CoinType.normalize(opts.coinType)
+  const [coins, balance] = yield* Effect.all([
+    Stream.runCollect(sui.streamCoins(opts.owner, coinType)),
+    sui.getBalance(opts.owner, coinType)
+  ], { concurrency: "unbounded" })
+  const sorted = [...coins].sort((left, right) =>
+    left.balance > right.balance ? -1 : left.balance < right.balance ? 1 : 0
+  )
+  const fromCoins = sumOf(sorted)
+  const addressBalance = balance.addressBalance as bigint
+  const gas = !isSui(coinType) ? "auto" : sorted.length === 0 || addressBalance >= fromCoins ? "coinReservation" : "coins"
+  return {
+    owner: opts.owner,
+    recipient: opts.recipient,
+    coinType,
+    coins: sorted,
+    addressBalance,
+    amount: fromCoins + addressBalance,
+    gas
+  }
+})
+
+/**
+ * The recipe of one sweep: everything in {@link SendAllSweep} into the
+ * recipient's **address balance**, with `0x2::coin::send_funds<T>` (and, for
+ * the balance of a non-SUI type, `0x2::balance::send_funds<T>` of
+ * `0x2::balance::redeem_funds<T>` of a `FundsWithdrawal` of all of it). The
+ * coins are pinned at the versions read (`tx.objectRef`).
+ *
+ * Never fails; the recipe throws for a sweep of nothing or of more than
+ * {@link MAX_SWEEP_COINS} coins, which `Tx.build` reports as `BuildError`.
+ */
+export const sweep = (plan: SendAllSweep): Recipe => (tx: Transaction) => {
+  if (plan.coins.length > MAX_SWEEP_COINS) {
+    throw new Error(
+      `a sweep takes at most ${MAX_SWEEP_COINS} coin objects, and ${plan.owner} holds ${plan.coins.length}` +
+        ` of ${plan.coinType}: fold them into the address balance first (Tx.foldCoins), then sweep`
+    )
+  }
+  if (plan.amount === 0n) throw new Error(`${plan.owner} holds no ${plan.coinType} to send`)
+  const refs = plan.coins.map((coin) => ({
+    objectId: coin.objectId,
+    version: coin.version.toString(),
+    digest: coin.digest
+  }))
+  const recipient = tx.pure.address(plan.recipient)
+  const withdraw = () =>
+    tx.withdrawal({ amount: plan.addressBalance, type: plan.coinType })
+  switch (plan.gas) {
+    case "coinReservation": {
+      // The payment is left to the resolver, which — the recipe uses the gas
+      // coin and the payer has an address balance — makes it a reservation of
+      // all of that balance; every coin is an input, so none is added to it.
+      if (refs.length > 0) tx.mergeCoins(tx.gas, refs.map((ref) => tx.objectRef(ref)))
+      break
+    }
+    case "coins": {
+      tx.setGasPayment(refs.slice(0, MAX_GAS_PAYMENT_COINS))
+      const rest: Array<TransactionObjectArgument> = refs.slice(MAX_GAS_PAYMENT_COINS).map((ref) => tx.objectRef(ref))
+      if (plan.addressBalance > 0n) {
+        rest.push(tx.moveCall({ target: "0x2::coin::redeem_funds", typeArguments: [plan.coinType], arguments: [withdraw()] }))
+      }
+      if (rest.length > 0) tx.mergeCoins(tx.gas, rest)
+      break
+    }
+    case "auto": {
+      const [first, ...rest] = refs.map((ref) => tx.objectRef(ref))
+      if (first !== undefined) {
+        if (rest.length > 0) tx.mergeCoins(first, rest)
+        tx.moveCall({ target: "0x2::coin::send_funds", typeArguments: [plan.coinType], arguments: [first, recipient] })
+      }
+      if (plan.addressBalance > 0n) {
+        tx.moveCall({
+          target: "0x2::balance::send_funds",
+          typeArguments: [plan.coinType],
+          arguments: [
+            tx.moveCall({ target: "0x2::balance::redeem_funds", typeArguments: [plan.coinType], arguments: [withdraw()] }),
+            recipient
+          ]
+        })
+      }
+      return
+    }
+  }
+  // SUI: the gas coin is everything, and what gas leaves of it is deposited.
+  tx.moveCall({ target: "0x2::coin::send_funds", typeArguments: [plan.coinType], arguments: [tx.gas, recipient] })
 }

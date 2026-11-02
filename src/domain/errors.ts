@@ -389,8 +389,24 @@ export class NotApplied extends Schema.TaggedError<NotApplied>()("NotApplied", {
 }
 
 /** A signer refused or failed to produce a signature. */
+/**
+ * Why a signer refused, when it knows: `"expired"` (a session-bound credential —
+ * a zkLogin proof — whose `maxEpoch` has passed or would pass before the bytes
+ * could land), `"locked"` (the secret was dropped by `lock` / `dispose` and must
+ * be unlocked again), `"rejected"` (the person, or the wallet acting for them,
+ * declined), `"unavailable"` (the device, wallet or remote signer could not be
+ * reached). Absent for every other failure. A program branches on this, never
+ * on `cause`.
+ *
+ * @since 0.5.0
+ */
+export const SigningFailureReason = Schema.Literals(["expired", "locked", "rejected", "unavailable"])
+export type SigningFailureReason = typeof SigningFailureReason.Type
+
 export class SigningError extends Schema.TaggedError<SigningError>()("SigningError", {
-  cause: Schema.Defect()
+  cause: Schema.Defect(),
+  /** Why the signer refused, when it knows; see {@link SigningFailureReason}. @since 0.5.0 */
+  reason: Schema.optionalKey(SigningFailureReason)
 }) {
   /** The one actionable line `SuiError.describe` produces for this error. */
   override get message(): string {
@@ -1053,7 +1069,7 @@ const describeTaxonomy = (error: SuiError): string => {
     case "NotApplied":
       return `NotApplied ${error.digest} (${error.evidence})`
     case "SigningError":
-      return withCause("SigningError", error.cause)
+      return withCause(error.reason === undefined ? "SigningError" : `SigningError (${error.reason})`, error.cause)
     case "BuildError":
       return withCause(oneLine(`BuildError ${error.message}`), error.cause)
     case "PolicyDenied":

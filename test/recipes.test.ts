@@ -349,7 +349,10 @@ describe("docs/llms-head.md recipes", () => {
       signals: { on: () => undefined }
     })
     expect(code).toBe(0)
-    expect(await run(Effect.map(kv.keys, (keys) => keys.length).pipe(Effect.orDie))).toBe(2)
+    // Two entries; settled ones also carry a `settled:` marker (0.5.0).
+    expect(
+      await run(Effect.map(kv.keys, (keys) => keys.filter((key) => key.startsWith("entry:")).length).pipe(Effect.orDie))
+    ).toBe(2)
   })
 
   test("resubmit: a lost submission is re-sent as the same bytes, and settled at startup", async () => {

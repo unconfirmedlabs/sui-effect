@@ -34,6 +34,7 @@ export {
   type OutcomePhase,
   PolicyDenied,
   SigningError,
+  SigningFailureReason,
   SimulationFailed,
   SubmissionUnknown,
   SuiError,
@@ -42,14 +43,17 @@ export {
   UnexpectedEffects
 } from "./domain/errors.ts"
 
+/** A phrase, secret key or derivation path that was refused (`Signer.fromMnemonic`, `Signer.fromSecretKey`). */
+export { KeyError, KeyErrorReason } from "./domain/keys.ts"
+
 /** Branded schemas and the transport-neutral object model. */
 export {
   Balance,
   BalanceChange,
-  Built,
   ChangedObject,
   CleverError,
   Coin,
+  CoinAmount,
   CoinMetadata,
   CoinType,
   CommandResult,
@@ -79,7 +83,6 @@ export {
   Owner,
   Signature,
   SignedTransaction,
-  Simulation,
   StructTag,
   SuiAddress,
   type SuiObject,
@@ -97,11 +100,17 @@ export {
   objectRefOf,
   type Published,
   type SdkObjectRef,
-  sdkRefOf
+  sdkRefOf,
+  Simulation,
+  type TransferredRef
 } from "./domain/executed.ts"
+
+/** A built transaction and what the build learned about it (0.5.0: its own module). */
+export { Built, BuiltGas, GasPaymentRef, GasPaymentSource } from "./domain/built.ts"
 
 /** The opinionated tier. */
 export {
+  type AffectedAddressFilter,
   type BatchItemError,
   type DecodedDynamicField,
   type EventFilter,

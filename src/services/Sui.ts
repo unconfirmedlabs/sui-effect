@@ -12,7 +12,7 @@ import type { BcsType } from "@mysten/bcs"
 import { bcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { Transaction } from "@mysten/sui/transactions"
-import { normalizeSuiAddress, SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
+import { fromBase64, normalizeSuiAddress, SUI_CLOCK_OBJECT_ID, toBase64 } from "@mysten/sui/utils"
 import {
   Array,
   Clock,
@@ -44,7 +44,7 @@ import {
   TransactionNotFound,
   TransportError
 } from "../domain/errors.ts"
-import { EXECUTE_INCLUDE, Executed, fromTransactionResult } from "../domain/executed.ts"
+import { EXECUTE_INCLUDE, Executed, fromTransactionResult, READ_INCLUDE, Simulation } from "../domain/executed.ts"
 import * as Metrics from "../domain/metrics.ts"
 import {
   Balance,
@@ -62,13 +62,12 @@ import {
   normalizeStructTagSafe,
   ObjectEnvelope,
   ObjectId,
-  Simulation,
   StructTag,
   SuiAddress,
   type SuiObject
 } from "../domain/schemas.ts"
 import type { SuiGrpcLayerOptions } from "./SuiCore.ts"
-import { SuiCore } from "./SuiCore.ts"
+import { defaultReadPolicy, SuiCore } from "./SuiCore.ts"
 
 /** A synchronous transaction draft. Reads happen before it, so it stays replayable. */
 export type Recipe = (tx: Transaction) => void
@@ -295,7 +294,10 @@ const normalizeEventFilter = (filter: EventFilter): EventFilter =>
  * only shows once there is enough history. A defect, because it is a bug in the
  * calling program: no retry and no node can fix it.
  */
-const assertPaginableFilter = (span: string, filter: TransactionFilter | undefined): void => {
+const assertPaginableFilter = (
+  span: string,
+  filter: TransactionFilter | AffectedAddressFilter | undefined
+): void => {
   const fn = filter?.function
   if (fn === undefined || fn === null) return
   const segments = fn.split("::")
@@ -306,6 +308,131 @@ const assertPaginableFilter = (span: string, filter: TransactionFilter | undefin
       "function, or read a single page with `sui.core.listTransactions({ filter })`."
   )
 }
+
+/** One frame of the gRPC ledger's `ListTransactions` stream, as far as a digest listing reads it. */
+interface LedgerTransactionFrame {
+  readonly transaction?: { readonly digest?: string }
+  readonly watermark?: { readonly cursor?: Uint8Array }
+  readonly end?: { readonly reason?: number }
+}
+
+/**
+ * The gRPC `LedgerService.ListTransactions` call, duck-typed so it compiles
+ * and loads against every SDK in the peer range (2.30 and 2.38 ship the same
+ * proto, `AffectedAddressFilter` included) and so a test double can serve it.
+ */
+interface LedgerTransactionListing {
+  readonly listTransactions: (
+    input: {
+      readonly readMask: { readonly paths: ReadonlyArray<string> }
+      readonly filter: {
+        readonly terms: ReadonlyArray<{
+          readonly literals: ReadonlyArray<{
+            readonly negated: boolean
+            readonly predicate: {
+              readonly oneofKind: "affectedAddress"
+              readonly affectedAddress: { readonly address: string }
+            }
+          }>
+        }>
+      }
+      readonly options: {
+        readonly limit: number
+        readonly ordering: number
+        readonly after?: Uint8Array
+        readonly before?: Uint8Array
+      }
+    },
+    options: { readonly abort: AbortSignal }
+  ) => { readonly responses: AsyncIterable<LedgerTransactionFrame> }
+}
+
+const ledgerListingOf = (client: unknown): LedgerTransactionListing | undefined => {
+  const ledger = (client as { readonly ledgerService?: unknown }).ledgerService
+  return typeof (ledger as { readonly listTransactions?: unknown } | undefined)?.listTransactions === "function"
+    ? ledger as LedgerTransactionListing
+    : undefined
+}
+
+/** The page size every SDK listing uses when none is given. */
+const LEDGER_PAGE_SIZE = 50
+/** `sui.rpc.v2.QueryEndReason`: the two reasons that mean there is more. */
+const END_ITEM_LIMIT = 1
+const END_SCAN_LIMIT = 2
+
+/**
+ * One page of digests for an `affectedAddress` listing, or `undefined` when
+ * the client has no gRPC ledger service. It is the SDK's own
+ * `GrpcCoreClient.listTransactions` page loop — the same fifty-item page, one
+ * look-ahead item, the same `hasNextPage` and cursors (the base64 of the
+ * node's watermark cursor) — so a cursor from it resumes this listing, and
+ * the unfiltered head a tail reads is in the same encoding. Only the read mask
+ * differs: digests, each then read through `getTransaction`.
+ */
+const listAffectedDigests = async (
+  client: unknown,
+  address: string,
+  order: ListOrder,
+  cursor: string | null,
+  signal: AbortSignal
+): Promise<
+  { readonly digests: ReadonlyArray<string>; readonly hasNextPage: boolean; readonly endCursor: string | null } | undefined
+> => {
+  const ledger = ledgerListingOf(client)
+  if (ledger === undefined) return undefined
+  const descending = order === "descending"
+  const call = ledger.listTransactions(
+    {
+      readMask: { paths: ["digest"] },
+      filter: {
+        terms: [{
+          literals: [{ negated: false, predicate: { oneofKind: "affectedAddress", affectedAddress: { address } } }]
+        }]
+      },
+      options: {
+        limit: LEDGER_PAGE_SIZE + 1,
+        ordering: descending ? 1 : 0,
+        ...(cursor === null ? {} : descending ? { before: fromBase64(cursor) } : { after: fromBase64(cursor) })
+      }
+    },
+    { abort: signal }
+  )
+  const digests: Array<string> = []
+  let endCursor: string | null = null
+  let frontier: string | null = null
+  let endReason: number | undefined
+  let sawLookahead = false
+  for await (const frame of call.responses) {
+    if (frame.watermark?.cursor !== undefined && frame.watermark.cursor.length > 0) {
+      frontier = toBase64(frame.watermark.cursor)
+    }
+    const digest = frame.transaction?.digest
+    if (digest !== undefined) {
+      if (digests.length >= LEDGER_PAGE_SIZE) sawLookahead = true
+      else {
+        endCursor = frontier
+        digests.push(digest)
+      }
+    }
+    if (frame.end !== undefined) endReason = frame.end.reason
+  }
+  const hasNextPage = sawLookahead || endReason === END_SCAN_LIMIT || endReason === END_ITEM_LIMIT
+  return {
+    digests,
+    hasNextPage,
+    endCursor: sawLookahead ? endCursor : hasNextPage ? frontier ?? endCursor : endCursor
+  }
+}
+
+/** The cause of the refusal on a transport with no gRPC ledger service. */
+const unimplementedAffectedAddress = (): Error =>
+  Object.assign(
+    new Error(
+      "an affectedAddress transaction listing needs the gRPC ledger service, which this transport does not have;" +
+        " a sender filter lists only the address's own transactions"
+    ),
+    { code: "UNIMPLEMENTED" }
+  )
 
 /**
  * The sender locks: one reference-counted semaphore per address, released a
@@ -416,6 +543,28 @@ export type EventFilter = SuiClientTypes.EventFilter
  * `SuiClientTypes.TransactionFilter`, under its own name.
  */
 export type TransactionFilter = SuiClientTypes.TransactionFilter
+
+/**
+ * A filter on transactions by an address whose state they moved — gRPC's
+ * `AffectedAddressFilter`, which the SDK's `TransactionFilter` does not
+ * expose. It matches a transaction after which the address owns an object, one
+ * that mutated, transferred away, deleted or wrapped an object the address
+ * owned, and one that changed the address's balance through an accumulator
+ * event: incoming transfers included, which a `sender` filter cannot find.
+ *
+ * Served by the gRPC ledger service only. On any other transport a listing
+ * with it fails with a non-retryable `TransportError` whose `status` is
+ * `UNIMPLEMENTED`, rather than quietly answering the sender's own
+ * transactions.
+ *
+ * @since 0.5.0
+ */
+export interface AffectedAddressFilter {
+  /** The address, in any spelling `normalizeSuiAddress` takes. */
+  readonly affectedAddress: string
+  readonly sender?: never
+  readonly function?: never
+}
 
 /** The ledger order a listing is read in. Mirrors the SDK's `order` option. */
 export type ListOrder = "ascending" | "descending"
@@ -908,12 +1057,27 @@ export interface SuiService {
    * `ExecutionFailed` — not a failure of the stream, which `getTransaction`'s
    * "a failure is a failure" rule would make it.
    *
-   * Fails with: `TransportError`.
+   * **`{ affectedAddress }` (0.5.0)** lists every transaction that moved the
+   * address's state — incoming transfers as well as its own — through the gRPC
+   * ledger service's `affectedAddress` predicate (see
+   * `AffectedAddressFilter`). Ordering, `after`/`before` and the cursors are
+   * the other filters' exactly: ledger order, oldest first unless
+   * descending, fifty digests a page, and an `endCursor` in the SDK's own
+   * encoding. Each page is one listing of digests and then one
+   * `getTransaction` per digest, so it costs a page's worth of reads; a
+   * digest the node prunes between the two is left out of the page. On a
+   * transport without the gRPC ledger service it fails with a non-retryable
+   * `TransportError` whose `status` is `UNIMPLEMENTED` — never a silent
+   * sender-only answer. A pruning node (localnet keeps a few dozen
+   * checkpoints) lists only what it still holds.
+   *
+   * Fails with: `TransportError` (`status: "UNIMPLEMENTED"` for an
+   * `affectedAddress` filter on a transport that cannot serve it).
    *
    * @since 0.4.0
    */
   readonly streamTransactions: (
-    filter?: TransactionFilter,
+    filter?: TransactionFilter | AffectedAddressFilter,
     opts?: ListOptions
   ) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>
 
@@ -926,7 +1090,7 @@ export interface SuiService {
    * @since 0.4.0
    */
   readonly streamTransactionPages: (
-    filter?: TransactionFilter,
+    filter?: TransactionFilter | AffectedAddressFilter,
     opts?: ListOptions
   ) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>
 
@@ -945,7 +1109,7 @@ export interface SuiService {
    * @since 0.4.0
    */
   readonly tailTransactions: (
-    filter?: TransactionFilter,
+    filter?: TransactionFilter | AffectedAddressFilter,
     opts?: TailOptions
   ) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>
 
@@ -960,7 +1124,7 @@ export interface SuiService {
    * @since 0.4.0
    */
   readonly tailTransactionPages: (
-    filter?: TransactionFilter,
+    filter?: TransactionFilter | AffectedAddressFilter,
     opts?: TailOptions
   ) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>
 
@@ -1262,7 +1426,7 @@ const makeSui = (
   const getTransaction = Effect.fn("Sui.getTransaction")(function*(
     digest: Digest
   ): Effect.fn.Return<Executed, ExecutionFailed | TransactionNotFound | TransportError> {
-    return yield* core.getTransaction({ digest, include: EXECUTE_INCLUDE }).pipe(
+    return yield* core.getTransaction({ digest, include: READ_INCLUDE }).pipe(
       Effect.flatMap(fromTransactionResult),
       Effect.catchTag("DecodeError", (error) => Effect.fail(decodeAsTransport("getTransaction")(error)))
     )
@@ -1523,13 +1687,60 @@ const makeSui = (
 
   type TransactionItem = Result.Result<Executed, ExecutionFailed>
 
-  const transactionsPage = (filter: TransactionFilter | undefined, order: ListOrder) =>
+  /**
+   * One transaction the affected-address listing named, read with the execute
+   * include set: `undefined` when the node has pruned it between the listing
+   * and the read (`None`), which a pruning node does within seconds of the head.
+   */
+  const readListed = (digest: string): Effect.Effect<Option.Option<TransactionItem>, TransportError> =>
+    core.getTransaction({ digest, include: READ_INCLUDE }).pipe(
+      Effect.flatMap(fromTransactionResult),
+      Effect.map((executed) => Option.some<TransactionItem>(Result.succeed(executed))),
+      Effect.catchTag("ExecutionFailed", (failed) => Effect.succeed(Option.some<TransactionItem>(Result.fail(failed)))),
+      Effect.catchTag("TransactionNotFound", () => Effect.succeed(Option.none<TransactionItem>())),
+      Effect.catchTag("DecodeError", (error) => Effect.fail(decodeAsTransport("getTransaction")(error)))
+    )
+
+  /**
+   * A page of the gRPC ledger's `ListTransactions` with an `affectedAddress`
+   * predicate: the digests in ledger order, then each transaction read through
+   * `getTransaction` (eight at a time, order kept). The listing runs under the
+   * read retry policy, like every other read.
+   */
+  const affectedPage = (address: string, order: ListOrder) =>
+  (cursor: string | null): Effect.Effect<RawPage<TransactionItem>, TransportError> =>
+    Effect.gen(function*() {
+      const listed = yield* core
+        .use((client, signal) => listAffectedDigests(client, address, order, cursor, signal))
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "TransportError" ? error : TransportError.fromUnknown("listTransactions", error, false)
+          ),
+          Effect.retry(core.readPolicy?.("listTransactions") ?? defaultReadPolicy("listTransactions"))
+        )
+      if (listed === undefined) {
+        return yield* TransportError.fromUnknown("listTransactions", unimplementedAffectedAddress(), false)
+      }
+      const read = yield* Effect.forEach(listed.digests, readListed, { concurrency: 8 })
+      return {
+        items: Array.getSomes(read),
+        hasNextPage: listed.hasNextPage,
+        endCursor: listed.endCursor
+      }
+    })
+
+  const transactionsPage = (filter: TransactionFilter | AffectedAddressFilter | undefined, order: ListOrder) =>
+    filter !== undefined && "affectedAddress" in filter && filter.affectedAddress !== undefined
+      ? affectedPage(normalizeSuiAddress(filter.affectedAddress), order)
+      : sdkTransactionsPage(filter as TransactionFilter | undefined, order)
+
+  const sdkTransactionsPage = (filter: TransactionFilter | undefined, order: ListOrder) =>
   (cursor: string | null): Effect.Effect<RawPage<TransactionItem>, TransportError> =>
     core
       .listTransactions({
         ...(filter === undefined ? {} : { filter }),
         ...ledgerCursor(order, cursor),
-        include: EXECUTE_INCLUDE
+        include: READ_INCLUDE
       })
       .pipe(
         Effect.flatMap((response) =>
@@ -1582,7 +1793,7 @@ const makeSui = (
   /** A stream that refuses an unpaginable function filter when it is run. */
   const checked = <A, E>(
     span: string,
-    filter: TransactionFilter | undefined,
+    filter: TransactionFilter | AffectedAddressFilter | undefined,
     stream: () => Stream.Stream<A, E>
   ): Stream.Stream<A, E> =>
     Stream.suspend(() => {
@@ -1590,7 +1801,7 @@ const makeSui = (
       return stream()
     })
 
-  const streamTransactionPages = (filter?: TransactionFilter, opts?: ListOptions) =>
+  const streamTransactionPages = (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) =>
     checked("Sui.streamTransactionPages", filter, () =>
       pagesOf(
         "Sui.streamTransactionPages",
@@ -1598,7 +1809,7 @@ const makeSui = (
         transactionsPage(filter, directionOf(opts))
       ))
 
-  const streamTransactions = (filter?: TransactionFilter, opts?: ListOptions) =>
+  const streamTransactions = (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) =>
     checked("Sui.streamTransactions", filter, () =>
       paginated(
         "Sui.streamTransactions",
@@ -1606,7 +1817,7 @@ const makeSui = (
         startOf(opts)
       ))
 
-  const tailTransactionPages = (filter?: TransactionFilter, opts?: TailOptions) =>
+  const tailTransactionPages = (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) =>
     checked("Sui.tailTransactions", filter, () =>
       tailOf(
         "Sui.tailTransactions",
@@ -1616,7 +1827,7 @@ const makeSui = (
         filter === undefined ? undefined : transactionsHead
       ))
 
-  const tailTransactions = (filter?: TransactionFilter, opts?: TailOptions) =>
+  const tailTransactions = (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) =>
     tailTransactionPages(filter, opts).pipe(Stream.map((page) => page.items), Stream.flattenIterable)
 
   const withSenderLock = (address: SuiAddress) =>

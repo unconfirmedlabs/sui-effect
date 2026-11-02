@@ -21,6 +21,10 @@ const SUBPATHS: ReadonlyArray<{ readonly name: string; readonly file: string }> 
   { name: "@unconfirmed/sui-effect", file: "dist/index.d.ts" },
   { name: "@unconfirmed/sui-effect/tx", file: "dist/tx.d.ts" },
   { name: "@unconfirmed/sui-effect/journal", file: "dist/journal.d.ts" },
+  { name: "@unconfirmed/sui-effect/gate", file: "dist/gate.d.ts" },
+  { name: "@unconfirmed/sui-effect/keystore", file: "dist/keystore.d.ts" },
+  { name: "@unconfirmed/sui-effect/storage", file: "dist/storage.d.ts" },
+  { name: "@unconfirmed/sui-effect/enoki", file: "dist/enoki.d.ts" },
   { name: "@unconfirmed/sui-effect/extension", file: "dist/extension.d.ts" },
   { name: "@unconfirmed/sui-effect/script", file: "dist/script.d.ts" },
   { name: "@unconfirmed/sui-effect/testing", file: "dist/testing.d.ts" }
@@ -64,6 +68,10 @@ const SUBPATH_OF_SOURCE: ReadonlyArray<readonly [string, string]> = [
   ["src/index.ts", "@unconfirmed/sui-effect"],
   ["src/tx.ts", "@unconfirmed/sui-effect/tx"],
   ["src/journal.ts", "@unconfirmed/sui-effect/journal"],
+  ["src/gate.ts", "@unconfirmed/sui-effect/gate"],
+  ["src/keystore.ts", "@unconfirmed/sui-effect/keystore"],
+  ["src/storage.ts", "@unconfirmed/sui-effect/storage"],
+  ["src/enoki.ts", "@unconfirmed/sui-effect/enoki"],
   ["src/extension.ts", "@unconfirmed/sui-effect/extension"],
   ["src/script.ts", "@unconfirmed/sui-effect/script"],
   ["src/testing.ts", "@unconfirmed/sui-effect/testing"]
@@ -704,9 +712,10 @@ const renderApi = (): { readonly api: string; readonly index: string } => {
     const exports = moduleSymbol === undefined ? [] : checker.getExportsOfModule(moduleSymbol)
     const sorted = [...exports]
       .sort((left, right) => (left.getName() < right.getName() ? -1 : left.getName() > right.getName() ? 1 : 0))
+    const members = namespaceMembersOf(sorted, checker)
     // Read before rendering: `renderSymbol` records where each declaration was
     // first printed, and the index has to know that from the state before.
-    const lines = sorted.map((symbol) => indexLineOf(symbol, checker, printed, subpath.name))
+    const lines = sorted.map((symbol) => indexLineOf(symbol, checker, printed, subpath.name, members))
     const rendered = sorted
       .map((symbol) => renderSymbol(symbol, checker, 3, printed, subpath.name))
       .filter((section): section is string => section !== undefined)
@@ -734,12 +743,46 @@ const renderApi = (): { readonly api: string; readonly index: string } => {
   return { api: sections.join("\n"), index: indexSections.join("\n") }
 }
 
+/**
+ * The namespace member each bare export of a subpath also is: `ephemeral` is
+ * `Signer.ephemeral`, `build` is `Tx.build`. A bare export is a member when an
+ * exported namespace object (`export const Signer = { ephemeral, … }`) has a
+ * property of that name and is declared in the same module — the `.d.ts`
+ * inlines the property's type, so the module is what ties the two. The index
+ * then says which namespace a bare name belongs to, instead of listing it
+ * alphabetically among another namespace's members.
+ */
+const namespaceMembersOf = (
+  exports: ReadonlyArray<ts.Symbol>,
+  checker: ts.TypeChecker
+): ReadonlyMap<ts.Declaration, string> => {
+  const resolve = (symbol: ts.Symbol) =>
+    (symbol.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(symbol) : symbol
+  const byName = new Map(exports.map((symbol) => [symbol.getName(), resolve(symbol)] as const))
+  const members = new Map<ts.Declaration, string>()
+  for (const exported of exports) {
+    const target = resolve(exported)
+    const value = target.declarations?.find(ts.isVariableDeclaration)
+    if (value === undefined) continue
+    const module = value.getSourceFile()
+    for (const property of checker.getTypeOfSymbolAtLocation(target, value).getProperties()) {
+      const bare = byName.get(property.getName())
+      const declaration = bare?.declarations?.[0]
+      if (bare === undefined || bare === target || declaration === undefined) continue
+      if (declaration.getSourceFile() !== module || members.has(declaration)) continue
+      members.set(declaration, `${exported.getName()}.${property.getName()}`)
+    }
+  }
+  return members
+}
+
 /** The index line of one exported name, read off the same declaration `renderSymbol` prints. */
 const indexLineOf = (
   symbol: ts.Symbol,
   checker: ts.TypeChecker,
   printed: Rendered,
-  subpath: string
+  subpath: string,
+  members: ReadonlyMap<ts.Declaration, string>
 ): IndexLine | undefined => {
   const target = (symbol.flags & ts.SymbolFlags.Alias) !== 0
     ? checker.getAliasedSymbol(symbol)
@@ -748,10 +791,12 @@ const indexLineOf = (
   if (declaration === undefined) return undefined
   const name = symbol.getName()
   if (ts.isSourceFile(declaration)) return { name, summary: "a namespace; its members are listed under it below." }
+  const member = members.get(declaration)
+  const owner = member === undefined || member === name ? "" : `\`${member}\`, also exported bare. `
   const first = printed.get(declaration)
-  if (first !== undefined && first !== subpath) return { name, summary: `re-exported from \`${first}\`.` }
+  if (first !== undefined && first !== subpath) return { name, summary: `${owner}re-exported from \`${first}\`.` }
   const documented = shownDeclarations(target, checker).map(docOfDeclaration).find((doc) => doc !== "") ?? ""
-  return { name, summary: withoutLinks(firstSentence(summaryOf(documented))) }
+  return { name, summary: `${owner}${withoutLinks(firstSentence(summaryOf(documented)))}` }
 }
 
 /** `docs/llms-head.md` with its recipes quoted and its index filled in. */

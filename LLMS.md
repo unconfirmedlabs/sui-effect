@@ -31,8 +31,12 @@ subpath by subpath; the examples and the extension template come last.
 | Import | What it exports |
 |---|---|
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
-| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `submit`, `submitVia`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, …), `Verify`, `SubmitConfig`, `SubmitConfigOverrides`, `LockSenderPolicy` and `GasPaymentPolicy`, `FoldBatch` / `FoldPlan` / `FoldGas` / `FoldResult`, `Journal`, `JournalEntry` |
+| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `foldMovement`, `sendAll`, `verifySponsored`, `submit`, `submitVia`, `verify`, `prepare`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, `fromMnemonic`, `fromSecretKey`, `zkLogin`, `passkey`, `wallet`, …), `LockableSigner`, `ZkLogin`, `verifySponsored`, `Intent`, `Verified`, `Gate`, `checkClaims`, `Verify`, `SubmitConfig`, `SubmitConfigOverrides`, `LockSenderPolicy` and `GasPaymentPolicy`, `FoldBatch` / `FoldPlan` / `FoldGas` / `FoldResult`, `Journal`, `JournalEntry` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
+| `@unconfirmed/sui-effect/gate` | The Jev screen for `Tx.verify` over `effect/http`: `layerJev`, `layerJevConfig`, `makeJev` (0.5.0) |
+| `@unconfirmed/sui-effect/enoki` | Enoki sponsorship through the journal: `Enoki.fromFlow`, `fromWallet`, `sponsor`, `execute`, `run`, `EnokiError` (0.5.0) |
+| `@unconfirmed/sui-effect/keystore` | `Keystore` (sealed keys at rest over `KeyValueStore`, WebCrypto), `Keystore.sealer` for zkLogin sessions, `KeyError`, `KeystoreError` (0.5.0) |
+| `@unconfirmed/sui-effect/storage` | `KeyValueStore` layers: `layerIndexedDb`, `layerAsyncStorage`, `layerMmkv`, `layerChromeStorage` (0.5.0) |
 | `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)` (an `Effect<Option<A>>` member becomes `Promise<A \| undefined>`, `FaceValue`), and `SuiExtension.leaf` |
 | `@unconfirmed/sui-effect/script` | `Script` / `ScriptReadOnly` (layers that read `SUI_NETWORK`, `SUI_PRIVATE_KEY`, …), `Script.run`, `Script.report`, `Script.exitCode` |
 | `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig`; the fake models address balances (`SuiTest.setAddressBalance`, `SuiTest.addressBalance`) |
@@ -554,17 +558,20 @@ The full entries follow under "API".
 
 ### `@unconfirmed/sui-effect`
 
+- `AffectedAddressFilter` — A filter on transactions by an address whose state they moved — gRPC's `AffectedAddressFilter`, which the SDK's `TransactionFilter` does not expose.
 - `Balance` — A coin balance for one coin type.
 - `BalanceChange` — A balance delta produced by a transaction.
 - `BatchItemError` — What can go wrong decoding one object of a batch read.
 - `BuildError` — The transaction could not be built into bytes.
 - `Built` — A transaction built into bytes and ready to sign, with the expiration the builder settled on recorded so `Tx.reconcile` can decide, later and without the builder, whether the transaction can still land.
+- `BuiltGas` — The gas a built transaction carries, read back out of its bytes: `budget` and `price` in MIST, the `owner` who pays (the sender unless it is sponsored), the `payment` refs, and the `source` they amount to.
 - `ChangedObject` — One object touched by a transaction.
 - `ChangedRef` — What the effects say about one object a transaction touched.
 - `CleverError` — A decoded `#[error]` constant.
 - `Coin` — A coin object.
+- `CoinAmount` — An amount of some coin in its smallest unit — MIST for SUI, the coin's own base unit for every other coin — as a plain non-negative `bigint`, encoded as the decimal string every SDK response uses.
 - `CoinMetadata` — The metadata of a coin type.
-- `CoinType` — A coin type in normalized form: the schema, plus `CoinType.normalize` for any spelling and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
+- `CoinType` — A coin type in normalized form: the schema, plus `CoinType.normalize` for any spelling, `CoinType.Strict` for user input and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
 - `CommandResult` — The return values and mutated references of one command.
 - `DecodeError` — BCS content or a schema boundary did not decode.
 - `DecodeKind` — Which of the three things that can go wrong at a decode boundary went wrong.
@@ -584,11 +591,15 @@ The full entries follow under "API".
 - `ExecutionStatus` — Whether a transaction succeeded.
 - `ExtensionNotReady` — A synchronous member of a Promise-faced extension was called before its runtime existed.
 - `GasCostSummary` — Gas cost breakdown.
+- `GasPaymentRef` — One entry of a transaction's gas payment, as the bytes name it: the SDK's own `{ objectId, version, digest }`.
+- `GasPaymentSource` — How built bytes pay for gas, as `Tx.build` reads it back out of them (and as the span attribute `sui.gas_payment` names it): - `"addressBalance"`: an empty payment; gas is drawn from the payer's SUI address balance at execution, and the bytes pin no gas coin.
 - `GetObjectError` — What can go wrong reading one object with a schema.
 - `GraphQLUnavailable` — The GraphQL endpoint an extension needs is not usable: none was configured, or the one that was could not be reached.
 - `HasOutcome` — An extension error may declare its own `outcome`, and `SuiError.outcome` and `Script.run` honour it before anything else.
 - `JournalError` — The submission journal could not be read or written.
 - `KNOWN_CHAIN_IDS` — The genesis checkpoint digest of each public network whose chain identifier is fixed and known.
+- `KeyError` — A recovery phrase, a secret key or a derivation path was refused.
+- `KeyErrorReason` — Why a phrase, a secret key or a path was refused.
 - `KnownNetwork` — The four networks with a built-in default gRPC endpoint.
 - `ListOptions` — Where a ledger listing starts and which way it reads.
 - `ListOrder` — The ledger order a listing is read in.
@@ -620,7 +631,8 @@ The full entries follow under "API".
 - `ServiceInfo` — What a node says about itself: the chain, where its ledger head is, and — the part a reconciler or an indexer needs — how far back its history reaches.
 - `Signature` — A serialized signature, as every SDK signer returns it: the base64 of the flag, signature and public key bytes.
 - `SignedTransaction` — The signed bytes of a transaction, kept so an uncertain submission can be reconciled or re-submitted later without rebuilding.
-- `SigningError` — A signer refused or failed to produce a signature.
+- `SigningError`
+- `SigningFailureReason` — Why a signer refused, when it knows: `"expired"` (a session-bound credential — a zkLogin proof — whose `maxEpoch` has passed or would pass before the bytes could land), `"locked"` (the secret was dropped by `lock` / `dispose` and must be unlocked again), `"rejected"` (the person, or the wallet acting for them, declined), `"unavailable"` (the device, wallet or remote signer could not be reached).
 - `Simulation` — The result of a successful simulation, with the fixed include set `Sui` asks for: effects, events, balance changes, object types and command results.
 - `SimulationFailed` — Simulation reported an execution failure.
 - `SimulationLookupError` — The failures of a simulation.
@@ -645,6 +657,7 @@ The full entries follow under "API".
 - `TransactionFilter` — A filter on transactions: exactly one of `sender` or `function`.
 - `TransactionLookupError` — The failures of a transaction lookup.
 - `TransactionNotFound` — No transaction with this digest is known to the node.
+- `TransferredRef` — A changed object whose **owner changed**: what `Executed.transferred` and `Simulation.transferred` return.
 - `TransportError` — A request did not reach a usable answer.
 - `UnchangedConsensusObject` — Mirrors `SuiClientTypes.UnchangedConsensusObject`.
 - `UnexpectedEffects` — The effects of an applied transaction did not contain what the caller expected.
@@ -660,25 +673,49 @@ The full entries follow under "API".
 ### `@unconfirmed/sui-effect/tx`
 
 - `Built` — re-exported from `@unconfirmed/sui-effect`.
+- `ClaimViolation` — One way the simulated effects stepped outside the claims.
 - `ExpirationPolicy` — How `Tx.build` sets an expiration when the recipe left one unset.
 - `ExpiryEvidencePolicy` — Whether `Tx.reconcile` is allowed to conclude that an expiration window closed on a transaction the node does not know.
 - `FoldBatch` — One fold transaction's worth of coins: what `fold` turns into a recipe.
 - `FoldGas` — How one fold transaction pays for gas.
+- `FoldMovement` — What one fold moves, read off its simulation (or its execution): `consumed`, the batch's coins the effects delete, with the balances the plan read them at; `fromCoins`, their total; `toAddressBalance`, what the owner's address balance of the coin type gains; and `netChange`, the owner's net balance change, which is all `balanceChanges` reports.
 - `FoldPlan` — What `planFold` answers: the transactions that fold an owner's coins, in the order they must run, and the SUI dust that cannot pay for its own fold.
 - `FoldResult` — What `foldCoins` did: the plan it ran, and one `Executed` per batch, in order.
+- `FromMnemonicOptions` — Options of `Signer.fromMnemonic`.
+- `FromSecretKeyOptions` — Options of `Signer.fromSecretKey`.
 - `GasPaymentPolicy` — How `Tx.build` treats a gas payment the recipe left unset.
+- `Gate` — The intent policy and its screen.
+- `GateService` — Every decision `Tx.verify` and `Tx.run` read from context about intents.
+- `Intent` — A declared intent: one sentence for the screen, exact claims for the code.
+- `IntentAuthor` — Who wrote the intent.
+- `IntentClaims` — What the transaction is allowed to do to the sender, deny by default: a coin that is not listed may not decrease, an address that is not listed may not receive anything, and an object that is not listed may not leave.
 - `Journal` — The submission journal.
 - `JournalEntry` — One line of the submission journal.
 - `JournalService` — Reading and writing the submission journal.
+- `KeyScheme` — The schemes a key at rest can be: the three a BIP-39 phrase derives on the standard Sui paths.
 - `LockSenderPolicy` — When `Tx.run` holds the sender lock.
+- `LockableSigner` — A `Signer` that holds a secret and can drop it.
+- `MnemonicLength` — The BIP-39 word counts: 128 to 256 bits of entropy in 32-bit steps.
+- `OutflowClaim` — The most of one coin the sender may lose, in base units, gas excluded.
+- `Parties` — Whose transaction it is.
+- `PasskeyProvider` — What a passkey signer asks the authenticator for, structurally: the SDK's `PasskeyProvider` from `@mysten/sui/keypairs/passkey` (its `BrowserPasskeyProvider` is one) without the DOM types it is declared with, so a React Native or extension provider can be typed without a DOM `lib`.
+- `Prepared` — Built bytes and what the lifecycle learned about them before anything is signed: the simulation of exactly those bytes, and the verified intent when one was declared.
 - `ReconcileInput` — What `Tx.reconcile` can be asked about.
 - `Reconciled` — What one entry of `Tx.reconcileAll` settled to, as a tagged union.
 - `RemoteSigner` — What `remote` needs to know about a credential it does not hold.
 - `RunError` — Everything `run` can fail with, as one name: `SubmitError` plus what building, preflighting and signing can produce.
+- `ScreenRequest` — What a screen is shown: the sentence, and both things it is compared with.
+- `ScreenedLine` — One rendered line and the probability that the declared summary covers it.
+- `Screening` — What a semantic screen answered: probabilities, never a decision.
+- `SecretSealer` — Seals and unseals a secret for storage.
+- `SendAllResult` — What `sendAll` did: the sweep it ran and the `Executed` it produced.
+- `SendAllSweep` — What one `sendAll` sweep takes: the coins and the address balance of one coin type, as read just before the build, and how the transaction pays for gas.
 - `Signature` — re-exported from `@unconfirmed/sui-effect`.
 - `SignatureScheme`
 - `Signed` — The schema of `Signed`.
 - `Signer` — A credential: who it signs as, how, and the two things it can sign.
+- `StandardWallet` — A Wallet Standard wallet, structurally: anything with a `features` record.
+- `StandardWalletAccount` — A Wallet Standard account, structurally: what `@wallet-standard/base`'s `WalletAccount` carries and this module reads.
 - `SubmitConfig` — The lifecycle settings.
 - `SubmitConfigOverrides` — What `SubmitConfig.with` and `SubmitConfig.layer` accept: any subset of `SubmitConfigService`, with every duration given as a `Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of milliseconds — and converted on the way in.
 - `SubmitConfigService` — Every decision `Tx.build`, `Tx.submit` and `Tx.reconcile` read from context.
@@ -686,37 +723,54 @@ The full entries follow under "API".
 - `SubmitViaError` — Everything `submitVia` can fail with, before the sender's own errors.
 - `SubmitViaReply` — What a third party answers when it has submitted your bytes.
 - `TransactionExpiration` — re-exported from `@unconfirmed/sui-effect`.
-- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.foldMovement`, `Tx.sendAll`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
 - `UNRESOLVED_TAGS` — The tags whose entries still need an answer from the network.
+- `Verdict` — How far a transaction was checked.
+- `Verified` — A `Built` whose simulated effects stayed inside a declared `Intent`.
 - `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
 - `VerifyOptions` — The options both verifiers take.
-- `attach` — Attaches a signature somebody else made — a sender's wallet, a remote sponsor, an HSM — to built or already signed bytes, after checking it.
-- `build` — Builds a transaction into signable bytes.
+- `ZkLogin` — The zkLogin session schemas and store, namespaced: `ZkLogin.Session`, `ZkLogin.SignatureInputs`, `ZkLogin.StoredSession`, `ZkLogin.save`, `ZkLogin.load`, `ZkLogin.remove`.
+- `ZkLoginSession` — The public half of a zkLogin session: everything but the ephemeral secret.
+- `ZkLoginSignatureInputs` — The proof inputs a zkLogin signature carries: the SDK's `ZkLoginSignatureInputs` from `@mysten/sui/zklogin`, as a schema, so a session can be stored and read back.
+- `ZkLoginSignerOptions` — What `zkLogin` needs: the public session and the ephemeral signer.
+- `ZkLoginStoredSession` — One stored zkLogin session: the public session and the sealed ephemeral secret (an Ed25519 32-byte seed, sealed by a `SecretSealer`).
+- `attach` — `Tx.attach`, also exported bare. Attaches a signature somebody else made — a sender's wallet, a remote sponsor, an HSM — to built or already signed bytes, after checking it.
+- `build` — `Tx.build`, also exported bare. Builds a transaction into signable bytes.
 - `chainOf` — re-exported from `@unconfirmed/sui-effect`.
-- `cosign` — Adds one more signature to already signed bytes, for a sponsored or multi-party transaction.
-- `ephemeral` — A fresh Ed25519 credential that exists only for this process.
+- `checkClaims` — Compares the simulated effects with the claims, exactly and in code.
+- `cosign` — `Tx.cosign`, also exported bare. Adds one more signature to already signed bytes, for a sponsored or multi-party transaction.
+- `describeClaims` — The claims as sentences, for the edge between the summary and the claims: a harmless sentence must not sit in front of permissions it has no use for.
+- `describeEffects` — The simulated effects as sentences a semantic screen can read: addresses become labels, types lose their package ids, and only SUI carries a number.
+- `ephemeral` — `Signer.ephemeral`, also exported bare. A fresh Ed25519 credential that exists only for this process.
 - `fold` — The recipe for one fold transaction: merge the batch's coins and deposit them into the owner's address balance with `0x2::coin::send_funds<T>`.
-- `foldCoins` — Folds the signer's coin objects into its address balance: `planFold` for `signer.address`, then one `run` of `fold` per batch, in order — SUI first, paying for its own fold, so a fresh account whose SUI is all coins needs no address balance to start.
-- `fromBytes` — Turns transaction bytes that came from somewhere else into a `Built`, reading everything the lifecycle needs out of the bytes themselves.
-- `fromConfig` — Reads a secret key from configuration and builds its signer.
-- `fromKeypair` — `fromSdkSigner` under the name the spec gave it when a keypair was the only thing it took.
-- `fromSdkSigner` — Wraps any `@mysten/sui/cryptography` `Signer`.
-- `gaslessStablecoinTransfer` — Builds the canonical transfer shape that an eligible stablecoin can execute without SUI gas: a `Balance<T>` from the SDK's `Transaction#balance` intent, consumed by `0x2::balance::send_funds<T>`.
+- `foldCoins` — `Tx.foldCoins`, also exported bare. Folds the signer's coin objects into its address balance: `planFold` for `signer.address`, then one `run` of `fold` per batch, in order — SUI first, paying for its own fold, so a fresh account whose SUI is all coins needs no address balance to start.
+- `foldMovement` — The coin → address-balance movement of one fold, which its balance changes do not show: a node nets them per address, so a fold of 1,000 SUI of coins reports only the gas (`+3,939,506` MIST on localnet, protocol 139, for five faucet coins whose storage rebate beat the gas), and the coins' balances are not in the effects at all — the coins are simply deleted, and the deposit is an accumulator write with no amount on it.
+- `fromBytes` — `Tx.fromBytes`, also exported bare. Turns transaction bytes that came from somewhere else into a `Built`, reading everything the lifecycle needs out of the bytes themselves.
+- `fromConfig` — `Signer.fromConfig`, also exported bare. Reads a secret key from configuration and builds its signer.
+- `fromKeypair` — `Signer.fromKeypair`, also exported bare. `fromSdkSigner` under the name the spec gave it when a keypair was the only thing it took.
+- `fromMnemonic` — `Signer.fromMnemonic`, also exported bare. A signer derived from a BIP-39 recovery phrase, **checked first**: the word count (12, 15, 18, 21 or 24), every word in the English list, and the checksum.
+- `fromSdkSigner` — `Signer.fromSdkSigner`, also exported bare. Wraps any `@mysten/sui/cryptography` `Signer`.
+- `fromSecretKey` — `Signer.fromSecretKey`, also exported bare. A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag names the scheme; a contradicting `scheme` option is refused), a 32-byte hex seed (`0x` optional), or 32 raw bytes — the last two read as `options.scheme`, default `ED25519`.
+- `gaslessStablecoinTransfer` — `Tx.gaslessStablecoinTransfer`, also exported bare. Builds the canonical transfer shape that an eligible stablecoin can execute without SUI gas: a `Balance<T>` from the SDK's `Transaction#balance` intent, consumed by `0x2::balance::send_funds<T>`.
 - `isUnresolved` — Whether this entry is still waiting for an answer, and therefore something `Tx.reconcileAll` has work to do about.
 - `maxEpochOf` — re-exported from `@unconfirmed/sui-effect`.
 - `maxTimestampMsOf` — re-exported from `@unconfirmed/sui-effect`.
 - `planFold` — Plans the transactions that fold an owner's coin objects into its address balance.
-- `reconcile` — Finds out what happened to a transaction that was sent but never answered for.
-- `reconcileAll` — Settles every unresolved entry in the journal: the explicit startup call a long-lived application makes after building a durable `Journal`.
-- `recorded` — What the journal recorded for one digest, if anything.
-- `remote` — Builds a signer around something that signs elsewhere: a KMS, a wallet, a hardware device, another process.
-- `resubmit` — Re-sends signed bytes whose outcome is unknown — the **identical** bytes, never a rebuild — and settles them the way `submit` does.
-- `run` — Build, preflight, sign and submit, under the sender lock wherever two runs could race.
+- `prepare` — `Tx.prepare`, also exported bare. Build (or take) a transaction, simulate exactly its bytes, run `SubmitConfig.preflight` and, given an intent, `Tx.verify`'s checks — and sign nothing.
+- `reconcile` — `Tx.reconcile`, also exported bare. Finds out what happened to a transaction that was sent but never answered for.
+- `reconcileAll` — `Tx.reconcileAll`, also exported bare. Settles every unresolved entry in the journal: the explicit startup call a long-lived application makes after building a durable `Journal`.
+- `recorded` — `Tx.recorded`, also exported bare. What the journal recorded for one digest, if anything.
+- `remote` — `Signer.remote`, also exported bare. Builds a signer around something that signs elsewhere: a KMS, a wallet, a hardware device, another process.
+- `resubmit` — `Tx.resubmit`, also exported bare. Re-sends signed bytes whose outcome is unknown — the **identical** bytes, never a rebuild — and settles them the way `submit` does.
+- `run` — `Tx.run`, also exported bare. Build, preflight, sign and submit, under the sender lock wherever two runs could race.
+- `sendAll` — `Tx.sendAll`, also exported bare. Sends **everything** the signer holds of one coin type — every coin object and the whole address balance — into `recipient`'s address balance, in one `run`, and leaves the sender **nothing** of it: no coin, no balance, no dust.
 - `sendFunds` — Sends `amount` of a coin type into `recipient`'s **address balance**: `0x2::balance::send_funds<T>(tx.balance({ type, balance: amount }), recipient)`, the canonical transfer on an address-balance account.
-- `sign` — Signs built bytes.
-- `sponsored` — Turns a recipe into a sponsored one: the sender owns the transaction, the gas owner pays, and gas comes from the sponsor's address balance rather than from coin objects, so the two parties never have to agree on a gas coin and can sign in either order.
-- `submit` — Sends signed bytes, and does not stop caring until it knows what happened.
-- `submitVia` — Submits through **someone else** — a relay, a sponsorship service, a backend that holds the only key allowed to talk to the node — and keeps the journal and the evidence rules that `Tx.submit` would have kept.
+- `sign` — `Tx.sign`, also exported bare. Signs built bytes.
+- `sponsored` — `Tx.sponsored`, also exported bare. Turns a recipe into a sponsored one: the sender owns the transaction, the gas owner pays, and gas comes from the sponsor's address balance rather than from coin objects, so the two parties never have to agree on a gas coin and can sign in either order.
+- `submit` — `Tx.submit`, also exported bare. Sends signed bytes, and does not stop caring until it knows what happened.
+- `submitVia` — `Tx.submitVia`, also exported bare. Submits through **someone else** — a relay, a sponsorship service, a backend that holds the only key allowed to talk to the node — and keeps the journal and the evidence rules that `Tx.submit` would have kept.
+- `verify` — `Tx.verify`, also exported bare. Checks built bytes against a declared intent, before anything is signed.
+- `verifySponsored` — Checks that sponsored bytes a service assembled are the transaction the sender asked to have sponsored, before the sender signs them.
 
 ### `@unconfirmed/sui-effect/journal`
 
@@ -727,6 +781,64 @@ The full entries follow under "API".
 - `makeKeyValueStore` — A journal backed by a `KeyValueStore`.
 - `pruneSettled` — Deletes every **settled** entry (`Executed`, `Failed`, `NotApplied`) whose answer was recorded strictly before `before`, and answers how many it deleted.
 
+### `@unconfirmed/sui-effect/gate`
+
+- `Gate` — re-exported from `@unconfirmed/sui-effect/tx`.
+- `GateService` — re-exported from `@unconfirmed/sui-effect/tx`.
+- `JevOptions` — How to reach Jev.
+- `ScreenRequest` — re-exported from `@unconfirmed/sui-effect/tx`.
+- `layerJev` — The `Gate` already in force, with Jev as its screen and `overrides` applied.
+- `layerJevConfig` — `layerJev` from the environment: `TYPESAFE_API_KEY` (required, redacted), `TYPESAFE_MODEL` and `TYPESAFE_BASE_URL` (optional).
+- `makeJev` — The screen itself, over an `HttpClient` you already have.
+
+### `@unconfirmed/sui-effect/keystore`
+
+- `DEFAULT_ITERATIONS` — PBKDF2-SHA256 iterations for a new seal: OWASP's 2023 recommendation.
+- `DEFAULT_PREFIX` — The `KeyValueStore` key prefix every record is stored under, by default.
+- `KEYSTORE_VERSION` — The format version this release writes and reads.
+- `KeyError` — re-exported from `@unconfirmed/sui-effect`.
+- `KeyErrorReason` — re-exported from `@unconfirmed/sui-effect`.
+- `Keystore` — The sealed keystore: `Keystore.layer(options?)` over a `KeyValueStore`, `Keystore.layerTest` in memory for tests.
+- `KeystoreAccount` — What the keystore says about an account.
+- `KeystoreError` — A keystore operation failed.
+- `KeystoreErrorReason` — Why a keystore operation failed.
+- `KeystoreOptions` — Options of `Keystore.layer` and `Keystore.make`.
+- `KeystoreService` — The keystore's members.
+- `LockableSigner` — re-exported from `@unconfirmed/sui-effect/tx`.
+- `MIN_LAYER_ITERATIONS` — The fewest iterations `Keystore.layer` accepts for a new seal.
+- `SealedKey` — One sealed account as stored, version 1.
+- `SealedSecret` — One secret sealed by `sealer`, as the string `seal` answers: the keystore's KDF and cipher parameters and its key-check value, version 1.
+- `sealer` — A `SecretSealer` (what `ZkLogin.save` and `ZkLogin.load` take) in the keystore's format: PBKDF2-HMAC-SHA256 over `password` (600 000 iterations by default, 16-byte random salt, 512 bits: the AES key and the key-check value), AES-256-GCM with a fresh 12-byte IV per seal, and as AAD `sui-effect/keystore/sealer/v1`, a newline, then the caller's `aad` — for a zkLogin session, its address — so a blob copied under another account's entry does not unseal.
+
+### `@unconfirmed/sui-effect/storage`
+
+- `AsyncStorageLike` — The part of `@react-native-async-storage/async-storage` (or anything shaped like it) this adapter calls.
+- `ChromeStorageAreaLike` — The part of a `chrome.storage` `StorageArea` this adapter calls, in its promise form.
+- `IndexedDbDatabase` — The part of an `IDBDatabase` this adapter calls.
+- `IndexedDbFactory` — The part of an `IDBFactory` (`globalThis.indexedDB`) this adapter calls.
+- `IndexedDbObjectStore` — The part of an `IDBObjectStore` this adapter calls.
+- `IndexedDbOpenRequest` — The part of an `IDBOpenDBRequest` this adapter reads.
+- `IndexedDbOptions` — Options for `layerIndexedDb`.
+- `IndexedDbRequest` — The part of an `IDBRequest` this adapter reads.
+- `IndexedDbTransaction` — The part of an `IDBTransaction` this adapter calls.
+- `MmkvLike` — The part of a `react-native-mmkv` instance this adapter calls: `delete` (2.x/3.x) or `remove` (4.x).
+- `layerAsyncStorage` — A `KeyValueStore` over an AsyncStorage-shaped store.
+- `layerChromeStorage` — A `KeyValueStore` over a `chrome.storage` area.
+- `layerIndexedDb` — A `KeyValueStore` backed by IndexedDB.
+- `layerMmkv` — A `KeyValueStore` over an MMKV-shaped synchronous store.
+
+### `@unconfirmed/sui-effect/enoki`
+
+- `Enoki` — The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`, `Enoki.sponsor`, `Enoki.execute`, `Enoki.run`.
+- `EnokiClient` — The two `EnokiClient` methods sponsorship uses, as `@mysten/enoki` 1.3.2 declares them (the input of `createSponsoredTransaction` narrowed to the `sender` form, plus `jwt`).
+- `EnokiError` — Enoki refused a request: an HTTP 4xx from the Enoki API, or a refusal the caller's `refused` predicate recognised.
+- `EnokiFlow` — The two `EnokiFlow` methods `fromFlow` uses.
+- `execute` — `Enoki.execute`, also exported bare. Executes a sponsored transaction through Enoki's `executeSponsoredTransaction`, **through the journal**: this is `Tx.submitVia(signed, send)`, so the `Signed` entry is written before Enoki is called, Enoki is called once, and its answer — a bare digest, never effects — is settled by asking the chain for the digest of the bytes that were signed.
+- `fromFlow` — `Enoki.fromFlow`, also exported bare. The signed-in `EnokiFlow` session as a `Signer`: `scheme: "ZkLogin"`, `maxEpoch` and the expiry checks of `Signer.zkLogin`, signing with the flow's own `EnokiKeypair` (`getKeypair`, which asks Enoki for the proof the first time and caches it in the flow's store).
+- `fromWallet` — `Enoki.fromWallet`, also exported bare. An Enoki wallet (from `registerEnokiWallets`) as a `Signer`: `Signer.wallet` over its Wallet Standard features, plus the session bound its `enoki:getSession` feature reports, so the signer carries `maxEpoch` and refuses after it like `Signer.zkLogin`.
+- `run` — `Enoki.run`, also exported bare. The whole Enoki-sponsored run, with the same front half as `Tx.run`: `sponsor` → `Tx.prepare(built, { sender, intent })` (one simulate of exactly Enoki's bytes, `SubmitConfig.preflight`, the intent's claims and screen) → `approve(prepared)` → `Tx.sign` (`prepared.verified` when there is an intent) → `onSigned` → `execute`, through the journal.
+- `sponsor` — `Enoki.sponsor`, also exported bare. Asks Enoki to sponsor a transaction, and answers its sponsored bytes as a `Built` that has been checked: `Tx.fromBytes` (the chain), Enoki's digest is the digest of its bytes, and `verifySponsored` (on `/tx`) — the sender is `options.sender`, the gas owner is someone else, and the transaction kind is **exactly** the kind that was sent.
+
 ### `@unconfirmed/sui-effect/extension`
 
 - `ExtensionFace` — What every registration carries besides the service's own members, under `$`-prefixed names so an extension is free to call a member `ready` or `dispose` itself.
@@ -735,8 +847,8 @@ The full entries follow under "API".
 - `PromiseFace` — The Promise face of a service interface.
 - `SuiExtension` — The namespace the spec spells: `SuiExtension.fromService(...)`, plus the leaf marker a service uses to say "this member is a value, not a namespace" (`SuiExtension.leaf(value)`, typed `SuiExtension.Leaf<T>`).
 - `SuiExtensionOptions` — What `fromService` needs to know beyond the service key itself.
-- `fromService` — Turns an Effect service into a `SuiClientRegistration` a Promise consumer passes to `client.$extend(...)`.
-- `leaf` — Marks a value as a `Leaf`: the Promise face passes it through untouched instead of walking into it.
+- `fromService` — `SuiExtension.fromService`, also exported bare. Turns an Effect service into a `SuiClientRegistration` a Promise consumer passes to `client.$extend(...)`.
+- `leaf` — `SuiExtension.leaf`, also exported bare. Marks a value as a `Leaf`: the Promise face passes it through untouched instead of walking into it.
 
 ### `@unconfirmed/sui-effect/script`
 
@@ -769,6 +881,7 @@ The full entries follow under "API".
 - `SuiCoreFake` — The in-memory `SuiCore`.
 - `SuiCoreFakeState` — What a test can do to the fake while it runs.
 - `SuiTest` — The harness: everything an extension's tests need to drive the fake from inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
+- `TestServices` — What `layerTest` provides, under one name: `Sui`, `SuiCore` and the fake's handle, `SuiCoreFake`.
 - `fakeCoin` — A gas coin for `FakeScript.coins`, in the SDK's `SuiClientTypes.Coin` shape, with the fields a fixture rarely cares about filled in: `coinType` defaults to SUI, `version` to 1 and `digest` to a `fakeDigest`.
 - `fakeDigest` — A deterministic base58 32-byte digest, for fixtures, already branded as a `Digest` so it compares with `executed.digest` and fills any field typed `Digest` without a cast.
 - `layerExtensionTest` — An extension's own layer over `layerTest`, which is the whole wiring an extension test needs.
@@ -780,16 +893,42 @@ The full entries follow under "API".
 ## `@unconfirmed/sui-effect`
 
 
-102 exported symbols.
+111 exported symbols.
+
+### `AffectedAddressFilter` (interface)
+
+```ts
+export interface AffectedAddressFilter {
+    /** The address, in any spelling `normalizeSuiAddress` takes. */
+    readonly affectedAddress: string;
+    readonly sender?: never;
+    readonly function?: never;
+}
+```
+
+A filter on transactions by an address whose state they moved — gRPC's
+`AffectedAddressFilter`, which the SDK's `TransactionFilter` does not
+expose. It matches a transaction after which the address owns an object, one
+that mutated, transferred away, deleted or wrapped an object the address
+owned, and one that changed the address's balance through an accumulator
+event: incoming transfers included, which a `sender` filter cannot find.
+
+Served by the gRPC ledger service only. On any other transport a listing
+with it fails with a non-retryable `TransportError` whose `status` is
+`UNIMPLEMENTED`, rather than quietly answering the sender's own
+transactions.
 
 ### `Balance` (const)
 
 ```ts
 declare const Balance: Schema
-// decodes to: { readonly coinType: CoinType; readonly balance: Mist; readonly coinBalance: Mist; readonly addressBalance: Mist; }
+// decodes to: { readonly coinType: CoinType; readonly balance: bigint; readonly coinBalance: bigint; readonly addressBalance: bigint; }
 ```
 
-A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`.
+A coin balance for one coin type. Mirrors `SuiClientTypes.Balance`. The
+amounts are `CoinAmount`s in the coin's own smallest unit — MIST only
+when `coinType` is SUI (they were branded `Mist` for every coin before
+0.5.0).
 
 ### `BalanceChange` (const)
 
@@ -828,6 +967,17 @@ declare const Built: Schema
 //     readonly bytes: Uint8Array<ArrayBufferLike>;
 //     readonly digest: Digest;
 //     readonly sender: SuiAddress;
+//     readonly gas: {
+//         readonly budget: Mist;
+//         readonly price: Mist;
+//         readonly owner: SuiAddress;
+//         readonly payment: readonly {
+//             readonly objectId: ObjectId;
+//             readonly version: Version;
+//             readonly digest: string;
+//         }[];
+//         readonly source: "addressBalance" | "coinReservation" | "coins";
+//     };
 //     readonly gasOwner?: SuiAddress | undefined;
 //     readonly expiration?: {
 //         readonly $kind: "None";
@@ -861,6 +1011,7 @@ declare const Built: Schema
 //         };
 //     } | undefined;
 //     readonly chain?: string | undefined;
+//     readonly simulation?: Simulation | undefined;
 // }
 ```
 
@@ -868,11 +1019,43 @@ A transaction built into bytes and ready to sign, with the expiration the
 builder settled on recorded so `Tx.reconcile` can decide, later and without
 the builder, whether the transaction can still land.
 
-Every field but `chain` is read back out of `bytes`. Bytes that arrived from
-somewhere else — a sponsor handed a sender's transaction — become a `Built`
-through `Tx.fromBytes`, never by hand: a hand-built value that leaves out
-`expiration` or `chain` silently disables the expiry rule and the chain guard
-`Tx.reconcile` depends on.
+Every field but `chain` and `simulation` is read back out of `bytes`. Bytes
+that arrived from somewhere else — a sponsor handed a sender's transaction,
+a dapp's request — become a `Built` through `Tx.fromBytes`, never by hand: a
+hand-built value that leaves out `expiration` or `chain` silently disables
+the expiry rule and the chain guard `Tx.reconcile` depends on.
+
+`gas` (0.5.0) is the gas data the bytes carry. `simulation` (0.5.0) is
+present only when `Tx.build` itself simulated **exactly these bytes** — the
+explicit simulate it runs when the SDK's resolver did not (a preset budget
+off gRPC, or nothing to resolve). On gRPC the resolver simulates the
+transaction before its budget is set, which is a different transaction, so
+there is no `simulation` there. The lifecycle reuses it (`Tx.run`,
+`Tx.prepare`, `Tx.verify`) only when it is the very object `Tx.build` made
+in this process; one that arrived inside a decoded `Built` is simulated
+again. Neither field is carried into `Signed` or the journal.
+
+### `BuiltGas` (const)
+
+```ts
+declare const BuiltGas: Schema
+// decodes to:
+// {
+//     readonly budget: Mist;
+//     readonly price: Mist;
+//     readonly owner: SuiAddress;
+//     readonly payment: readonly {
+//         readonly objectId: ObjectId;
+//         readonly version: Version;
+//         readonly digest: string;
+//     }[];
+//     readonly source: "addressBalance" | "coinReservation" | "coins";
+// }
+```
+
+The gas a built transaction carries, read back out of its bytes: `budget`
+and `price` in MIST, the `owner` who pays (the sender unless it is
+sponsored), the `payment` refs, and the `source` they amount to.
 
 ### `ChangedObject` (const)
 
@@ -1009,12 +1192,25 @@ declare const Coin: Schema
 //         readonly $kind: "Unknown";
 //     };
 //     readonly type: StructTag;
-//     readonly balance: Mist;
+//     readonly balance: bigint;
 // }
 ```
 
 A coin object. Mirrors `SuiClientTypes.Coin`: `type` is the full object type
 (`0x2::coin::Coin<T>`), `balance` the coin's value in its smallest unit.
+
+### `CoinAmount` (const)
+
+```ts
+declare const CoinAmount: Schema
+// decodes to: bigint
+```
+
+An amount of some coin in its smallest unit — MIST for SUI, the coin's own
+base unit for every other coin — as a plain non-negative `bigint`, encoded
+as the decimal string every SDK response uses. Which unit it is depends on
+the coin type beside it, so it carries no brand: `Mist` is for amounts
+that are always SUI (gas), and a SUI balance is `Mist.make(amount)` away.
 
 ### `CoinMetadata` (const)
 
@@ -1034,7 +1230,8 @@ declare const CoinType: Schema
 ```
 
 A coin type in normalized form: the schema, plus `CoinType.normalize` for any
-spelling and `CoinType.SUI`, the normalized `0x2::sui::SUI`.
+spelling, `CoinType.Strict` for user input and `CoinType.SUI`, the
+normalized `0x2::sui::SUI`.
 
 ### `CommandResult` (const)
 
@@ -1140,13 +1337,13 @@ declare const DynamicField: Schema
 // decodes to:
 // {
 //     readonly type: string;
-//     readonly digest: string;
 //     readonly $kind: "DynamicField" | "DynamicObject";
 //     readonly value: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
 //     };
 //     readonly version: Version;
+//     readonly digest: string;
 //     readonly name: {
 //         readonly type: string;
 //         readonly bcs: Uint8Array<ArrayBufferLike>;
@@ -1207,7 +1404,7 @@ with `{ include: EXECUTE_INCLUDE }` is a result that method accepts.
 
 ```ts
 declare const Event: Schema
-// decodes to: { readonly sender: SuiAddress; readonly bcs: Uint8Array<ArrayBufferLike>; readonly packageId: ObjectId; readonly module: string; readonly eventType: string; readonly json?: unknown; }
+// decodes to: { readonly bcs: Uint8Array<ArrayBufferLike>; readonly packageId: ObjectId; readonly module: string; readonly sender: SuiAddress; readonly eventType: string; readonly json?: unknown; }
 ```
 
 An emitted Move event. Mirrors `SuiClientTypes.Event` with the branded ids
@@ -1226,10 +1423,10 @@ which in practice means a relay or sponsor envelope decoded through
 declare const EventEntry: Schema
 // decodes to:
 // {
-//     readonly sender: SuiAddress;
 //     readonly bcs: Uint8Array<ArrayBufferLike>;
 //     readonly packageId: ObjectId;
 //     readonly module: string;
+//     readonly sender: SuiAddress;
 //     readonly eventType: string;
 //     readonly checkpoint: bigint | null;
 //     readonly transactionDigest: Digest;
@@ -1257,12 +1454,13 @@ The SDK's `SuiClientTypes.EventFilter`, under its own name.
 ```ts
 export declare class Executed extends Executed_base {
     readonly digest: Digest;
+    readonly checkpoint: bigint | null;
     readonly effects: TransactionEffects;
     readonly events: ReadonlyArray<Event>;
     readonly balanceChanges: ReadonlyArray<BalanceChange>;
     readonly objectTypes: { readonly [x: string]: string; };
-    readonly checkpoint: bigint | null;
     readonly timestampMs: number | null;
+    readonly sender?: SuiAddress | undefined;
     /**
      * Objects this transaction created, optionally filtered by Move type through
      * `typeMatches`: a bare tag matches every instantiation of the generic, a
@@ -1278,7 +1476,11 @@ export declare class Executed extends Executed_base {
      * Never fails.
      */
     createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef>;
-    /** Objects this transaction mutated in place, optionally filtered by type. Never fails. */
+    /**
+     * Objects this transaction mutated in place, optionally filtered by type.
+     * An object that changed owner is mutated too, and is also in
+     * `transferred`. Never fails.
+     */
     mutated(type?: string): ReadonlyArray<ChangedRef>;
     /**
      * Objects this transaction deleted or wrapped. The refs carry the versions the
@@ -1304,6 +1506,23 @@ export declare class Executed extends Executed_base {
      */
     wrapped(): ReadonlyArray<ChangedRef>;
     /**
+     * Objects whose **owner changed**, optionally filtered by type: they existed
+     * going in, still exist with the same id, and their input owner and output
+     * owner differ. Owners are compared by kind and party — an address, an
+     * object (a dynamic object field's parent), shared, immutable, a consensus
+     * address — never by version, so a transfer to someone else, a freeze, a
+     * move under a dynamic object field and a move between `AddressOwner` and
+     * `ConsensusAddressOwner` all count, while a consensus object whose
+     * `startVersion` moved does not. A created object is not transferred (its
+     * owner is on `created`'s ref), and neither is a deleted or wrapped
+     * one. Either owner unknown — a reduced envelope that left it out, or the
+     * `Unknown` variant — is not evidence of a change and is left out. Each ref
+     * is the output side, with `inputOwner` the owner going in. Never fails.
+     *
+     * @since 0.5.0
+     */
+    transferred(type?: string): ReadonlyArray<TransferredRef>;
+    /**
      * Packages this transaction published (`PackageWrite` plus `Created`), as
      * full refs like every other accessor. A package's `type` is the literal
      * `package` when the node reports one, and the ref falls back to it when the
@@ -1314,7 +1533,10 @@ export declare class Executed extends Executed_base {
     /**
      * The net balance change for one address and coin type, in the coin's base
      * unit (MIST for SUI). `coinType` is any spelling — `"0x2::sui::SUI"`,
-     * `CoinType.SUI` — compared under the one Move type rule. Never fails.
+     * `CoinType.SUI` — compared under the one Move type rule. It covers coin
+     * objects and the address balance alike, netted per address: a fold that
+     * moves 1,000 SUI of coins into its owner's address balance reports only
+     * the gas it cost (`Tx.foldMovement` reports the movement). Never fails.
      */
     balanceChange(address: SuiAddress, coinType: CoinType | string): bigint;
     /** Computation plus storage less the storage rebate, in MIST. Can be negative. Never fails. */
@@ -1325,7 +1547,9 @@ export declare class Executed extends Executed_base {
      *
      * This is what `Tx.submit` uses, exported so a caller holding a result from
      * somewhere else — `client.core.executeTransaction`, a sponsor's SDK call —
-     * can get the accessors without re-implementing the decode.
+     * can get the accessors without re-implementing the decode. `sender` is
+     * filled when the result carries the transaction data (it was read with
+     * `transaction: true` as well).
      *
      * Fails with: `ExecutionFailed` (the transaction applied and failed),
      * `DecodeError` (the response does not carry the include set).
@@ -1352,7 +1576,8 @@ export declare class Executed extends Executed_base {
      *   `createdWhere`, still list every created id.
      * - `balanceChanges` and `events` default to `[]`, `checkpoint` and
      *   `timestampMs` to `null`, `gasUsed` to zeros, and `effects.status` to
-     *   success.
+     *   success. `sender` (or `transaction.sender`) is kept when it is an
+     *   address.
      * - **JSON spellings are accepted** where the SDK's types are not JSON:
      *   `bcs` as base64 or as an array of byte values as well as a
      *   `Uint8Array`, and every `u64` (versions, balances, gas, `checkpoint`)
@@ -1480,7 +1705,10 @@ or map the fields you need.
 
 The data fields are `digest`, `effects`, `events`, `balanceChanges`,
 `objectTypes` (object id to Move type), `checkpoint` (`null` until the node
-says) and `timestampMs` (`null` likewise).
+says), `timestampMs` (`null` likewise) and `sender` (0.5.0).
+
+The accessors are **one implementation shared with `Simulation`**, so
+a preview reads a simulation exactly the way a receipt reads an execution.
 
 ### `ExecutionFailed` (class)
 
@@ -1634,6 +1862,35 @@ declare const GasCostSummary: Schema
 
 Gas cost breakdown. Mirrors `SuiClientTypes.GasCostSummary`.
 
+### `GasPaymentRef` (const)
+
+```ts
+declare const GasPaymentRef: Schema
+// decodes to: { readonly objectId: ObjectId; readonly version: Version; readonly digest: string; }
+```
+
+One entry of a transaction's gas payment, as the bytes name it: the SDK's
+own `{ objectId, version, digest }`. A coin reservation is one of these too
+(version `0`); `BuiltGas.source` says which kind the payment is.
+
+### `GasPaymentSource` (const)
+
+```ts
+declare const GasPaymentSource: Schema
+// decodes to: "addressBalance" | "coinReservation" | "coins"
+```
+
+How built bytes pay for gas, as `Tx.build` reads it back out of them (and
+as the span attribute `sui.gas_payment` names it):
+
+- `"addressBalance"`: an empty payment; gas is drawn from the payer's SUI
+  address balance at execution, and the bytes pin no gas coin.
+- `"coinReservation"`: every payment ref is a **coin reservation** — gas
+  drawn from the balance through a synthetic coin (version `0`), which is
+  what a `tx.gas` user whose payer has a balance gets. It reserves the
+  payer's whole balance as read at build time.
+- `"coins"`: at least one ref is a coin object.
+
 ### `GetObjectError` (type)
 
 ```ts
@@ -1704,6 +1961,52 @@ is fixed and known. These are the digests observed on the live networks
 (`getChainIdentifier` returns the genesis checkpoint digest); the SDK ships
 no such table. `devnet` and `localnet` are regenerated, so they are absent
 and `Sui.layerNoDeps` records whatever the node reports instead of asserting.
+
+### `KeyError` (class)
+
+```ts
+export declare class KeyError extends KeyError_base {
+    readonly reason: KeyErrorReason;
+    readonly message: string;
+    /** Nothing was derived or sent. */
+    readonly outcome: Outcome;
+    /**
+     * `Script.exitCode`'s answer: 2, like a `ConfigError`. Every reason is input
+     * (or a platform) a person has to fix; retrying the same call cannot succeed.
+     *
+     * @since 0.5.0
+     */
+    get exitCode(): number;
+}
+```
+
+A recovery phrase, a secret key or a derivation path was refused. Nothing
+was derived and nothing was sent: outcome `not_applied`.
+
+`message` is a schema field because the sentence comes from the check that
+failed; it never contains the phrase, a word of it, or the key.
+
+### `KeyErrorReason` (const)
+
+```ts
+declare const KeyErrorReason: Schema
+// decodes to: "unavailable" | "invalidMnemonic" | "invalidSecretKey" | "invalidPath" | "unsupportedScheme"
+```
+
+Why a phrase, a secret key or a path was refused.
+
+- `invalidMnemonic`: not 12/15/18/21/24 words, a word outside the BIP-39
+  English list, or a failed checksum. A mistyped phrase is always this,
+  never a valid account nobody owns.
+- `invalidSecretKey`: not a Bech32 `suiprivkey1…`, not 32 bytes (hex or
+  raw), or not a valid key of its scheme.
+- `invalidPath`: a derivation path that is not the scheme's Sui path shape,
+  or an account index outside `[0, 2^31)`.
+- `unsupportedScheme`: a scheme this constructor does not hold keys for
+  (only `ED25519`, `Secp256k1` and `Secp256r1` derive from a mnemonic), or a
+  `scheme` option that contradicts the key's own flag.
+- `unavailable`: the platform has no `crypto.getRandomValues`, which a fresh
+  mnemonic needs (React Native without a CSPRNG polyfill).
 
 ### `KnownNetwork` (const)
 
@@ -2273,181 +2576,91 @@ The expiration the transaction was built with rides along, because it is what
 ```ts
 export declare class SigningError extends SigningError_base {
     readonly cause: unknown;
+    readonly reason?: "expired" | "locked" | "rejected" | "unavailable" | undefined;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
 ```
 
-A signer refused or failed to produce a signature.
-
-### `Simulation` (const)
+### `SigningFailureReason` (const)
 
 ```ts
-declare const Simulation: Schema
-// decodes to:
-// {
-//     readonly digest: Digest;
-//     readonly effects: {
-//         readonly version: number;
-//         readonly status: {
-//             readonly success: boolean;
-//         };
-//         readonly gasUsed: {
-//             readonly computationCost: Mist;
-//             readonly storageCost: Mist;
-//             readonly storageRebate: Mist;
-//             readonly nonRefundableStorageFee: Mist;
-//         };
-//         readonly transactionDigest: Digest;
-//         readonly gasObject: {
-//             readonly objectId: ObjectId;
-//             readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
-//             readonly inputVersion: Version | null;
-//             readonly inputDigest: string | null;
-//             readonly inputOwner: {
-//                 readonly $kind: "AddressOwner";
-//                 readonly AddressOwner: SuiAddress;
-//             } | {
-//                 readonly $kind: "ObjectOwner";
-//                 readonly ObjectOwner: ObjectId;
-//             } | {
-//                 readonly $kind: "Shared";
-//                 readonly Shared: {
-//                     readonly initialSharedVersion: Version;
-//                 };
-//             } | {
-//                 readonly $kind: "Immutable";
-//                 readonly Immutable: true;
-//             } | {
-//                 readonly $kind: "ConsensusAddressOwner";
-//                 readonly ConsensusAddressOwner: {
-//                     readonly startVersion: Version;
-//                     readonly owner: SuiAddress;
-//                 };
-//             } | {
-//                 readonly $kind: "Unknown";
-//             } | null;
-//             readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
-//             readonly outputVersion: Version | null;
-//             readonly outputDigest: string | null;
-//             readonly outputOwner: {
-//                 readonly $kind: "AddressOwner";
-//                 readonly AddressOwner: SuiAddress;
-//             } | {
-//                 readonly $kind: "ObjectOwner";
-//                 readonly ObjectOwner: ObjectId;
-//             } | {
-//                 readonly $kind: "Shared";
-//                 readonly Shared: {
-//                     readonly initialSharedVersion: Version;
-//                 };
-//             } | {
-//                 readonly $kind: "Immutable";
-//                 readonly Immutable: true;
-//             } | {
-//                 readonly $kind: "ConsensusAddressOwner";
-//                 readonly ConsensusAddressOwner: {
-//                     readonly startVersion: Version;
-//                     readonly owner: SuiAddress;
-//                 };
-//             } | {
-//                 readonly $kind: "Unknown";
-//             } | null;
-//             readonly idOperation: "Unknown" | "None" | "Created" | "Deleted";
-//         } | null;
-//         readonly eventsDigest: string | null;
-//         readonly dependencies: readonly string[];
-//         readonly lamportVersion: Version | null;
-//         readonly changedObjects: readonly {
-//             readonly objectId: ObjectId;
-//             readonly inputState: "Unknown" | "DoesNotExist" | "Exists";
-//             readonly inputVersion: Version | null;
-//             readonly inputDigest: string | null;
-//             readonly inputOwner: {
-//                 readonly $kind: "AddressOwner";
-//                 readonly AddressOwner: SuiAddress;
-//             } | {
-//                 readonly $kind: "ObjectOwner";
-//                 readonly ObjectOwner: ObjectId;
-//             } | {
-//                 readonly $kind: "Shared";
-//                 readonly Shared: {
-//                     readonly initialSharedVersion: Version;
-//                 };
-//             } | {
-//                 readonly $kind: "Immutable";
-//                 readonly Immutable: true;
-//             } | {
-//                 readonly $kind: "ConsensusAddressOwner";
-//                 readonly ConsensusAddressOwner: {
-//                     readonly startVersion: Version;
-//                     readonly owner: SuiAddress;
-//                 };
-//             } | {
-//                 readonly $kind: "Unknown";
-//             } | null;
-//             readonly outputState: "Unknown" | "DoesNotExist" | "ObjectWrite" | "PackageWrite" | "AccumulatorWriteV1";
-//             readonly outputVersion: Version | null;
-//             readonly outputDigest: string | null;
-//             readonly outputOwner: {
-//                 readonly $kind: "AddressOwner";
-//                 readonly AddressOwner: SuiAddress;
-//             } | {
-//                 readonly $kind: "ObjectOwner";
-//                 readonly ObjectOwner: ObjectId;
-//             } | {
-//                 readonly $kind: "Shared";
-//                 readonly Shared: {
-//                     readonly initialSharedVersion: Version;
-//                 };
-//             } | {
-//                 readonly $kind: "Immutable";
-//                 readonly Immutable: true;
-//             } | {
-//                 readonly $kind: "ConsensusAddressOwner";
-//                 readonly ConsensusAddressOwner: {
-//                     readonly startVersion: Version;
-//                     readonly owner: SuiAddress;
-//                 };
-//             } | {
-//                 readonly $kind: "Unknown";
-//             } | null;
-//             readonly idOperation: "Unknown" | "None" | "Created" | "Deleted";
-//         }[];
-//         readonly unchangedConsensusObjects: readonly {
-//             readonly kind: "Unknown" | "ReadOnlyRoot" | "MutateConsensusStreamEnded" | "ReadConsensusStreamEnded" | "Cancelled" | "PerEpochConfig";
-//             readonly objectId: ObjectId;
-//             readonly version: Version | null;
-//             readonly digest: string | null;
-//         }[];
-//         readonly auxiliaryDataDigest: string | null;
-//     };
-//     readonly events: readonly {
-//         readonly sender: SuiAddress;
-//         readonly bcs: Uint8Array<ArrayBufferLike>;
-//         readonly packageId: ObjectId;
-//         readonly module: string;
-//         readonly eventType: string;
-//         readonly json?: unknown;
-//     }[];
-//     readonly balanceChanges: readonly {
-//         readonly coinType: CoinType;
-//         readonly address: SuiAddress;
-//         readonly amount: bigint;
-//     }[];
-//     readonly objectTypes: {
-//         readonly [x: string]: string;
-//     };
-//     readonly commandResults: readonly {
-//         readonly returnValues: readonly {
-//             readonly bcs: Uint8Array<ArrayBufferLike>;
-//         }[];
-//         readonly mutatedReferences: readonly {
-//             readonly bcs: Uint8Array<ArrayBufferLike>;
-//         }[];
-//     }[];
-//     readonly gasPaymentMocked: boolean;
-// }
+declare const SigningFailureReason: Schema
+// decodes to: "expired" | "locked" | "rejected" | "unavailable"
+```
+
+Why a signer refused, when it knows: `"expired"` (a session-bound credential —
+a zkLogin proof — whose `maxEpoch` has passed or would pass before the bytes
+could land), `"locked"` (the secret was dropped by `lock` / `dispose` and must
+be unlocked again), `"rejected"` (the person, or the wallet acting for them,
+declined), `"unavailable"` (the device, wallet or remote signer could not be
+reached). Absent for every other failure. A program branches on this, never
+on `cause`.
+
+### `Simulation` (class)
+
+```ts
+export declare class Simulation extends Simulation_base {
+    readonly digest: Digest;
+    readonly effects: TransactionEffects;
+    readonly events: ReadonlyArray<Event>;
+    readonly balanceChanges: ReadonlyArray<BalanceChange>;
+    readonly objectTypes: { readonly [x: string]: string; };
+    readonly commandResults: ReadonlyArray<CommandResult>;
+    readonly gasPaymentMocked: boolean;
+    /** `Executed.created`, over the simulated effects. Never fails. @since 0.5.0 */
+    created(type?: string): ReadonlyArray<ChangedRef>;
+    /** `Executed.createdWhere`, over the simulated effects. Never fails. @since 0.5.0 */
+    createdWhere(predicate: (ref: ChangedRef) => boolean): ReadonlyArray<ChangedRef>;
+    /** `Executed.mutated`, over the simulated effects. Never fails. @since 0.5.0 */
+    mutated(type?: string): ReadonlyArray<ChangedRef>;
+    /** `Executed.deleted` (deleted or wrapped), over the simulated effects. Never fails. @since 0.5.0 */
+    deleted(): ReadonlyArray<ChangedRef>;
+    /** `Executed.wrapped`, over the simulated effects. Never fails. @since 0.5.0 */
+    wrapped(): ReadonlyArray<ChangedRef>;
+    /** `Executed.transferred`: objects whose owner changed. Never fails. @since 0.5.0 */
+    transferred(type?: string): ReadonlyArray<TransferredRef>;
+    /** `Executed.packagesPublished`, over the simulated effects. Never fails. @since 0.5.0 */
+    packagesPublished(): ReadonlyArray<ChangedRef>;
+    /** `Executed.balanceChange`: the net delta for one address and coin type. Never fails. @since 0.5.0 */
+    balanceChange(address: SuiAddress, coinType: CoinType | string): bigint;
+    /** Computation plus storage less the storage rebate, in MIST. Can be negative. Never fails. @since 0.5.0 */
+    get gasUsedTotal(): bigint;
+    /**
+     * `Executed.expectCreated`, over the simulated effects.
+     *
+     * Fails with: `UnexpectedEffects` when the simulation created no object of
+     * that type, or more than one.
+     *
+     * @since 0.5.0
+     */
+    expectCreated(type: string): Effect.Effect<ChangedRef, UnexpectedEffects>;
+    /**
+     * `Executed.eventsOf`, over the simulated events.
+     *
+     * Fails with: `DecodeError`.
+     *
+     * @since 0.5.0
+     */
+    eventsOf<T>(codec: Schema.Codec<T, Uint8Array>, eventType?: string): Effect.Effect<ReadonlyArray<T>, DecodeError>;
+    /**
+     * `Executed.expectEvent`, over the simulated events.
+     *
+     * Fails with: `UnexpectedEffects`, `DecodeError`.
+     *
+     * @since 0.5.0
+     */
+    expectEvent<T>(codec: Schema.Codec<T, Uint8Array>, eventType?: string): Effect.Effect<T, UnexpectedEffects | DecodeError>;
+    /**
+     * `Executed.expectPublished`, over the simulated effects: the package a
+     * publish would create, and its `UpgradeCap`.
+     *
+     * Fails with: `UnexpectedEffects`.
+     *
+     * @since 0.5.0
+     */
+    expectPublished(): Effect.Effect<Published, UnexpectedEffects>;
+}
 ```
 
 The result of a successful simulation, with the fixed include set `Sui` asks
@@ -2458,6 +2671,15 @@ simulated transaction had no gas payment, so the node ran it on a mocked gas
 coin — gas costs and logic are exercised, but anything drawn from `tx.gas`
 was funded by the mock, not the sender. `false` when gas was paid with real
 coins or from the sender's address balance.
+
+**A `Schema.Class` since 0.5.0** (a `Schema.Struct` before), so it carries
+`Executed`'s accessors — `created`, `createdWhere`, `mutated`,
+`deleted`, `wrapped`, `transferred`, `packagesPublished`, `balanceChange`,
+`gasUsedTotal`, `expectCreated`, `eventsOf`, `expectEvent`,
+`expectPublished` — through **the same implementation**, so a preview and
+the receipt it predicts read the same way. The fields are unchanged. Values
+come from `Sui.simulate` or a decode (`Schema.decodeUnknownEffect(Simulation)`);
+one assembled by hand is `new Simulation({ ... })`.
 
 ### `SimulationFailed` (class)
 
@@ -3501,11 +3723,26 @@ export interface SuiService {
      * `ExecutionFailed` — not a failure of the stream, which `getTransaction`'s
      * "a failure is a failure" rule would make it.
      *
-     * Fails with: `TransportError`.
+     * **`{ affectedAddress }` (0.5.0)** lists every transaction that moved the
+     * address's state — incoming transfers as well as its own — through the gRPC
+     * ledger service's `affectedAddress` predicate (see
+     * `AffectedAddressFilter`). Ordering, `after`/`before` and the cursors are
+     * the other filters' exactly: ledger order, oldest first unless
+     * descending, fifty digests a page, and an `endCursor` in the SDK's own
+     * encoding. Each page is one listing of digests and then one
+     * `getTransaction` per digest, so it costs a page's worth of reads; a
+     * digest the node prunes between the two is left out of the page. On a
+     * transport without the gRPC ledger service it fails with a non-retryable
+     * `TransportError` whose `status` is `UNIMPLEMENTED` — never a silent
+     * sender-only answer. A pruning node (localnet keeps a few dozen
+     * checkpoints) lists only what it still holds.
+     *
+     * Fails with: `TransportError` (`status: "UNIMPLEMENTED"` for an
+     * `affectedAddress` filter on a transport that cannot serve it).
      *
      * @since 0.4.0
      */
-    readonly streamTransactions: (filter?: TransactionFilter, opts?: ListOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
+    readonly streamTransactions: (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
     /**
      * `streamTransactions` a page at a time, each page carrying the cursor to
      * resume from (see `streamEventPages`).
@@ -3514,7 +3751,7 @@ export interface SuiService {
      *
      * @since 0.4.0
      */
-    readonly streamTransactionPages: (filter?: TransactionFilter, opts?: ListOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
+    readonly streamTransactionPages: (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
     /**
      * Every transaction matching `filter`, oldest first, without end — the
      * transaction twin of `tailEvents`, with the same polling, retry and
@@ -3529,7 +3766,7 @@ export interface SuiService {
      *
      * @since 0.4.0
      */
-    readonly tailTransactions: (filter?: TransactionFilter, opts?: TailOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
+    readonly tailTransactions: (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
     /**
      * `tailTransactions` a page at a time (see `tailEventPages`), with the
      * same caveat: a filtered tail whose completeness matters uses a single
@@ -3540,7 +3777,7 @@ export interface SuiService {
      *
      * @since 0.4.0
      */
-    readonly tailTransactionPages: (filter?: TransactionFilter, opts?: TailOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
+    readonly tailTransactionPages: (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
     /**
      * Serializes work for one sender, so two transactions from the same address
      * cannot pick the same gas coin. Adds no failures of its own.
@@ -3788,6 +4025,21 @@ export declare class TransactionNotFound extends TransactionNotFound_base {
 
 No transaction with this digest is known to the node.
 
+### `TransferredRef` (interface)
+
+```ts
+export interface TransferredRef extends ChangedRef {
+    /** The owner the object had going in. */
+    readonly inputOwner: Owner;
+    /** The owner it has afterwards. */
+    readonly owner: Owner;
+}
+```
+
+A changed object whose **owner changed**: what `Executed.transferred`
+and `Simulation.transferred` return. The output side's ref, with the
+owner it had going in as `inputOwner` and the one it has now as `owner`.
+
 ### `TransportError` (class)
 
 ```ts
@@ -4016,11 +4268,22 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-58 exported symbols.
+99 exported symbols.
 
 ### `Built` (const)
 
 Re-exported from `@unconfirmed/sui-effect`.
+
+### `ClaimViolation` (interface)
+
+```ts
+export interface ClaimViolation {
+    readonly rule: "outflow" | "recipient" | "object";
+    readonly message: string;
+}
+```
+
+One way the simulated effects stepped outside the claims.
 
 ### `ExpirationPolicy` (type)
 
@@ -4096,6 +4359,41 @@ How one fold transaction pays for gas.
   pays from the SUI balance when it covers the budget and from SUI coins
   otherwise.
 
+### `FoldMovement` (interface)
+
+```ts
+export interface FoldMovement {
+    readonly owner: SuiAddress;
+    readonly coinType: CoinType;
+    /** The batch's coins this fold consumes, at the versions and balances the plan read. */
+    readonly consumed: ReadonlyArray<Coin>;
+    /** The batch's coins the effects do **not** consume. Empty for a fold that does what it says. */
+    readonly missing: ReadonlyArray<Coin>;
+    /** The total of `consumed`, in the coin type's smallest unit. */
+    readonly fromCoins: bigint;
+    /**
+     * What the owner's address balance of this coin type gains: `netChange +
+     * fromCoins`. For a SUI batch paying for itself, the coins less the net gas
+     * (more than the coins when the storage rebates exceed the gas).
+     */
+    readonly toAddressBalance: bigint;
+    /** The owner's net balance change for the coin type, coins and balance together. */
+    readonly netChange: bigint;
+    /**
+     * Whether `toAddressBalance` is exact: every coin of the batch is consumed,
+     * and the owner ends up with no coin object of this type created or
+     * mutated, so nothing but the address balance can hold the difference.
+     */
+    readonly exact: boolean;
+}
+```
+
+What one fold moves, read off its simulation (or its execution):
+`consumed`, the batch's coins the effects delete, with the balances the plan
+read them at; `fromCoins`, their total; `toAddressBalance`, what the owner's
+address balance of the coin type gains; and `netChange`, the owner's net
+balance change, which is all `balanceChanges` reports.
+
 ### `FoldPlan` (interface)
 
 ```ts
@@ -4128,6 +4426,43 @@ export interface FoldResult {
 What `foldCoins` did: the plan it ran, and one `Executed` per batch, in
 order.
 
+### `FromMnemonicOptions` (interface)
+
+```ts
+export interface FromMnemonicOptions {
+    /** The scheme to derive. Default `"ED25519"`, which is what every Sui wallet derives first. */
+    readonly scheme?: KeyScheme;
+    /**
+     * The account index on the scheme's standard path, `[0, 2^31)`. Default 0.
+     * Ignored when `path` is given.
+     */
+    readonly account?: number;
+    /**
+     * An explicit derivation path, checked against the scheme's shape:
+     * `m/44'/784'/a'/c'/i'` (Ed25519, every level hardened, SLIP-0010),
+     * `m/54'/784'/a'/c/i` (Secp256k1) or `m/74'/784'/a'/c/i` (Secp256r1).
+     */
+    readonly path?: string;
+}
+```
+
+Options of `Signer.fromMnemonic`.
+
+### `FromSecretKeyOptions` (interface)
+
+```ts
+export interface FromSecretKeyOptions {
+    /**
+     * The scheme of a key that carries none: raw bytes or a 64-digit hex seed
+     * (default `"ED25519"`). For a Bech32 `suiprivkey1…` the key's own flag
+     * decides, and a `scheme` that contradicts it is refused.
+     */
+    readonly scheme?: KeyScheme;
+}
+```
+
+Options of `Signer.fromSecretKey`.
+
 ### `GasPaymentPolicy` (type)
 
 ```ts
@@ -4147,6 +4482,126 @@ How `Tx.build` treats a gas payment the recipe left unset.
   `Tx.foldCoins`.
 
 A payment the recipe set itself is the recipe's choice under either policy.
+
+### `Gate` (const)
+
+```ts
+declare const Gate: Context.Reference<GateService> & {
+    defaults: GateService;
+    layer: (overrides: Partial<GateService>) => Layer.Layer<never>;
+    with: (overrides: Partial<GateService>) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+}
+```
+
+The intent policy and its screen.
+
+Because this is a `Context.Reference`, `Tx.verify` keeps `R = Sui`: with
+nothing provided the claims are checked and the verdict is `Unscreened`.
+`Gate.layer(overrides)` spreads `defaults`; `Gate.with(overrides)`
+merges over the gate in force.
+
+### `GateService` (interface)
+
+```ts
+export interface GateService {
+    /**
+     * The semantic screen. It answers in probabilities and decides nothing.
+     *
+     * Fails with: `TransportError`, which is what `GateService.onUnavailable`
+     * is about.
+     */
+    readonly screen?: (request: ScreenRequest) => Effect.Effect<Screening, TransportError>;
+    /**
+     * Whether `Tx.run` refuses a transaction that declares no intent, with
+     * `PolicyDenied { rule: "intent.required" }`, before it builds anything.
+     * Off by default; on is the setting for a wallet an agent drives. It binds
+     * `Tx.run` only: the explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.submit`)
+     * is not gated, and a caller assembling it calls `Tx.verify` itself.
+     */
+    readonly requireIntent: boolean;
+    /**
+     * What a screen that could not answer means. `"deny"` refuses the transaction
+     * with `PolicyDenied { rule: "gate.unavailable" }`: a gate that was configured
+     * and is down is not a gate that passed. `"unscreened"` lets the claims check
+     * stand alone and records why on the verdict.
+     */
+    readonly onUnavailable: "deny" | "unscreened";
+    /** An effect line the summary covers with less probability than this is refused. */
+    readonly minEffectInScope: number;
+    /** A claim line the summary has less use for than this is refused. */
+    readonly minClaimInScope: number;
+    /** A summary less specific than this (0 to 2) covers nothing and is refused. */
+    readonly minSpecificity: number;
+    /** A summary more likely than this to be addressing the screen is refused. */
+    readonly maxInjection: number;
+}
+```
+
+Every decision `Tx.verify` and `Tx.run` read from context about intents.
+
+### `Intent` (const)
+
+```ts
+declare const Intent: Schema
+// decodes to:
+// {
+//     readonly summary: string;
+//     readonly author: "user" | "task" | "dapp";
+//     readonly claims: {
+//         readonly outflows: readonly {
+//             readonly coinType: CoinType;
+//             readonly max: bigint;
+//         }[];
+//         readonly recipients: readonly SuiAddress[];
+//         readonly objects: readonly ObjectId[];
+//     };
+// }
+```
+
+A declared intent: one sentence for the screen, exact claims for the code.
+
+`Intent.fromSimulation(simulation: Simulation, parties: Parties, opts: {
+summary: string; author: IntentAuthor }): Intent` renders a simulation as
+the exact claims it implies: every coin the sender loses at exactly the
+amount lost (net of gas), every address other than the sender that receives
+a coin or an object, every non-coin object that leaves the sender. So
+`checkClaims(Intent.fromSimulation(s, p, opts), s, p)` is empty. It is how a
+wallet shows a dapp's bytes as claims a person can approve, then holds what
+it signs to them with `Tx.verify`; `parties` may be the `Built` itself.
+
+**Never fails; the summary is checked by `Tx.verify` (`intent.invalid`).**
+
+### `IntentAuthor` (const)
+
+```ts
+declare const IntentAuthor: Schema
+// decodes to: "user" | "task" | "dapp"
+```
+
+Who wrote the intent. Provenance for the audit record, and nothing else: the
+checks are the same for all three, because none of them can be verified from
+here.
+
+`"user"` is a person describing their own transaction. `"task"` is the scope
+a person gave an agent **before** the agent built anything, which is the only
+form that constrains a prompt-injected agent; an agent describing its own PTB
+after the fact is `"dapp"` in all but name. `"dapp"` is a third party's
+description of a transaction it built, which is a claim to check and never
+evidence.
+
+### `IntentClaims` (const)
+
+```ts
+declare const IntentClaims: Schema
+// decodes to: { readonly outflows: readonly { readonly coinType: CoinType; readonly max: bigint; }[]; readonly recipients: readonly SuiAddress[]; readonly objects: readonly ObjectId[]; }
+```
+
+What the transaction is allowed to do to the sender, deny by default: a coin
+that is not listed may not decrease, an address that is not listed may not
+receive anything, and an object that is not listed may not leave.
+
+Gas is not an outflow. It is bounded by `SubmitConfig.maxGasBudget`, and
+counting it would make every claim a guess about the reference gas price.
 
 ### `Journal` (const)
 
@@ -4398,6 +4853,16 @@ export interface JournalService {
 
 Reading and writing the submission journal.
 
+### `KeyScheme` (type)
+
+```ts
+export type KeyScheme = "ED25519" | "Secp256k1" | "Secp256r1";
+```
+
+The schemes a key at rest can be: the three a BIP-39 phrase derives on the
+standard Sui paths. (`MLDSA65` has its own path family and is read only by
+`Signer.fromConfig`; `ZkLogin`, `Passkey` and `MultiSig` hold no secret key.)
+
 ### `LockSenderPolicy` (type)
 
 ```ts
@@ -4424,6 +4889,113 @@ When `Tx.run` holds the sender lock.
 A config provided directly rather than through `SubmitConfig.with` may still
 hold the pre-0.4.0 boolean or another value: `Tx.run` reads `true` as
 `"always"`, `false` as `"never"`, and anything else as `"always"`.
+
+### `LockableSigner` (interface)
+
+```ts
+export interface LockableSigner extends Signer {
+    /** Drops the secret; every later signature fails with `reason: "locked"`. Never fails. */
+    readonly lock: Effect.Effect<void>;
+    /** Whether `lock` has run. Never fails. */
+    readonly locked: Effect.Effect<boolean>;
+}
+```
+
+A `Signer` that holds a secret and can drop it.
+
+`lock` is **disposal, one way**: it zeroes the secret bytes the signer owns,
+zeroes the keypair's own copy where the SDK keeps one, and releases the
+keypair. Afterwards both members fail with `SigningError { reason:
+"locked" }`; there is no unlock — open the account again (`Keystore.unlock`,
+`Signer.fromMnemonic`) for a new signer. `lock` is idempotent and never
+fails. A `lock` racing a signature cannot land mid-signature: the signature
+either answers by the real key (it was computed before the lock) or fails
+with `reason: "locked"`.
+
+A `LockableSigner` **is** a `Signer`: every function that takes a signer
+takes this one, and it carries no secret either — the keypair lives in a
+closure, not on the value.
+
+### `MnemonicLength` (type)
+
+```ts
+export type MnemonicLength = 12 | 15 | 18 | 21 | 24;
+```
+
+The BIP-39 word counts: 128 to 256 bits of entropy in 32-bit steps.
+
+### `OutflowClaim` (const)
+
+```ts
+declare const OutflowClaim: Schema
+// decodes to: { readonly coinType: CoinType; readonly max: bigint; }
+```
+
+The most of one coin the sender may lose, in base units, gas excluded.
+
+### `Parties` (interface)
+
+```ts
+export interface Parties {
+    readonly sender: SuiAddress;
+    readonly gasOwner?: SuiAddress | undefined;
+}
+```
+
+Whose transaction it is. Gas spent by whoever pays it is never an outflow.
+
+A `Built` is a `Parties` as it is: `sender`, and `gasOwner` only when someone
+else pays.
+
+### `PasskeyProvider` (interface)
+
+```ts
+export interface PasskeyProvider {
+    readonly create: () => Promise<{
+        readonly rawId: ArrayBuffer;
+        readonly response: {
+            readonly getPublicKey: () => ArrayBuffer | null;
+        };
+    }>;
+    readonly get: (challenge: Uint8Array, credentialId?: Uint8Array) => Promise<{
+        readonly response: {
+            readonly authenticatorData: ArrayBuffer;
+            readonly clientDataJSON: ArrayBuffer;
+            readonly signature: ArrayBuffer;
+        };
+    }>;
+}
+```
+
+What a passkey signer asks the authenticator for, structurally: the SDK's
+`PasskeyProvider` from `@mysten/sui/keypairs/passkey` (its
+`BrowserPasskeyProvider` is one) without the DOM types it is declared with,
+so a React Native or extension provider can be typed without a DOM `lib`.
+`create()` answers the `navigator.credentials.create()` credential (its
+`rawId` and `response.getPublicKey()`), `get()` the
+`navigator.credentials.get()` assertion for `challenge`.
+
+### `Prepared` (interface)
+
+```ts
+export interface Prepared {
+    readonly built: Built;
+    readonly simulation: Simulation;
+    readonly verified?: Verified;
+}
+```
+
+Built bytes and what the lifecycle learned about them before anything is
+signed: the simulation of exactly those bytes, and the verified intent when
+one was declared. What `prepare` answers and what `Tx.run`'s
+`approve` is shown.
+
+`built.gas` is the gas the bytes carry (budget, price, payer, payment and
+where it comes from) and `built.gasOwner` the sponsor, when there is one;
+`simulation` has `Executed`'s accessors (`created`, `transferred`,
+`balanceChange`, ...), and `simulation.gasUsedTotal` is the gas it is
+expected to cost. `verified` is present exactly when an intent was given,
+and is the `Built` to sign when it is.
 
 ### `ReconcileInput` (type)
 
@@ -4489,6 +5061,123 @@ export type RunError = BuildError | SimulationFailed | PolicyDenied | SigningErr
 
 Everything `run` can fail with, as one name: `SubmitError` plus
 what building, preflighting and signing can produce.
+
+### `ScreenRequest` (interface)
+
+```ts
+export interface ScreenRequest {
+    readonly intent: Intent;
+    /** `describeEffects` of the simulation. Never empty. */
+    readonly effects: ReadonlyArray<string>;
+    /** `describeClaims` of the intent. Empty when it claims nothing. */
+    readonly claims: ReadonlyArray<string>;
+}
+```
+
+What a screen is shown: the sentence, and both things it is compared with.
+
+### `ScreenedLine` (const)
+
+```ts
+declare const ScreenedLine: Schema
+// decodes to: { readonly text: string; readonly inScope: number; }
+```
+
+One rendered line and the probability that the declared summary covers it.
+
+### `Screening` (const)
+
+```ts
+declare const Screening: Schema
+// decodes to:
+// {
+//     readonly effects: readonly {
+//         readonly text: string;
+//         readonly inScope: number;
+//     }[];
+//     readonly claims: readonly {
+//         readonly text: string;
+//         readonly inScope: number;
+//     }[];
+//     readonly specificity: number;
+//     readonly injection: number;
+// }
+```
+
+What a semantic screen answered: probabilities, never a decision. The
+decision is `Gate`'s thresholds, applied in code by `Tx.verify`.
+
+### `SecretSealer` (interface)
+
+```ts
+export interface SecretSealer {
+    /** Fails with: `SigningError`. */
+    readonly seal: (secret: Redacted.Redacted<Uint8Array>, aad: Uint8Array) => Effect.Effect<string, SigningError>;
+    /** Fails with: `SigningError` (`reason: "locked"` when the keystore is locked is the convention). */
+    readonly unseal: (sealed: string, aad: Uint8Array) => Effect.Effect<Redacted.Redacted<Uint8Array>, SigningError>;
+}
+```
+
+Seals and unseals a secret for storage. The keystore that owns the wrapping
+key implements this: `Keystore.sealer(password)` on
+`@unconfirmed/sui-effect/keystore` is one (PBKDF2 and AES-GCM, the
+keystore's format), and WebCrypto under a key the platform keeps or the OS
+keychain are others.
+
+`aad` is additional authenticated data the sealer must bind the blob to —
+here, the UTF-8 bytes of the session's address — so a sealed key copied
+under another account's entry does not unseal. A sealer that returns its
+input unchanged stores the ephemeral key in plain text; that is a decision
+the caller makes by writing one, never a default.
+
+### `SendAllResult` (interface)
+
+```ts
+export interface SendAllResult {
+    readonly sweep: SendAllSweep;
+    readonly executed: Executed;
+    readonly received: bigint;
+}
+```
+
+What `sendAll` did: the sweep it ran and the `Executed` it produced.
+`received` is what the recipient's balance of the coin type gained, read
+off the effects: for SUI, the sweep less the net gas (more than the sweep
+when the deleted coins' storage rebate beats the gas); for any other type,
+exactly `sweep.amount`.
+
+### `SendAllSweep` (interface)
+
+```ts
+export interface SendAllSweep {
+    readonly owner: SuiAddress;
+    readonly recipient: SuiAddress;
+    /** The coin type, normalized. */
+    readonly coinType: CoinType;
+    /** The coin objects swept, largest first, at the versions read. */
+    readonly coins: ReadonlyArray<Coin>;
+    /** The owner's address balance of the coin type as read: all of it is swept. */
+    readonly addressBalance: bigint;
+    /** `coins` plus `addressBalance`, before gas. */
+    readonly amount: bigint;
+    readonly gas: "coinReservation" | "coins" | "auto";
+}
+```
+
+What one `sendAll` sweep takes: the coins and the address balance of
+one coin type, as read just before the build, and how the transaction pays
+for gas. What `Tx.sendAll`'s `approve` is shown beside the prepared
+transaction, and what its answer reports.
+
+- `"coinReservation"` (SUI): gas is a reservation of the **whole** SUI
+  address balance, the coins are merged into that gas coin, and the gas
+  coin is deposited — what is left after gas is the recipient's.
+- `"coins"` (SUI): the coins are the gas payment (the first 256; the rest
+  are merged into the gas coin), the address balance is redeemed into a
+  coin and merged into it, and the gas coin is deposited.
+- `"auto"` (any other coin type): the coins are merged and deposited, the
+  balance is withdrawn and deposited, and SUI pays the gas, from wherever
+  the resolver finds it.
 
 ### `Signature` (const)
 
@@ -4568,6 +5257,15 @@ export interface Signer {
      * Fails with: `SigningError`.
      */
     readonly signPersonalMessage: (bytes: Uint8Array) => Effect.Effect<Signature, SigningError>;
+    /**
+     * The last epoch this credential can sign for, when it is session-bound (a
+     * zkLogin proof's `maxEpoch`). Absent for a credential that does not expire.
+     * `Tx.run` keeps the built bytes' validity window inside it, and a signer
+     * whose bound has passed fails with `SigningError { reason: "expired" }`.
+     *
+     * @since 0.5.0
+     */
+    readonly maxEpoch?: bigint;
 }
 ```
 
@@ -4584,12 +5282,65 @@ declare const Signer: {
     readonly fromConfig: (name?: string) => Effect.Effect<Signer, Config.ConfigError>;
     readonly ephemeral: Effect.Effect<Signer, never, never>;
     readonly remote: (signer: RemoteSigner) => Signer;
+    readonly fromMnemonic: (phrase: Redacted.Redacted<string> | string, options?: FromMnemonicOptions) => Effect.Effect<LockableSigner, KeyError>;
+    readonly fromSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, options?: FromSecretKeyOptions) => Effect.Effect<LockableSigner, KeyError>;
+    readonly generateMnemonic: (words?: MnemonicLength) => Effect.Effect<Redacted.Redacted<string>, KeyError>;
+    readonly derivationPath: (scheme: KeyScheme, account?: number) => string;
+    readonly scoped: <E, R>(acquire: Effect.Effect<LockableSigner, E, R>) => Effect.Effect<LockableSigner, E, R | Scope.Scope>;
+    readonly zkLogin: (options: import("./ZkLoginSigner.ts").ZkLoginSignerOptions) => Effect.Effect<Signer, SigningError, never>;
+    readonly passkey: (options: {
+        readonly publicKey: Uint8Array;
+        readonly provider: import("./AccountSigners.ts").PasskeyProvider;
+        readonly credentialId?: Uint8Array;
+    }) => Effect.Effect<Signer, SigningError, never>;
+    readonly createPasskey: (provider: import("./AccountSigners.ts").PasskeyProvider) => Effect.Effect<{
+        readonly signer: Signer;
+        readonly publicKey: Uint8Array;
+        readonly credentialId?: Uint8Array;
+    }, SigningError, never>;
+    readonly wallet: (options: {
+        readonly wallet: import("./AccountSigners.ts").StandardWallet;
+        readonly account: import("./AccountSigners.ts").StandardWalletAccount;
+        readonly chain: string;
+        readonly scheme?: SignatureScheme;
+    }) => Effect.Effect<Signer, SigningError, never>;
 }
 ```
 
 The constructors, namespaced the way the spec spells them:
 `Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.fromConfig`,
-`Signer.ephemeral`, `Signer.remote`. The type `Signer` is the interface above.
+`Signer.ephemeral`, `Signer.remote`; for keys the process holds
+`Signer.fromMnemonic`, `Signer.fromSecretKey`, `Signer.generateMnemonic`,
+`Signer.derivationPath` and `Signer.scoped`; and the account signers
+(0.5.0) `Signer.zkLogin`, `Signer.passkey`, `Signer.createPasskey`,
+`Signer.wallet`. The type `Signer` is the interface above.
+
+### `StandardWallet` (interface)
+
+```ts
+export interface StandardWallet {
+    readonly name?: string;
+    readonly features: Readonly<Record<string, unknown>>;
+}
+```
+
+A Wallet Standard wallet, structurally: anything with a `features` record.
+A `Wallet` from `@wallet-standard/base` (or a `WalletWithRequiredFeatures`
+from `@mysten/wallet-standard`) is one.
+
+### `StandardWalletAccount` (interface)
+
+```ts
+export interface StandardWalletAccount {
+    readonly address: string;
+    readonly publicKey: ArrayLike<number>;
+    readonly chains: ReadonlyArray<string>;
+    readonly features?: ReadonlyArray<string>;
+}
+```
+
+A Wallet Standard account, structurally: what `@wallet-standard/base`'s
+`WalletAccount` carries and this module reads.
 
 ### `SubmitConfig` (const)
 
@@ -4814,6 +5565,15 @@ declare const Tx: {
     readonly build: (input: Transaction | Recipe, opts: {
         readonly sender: SuiAddress;
         readonly gasOwner?: SuiAddress;
+        /**
+         * The last epoch the transaction may be valid in: a signer's session
+         * bound (`Signer.maxEpoch`). The default expiration's `maxEpoch` is capped
+         * at it, and a bound already below the current epoch fails the build
+         * before anything resolves.
+         *
+         * @since 0.5.0
+         */
+        readonly maxEpoch?: bigint;
     }) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
     readonly sign: (built: Built, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
     readonly cosign: (signed: Signed, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
@@ -4845,20 +5605,70 @@ declare const Tx: {
         readonly coinType?: CoinType;
         readonly maxCoinsPerTransaction?: number;
     }) => Effect.Effect<FoldPlan, TransportError, Sui>;
-    readonly fold: (batch: import("./Fold.ts").FoldBatch) => Recipe;
-    readonly foldCoins: (opts: {
+    readonly fold: (batch: FoldBatch) => Recipe;
+    readonly foldCoins: <E = never>(opts: {
         readonly signer: Signer;
         /** One coin type to fold; every coin type the signer holds coins of when omitted. */
         readonly coinType?: CoinType;
         /** At most this many coins per transaction: 1 to 500, 500 by default. */
         readonly maxCoinsPerTransaction?: number;
-    }) => Effect.Effect<FoldResult, RunError, Sui>;
+        /**
+         * A plan from `Tx.planFold`, run as given rather than re-planned.
+         *
+         * @since 0.5.0
+         */
+        readonly plan?: FoldPlan;
+        /**
+         * `Tx.run`'s `approve`, per batch, with the batch it is about to fold.
+         *
+         * @since 0.5.0
+         */
+        readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>;
+        /**
+         * The intent every batch is verified against, as `Tx.run`'s `intent`. When
+         * omitted and `Gate.requireIntent` is on, each batch declares the fold's own
+         * intent — a summary saying the coins go into the owner's own address
+         * balance, and **no claims**, so the claims check refuses a batch whose
+         * simulation moves anything out of the account. When omitted and the gate
+         * requires nothing, no intent is checked (0.4.0's cost: no extra simulate).
+         *
+         * @since 0.5.0
+         */
+        readonly intent?: Intent;
+    }) => Effect.Effect<FoldResult, RunError | E, Sui>;
+    readonly foldMovement: (batch: FoldBatch, effects: Simulation | Executed) => import("./Fold.ts").FoldMovement;
+    readonly sendAll: <E = never>(opts: {
+        readonly signer: Signer;
+        readonly recipient: SuiAddress;
+        /** The coin type to sweep. Default SUI. */
+        readonly coinType?: CoinType;
+        /** What the sweep is declared to do; see `Tx.run`. */
+        readonly intent?: Intent;
+        /** `Tx.run`'s `approve`, with the sweep it is about to send. */
+        readonly approve?: (prepared: Prepared, sweep: SendAllSweep) => Effect.Effect<void, E>;
+        /** `Tx.run`'s `onSigned`. */
+        readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+    }) => Effect.Effect<SendAllResult, RunError | E, Sui>;
+    readonly verifySponsored: (built: Built, expect: {
+        readonly sender: string;
+        readonly gasOwner?: string;
+        readonly transactionKind?: Uint8Array;
+    }) => Effect.Effect<Built, PolicyDenied, never>;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
+    readonly verify: (built: Built, intent: Intent) => Effect.Effect<Verified, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
+    readonly prepare: (input: Built | Transaction | Recipe, opts: {
+        readonly sender: SuiAddress;
+        readonly gasOwner?: SuiAddress;
+        /** What the transaction is declared to do; `verified` is present when given. */
+        readonly intent?: Intent;
+        /** A session bound for what is built here (`Signer.maxEpoch`); see `Tx.build`. Ignored for a `Built`. */
+        readonly maxEpoch?: bigint;
+    }) => Effect.Effect<Prepared, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
     readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
     readonly resubmit: (input: SubmissionUnknown | Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly recorded: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never>;
-    readonly run: (recipe: Transaction | Recipe, opts: {
+    readonly run: <E = never>(recipe: Transaction | Recipe, opts: {
         readonly signer: Signer;
         readonly gasOwner?: SuiAddress;
         /**
@@ -4888,7 +5698,31 @@ declare const Tx: {
          * @since 0.1.2
          */
         readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
-    }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>;
+        /**
+         * What this transaction is declared to do. When present, the built bytes
+         * go through `verify` before anything is signed, sharing its
+         * simulate with `SubmitConfig.preflight`. `Gate.requireIntent` makes it
+         * mandatory.
+         *
+         * @since 0.5.0
+         */
+        readonly intent?: Intent;
+        /**
+         * Shown the `Prepared` transaction — the built bytes with their gas,
+         * the simulation of exactly those bytes, the verified intent — **after**
+         * `preflight` and the intent checks and **before the first signature**.
+         * Succeeding approves; failing refuses with the caller's own error (a
+         * wallet's `UserRejected`), which `Tx.run` fails with, nothing signed and
+         * nothing journalled. It runs where signing runs: under the sender lock
+         * when the bytes pin something, after it is released when they do not,
+         * so a person taking their time never holds an address-balance account's
+         * lock. Giving it always costs the simulate it is shown (the build's own,
+         * when the build made one of exactly these bytes).
+         *
+         * @since 0.5.0
+         */
+        readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
+    }) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError | E, Sui>;
     readonly reconcileAll: (opts?: {
         /**
          * Re-send, as identical bytes, every entry that is still
@@ -4916,8 +5750,9 @@ declare const Tx: {
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
 `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
 `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
-`Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
-`Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+`Tx.foldCoins`, `Tx.foldMovement`, `Tx.sendAll`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`,
+`Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
+`Tx.reconcileAll`.
 
 ### `UNRESOLVED_TAGS` (const)
 
@@ -4926,6 +5761,126 @@ declare const UNRESOLVED_TAGS: readonly ["Signed", "Unknown"]
 ```
 
 The tags whose entries still need an answer from the network.
+
+### `Verdict` (const)
+
+```ts
+declare const Verdict: Schema
+// decodes to:
+// {
+//     readonly _tag: "Screened";
+//     readonly screening: {
+//         readonly effects: readonly {
+//             readonly text: string;
+//             readonly inScope: number;
+//         }[];
+//         readonly claims: readonly {
+//             readonly text: string;
+//             readonly inScope: number;
+//         }[];
+//         readonly specificity: number;
+//         readonly injection: number;
+//     };
+// } | {
+//     readonly _tag: "Unscreened";
+//     readonly reason: string;
+// }
+```
+
+How far a transaction was checked. The claims always held, or there would be
+a `PolicyDenied` instead of a verdict; what varies is whether anything read
+the sentence. `Unscreened` is never silent: it is on the record with a reason.
+
+### `Verified` (const)
+
+```ts
+declare const Verified: Schema
+// decodes to:
+// {
+//     readonly bytes: Uint8Array<ArrayBufferLike>;
+//     readonly digest: Digest;
+//     readonly sender: SuiAddress;
+//     readonly gas: {
+//         readonly budget: Mist;
+//         readonly price: Mist;
+//         readonly owner: SuiAddress;
+//         readonly payment: readonly {
+//             readonly objectId: ObjectId;
+//             readonly version: Version;
+//             readonly digest: string;
+//         }[];
+//         readonly source: "addressBalance" | "coinReservation" | "coins";
+//     };
+//     readonly intent: {
+//         readonly summary: string;
+//         readonly author: "user" | "task" | "dapp";
+//         readonly claims: {
+//             readonly outflows: readonly {
+//                 readonly coinType: CoinType;
+//                 readonly max: bigint;
+//             }[];
+//             readonly recipients: readonly SuiAddress[];
+//             readonly objects: readonly ObjectId[];
+//         };
+//     };
+//     readonly verdict: {
+//         readonly _tag: "Screened";
+//         readonly screening: {
+//             readonly effects: readonly {
+//                 readonly text: string;
+//                 readonly inScope: number;
+//             }[];
+//             readonly claims: readonly {
+//                 readonly text: string;
+//                 readonly inScope: number;
+//             }[];
+//             readonly specificity: number;
+//             readonly injection: number;
+//         };
+//     } | {
+//         readonly _tag: "Unscreened";
+//         readonly reason: string;
+//     };
+//     readonly gasOwner?: SuiAddress | undefined;
+//     readonly expiration?: {
+//         readonly $kind: "None";
+//         readonly None: true;
+//     } | {
+//         readonly $kind: "Epoch";
+//         readonly Epoch: bigint;
+//     } | {
+//         readonly $kind: "ValidDuring";
+//         readonly ValidDuring: {
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | {
+//         readonly $kind: "Validity";
+//         readonly Validity: {
+//             readonly allowedProposers: {
+//                 readonly epoch: bigint;
+//                 readonly proposers: readonly number[];
+//             } | null;
+//             readonly minEpoch: bigint | null;
+//             readonly maxEpoch: bigint | null;
+//             readonly minTimestamp: bigint | null;
+//             readonly maxTimestamp: bigint | null;
+//             readonly chain: string;
+//             readonly nonce: number;
+//         };
+//     } | undefined;
+//     readonly chain?: string | undefined;
+//     readonly simulation?: SimulationClass | undefined;
+// } & Brand<"Verified">
+```
+
+A `Built` whose simulated effects stayed inside a declared
+`Intent`. Structurally a `Built`, so `Tx.sign` takes it as it is; the
+brand is what says `Tx.verify` produced it.
 
 ### `Verify` (const)
 
@@ -4956,6 +5911,210 @@ export interface VerifyOptions {
 
 The options both verifiers take.
 
+### `ZkLogin` (const)
+
+```ts
+declare const ZkLogin: {
+    readonly Session: Schema.Struct<{
+        readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress"> & {
+            normalize: (input: string) => SuiAddress;
+            Strict: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+        };
+        readonly maxEpoch: Schema.BigIntFromString;
+        readonly proof: Schema.Struct<{
+            readonly proofPoints: Schema.Struct<{
+                readonly a: Schema.$Array<Schema.String>;
+                readonly b: Schema.$Array<Schema.$Array<Schema.String>>;
+                readonly c: Schema.$Array<Schema.String>;
+            }>;
+            readonly issBase64Details: Schema.Struct<{
+                readonly value: Schema.String;
+                readonly indexMod4: Schema.Int;
+            }>;
+            readonly headerBase64: Schema.String;
+            readonly addressSeed: Schema.String;
+        }>;
+        readonly expiresAt: Schema.optionalKey<Schema.Finite>;
+    }>;
+    readonly SignatureInputs: Schema.Struct<{
+        readonly proofPoints: Schema.Struct<{
+            readonly a: Schema.$Array<Schema.String>;
+            readonly b: Schema.$Array<Schema.$Array<Schema.String>>;
+            readonly c: Schema.$Array<Schema.String>;
+        }>;
+        readonly issBase64Details: Schema.Struct<{
+            readonly value: Schema.String;
+            readonly indexMod4: Schema.Int;
+        }>;
+        readonly headerBase64: Schema.String;
+        readonly addressSeed: Schema.String;
+    }>;
+    readonly StoredSession: Schema.Struct<{
+        readonly session: Schema.Struct<{
+            readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress"> & {
+                normalize: (input: string) => SuiAddress;
+                Strict: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
+            };
+            readonly maxEpoch: Schema.BigIntFromString;
+            readonly proof: Schema.Struct<{
+                readonly proofPoints: Schema.Struct<{
+                    readonly a: Schema.$Array<Schema.String>;
+                    readonly b: Schema.$Array<Schema.$Array<Schema.String>>;
+                    readonly c: Schema.$Array<Schema.String>;
+                }>;
+                readonly issBase64Details: Schema.Struct<{
+                    readonly value: Schema.String;
+                    readonly indexMod4: Schema.Int;
+                }>;
+                readonly headerBase64: Schema.String;
+                readonly addressSeed: Schema.String;
+            }>;
+            readonly expiresAt: Schema.optionalKey<Schema.Finite>;
+        }>;
+        readonly ephemeral: Schema.Struct<{
+            readonly scheme: Schema.Literal<"ED25519">;
+            readonly sealed: Schema.String;
+        }>;
+    }>;
+    readonly save: (store: KeyValueStore.KeyValueStore, key: string, input: {
+        readonly session: ZkLoginSession;
+        readonly ephemeralSecretKey: Redacted.Redacted<Uint8Array>;
+        readonly sealer: SecretSealer;
+    }) => Effect.Effect<void, SigningError, never>;
+    readonly load: (store: KeyValueStore.KeyValueStore, key: string, options: {
+        readonly sealer: SecretSealer;
+    }) => Effect.Effect<Option.Option<Signer>, SigningError, never>;
+    readonly remove: (store: KeyValueStore.KeyValueStore, key: string) => Effect.Effect<void, SigningError, never>;
+}
+```
+
+The zkLogin session schemas and store, namespaced: `ZkLogin.Session`,
+`ZkLogin.SignatureInputs`, `ZkLogin.StoredSession`, `ZkLogin.save`,
+`ZkLogin.load`, `ZkLogin.remove`. The signer itself is `Signer.zkLogin`.
+
+### `ZkLoginSession` (const)
+
+```ts
+declare const ZkLoginSession: Schema
+// decodes to:
+// {
+//     readonly address: SuiAddress;
+//     readonly maxEpoch: bigint;
+//     readonly proof: {
+//         readonly proofPoints: {
+//             readonly a: readonly string[];
+//             readonly b: readonly (readonly string[])[];
+//             readonly c: readonly string[];
+//         };
+//         readonly issBase64Details: {
+//             readonly value: string;
+//             readonly indexMod4: number;
+//         };
+//         readonly headerBase64: string;
+//         readonly addressSeed: string;
+//     };
+//     readonly expiresAt?: number | undefined;
+// }
+```
+
+The public half of a zkLogin session: everything but the ephemeral secret.
+
+- `address` is the zkLogin address. It is checked against the proof (its
+  address seed and issuer) when a signer is made, legacy and current
+  derivations both, so a session for another account is refused.
+- `maxEpoch` is the last epoch the proof is accepted in, the bound the
+  ephemeral key's nonce committed to.
+- `expiresAt`, when known, is a wall-clock deadline in milliseconds since
+  the Unix epoch (Enoki's `ZkLoginSession.expiresAt`). It is a cheap local
+  approximation of `maxEpoch` the signer checks against `Clock`.
+
+Nothing here is secret: the proof is public on chain in every signature the
+session makes. The JWT is deliberately not part of it — a session that can
+sign never needs the token again.
+
+### `ZkLoginSignatureInputs` (const)
+
+```ts
+declare const ZkLoginSignatureInputs: Schema
+// decodes to:
+// {
+//     readonly proofPoints: {
+//         readonly a: readonly string[];
+//         readonly b: readonly (readonly string[])[];
+//         readonly c: readonly string[];
+//     };
+//     readonly issBase64Details: {
+//         readonly value: string;
+//         readonly indexMod4: number;
+//     };
+//     readonly headerBase64: string;
+//     readonly addressSeed: string;
+// }
+```
+
+The proof inputs a zkLogin signature carries: the SDK's
+`ZkLoginSignatureInputs` from `@mysten/sui/zklogin`, as a schema, so a
+session can be stored and read back. Exactly what Enoki's
+`createZkLoginZkp` and `EnokiFlow.getProof` answer.
+
+### `ZkLoginSignerOptions` (interface)
+
+```ts
+export interface ZkLoginSignerOptions {
+    readonly session: {
+        readonly address: string;
+        readonly maxEpoch: bigint | number | string;
+        readonly proof: ZkLoginSignatureInputs;
+        readonly expiresAt?: number;
+    };
+    readonly ephemeral: SdkSigner;
+}
+```
+
+What `zkLogin` needs: the public session and the ephemeral signer.
+
+`ephemeral` is any `@mysten/sui/cryptography` `Signer` — an
+`Ed25519Keypair`, or a `WebCryptoSigner` over a non-extractable key held in
+IndexedDB (what Enoki's `experimental_nativeCryptoSigner` stores). It is the
+key the proof's nonce committed to; that commitment is inside the proof and
+cannot be checked here, so a wrong ephemeral key produces signatures the node
+refuses (`INVALID_ARGUMENT`, which `Tx.submit` reports as itself).
+
+### `ZkLoginStoredSession` (const)
+
+```ts
+declare const ZkLoginStoredSession: Schema
+// decodes to:
+// {
+//     readonly session: {
+//         readonly address: SuiAddress;
+//         readonly maxEpoch: bigint;
+//         readonly proof: {
+//             readonly proofPoints: {
+//                 readonly a: readonly string[];
+//                 readonly b: readonly (readonly string[])[];
+//                 readonly c: readonly string[];
+//             };
+//             readonly issBase64Details: {
+//                 readonly value: string;
+//                 readonly indexMod4: number;
+//             };
+//             readonly headerBase64: string;
+//             readonly addressSeed: string;
+//         };
+//         readonly expiresAt?: number | undefined;
+//     };
+//     readonly ephemeral: {
+//         readonly scheme: "ED25519";
+//         readonly sealed: string;
+//     };
+// }
+```
+
+One stored zkLogin session: the public session and the sealed ephemeral
+secret (an Ed25519 32-byte seed, sealed by a `SecretSealer`). The JSON
+a `save` writes under its key.
+
 ### `attach` (const)
 
 ```ts
@@ -4985,6 +6144,15 @@ const signed = yield* Tx.cosign(withSender, sponsor)
 declare const build: (input: Transaction | Recipe, opts: {
     readonly sender: SuiAddress;
     readonly gasOwner?: SuiAddress;
+    /**
+     * The last epoch the transaction may be valid in: a signer's session
+     * bound (`Signer.maxEpoch`). The default expiration's `maxEpoch` is capped
+     * at it, and a bound already below the current epoch fails the build
+     * before anything resolves.
+     *
+     * @since 0.5.0
+     */
+    readonly maxEpoch?: bigint;
 }) => Effect.Effect<Built, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>
 ```
 
@@ -5060,13 +6228,50 @@ does not show and execution fails on, charging gas.
 
 `Built.gasOwner` is read out of the bytes: it is present whenever the bytes
 name a gas owner other than the sender, whether `opts.gasOwner` or the
-recipe set it.
+recipe set it. So is `Built.gas` (0.5.0): budget, price, payer, payment refs
+and their `source` — `"addressBalance"`, `"coinReservation"` or `"coins"`,
+the `sui.gas_payment` attribute. `Built.simulation` (0.5.0) is the explicit
+simulate above when it ran, which is a simulation of exactly the returned
+bytes; when the SDK's resolver simulated instead (always on gRPC) it
+simulated the transaction before its budget was set, and there is none.
 
-**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the node refused to resolve the transaction, a zero-gas requirement was not met, the payer's address balance cannot cover the budget and withdrawals, coins were chosen under `gasPayment: "requireAddressBalance"`, or an address-balance payment lacks an epoch-bounded expiration or is used with `tx.gas`), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
+**`opts.maxEpoch` keeps the window inside a session** (0.5.0): the default
+expiration's `maxEpoch` is the current epoch plus one or the bound,
+whichever is lower, and a bound below the current epoch fails before
+anything resolves. `Tx.run` passes the signer's (and sponsor's)
+`Signer.maxEpoch` here. A recipe's own expiration is the recipe's choice
+and is not changed.
+
+**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the session bound `opts.maxEpoch` is below the current epoch — its `cause` is the `SigningError { reason: "expired" }` `Tx.run` reports instead, the node refused to resolve the transaction, a zero-gas requirement was not met, the payer's address balance cannot cover the budget and withdrawals, coins were chosen under `gasPayment: "requireAddressBalance"`, or an address-balance payment lacks an epoch-bounded expiration or is used with `tx.gas`), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
 
 ### `chainOf` (const)
 
 Re-exported from `@unconfirmed/sui-effect`.
+
+### `checkClaims` (const)
+
+```ts
+declare const checkClaims: (intent: Intent, simulation: Simulation, parties: Parties) => ReadonlyArray<ClaimViolation>
+```
+
+Compares the simulated effects with the claims, exactly and in code.
+
+Deny by default: a coin the sender loses needs an outflow claim that covers
+the amount (net of gas), an address that gains a coin or an object needs to
+be a claimed recipient, and a non-coin object that leaves the sender —
+transferred, shared, wrapped or deleted — needs to be a claimed object.
+
+**Gas is gas wherever it is paid from.** A node's balance changes cover coin
+objects and address balances alike, so the payer's SUI delta carries the
+gas whether the payment was a gas coin or the payer's address balance (an
+empty payment), and it is taken back out either way. Anything else that
+leaves the sender's address balance — a `balance::send_funds` of a
+`tx.balance()` withdrawal — is an outflow like any coin transfer, and its
+receiver a recipient. Accumulator writes are bookkeeping and never an object.
+
+An empty answer means the claims held.
+
+**Never fails.**
 
 ### `cosign` (const)
 
@@ -5082,6 +6287,33 @@ As in `sign`, the co-signer's address must be the sender or the gas
 owner named in the bytes.
 
 **Fails with: `SigningError`.**
+
+### `describeClaims` (const)
+
+```ts
+declare const describeClaims: (intent: Intent) => ReadonlyArray<string>
+```
+
+The claims as sentences, for the edge between the summary and the claims: a
+harmless sentence must not sit in front of permissions it has no use for.
+
+Answers with no lines when the intent claims nothing.
+
+**Never fails.**
+
+### `describeEffects` (const)
+
+```ts
+declare const describeEffects: (simulation: Simulation, parties: Parties) => ReadonlyArray<string>
+```
+
+The simulated effects as sentences a semantic screen can read: addresses
+become labels, types lose their package ids, and only SUI carries a number.
+What it cannot say reliably it does not say.
+
+Always answers with at least one line.
+
+**Never fails.**
 
 ### `ephemeral` (const)
 
@@ -5126,13 +6358,36 @@ coin that moved since fails the build rather than folding something else.
 ### `foldCoins` (const)
 
 ```ts
-declare const foldCoins: (opts: {
+declare const foldCoins: <E = never>(opts: {
     readonly signer: Signer;
     /** One coin type to fold; every coin type the signer holds coins of when omitted. */
     readonly coinType?: CoinType;
     /** At most this many coins per transaction: 1 to 500, 500 by default. */
     readonly maxCoinsPerTransaction?: number;
-}) => Effect.Effect<FoldResult, RunError, Sui>
+    /**
+     * A plan from `Tx.planFold`, run as given rather than re-planned.
+     *
+     * @since 0.5.0
+     */
+    readonly plan?: FoldPlan;
+    /**
+     * `Tx.run`'s `approve`, per batch, with the batch it is about to fold.
+     *
+     * @since 0.5.0
+     */
+    readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>;
+    /**
+     * The intent every batch is verified against, as `Tx.run`'s `intent`. When
+     * omitted and `Gate.requireIntent` is on, each batch declares the fold's own
+     * intent — a summary saying the coins go into the owner's own address
+     * balance, and **no claims**, so the claims check refuses a batch whose
+     * simulation moves anything out of the account. When omitted and the gate
+     * requires nothing, no intent is checked (0.4.0's cost: no extra simulate).
+     *
+     * @since 0.5.0
+     */
+    readonly intent?: Intent;
+}) => Effect.Effect<FoldResult, RunError | E, Sui>
 ```
 
 Folds the signer's coin objects into its address balance: `planFold`
@@ -5149,7 +6404,39 @@ stay executed. Calling it again re-plans from what is left, so it is safe to
 repeat. Dust that cannot pay for its own fold is in `plan.skipped`, and an
 owner with no coins answers an empty plan with nothing executed.
 
-**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` — exactly `run`'s, for the batch that failed.**
+**A previewed plan is run as given** (0.5.0). Pass the `plan` a person was
+shown and it is not re-planned — `coinType` and `maxCoinsPerTransaction` are
+then ignored — so what runs is exactly what was previewed; a coin in it that
+has moved since fails that batch's build with `BuildError`, as any pinned
+input does. A plan for another owner — the plan's or any batch's — is a
+`BuildError` before anything runs. `approve` is `Tx.run`'s, once per batch, shown the batch beside the
+prepared transaction: `foldMovement` of the two is what the fold
+moves from coins into the balance, which the simulation's balance changes
+alone do not show.
+
+**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` — exactly `run`'s, for the batch that failed — and `E`, whatever `approve` fails with.**
+
+### `foldMovement` (const)
+
+```ts
+declare const foldMovement: (batch: FoldBatch, effects: Simulation | Executed) => FoldMovement
+```
+
+The coin → address-balance movement of one fold, which its balance changes
+do not show: a node nets them per address, so a fold of 1,000 SUI of coins
+reports only the gas (`+3,939,506` MIST on localnet, protocol 139, for five
+faucet coins whose storage rebate beat the gas), and the coins' balances are
+not in the effects at all — the coins are simply deleted, and the deposit is
+an accumulator write with no amount on it. So the movement is computed from
+what is known exactly: the batch's coins were pinned at the versions the plan
+read (`tx.objectRef`), so their balances are the plan's; the effects say
+which of them were consumed; and the owner's net balance change is the rest.
+
+For `simulation` pass `prepared.simulation` (`Tx.prepare(Tx.fold(batch),
+{ sender })`, or what `Tx.foldCoins`' `approve` is shown), or the
+`Executed` the fold produced.
+
+**Never fails.**
 
 ### `fromBytes` (const)
 
@@ -5173,10 +6460,15 @@ chain (the default `ValidDuring` does) must name that one; bytes whose
 expiration names none (`Epoch`, `None`) cannot be checked, and are taken to
 be for this chain.
 
-Unlike `Tx.build`, nothing is simulated: run `sui.simulate(built.bytes)` (or
-a `SubmitConfig.preflight`) before co-signing bytes you did not build.
+`gas` is read out of the bytes too (budget, price, payer, payment and its
+source); there is never a `simulation`.
 
-**Fails with: `BuildError` (the bytes are not a full transaction this SDK can read, name no sender, or are bound to another chain).**
+Unlike `Tx.build`, nothing is simulated: `Tx.prepare(built, { sender })`
+simulates the bytes (with `preflight` and an intent) and shows them to an
+`approve` step, or run `sui.simulate(built.bytes)` before co-signing bytes
+you did not build.
+
+**Fails with: `BuildError` (the bytes are not a full transaction this SDK can read, name no sender or no gas data, or are bound to another chain).**
 
 ### `fromConfig` (const)
 
@@ -5214,6 +6506,34 @@ only thing it took. A `Keypair` **is** an SDK `Signer`, so this is a thin
 alias kept for callers who hold one.
 
 **Never fails.**
+
+### `fromMnemonic` (const)
+
+```ts
+declare const fromMnemonic: (phrase: Redacted.Redacted<string> | string, options?: FromMnemonicOptions) => Effect.Effect<LockableSigner, KeyError>
+```
+
+A signer derived from a BIP-39 recovery phrase, **checked first**: the word
+count (12, 15, 18, 21 or 24), every word in the English list, and the
+checksum. The SDK's `deriveKeypair` checks none of them, so a phrase with one
+word wrong derives a valid account nobody has ever funded; here it is a
+`KeyError { reason: "invalidMnemonic" }` and nothing is derived. The phrase
+is normalized (trimmed, lowercased, single-spaced) before the check; no
+BIP-39 passphrase is used, which is what every Sui wallet does.
+
+Paths are the standard Sui ones (`Signer.derivationPath`):
+`m/44'/784'/{account}'/0'/0'` (Ed25519, the default),
+`m/54'/784'/{account}'/0/0` (Secp256k1), `m/74'/784'/{account}'/0/0`
+(Secp256r1). An explicit `path` must have its scheme's shape (the SDK's
+`isValidHardenedPath` / `isValidBIP32Path`, with the scheme's own purpose)
+and every level below 2^31.
+
+The answer is a `LockableSigner`: it holds the derived key in a buffer
+nobody else references, and `lock` zeroes it. The BIP-39 seed and the HD
+nodes are zeroed before this returns. A `Redacted` phrase is read, not
+wiped: it is the caller's (`Redacted.wipeUnsafe` it when done).
+
+**Fails with: `KeyError` (`invalidMnemonic`, `invalidPath`, `unsupportedScheme`). The message names a bad word's position, never a word.**
 
 ### `fromSdkSigner` (const)
 
@@ -5253,6 +6573,27 @@ an SDK signer — that is a wiring mistake in the caller, not a runtime
 failure a program recovers from.
 
 **Otherwise never fails: a bad address or signature surfaces as a `SigningError` from the member that produced it, not from construction.**
+
+### `fromSecretKey` (const)
+
+```ts
+declare const fromSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, options?: FromSecretKeyOptions) => Effect.Effect<LockableSigner, KeyError>
+```
+
+A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag
+names the scheme; a contradicting `scheme` option is refused), a 32-byte hex
+seed (`0x` optional), or 32 raw bytes — the last two read as
+`options.scheme`, default `ED25519`.
+
+**The bytes are copied before any keypair is built over them.** The SDK's
+Secp256k1/Secp256r1 keypairs keep a reference to the array they are given,
+so building over the caller's buffer would let a later write to it change
+the key, and zeroing it break the signer. Here the caller's `Uint8Array` is
+copied and left untouched, decoded bytes are zeroed once copied, and the
+answer is a `LockableSigner` whose `lock` zeroes the copy. A
+`Redacted` input is read, not wiped.
+
+**Fails with: `KeyError` (`invalidSecretKey` — the message is fixed and never quotes the input — or `unsupportedScheme` for `MLDSA65`, `ZkLogin`, … and a contradicting `scheme`).**
 
 ### `gaslessStablecoinTransfer` (const)
 
@@ -5351,6 +6692,11 @@ declare const isUnresolved: (value: {
     readonly evidence: "expired" | "inputConsumed" | "refused";
     readonly at: import("effect/DateTime").Utc;
 } | {
+    readonly at: import("effect/DateTime").Utc;
+    readonly digest: Digest;
+    readonly _tag: "Executed";
+    readonly checkpoint?: bigint;
+} | {
     readonly _tag: "Signed";
     readonly digest: Digest;
     readonly signed: {
@@ -5393,11 +6739,6 @@ declare const isUnresolved: (value: {
         };
     };
     readonly signedAt: import("effect/DateTime").Utc;
-} | {
-    readonly at: import("effect/DateTime").Utc;
-    readonly digest: Digest;
-    readonly _tag: "Executed";
-    readonly checkpoint?: bigint;
 } | {
     readonly _tag: "Failed";
     readonly digest: Digest;
@@ -5611,10 +6952,61 @@ after the earlier batches covers that estimate, and is `skipped` otherwise.
 Other coin types fold with `gas: "auto"`, after every SUI batch, so the SUI
 just folded pays for them.
 
-Preview a batch with `Tx.build(Tx.fold(batch), { sender })` and then
-`Sui.simulate` of the bytes, with nothing signed.
+Preview a batch with `Tx.prepare(Tx.fold(batch), { sender })`, nothing
+signed, and read what it moves with `foldMovement`; pass the plan
+you previewed to `Tx.foldCoins({ plan, approve })` to run exactly it.
 
 **Fails with: `TransportError`.**
+
+### `prepare` (const)
+
+```ts
+declare const prepare: (input: Built | Transaction | Recipe, opts: {
+    readonly sender: SuiAddress;
+    readonly gasOwner?: SuiAddress;
+    /** What the transaction is declared to do; `verified` is present when given. */
+    readonly intent?: Intent;
+    /** A session bound for what is built here (`Signer.maxEpoch`); see `Tx.build`. Ignored for a `Built`. */
+    readonly maxEpoch?: bigint;
+}) => Effect.Effect<Prepared, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>
+```
+
+Build (or take) a transaction, simulate exactly its bytes, run
+`SubmitConfig.preflight` and, given an intent, `Tx.verify`'s checks — and
+sign nothing. The front half of `Tx.run`, for previews, dry runs, sign-only
+flows and transactions a dapp hands over; the answer is a `Prepared`
+to show a person, then `Tx.sign` (`prepared.verified ?? prepared.built`)
+and `Tx.submit`, `Tx.submitVia`, or another party's co-signature.
+
+**A `Built` is not rebuilt.** Bytes from `Tx.fromBytes` — a dapp's request,
+a sponsor's reply — are what is simulated and what will be signed;
+`opts.sender` must be the sender the bytes name and `opts.gasOwner`, when
+given, their payer, or it fails with `PolicyDenied` (`prepare.sender`,
+`prepare.gasOwner`) before anything is asked of the node. A recipe or a
+`Transaction` goes through `Tx.build` with `sender`, `gasOwner` and
+`maxEpoch`, and when the build already simulated exactly the bytes it
+returned (`built.simulation`), that simulation is the one used.
+
+**One simulate.** On gRPC the build's resolver simulates a pre-budget
+transaction, so a prepare costs that plus one simulate of the final bytes;
+off gRPC with a preset budget the build's own simulate is reused and the
+prepare costs one in all.
+
+**No sender lock**, unlike `Tx.run`: the answer is a value that may wait for
+a person, a second device or a sponsor for as long as it likes, and a lock
+held across that would stall every other transaction from the account. The
+cost is the one `Tx.build` already documents — two prepares from one sender
+can resolve the same gas coin or owned object, and the second to land fails
+— so a flow that signs straight after approval uses `Tx.run({ approve })`,
+which runs this same front half under the lock exactly when the bytes pin.
+
+**`Gate.requireIntent` does not apply**: it binds `Tx.run`, the call that
+signs. A prepare without an intent is how a wallet first sees a dapp's
+effects, to render them (`Intent.fromSimulation`) and ask; give the intent
+then — here, to `Tx.verify`, or to `Tx.run` — and `verified` is what gets
+signed.
+
+**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied` (the gas ceiling, `preflight`, the intent's rules, `prepare.sender`, `prepare.gasOwner`), `TransportError`.**
 
 ### `reconcile` (const)
 
@@ -5827,7 +7219,7 @@ reconciling a bare digest), there is nothing to send and this is `reconcile`.
 ### `run` (const)
 
 ```ts
-declare const run: (recipe: Transaction | Recipe, opts: {
+declare const run: <E = never>(recipe: Transaction | Recipe, opts: {
     readonly signer: Signer;
     readonly gasOwner?: SuiAddress;
     /**
@@ -5857,7 +7249,31 @@ declare const run: (recipe: Transaction | Recipe, opts: {
      * @since 0.1.2
      */
     readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
-}) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError, Sui>
+    /**
+     * What this transaction is declared to do. When present, the built bytes
+     * go through `verify` before anything is signed, sharing its
+     * simulate with `SubmitConfig.preflight`. `Gate.requireIntent` makes it
+     * mandatory.
+     *
+     * @since 0.5.0
+     */
+    readonly intent?: Intent;
+    /**
+     * Shown the `Prepared` transaction — the built bytes with their gas,
+     * the simulation of exactly those bytes, the verified intent — **after**
+     * `preflight` and the intent checks and **before the first signature**.
+     * Succeeding approves; failing refuses with the caller's own error (a
+     * wallet's `UserRejected`), which `Tx.run` fails with, nothing signed and
+     * nothing journalled. It runs where signing runs: under the sender lock
+     * when the bytes pin something, after it is released when they do not,
+     * so a person taking their time never holds an address-balance account's
+     * lock. Giving it always costs the simulate it is shown (the build's own,
+     * when the build made one of exactly these bytes).
+     *
+     * @since 0.5.0
+     */
+    readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
+}) => Effect.Effect<Executed, TransportError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError | E, Sui>
 ```
 
 Build, preflight, sign and submit, under the sender lock wherever two runs
@@ -5916,6 +7332,13 @@ When `SubmitConfig.preflight` is set it costs one extra simulate, and is
 where spend limits and target policies refuse a transaction before anything
 is signed.
 
+**`intent` puts the bytes through `verify` before anything is
+signed**, on the same simulate `preflight` uses — one extra simulate for
+either or both, run after the build exactly where signing runs (under the
+lock when the bytes pin). `Gate.requireIntent` makes it mandatory: a run
+that declares none fails with `PolicyDenied { rule: "intent.required" }`
+before the recipe is even applied.
+
 **A sponsored run needs both signatures.** A transaction whose gas owner is
 not its sender is signed by *both* parties; one signature is bytes a
 validator rejects. So when `opts.gasOwner` differs from the signer's address
@@ -5942,7 +7365,78 @@ hand. Pass `onSigned` instead: it runs inside the sender lock, after the last
 signature and before `Tx.submit`'s first `executeTransaction`, and failing it
 fails the run with nothing sent.
 
-**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`).**
+**`approve` is the person in the loop** (0.5.0). After `preflight` and the
+intent, before the first signature, `approve` is shown the `Prepared`
+transaction — the same thing `prepare` answers — and refuses by
+failing with its own error, which is then `Tx.run`'s: nothing is signed,
+`onSigned` does not run and nothing is journalled. It runs under the lock
+exactly when signing does. A sponsored run approves too: `built.gasOwner`
+and `built.gas.owner` name the sponsor.
+
+**The session bound** (0.5.0). A signer with a `maxEpoch` (a zkLogin
+session) — and a sponsor with one — bounds the window the build sets:
+`Tx.build`'s `maxEpoch` is the earlier of the two, and a bound already below
+the current epoch fails with `SigningError { reason: "expired" }` before
+anything resolves.
+
+**A locked signer is refused first** (0.5.0). A `LockableSigner`
+(`Signer.fromMnemonic`, `Keystore.unlock`) — signer or sponsor — whose
+`locked` answers `true` fails the run with `SigningError { reason:
+"locked" }` before anything is built or simulated.
+
+**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`), and `E` — whatever `approve` fails with.**
+
+### `sendAll` (const)
+
+```ts
+declare const sendAll: <E = never>(opts: {
+    readonly signer: Signer;
+    readonly recipient: SuiAddress;
+    /** The coin type to sweep. Default SUI. */
+    readonly coinType?: CoinType;
+    /** What the sweep is declared to do; see `Tx.run`. */
+    readonly intent?: Intent;
+    /** `Tx.run`'s `approve`, with the sweep it is about to send. */
+    readonly approve?: (prepared: Prepared, sweep: SendAllSweep) => Effect.Effect<void, E>;
+    /** `Tx.run`'s `onSigned`. */
+    readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+}) => Effect.Effect<SendAllResult, RunError | E, Sui>
+```
+
+Sends **everything** the signer holds of one coin type — every coin object
+and the whole address balance — into `recipient`'s address balance, in one
+`run`, and leaves the sender **nothing** of it: no coin, no balance,
+no dust.
+
+**SUI pays for its own sweep out of the sweep.** The gas coin is made to be
+everything — a coin reservation of the whole address balance with every
+coin merged into it, or, when the coins hold more, the coins as the gas
+payment with the balance redeemed and merged in — and
+`0x2::coin::send_funds<SUI>(GasCoin, recipient)` deposits it; gas is
+charged against that coin, so the recipient gets the rest and the sender
+keeps 0 (localnet, protocol 139: a coin-only, a balance-only and a mixed
+account all end at 0 coins and 0 balance). There is no budget to guess and
+no refund left behind, which is what a send of `balance − budget` from the
+address balance leaves (the unused budget comes back to the sender). **Any
+other coin type** sends every coin (`coin::send_funds`) and the whole
+balance (`balance::send_funds` of a `FundsWithdrawal`), and gas comes from
+the signer's SUI as usual, so the signer needs some.
+
+**What can remain**: anything that arrives after the read — a deposit into
+the balance, a coin — stays with the sender; a spend from the balance that
+lands after the read makes the withdrawal too large, and the sweep executes
+as a failure (`ExecutionFailed`, `InsufficientFundsForWithdraw`) or is
+refused at submit, moving nothing. A SUI sweep paid from a reservation holds
+the sender lock through submission and waits for lock-free runs in flight
+first, like every `tx.gas` run. More than 500 coin objects do not fit
+one transaction: `BuildError`, and `Tx.foldCoins` first.
+A SUI account worth less than about twice a budget cannot pay for its own
+sweep: that build fails.
+
+`intent`, `approve` (shown the sweep beside the prepared transaction) and
+`onSigned` are `Tx.run`'s.
+
+**Fails with: `BuildError` (nothing to send, the signer is the recipient, too many coins, or the build), `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` — `run`'s — and `E`, whatever `approve` fails with.**
 
 ### `sendFunds` (const)
 
@@ -6111,6 +7605,81 @@ whatever the service returns. What this owns is everything around it:
 
 **Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown` (carrying the signed bytes, with the sender's failure as its `cause`), `JournalError` (only from the write before `send`), and `E` — whatever `send` fails with — when that error declares `outcome: "not_applied"`.**
 
+### `verify` (const)
+
+```ts
+declare const verify: (built: Built, intent: Intent) => Effect.Effect<Verified, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>
+```
+
+Checks built bytes against a declared intent, before anything is signed.
+
+One simulate of exactly `built.bytes`, then two checkers. The claims are
+compared with the simulated effects exactly, in code, deny by default (gas
+is never an outflow, whether a gas coin or the payer's address balance paid
+it; an address-balance withdrawal sent to someone is). Then `Gate.screen`,
+when the gate in force has one, reads the summary against the effects and
+the claims rendered as words, and `Gate`'s thresholds turn its
+probabilities into a refusal. With no screen configured the claims check
+stands alone and the verdict is `Unscreened`. `SubmitConfig.preflight` is
+not run here; `Tx.run` runs it on the same simulate.
+
+**Whose transaction it is comes from the bytes.** The sender and gas owner
+the claims are checked for are the ones `built.bytes` name, and a value whose
+`digest`, `sender` or `gasOwner` field disagrees with its bytes (spread from
+another build, decoded from a queue) is refused as `intent.invalid`; a
+`built.simulation` is reused only when `Tx.build` made it in this process
+for the digest of these bytes.
+
+The answer is structurally a `Built`, so it goes straight to `Tx.sign`. The
+explicit lifecycle is not gated: `Tx.sign` takes any `Built`, so a caller
+assembling `build`/`sign`/`submit` by hand calls this itself.
+
+**What it does not prove.** A simulation is one execution against the state
+the node had; a package that branches on a shared object, the clock or
+randomness can behave differently when the bytes land. The claims bound what
+was simulated, not what will execute.
+
+Gas is not counted because it is bounded: bytes whose budget is over
+`SubmitConfig.maxGasBudget` are refused (`maxGasBudget`) before the
+simulate, as `Tx.build` refuses them, whoever built them.
+
+Every refusal is a `PolicyDenied` whose `rule` says which check:
+`maxGasBudget`, `intent.invalid`, `intent.outflow`, `intent.recipient`, `intent.object`,
+`gate.unavailable`, `intent.injection`, `intent.vague`, `intent.effect`,
+`intent.claim`.
+
+**Fails with: `PolicyDenied`, `SimulationFailed`, `BuildError`, `TransportError`.**
+
+### `verifySponsored` (const)
+
+```ts
+declare const verifySponsored: (built: Built, expect: {
+    readonly sender: string;
+    readonly gasOwner?: string;
+    readonly transactionKind?: Uint8Array;
+}) => Effect.Effect<Built, PolicyDenied, never>
+```
+
+Checks that sponsored bytes a service assembled are the transaction the
+sender asked to have sponsored, before the sender signs them.
+
+A sponsorship service (Enoki's `createSponsoredTransaction`, or an
+application's own sponsor) takes a transaction **kind** and answers full
+bytes with its gas data added. Those bytes are what the sender's signature
+will authorize, so they are read back, not trusted:
+
+- the sender the bytes name is `expect.sender` (`sponsored.sender`);
+- the bytes name a gas owner, it is not the sender, and it is
+  `expect.gasOwner` when one is given (`sponsored.gasOwner`);
+- when `expect.transactionKind` is given, the bytes' transaction kind is
+  **exactly** those kind bytes (`sponsored.kind`): a service cannot add a
+  command, swap an input or change an argument and still get a signature.
+
+The chain is `Tx.fromBytes`'s check, which made the `Built`. Simulating the
+bytes before signing them is still the caller's (or `Tx.prepare`'s) job.
+
+**Fails with: `PolicyDenied` (rule `sponsored.sender`, `sponsored.gasOwner` or `sponsored.kind`).**
+
 ## `@unconfirmed/sui-effect/journal`
 
 
@@ -6163,36 +7732,72 @@ declare const makeKeyValueStore: (store: KeyValueStore.KeyValueStore, options?: 
 
 A journal backed by a `KeyValueStore`.
 
-Each entry is one key, `entry:<digest>`, holding the entry as JSON, and a
-`put` is one `set` of that key. A terminal entry (`Executed`, `Failed`,
-`NotApplied`) overwrites the unresolved one and stays, so a later `get`
-still finds the answer.
+Each entry is one key, `entry:<digest>`, holding the entry as JSON. A
+terminal entry (`Executed`, `Failed`, `NotApplied`) overwrites the
+unresolved one and stays, so a later `get` still finds the answer.
 
-There is no index and no lock. `listUnresolved` enumerates the store with
-`KeyValueStore.keys`, so the only thing a `put` writes is the entry itself:
-no read-modify-write, nothing for two writers — two fibers, two layer
-instances, two processes over one store — to lose between them, and no
-crash between two writes to order around. Two writers that put the **same**
-digest at once still race, and the last `set` wins; the lifecycle never does
-that, because one submission is one fiber.
+**A settled marker beside each terminal entry.** `settled:<digest>` (value:
+the tag) exists only while the entry under that digest is terminal, and
+`listUnresolved` reads every entry key **except** the marked ones: one
+`keys` and one `get` per unresolved entry, however many settled ones the
+store keeps. The marker is a negative index — it says what may be skipped,
+never what must be read — so the write order is chosen to make a crash cost
+a spurious read and never a missing entry:
 
-**The cost is a scan.** `listUnresolved` reads every entry under the prefix,
-terminal ones included (`keys` is O(n) in the prefix, and each entry is one
-`get`, eight at a time). A journal that keeps every settled entry forever
-makes startup recovery slower without bound; `pruneSettled` is how a
-long-lived service keeps it short.
+- an unresolved `put` (`Signed`, `Unknown`) clears the marker, writes the
+  entry, and clears the marker again (each clear a `has`, and a `remove`
+  only when it exists). A crash after the first clear leaves an unmarked
+  terminal entry, which the next listing reads once and marks.
+- a terminal `put` writes the entry, then the marker, then reads the entry
+  back and removes the marker unless the read confirms a terminal entry —
+  so an unresolved `put` of the same digest from another writer that lands
+  between the two writes stays listed. A crash between the entry and the
+  marker leaves an unmarked terminal entry, read once and marked.
+- a listing that reads an unmarked terminal entry marks it, reads the entry
+  again and takes the marker back if the entry is no longer terminal — the
+  other half of the second clear above, so a listing racing a fresh `Signed`
+  for the same digest cannot leave it hidden. Marker writes during a listing
+  are best effort and never fail it.
 
-A store written by 0.3 or earlier also holds an `index` key, and reading
-such a store needs no migration: the key is dead data here — never read,
-never rewritten, never an error — left in place and no longer maintained.
-**Rolling back to 0.3 is therefore not safe as is.** 0.3 lists unresolved
-entries only through that index, so a `Signed` or `Unknown` entry this
-journal wrote is invisible to a 0.3 `listUnresolved`, `Tx.reconcileAll` and
-`onUnresolved: "fail"` (only `Tx.recorded(digest)` finds it), and a 0.3
-reader cannot decode a `NotApplied { evidence: "refused" }` entry at all.
-Before rolling back, or while 0.3 and 0.4 processes share a store, drain it
-with `Tx.reconcileAll()` on 0.4 (or settle the entries by hand) and delete
-the `"refused"` entries.
+Nothing is read-modify-written: two fibers, two layer instances, two
+processes over one store do not lose each other's entries. Two writers that
+put the **same** digest at once still race for the entry, and the last
+`set` wins; that happens when another context's `Tx.reconcileAll` writes
+`Unknown` (or re-sends) for a `Signed` entry this one is settling. A marker
+is never left over an unresolved entry by that race, **except** when the
+settling process dies (or its `remove` fails) between its marker write and
+its re-read while the other writer's whole `put` landed just before the
+marker write: then the entry is hidden from listings (never from `get`)
+until it is written again. Closing that needs a compare-and-set.
+
+**A store 0.4 wrote needs no migration.** It has entries and no markers, and
+an unmarked entry is always read, so the first listing is the 0.4 scan and
+marks every settled entry it finds; the second reads only the unresolved
+ones. Rolling back to 0.4 is safe for 0.4: it reads only `entry:` keys and
+ignores the markers. **Rolling forward again is not, after 0.4 wrote**: a
+0.4 process that put an unresolved entry over a digest 0.5 had settled left
+0.5's marker in place, so delete every `settled:` key (or drain the journal
+with `Tx.reconcileAll` on 0.4) before a 0.5 process lists the store again. **Running a 0.4 writer beside this one is not**, in one case: a
+0.4 process that writes an unresolved entry over a digest this journal had
+settled leaves the marker in place, and the entry is hidden from
+`listUnresolved` (not from `get`). The lifecycle re-signs a settled digest
+only when the same bytes are submitted again; drain with `Tx.reconcileAll`
+and stop the 0.4 writers before mixing versions.
+
+A store written by 0.3 or earlier also holds an `index` key: dead data here
+— never read, never rewritten, never an error. **Rolling back to 0.3 is not
+safe as is.** 0.3 lists unresolved entries only through that index, so a
+`Signed` or `Unknown` entry this journal wrote is invisible to a 0.3
+`listUnresolved`, `Tx.reconcileAll` and `onUnresolved: "fail"` (only
+`Tx.recorded(digest)` finds it), and a 0.3 reader cannot decode a
+`NotApplied { evidence: "refused" }` entry at all. Before rolling back, or
+while 0.3 and later processes share a store, drain it with
+`Tx.reconcileAll()` (or settle the entries by hand) and delete the
+`"refused"` entries.
+
+`keys` is still O(n) in the prefix on every store, and some stores pay for
+it in values (`chrome.storage` without `getKeys`); `pruneSettled` is
+how a long-lived service keeps n short.
 
 Every member fails with `JournalError` and nothing else.
 
@@ -6208,8 +7813,12 @@ Deletes every **settled** entry (`Executed`, `Failed`, `NotApplied`) whose
 answer was recorded strictly before `before`, and answers how many it
 deleted. `Signed` and `Unknown` entries are never deleted, however old.
 
-This is what keeps `make`'s scan short in a service that runs for
-months. After it, `Journal.get` and `Tx.recorded` answer `None` for a pruned
+`listUnresolved` reads only unmarked entries, but `keys` still enumerates
+every one, and some stores pay for that in values; this is what keeps the
+store short in a service that runs for months. It reads every entry itself
+(it deletes nothing on the strength of a marker alone), removes each pruned
+entry's marker before the entry, and removes markers whose entry is gone.
+After it, `Journal.get` and `Tx.recorded` answer `None` for a pruned
 digest, so choose `before` older than anything you still look up by digest —
 and older than any bytes you might still hand to `Tx.submit` again, because a
 resubmission puts a fresh `Signed` entry that a concurrent prune of the same
@@ -6220,6 +7829,942 @@ It reads the same `KeyValueStore` the journal layer was built over; pass the
 same `prefix`. The dead `index` key a 0.3 journal kept is not touched.
 
 **Fails with: `JournalError`, when the store cannot be listed, read or written, or holds an entry that does not decode (nothing is deleted on the strength of an entry it could not read).**
+
+## `@unconfirmed/sui-effect/gate`
+
+
+7 exported symbols.
+
+### `Gate` (const)
+
+Re-exported from `@unconfirmed/sui-effect/tx`.
+
+### `GateService` (interface)
+
+Re-exported from `@unconfirmed/sui-effect/tx`.
+
+### `JevOptions` (interface)
+
+```ts
+export interface JevOptions {
+    readonly apiKey: Redacted.Redacted<string>;
+    /** Defaults to `"jev-latest"`. Pin a version to keep thresholds meaningful. */
+    readonly model?: string;
+    /** Defaults to `https://api.typesafe.ai`. */
+    readonly baseUrl?: string;
+    /** The bound on one screen, retries included. Defaults to 10 seconds. */
+    readonly timeout?: Duration.Input;
+}
+```
+
+How to reach Jev.
+
+### `ScreenRequest` (interface)
+
+Re-exported from `@unconfirmed/sui-effect/tx`.
+
+### `layerJev` (const)
+
+```ts
+declare const layerJev: (options: JevOptions, overrides?: Partial<Omit<GateService, "screen">>) => Layer.Layer<never, never, HttpClient.HttpClient>
+```
+
+The `Gate` already in force, with Jev as its screen and `overrides` applied.
+
+Requires an `HttpClient`: `FetchHttpClient.layer` from
+`effect/http` needs no platform package.
+
+**Never fails.**
+
+### `layerJevConfig` (const)
+
+```ts
+declare const layerJevConfig: (overrides?: Partial<Omit<GateService, "screen">>) => Layer.Layer<never, Config.ConfigError, HttpClient.HttpClient>
+```
+
+`layerJev` from the environment: `TYPESAFE_API_KEY` (required,
+redacted), `TYPESAFE_MODEL` and `TYPESAFE_BASE_URL` (optional).
+
+**Fails with: `ConfigError` when the key is absent.**
+
+### `makeJev` (const)
+
+```ts
+declare const makeJev: (options: JevOptions) => Effect.Effect<NonNullable<GateService["screen"]>, never, HttpClient.HttpClient>
+```
+
+The screen itself, over an `HttpClient` you already have.
+
+One `POST /v1/systemone` per screen, retried on 429, 5xx and a dropped
+connection inside `timeout`. An answer that is missing a question it was
+asked is a non-retryable `TransportError`, never a default.
+
+The screen fails with: `TransportError`.
+
+**Never fails to build.**
+
+## `@unconfirmed/sui-effect/keystore`
+
+
+16 exported symbols.
+
+### `DEFAULT_ITERATIONS` (const)
+
+```ts
+declare const DEFAULT_ITERATIONS = 600000
+```
+
+PBKDF2-SHA256 iterations for a new seal: OWASP's 2023 recommendation.
+
+### `DEFAULT_PREFIX` (const)
+
+```ts
+declare const DEFAULT_PREFIX = "sui-effect/keystore/"
+```
+
+The `KeyValueStore` key prefix every record is stored under, by default.
+
+### `KEYSTORE_VERSION` (const)
+
+```ts
+declare const KEYSTORE_VERSION = 1
+```
+
+The format version this release writes and reads.
+
+### `KeyError` (class)
+
+Re-exported from `@unconfirmed/sui-effect`.
+
+### `KeyErrorReason` (const)
+
+Re-exported from `@unconfirmed/sui-effect`.
+
+### `Keystore` (class)
+
+```ts
+export declare class Keystore extends Keystore_base {
+    /**
+     * The service over the `KeyValueStore` in context, for an application that
+     * builds its own layer. **Throws** a `RangeError` for `iterations` that is
+     * not an integer in `[1 000, 10 000 000]`; the effect never fails.
+     */
+    static readonly make: (options?: KeystoreOptions) => Effect.Effect<KeystoreService, never, KeyValueStore.KeyValueStore>;
+    /** See `sealer`: a `SecretSealer` (for `ZkLogin.save`/`load`) in the keystore's format. */
+    static readonly sealer: (password: Redacted.Redacted<string>, options?: {
+        readonly iterations?: number;
+    }) => SecretSealer;
+    /**
+     * The keystore over the `KeyValueStore` in context. Builds without reading
+     * anything.
+     *
+     * **Throws** a `RangeError` when `options.iterations` is not an integer from
+     * `MIN_LAYER_ITERATIONS` to 10 000 000 — fewer would make every
+     * record cheap to brute-force, more would seal records `unlock` refuses.
+     * Otherwise never fails.
+     */
+    static readonly layer: (options?: KeystoreOptions) => Layer.Layer<Keystore, never, KeyValueStore.KeyValueStore>;
+    /**
+     * An in-memory keystore (`KeyValueStore.layerMemory`) sealing with 1 000
+     * PBKDF2 iterations, so a test does not spend seconds per seal. **Not for
+     * production**: those records are cheap to brute-force. Never fails.
+     */
+    static readonly layerTest: Layer.Layer<Keystore>;
+}
+```
+
+The sealed keystore: `Keystore.layer(options?)` over a `KeyValueStore`,
+`Keystore.layerTest` in memory for tests.
+
+### `KeystoreAccount` (interface)
+
+```ts
+export interface KeystoreAccount {
+    readonly address: SuiAddress;
+    readonly scheme: KeyScheme;
+    /** Whether the account was derived from a recovery phrase (exportable) or imported as a key. */
+    readonly source: "mnemonic" | "secretKey";
+    /** The derivation path, for a mnemonic account. */
+    readonly path?: string;
+    readonly label?: string;
+    readonly createdAt: DateTime.Utc;
+}
+```
+
+What the keystore says about an account. Never carries secret material.
+
+### `KeystoreError` (class)
+
+```ts
+export declare class KeystoreError extends KeystoreError_base {
+    readonly message: string;
+    readonly reason: "unavailable" | "wrongPassword" | "invalidPassword" | "notFound" | "exists" | "noMnemonic" | "corrupt" | "unsupported" | "storage";
+    readonly address?: SuiAddress | undefined;
+    readonly cause?: unknown;
+    /** Nothing was sent. */
+    readonly outcome: Outcome;
+    /**
+     * `Script.exitCode`'s answer: 2, like a `ConfigError`, for every reason a
+     * person has to fix (a wrong password, a missing or existing account, a
+     * corrupt or newer record, no WebCrypto); `undefined` for `"storage"`, a
+     * store failure that may pass on retry, which therefore exits 4 like any
+     * other `not_applied` failure.
+     *
+     * @since 0.5.0
+     */
+    get exitCode(): number | undefined;
+}
+```
+
+A keystore operation failed. Nothing was sent: outcome `not_applied`.
+
+A wrong password is this error with `reason: "wrongPassword"`, never a
+defect. `message` never contains the password or anything sealed.
+
+### `KeystoreErrorReason` (const)
+
+```ts
+declare const KeystoreErrorReason: Schema
+// decodes to: "unavailable" | "wrongPassword" | "invalidPassword" | "notFound" | "exists" | "noMnemonic" | "corrupt" | "unsupported" | "storage"
+```
+
+Why a keystore operation failed.
+
+- `wrongPassword`: the password does not open this account's record (its
+  key-check value does not match).
+- `invalidPassword`: a new password is empty.
+- `notFound`: no record for this address.
+- `exists`: a record for this address is already stored (`import*`).
+- `noMnemonic`: `exportMnemonic` of an account imported from a secret key.
+- `corrupt`: the record does not decode, was moved onto another address, was
+  edited (the AES-GCM tag over the ciphertext and its bound metadata does not
+  verify under a password whose check value matched), or holds a key that is
+  not the address's key.
+- `unsupported`: the record was written by a newer format version, or names
+  a KDF or cipher this version does not know.
+- `unavailable`: the platform has no WebCrypto (`crypto.subtle` or
+  `crypto.getRandomValues`), which React Native lacks without a polyfill.
+- `storage`: the `KeyValueStore` failed; `cause` is its error.
+
+### `KeystoreOptions` (interface)
+
+```ts
+export interface KeystoreOptions {
+    /** The `KeyValueStore` key prefix. Default `DEFAULT_PREFIX`. */
+    readonly prefix?: string;
+    /**
+     * PBKDF2-SHA256 iterations for records sealed from now on (existing records
+     * keep their own until `changePassword`). Default `DEFAULT_ITERATIONS`.
+     * An integer of at most 10 000 000; `Keystore.layer` refuses fewer than
+     * `MIN_LAYER_ITERATIONS`, `Keystore.make` fewer than 1 000.
+     */
+    readonly iterations?: number;
+}
+```
+
+Options of `Keystore.layer` and `Keystore.make`.
+
+### `KeystoreService` (interface)
+
+```ts
+export interface KeystoreService {
+    /**
+     * Every account, oldest first. Reads no secret and needs no password.
+     *
+     * Fails with: `KeystoreError` (`storage`; `unsupported` when a record is a
+     * newer format version or names a KDF or cipher this release does not know,
+     * `corrupt` when it otherwise does not decode).
+     */
+    readonly list: Effect.Effect<ReadonlyArray<KeystoreAccount>, KeystoreError>;
+    /**
+     * One account's public description.
+     *
+     * Fails with: `KeystoreError` (`notFound`, `corrupt`, `unsupported`, `storage`).
+     */
+    readonly account: (address: SuiAddress) => Effect.Effect<KeystoreAccount, KeystoreError>;
+    /**
+     * A fresh recovery phrase (`Signer.generateMnemonic`), its account on the
+     * standard path sealed under `password`. Answers the phrase once, redacted,
+     * for the person to write down.
+     *
+     * Fails with: `KeyError` (`unavailable`), `KeystoreError` (`invalidPassword`,
+     * `exists`, `unavailable`, `storage`).
+     */
+    readonly generate: (password: Redacted.Redacted<string>, options?: FromMnemonicOptions & {
+        readonly words?: MnemonicLength;
+        readonly label?: string;
+    }) => Effect.Effect<{
+        readonly account: KeystoreAccount;
+        readonly mnemonic: Redacted.Redacted<string>;
+    }, KeyError | KeystoreError>;
+    /**
+     * Checks a recovery phrase (`Signer.fromMnemonic`'s rules: word list and
+     * checksum), derives it and seals the key and the phrase under `password`.
+     *
+     * Fails with: `KeyError` (`invalidMnemonic`, `invalidPath`,
+     * `unsupportedScheme`), `KeystoreError` (`invalidPassword`, `exists`,
+     * `unavailable`, `storage`).
+     */
+    readonly importMnemonic: (phrase: Redacted.Redacted<string> | string, password: Redacted.Redacted<string>, options?: FromMnemonicOptions & {
+        readonly label?: string;
+    }) => Effect.Effect<KeystoreAccount, KeyError | KeystoreError>;
+    /**
+     * Seals an imported secret key (`Signer.fromSecretKey`'s spellings) under
+     * `password`. The caller's bytes are copied and left as they were.
+     *
+     * Fails with: `KeyError` (`invalidSecretKey`, `unsupportedScheme`),
+     * `KeystoreError` (`invalidPassword`, `exists`, `unavailable`, `storage`).
+     */
+    readonly importSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, password: Redacted.Redacted<string>, options?: FromSecretKeyOptions & {
+        readonly label?: string;
+    }) => Effect.Effect<KeystoreAccount, KeyError | KeystoreError>;
+    /**
+     * Opens an account into a `LockableSigner`. The caller locks it
+     * (`signer.lock`), or acquires it with `Signer.scoped` so the scope does.
+     *
+     * Fails with: `KeystoreError` (`wrongPassword`, `notFound`, `corrupt`,
+     * `unsupported`, `unavailable`, `storage`).
+     */
+    readonly unlock: (address: SuiAddress, password: Redacted.Redacted<string>) => Effect.Effect<LockableSigner, KeystoreError>;
+    /**
+     * Deletes an account's record. Needs no password: it destroys, it reveals
+     * nothing.
+     *
+     * Fails with: `KeystoreError` (`notFound`, `storage`).
+     */
+    readonly remove: (address: SuiAddress) => Effect.Effect<void, KeystoreError>;
+    /**
+     * Re-seals one account under a new password, with a fresh salt and IV and
+     * the layer's current iteration count. The new record is opened under the
+     * new password (one more PBKDF2 derivation) before it is written, so a
+     * re-seal that does not open never replaces the stored record; that failure
+     * is `corrupt` and leaves the store as it was.
+     *
+     * Fails with: `KeystoreError` (`wrongPassword`, `invalidPassword`,
+     * `notFound`, `corrupt`, `unsupported`, `unavailable`, `storage`).
+     */
+    readonly changePassword: (address: SuiAddress, oldPassword: Redacted.Redacted<string>, newPassword: Redacted.Redacted<string>) => Effect.Effect<void, KeystoreError>;
+    /**
+     * The recovery phrase of a mnemonic account, redacted.
+     *
+     * Fails with: `KeystoreError` (`noMnemonic` for an imported key,
+     * `wrongPassword`, `notFound`, `corrupt`, `unsupported`, `unavailable`,
+     * `storage`).
+     */
+    readonly exportMnemonic: (address: SuiAddress, password: Redacted.Redacted<string>) => Effect.Effect<Redacted.Redacted<string>, KeystoreError>;
+    /**
+     * The account's secret key as a Bech32 `suiprivkey1…`, redacted.
+     *
+     * Fails with: `KeystoreError` (`wrongPassword`, `notFound`, `corrupt`,
+     * `unsupported`, `unavailable`, `storage`).
+     */
+    readonly exportSecretKey: (address: SuiAddress, password: Redacted.Redacted<string>) => Effect.Effect<Redacted.Redacted<string>, KeystoreError>;
+}
+```
+
+The keystore's members.
+
+### `LockableSigner` (interface)
+
+Re-exported from `@unconfirmed/sui-effect/tx`.
+
+### `MIN_LAYER_ITERATIONS` (const)
+
+```ts
+declare const MIN_LAYER_ITERATIONS = 100000
+```
+
+The fewest iterations `Keystore.layer` accepts for a new seal.
+
+### `SealedKey` (const)
+
+```ts
+declare const SealedKey: Schema
+// decodes to:
+// {
+//     readonly address: SuiAddress;
+//     readonly version: 1;
+//     readonly source: "mnemonic" | "secretKey";
+//     readonly scheme: "ED25519" | "Secp256k1" | "Secp256r1";
+//     readonly createdAt: DateTime.Utc;
+//     readonly kdf: {
+//         readonly name: "PBKDF2-SHA256";
+//         readonly iterations: number;
+//         readonly salt: string;
+//     };
+//     readonly cipher: {
+//         readonly name: "AES-256-GCM";
+//         readonly iv: string;
+//     };
+//     readonly check: string;
+//     readonly ciphertext: string;
+//     readonly path?: string | undefined;
+//     readonly label?: string | undefined;
+// }
+```
+
+One sealed account as stored, version 1. Every byte field is standard
+base64; `createdAt` is epoch milliseconds from the Effect `Clock`.
+
+The AAD binds `address`, `scheme`, `source` and `path` (an absent `path`
+and `path: ""` are the same AAD); an edit to one of them, to the `iv` or to
+the ciphertext is `corrupt`. `label` and `createdAt` are outside it and may
+be edited in place. An edited `salt`, `iterations` or `check` derives a
+check value that does not match, so it reads as `wrongPassword`.
+
+### `SealedSecret` (const)
+
+```ts
+declare const SealedSecret: Schema
+// decodes to:
+// {
+//     readonly version: 1;
+//     readonly kdf: {
+//         readonly name: "PBKDF2-SHA256";
+//         readonly iterations: number;
+//         readonly salt: string;
+//     };
+//     readonly cipher: {
+//         readonly name: "AES-256-GCM";
+//         readonly iv: string;
+//     };
+//     readonly check: string;
+//     readonly ciphertext: string;
+// }
+```
+
+One secret sealed by `sealer`, as the string `seal` answers: the
+keystore's KDF and cipher parameters and its key-check value, version 1.
+Every byte field is standard base64.
+
+### `sealer` (const)
+
+```ts
+declare const sealer: (password: Redacted.Redacted<string>, options?: {
+    readonly iterations?: number;
+}) => SecretSealer
+```
+
+A `SecretSealer` (what `ZkLogin.save` and `ZkLogin.load` take) in the
+keystore's format: PBKDF2-HMAC-SHA256 over `password` (600 000 iterations
+by default, 16-byte random salt, 512 bits: the AES key and the key-check
+value), AES-256-GCM with a fresh 12-byte IV per seal, and as AAD
+`sui-effect/keystore/sealer/v1`, a newline, then the caller's `aad` — for
+a zkLogin session, its address — so a blob copied under another account's
+entry does not unseal. The blob is `SealedSecret` as JSON.
+
+The password is held by the sealer for as long as the sealer lives: make
+one when the person unlocks and drop it when they lock. Each `seal` and
+`unseal` costs one PBKDF2 derivation.
+
+**Throws** a `RangeError` when `options.iterations` is not an integer from
+`MIN_LAYER_ITERATIONS` to 10 000 000, `Keystore.layer`'s bounds
+(`unseal` refuses a blob naming more than 10 000 000). Its members
+fail with: `SigningError` — `reason: "locked"` for a wrong password,
+`reason: "unavailable"` without WebCrypto, and no reason for an empty
+password, an empty secret or a blob that was edited, moved or is not one.
+
+## `@unconfirmed/sui-effect/storage`
+
+
+14 exported symbols.
+
+### `AsyncStorageLike` (interface)
+
+```ts
+export interface AsyncStorageLike {
+    getItem(key: string): Promise<string | null | undefined>;
+    setItem(key: string, value: string): Promise<unknown>;
+    removeItem(key: string): Promise<unknown>;
+    getAllKeys(): Promise<ReadonlyArray<string>>;
+    clear?(): Promise<unknown>;
+}
+```
+
+The part of `@react-native-async-storage/async-storage` (or anything shaped
+like it) this adapter calls. `clear` is optional; without it, `clear` removes
+every key one by one.
+
+### `ChromeStorageAreaLike` (interface)
+
+```ts
+export interface ChromeStorageAreaLike {
+    get(keys: string | ReadonlyArray<string> | null): Promise<Readonly<Record<string, unknown>>>;
+    set(items: Readonly<Record<string, unknown>>): Promise<unknown>;
+    remove(keys: string | ReadonlyArray<string>): Promise<unknown>;
+    clear(): Promise<unknown>;
+    getKeys?(): Promise<ReadonlyArray<string>>;
+}
+```
+
+The part of a `chrome.storage` `StorageArea` this adapter calls, in its
+promise form. `getKeys` (Chrome 130+) is used when present; without it,
+`keys` is `get(null)`, which reads every value in the area.
+
+### `IndexedDbDatabase` (interface)
+
+```ts
+export interface IndexedDbDatabase {
+    readonly version: number;
+    readonly objectStoreNames: {
+        contains(name: string): boolean;
+    };
+    createObjectStore(name: string): unknown;
+    transaction(storeName: string, mode: "readonly" | "readwrite", options?: {
+        readonly durability?: "default" | "strict" | "relaxed";
+    }): IndexedDbTransaction;
+    close(): void;
+    onversionchange: ((event: never) => void) | null;
+    onclose: ((event: never) => void) | null;
+}
+```
+
+The part of an `IDBDatabase` this adapter calls.
+
+### `IndexedDbFactory` (interface)
+
+```ts
+export interface IndexedDbFactory {
+    open(name: string, version?: number): IndexedDbOpenRequest;
+}
+```
+
+The part of an `IDBFactory` (`globalThis.indexedDB`) this adapter calls.
+
+### `IndexedDbObjectStore` (interface)
+
+```ts
+export interface IndexedDbObjectStore {
+    get(key: string): IndexedDbRequest<unknown>;
+    put(value: unknown, key: string): IndexedDbRequest<unknown>;
+    delete(key: string): IndexedDbRequest<unknown>;
+    clear(): IndexedDbRequest<unknown>;
+    count(): IndexedDbRequest<number>;
+    getAllKeys(): IndexedDbRequest<ReadonlyArray<unknown>>;
+}
+```
+
+The part of an `IDBObjectStore` this adapter calls.
+
+### `IndexedDbOpenRequest` (interface)
+
+```ts
+export interface IndexedDbOpenRequest extends IndexedDbRequest<IndexedDbDatabase> {
+    onupgradeneeded: ((event: never) => void) | null;
+    onblocked: ((event: never) => void) | null;
+}
+```
+
+The part of an `IDBOpenDBRequest` this adapter reads.
+
+### `IndexedDbOptions` (interface)
+
+```ts
+export interface IndexedDbOptions {
+    /** The factory to open the database with. Defaults to `globalThis.indexedDB`. */
+    readonly indexedDB?: IndexedDbFactory;
+    /** The database name. Defaults to `"sui-effect"`. */
+    readonly databaseName?: string;
+    /** The object store name. Defaults to `"keyvalue"`. */
+    readonly storeName?: string;
+    /**
+     * The durability hint every write transaction carries. Defaults to
+     * `"strict"`: the journal's `Signed` entry is written before any bytes are
+     * sent, and a write that a power loss can undo is not a journal. Browsers
+     * that do not know the hint ignore it.
+     */
+    readonly durability?: "default" | "strict" | "relaxed";
+}
+```
+
+Options for `layerIndexedDb`.
+
+### `IndexedDbRequest` (interface)
+
+```ts
+export interface IndexedDbRequest<T> {
+    readonly result: T;
+    readonly error: unknown;
+    onsuccess: ((event: never) => void) | null;
+    onerror: ((event: never) => void) | null;
+}
+```
+
+The part of an `IDBRequest` this adapter reads.
+
+### `IndexedDbTransaction` (interface)
+
+```ts
+export interface IndexedDbTransaction {
+    readonly error: unknown;
+    objectStore(name: string): IndexedDbObjectStore;
+    abort(): void;
+    oncomplete: ((event: never) => void) | null;
+    onerror: ((event: never) => void) | null;
+    onabort: ((event: never) => void) | null;
+}
+```
+
+The part of an `IDBTransaction` this adapter calls.
+
+### `MmkvLike` (type)
+
+```ts
+export type MmkvLike = (MmkvBase & {
+    delete(key: string): void;
+}) | (MmkvBase & {
+    remove(key: string): unknown;
+});
+```
+
+The part of a `react-native-mmkv` instance this adapter calls: `delete`
+(2.x/3.x) or `remove` (4.x).
+
+### `layerAsyncStorage` (const)
+
+```ts
+declare const layerAsyncStorage: (storage: AsyncStorageLike) => Layer.Layer<KeyValueStore.KeyValueStore>
+```
+
+A `KeyValueStore` over an AsyncStorage-shaped store.
+
+Every operation is one call (`clearPrefix` is `getAllKeys` and a
+`removeItem` per match; `size` is `getAllKeys`). AsyncStorage has no
+transactions, so a `set` that resolved is as durable as AsyncStorage makes
+it, and nothing groups two calls. Android's default backend caps the whole
+store (6 MB by default) and each value (about 2 MB); a journal or keystore is
+far below either.
+
+**Never fails to build; every operation fails with `KeyValueStoreError`.**
+
+### `layerChromeStorage` (const)
+
+```ts
+declare const layerChromeStorage: (area: ChromeStorageAreaLike) => Layer.Layer<KeyValueStore.KeyValueStore>
+```
+
+A `KeyValueStore` over a `chrome.storage` area.
+
+The area holds JSON values; this store writes only strings (a `Uint8Array`
+as base64, through `KeyValueStore.makeStringOnly`) and fails `get` with
+`KeyValueStoreError` on a key that holds anything else, which only another
+writer to the same area can have put there. Every operation is one call;
+`clearPrefix` is one `keys` and one `remove` of the matches.
+
+`chrome.storage.local` is the area that survives the browser restarting; it
+holds 10 MB unless the extension asks for `"unlimitedStorage"`, and it is
+reachable from the MV3 service worker, where `localStorage` is not. Unlike
+IndexedDB it is shared by every context of the extension and gives no
+transactions. `chrome.storage.session` is memory only and lost when the
+browser closes: not a journal.
+
+**Never fails to build; every operation fails with `KeyValueStoreError`.**
+
+### `layerIndexedDb` (const)
+
+```ts
+declare const layerIndexedDb: (options?: IndexedDbOptions) => Layer.Layer<KeyValueStore.KeyValueStore>
+```
+
+A `KeyValueStore` backed by IndexedDB.
+
+Strings and `Uint8Array`s are stored as themselves (IndexedDB clones both),
+so `getUint8Array` returns stored bytes unchanged and `get` returns them as
+base64; a stored string read with `getUint8Array` is its UTF-8 encoding —
+the semantics of `KeyValueStore.layerMemory`.
+
+The database is opened on first use, not when the layer is built, so
+building never fails; an IndexedDB that cannot be opened (absent, blocked,
+refused in a private window) fails each operation with
+`KeyValueStoreError`, `method` naming the operation. The object store is
+created when missing, by reopening at the next version. A `versionchange`
+from another tab closes this connection and the next operation reopens it;
+the layer's scope closes it for good.
+
+Each operation is one transaction, and a write resolves when its
+transaction **completes** (not when its request succeeds), so a write this
+store reported done is committed. Interrupting an operation aborts its
+transaction. `clearPrefix` reads every key and deletes the matching ones in
+the same transaction: IndexedDB's key ranges need `IDBKeyRange`, which is
+not structural.
+
+**Never fails to build; every operation fails with `KeyValueStoreError`.**
+
+### `layerMmkv` (const)
+
+```ts
+declare const layerMmkv: (mmkv: MmkvLike) => Layer.Layer<KeyValueStore.KeyValueStore>
+```
+
+A `KeyValueStore` over an MMKV-shaped synchronous store.
+
+Every operation is one synchronous call, wrapped in `Effect.try`. MMKV
+writes through a memory map, so a `set` survives the app being killed once
+it returns; it does not group two writes either.
+
+**Never fails to build; every operation fails with `KeyValueStoreError`.**
+
+## `@unconfirmed/sui-effect/enoki`
+
+
+9 exported symbols.
+
+### `Enoki` (const)
+
+```ts
+declare const Enoki: {
+    readonly fromFlow: (flow: EnokiFlow, options?: {
+        readonly network?: "mainnet" | "testnet" | "devnet";
+    } | undefined) => Effect.Effect<Signer, SigningError, never>;
+    readonly fromWallet: (options: {
+        readonly wallet: StandardWallet;
+        readonly account: StandardWalletAccount;
+        readonly chain: string;
+        readonly scheme?: SignatureScheme;
+    }) => Effect.Effect<Signer, SigningError, never>;
+    readonly sponsor: (client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
+        readonly sender: SuiAddress;
+        readonly network?: "mainnet" | "testnet" | "devnet";
+        readonly jwt?: string;
+        readonly allowedAddresses?: ReadonlyArray<string>;
+        readonly allowedMoveCallTargets?: ReadonlyArray<string>;
+    }) => Effect.Effect<Built, TransportError | BuildError | PolicyDenied | EnokiError, Sui>;
+    readonly execute: (client: EnokiClient, signed: Signed, options?: {
+        readonly refused?: (cause: unknown) => boolean;
+    } | undefined) => Effect.Effect<Executed, SubmitViaError | EnokiError, Sui>;
+    readonly run: <E = never>(client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
+        readonly signer: Signer;
+        readonly network?: "mainnet" | "testnet" | "devnet";
+        readonly jwt?: string;
+        readonly allowedAddresses?: ReadonlyArray<string>;
+        readonly allowedMoveCallTargets?: ReadonlyArray<string>;
+        /** What the transaction is declared to do; see `Tx.run`. */
+        readonly intent?: Intent;
+        /** Shown the prepared, sponsored transaction before the sender signs; failing refuses. */
+        readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
+        /** `Tx.run`'s `onSigned`: after the sender's signature, before Enoki is called. */
+        readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+        /** `execute`'s `refused`. */
+        readonly refused?: (cause: unknown) => boolean;
+    }) => Effect.Effect<Executed, TransportError | SimulationFailed | SigningError | BuildError | PolicyDenied | SubmitViaError | EnokiError | E, Sui>;
+}
+```
+
+The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`,
+`Enoki.sponsor`, `Enoki.execute`, `Enoki.run`.
+
+### `EnokiClient` (interface)
+
+```ts
+export interface EnokiClient {
+    readonly createSponsoredTransaction: (input: {
+        readonly network?: "mainnet" | "testnet" | "devnet";
+        readonly transactionKindBytes: string;
+    } & ({
+        readonly jwt: string;
+        readonly sender?: never;
+        readonly allowedAddresses?: never;
+        readonly allowedMoveCallTargets?: never;
+    } | {
+        readonly sender: string;
+        readonly allowedAddresses?: Array<string>;
+        readonly allowedMoveCallTargets?: Array<string>;
+        readonly jwt?: never;
+    })) => Promise<{
+        readonly bytes: string;
+        readonly digest: string;
+    }>;
+    readonly executeSponsoredTransaction: (input: {
+        readonly digest: string;
+        readonly signature: string;
+    }) => Promise<{
+        readonly digest: string;
+    }>;
+}
+```
+
+The two `EnokiClient` methods sponsorship uses, as `@mysten/enoki` 1.3.2
+declares them (the input of `createSponsoredTransaction` narrowed to the
+`sender` form, plus `jwt`).
+
+### `EnokiError` (class)
+
+```ts
+export declare class EnokiError extends EnokiError_base {
+    readonly refused: boolean;
+    readonly cause: unknown;
+    readonly method: string;
+    readonly status?: number | undefined;
+    readonly code?: string | undefined;
+    /** `not_applied` for a refusal; `unknown` otherwise. */
+    get outcome(): "not_applied" | "unknown";
+    get message(): string;
+}
+```
+
+Enoki refused a request: an HTTP 4xx from the Enoki API, or a refusal the
+caller's `refused` predicate recognised. `refused: true` is the claim that
+nothing was submitted, which makes the outcome `not_applied`; any other
+failure of the execute call is ambiguous, is reconciled by `Tx.submitVia`,
+and only ever surfaces as the `cause` of a `SubmissionUnknown`.
+
+### `EnokiFlow` (interface)
+
+```ts
+export interface EnokiFlow {
+    readonly getSession: () => Promise<{
+        readonly maxEpoch: number;
+        readonly expiresAt: number;
+    } | null>;
+    readonly getKeypair: (input?: {
+        readonly network?: "mainnet" | "testnet" | "devnet";
+    }) => Promise<SdkSigner>;
+}
+```
+
+The two `EnokiFlow` methods `fromFlow` uses. `EnokiFlow` is deprecated
+in `@mysten/enoki` 1.x in favour of `registerEnokiWallets`, whose wallets
+`fromWallet` reads; both are supported.
+
+### `execute` (const)
+
+```ts
+declare const execute: (client: EnokiClient, signed: Signed, options?: {
+    readonly refused?: (cause: unknown) => boolean;
+} | undefined) => Effect.Effect<Executed, SubmitViaError | EnokiError, Sui>
+```
+
+Executes a sponsored transaction through Enoki's
+`executeSponsoredTransaction`, **through the journal**: this is
+`Tx.submitVia(signed, send)`, so the `Signed` entry is written before Enoki
+is called, Enoki is called once, and its answer — a bare digest, never
+effects — is settled by asking the chain for the digest of the bytes that
+were signed. A failure that may have reached the chain is reconciled with the
+full evidence rules and is `SubmissionUnknown` (carrying the bytes) when the
+chain cannot say yet; `Tx.reconcileAll()` settles it later.
+
+The signature sent is `signed.signatures[0]`, the sender's: Enoki holds the
+sponsor's.
+
+`refused` says which Enoki failures are refusals before anything was
+submitted, which fail straight through as `EnokiError { refused: true }`
+and settle the journal entry as `NotApplied { refused }`. The default is an
+HTTP 401 or 403 (Enoki refused the API key or the session); every other
+failure — a 400 included, since Enoki submits to a node and does not say
+whether it got that far — is treated as ambiguous and reconciled.
+
+**Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError` (only from the write before Enoki is called), and `EnokiError` (only `refused: true`).**
+
+### `fromFlow` (const)
+
+```ts
+declare const fromFlow: (flow: EnokiFlow, options?: {
+    readonly network?: "mainnet" | "testnet" | "devnet";
+} | undefined) => Effect.Effect<Signer, SigningError, never>
+```
+
+The signed-in `EnokiFlow` session as a `Signer`: `scheme: "ZkLogin"`,
+`maxEpoch` and the expiry checks of `Signer.zkLogin`, signing with the
+flow's own `EnokiKeypair` (`getKeypair`, which asks Enoki for the proof the
+first time and caches it in the flow's store).
+
+The keypair and the session are read once, here: a session refreshed or
+signed out later is a different signer, made again.
+
+**Fails with: `SigningError` — `reason: "expired"` when the session or its proof has expired, `reason: "unavailable"` when nobody is signed in or the proof could not be fetched.**
+
+### `fromWallet` (const)
+
+```ts
+declare const fromWallet: (options: {
+    readonly wallet: StandardWallet;
+    readonly account: StandardWalletAccount;
+    readonly chain: string;
+    readonly scheme?: SignatureScheme;
+}) => Effect.Effect<Signer, SigningError, never>
+```
+
+An Enoki wallet (from `registerEnokiWallets`) as a `Signer`: `Signer.wallet`
+over its Wallet Standard features, plus the session bound its
+`enoki:getSession` feature reports, so the signer carries `maxEpoch` and
+refuses after it like `Signer.zkLogin`.
+
+**Fails with: `SigningError` — everything `Signer.wallet` fails with, `reason: "unavailable"` when the wallet has no `enoki:getSession` or nobody is signed in, and `reason: "expired"` when the session has expired.**
+
+### `run` (const)
+
+```ts
+declare const run: <E = never>(client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
+    readonly signer: Signer;
+    readonly network?: "mainnet" | "testnet" | "devnet";
+    readonly jwt?: string;
+    readonly allowedAddresses?: ReadonlyArray<string>;
+    readonly allowedMoveCallTargets?: ReadonlyArray<string>;
+    /** What the transaction is declared to do; see `Tx.run`. */
+    readonly intent?: Intent;
+    /** Shown the prepared, sponsored transaction before the sender signs; failing refuses. */
+    readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
+    /** `Tx.run`'s `onSigned`: after the sender's signature, before Enoki is called. */
+    readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
+    /** `execute`'s `refused`. */
+    readonly refused?: (cause: unknown) => boolean;
+}) => Effect.Effect<Executed, TransportError | SimulationFailed | SigningError | BuildError | PolicyDenied | SubmitViaError | EnokiError | E, Sui>
+```
+
+The whole Enoki-sponsored run, with the same front half as `Tx.run`:
+`sponsor` → `Tx.prepare(built, { sender, intent })` (one simulate of
+exactly Enoki's bytes, `SubmitConfig.preflight`, the intent's claims and
+screen) → `approve(prepared)` → `Tx.sign` (`prepared.verified` when there
+is an intent) → `onSigned` → `execute`, through the journal.
+
+**The sender lock follows `Tx.run`'s rule for the sender's own pins.**
+Under `SubmitConfig.lockSender: "whenPinned"` (the default) the sponsor
+request — which resolves the sender's object inputs — runs under the
+sender's lock, and the lock is held on through approval, signing and
+execution only when Enoki's bytes pin an owned or receiving input. The gas
+coins are Enoki's and are not the sender's to race, so a sponsored
+transaction that pins nothing of the sender's (pure values, shared objects,
+withdrawals) is approved, signed and executed with the lock released, and
+a person taking their time never holds it. `"always"` holds it throughout,
+`"never"` takes none. `Gate.requireIntent` applies, as it does to `Tx.run`,
+and so does its early refusal of a locked signer (`SigningError { reason:
+"locked" }` before Enoki is asked anything).
+
+`options.signer` is the sender: an Enoki zkLogin session
+(`Enoki.fromFlow`, `Enoki.fromWallet`, `Signer.zkLogin`) or any other
+signer Enoki sponsors. `options.jwt`, `allowedAddresses` and
+`allowedMoveCallTargets` are `sponsor`'s; `refused` is
+`execute`'s.
+
+**Fails with: `EnokiError` (a refusal: the sponsor request answered 4xx, or the execute call failed in a way `refused` recognises), `TransportError` (Enoki could not be reached for the sponsor request, or the simulate), `BuildError`, `PolicyDenied` (`enoki.digest`, `sponsored.*`, `prepare.sender`, `intent.*`, `preflight`), `SimulationFailed`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, and `E` — whatever `approve` fails with.**
+
+### `sponsor` (const)
+
+```ts
+declare const sponsor: (client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
+    readonly sender: SuiAddress;
+    readonly network?: "mainnet" | "testnet" | "devnet";
+    readonly jwt?: string;
+    readonly allowedAddresses?: ReadonlyArray<string>;
+    readonly allowedMoveCallTargets?: ReadonlyArray<string>;
+}) => Effect.Effect<Built, TransportError | BuildError | PolicyDenied | EnokiError, Sui>
+```
+
+Asks Enoki to sponsor a transaction, and answers its sponsored bytes as a
+`Built` that has been checked: `Tx.fromBytes` (the chain), Enoki's
+digest is the digest of its bytes, and `verifySponsored` (on `/tx`) — the sender is
+`options.sender`, the gas owner is someone else, and the transaction kind is
+**exactly** the kind that was sent.
+
+`transaction` is a recipe, built kind-only against the `Sui` in context (so
+its object inputs are resolved), or kind bytes already built. Pass `jwt` to
+let Enoki derive the sender from the session instead (Enoki's `jwt` form);
+`sender` is still what the bytes are checked against.
+
+Then: `Tx.sign(built, signer)` (or `Tx.prepare` first, to simulate the
+bytes), then `execute`.
+
+**Fails with: `EnokiError` (`refused: true`: Enoki answered 4xx), `TransportError` (Enoki could not be reached, answered 5xx or 429, or answered something unreadable), `BuildError` (the recipe did not build, or the bytes are not a transaction for this chain), `PolicyDenied` (`enoki.digest`, `sponsored.sender`, `sponsored.gasOwner`, `sponsored.kind`).**
 
 ## `@unconfirmed/sui-effect/extension`
 
@@ -6596,6 +9141,18 @@ export interface ReportOptions {
      * reports only those.
      */
     readonly journal?: JournalService;
+    /**
+     * How many transactions the program submitted that the network answered as
+     * applied, for `ExitCodeOptions.applied`: above zero, with nothing
+     * unresolved, a failure that would exit 2, 4 or 130 exits 5. `report` cannot
+     * count them itself — the journal it reads may hold other processes'
+     * entries — so a CLI that runs several commands keeps the count (one per
+     * `Executed`, or `ExecutionFailed`, it saw) and hands it over. Left out, it
+     * is zero.
+     *
+     * @since 0.5.0
+     */
+    readonly applied?: number;
 }
 ```
 
@@ -6654,6 +9211,33 @@ export declare class Script extends Script_base {
      * Fails with: `ConfigError`.
      */
     static readonly layerReadOnlyNoDeps: Layer.Layer<ScriptReadOnly, Config.ConfigError, Sui | SuiCore>;
+    /**
+     * The logger `Script.run` installs, as a layer for a program that owns its
+     * process: every `Effect.log` — the program's and the library's (the
+     * `SuiCore` read retries at debug, `Tx.submit`'s visibility warning, a
+     * tail's retry warnings) — rendered as logfmt on stderr, and nothing on
+     * stdout.
+     *
+     * Effect's default logger writes to `console.log`, which is **stdout**, so
+     * without this a CLI whose stdout is one JSON document (`--json`) gets a
+     * library warning in the middle of it. It replaces the loggers in force.
+     * `stderr` defaults to `process.stderr`; a writer that throws loses its line.
+     * It does not read `SUI_LOG_LEVEL` (that is `Script.run`'s); set
+     * `References.MinimumLogLevel` yourself. Never fails.
+     *
+     * @example
+     * ```ts
+     * const exit = await Effect.runPromiseExit(
+     *   command.pipe(Effect.provide(Script.layerStderrLogger()))
+     * )
+     * process.exitCode = await Script.report(exit)
+     * ```
+     *
+     * @since 0.5.0
+     */
+    static readonly layerStderrLogger: (options?: {
+        readonly stderr?: (line: string) => void;
+    }) => Layer.Layer<never>;
     /** See `exitCode`. */
     static readonly exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number;
     /** See `run`. */
@@ -6772,6 +9356,13 @@ on the same axis. `SchemaError` — what Effect's own `Config.schema` and
 because in a script it can only mean the input a person gave did not fit the
 schema, and no retry fixes that.
 
+**effect/cli's `CliError` (0.5.0)** is recognised by its marker, without an
+import: a bad command line (an unknown option or subcommand, a missing or
+invalid value, `ShowHelp` carrying parse errors) exits 2, `ShowHelp` with no
+errors — `--help` — exits 0, and a `UserError` exits as the `cause` it wraps
+would. It is read before a declared exit code, because `ShowHelp` declares
+`[Runtime.errorExitCode]` 1, which on this axis means a defect.
+
 **While a submission is outstanding** (`ExitCodeOptions.unresolved`),
 any failure that would exit 2, 4 or 130 — a declared `exitCode` included —
 exits 3, applied transactions or not: reconcile before anything else.
@@ -6824,9 +9415,17 @@ yourself rather than `process.exit`, so buffered output still flushes.
 
 It is not quite `run`'s tail. It counts **every** unresolved entry in the
 journal it is given — in a shared durable store, another process's too —
-and any one of them turns a would-be 2, 4 or 130 into 3. It has no count of
-what applied, so it never turns a failure into 5 for an applied
-transaction: that rule needs the run record only `Script.run` keeps.
+and any one of them turns a would-be 2, 4 or 130 into 3. It cannot count
+what applied, so a multi-command CLI hands that over as
+`ReportOptions.applied` (0.5.0), and then a failure after an applied
+transaction exits 5 as it does under `run`.
+
+**effect/cli (0.5.0).** A `CliError` is mapped without importing
+`effect/cli`: `ShowHelp` with no errors exits 0, `UserError` exits as its
+`cause` would, and every other `CliError` exits 2; no failure line is
+printed for one, because the CLI runner has already rendered it. Library
+log lines are the program's logger's business: provide
+`Script.layerStderrLogger` so they reach stderr, not a JSON stdout.
 
 **Never fails.**
 
@@ -6877,7 +9476,7 @@ Returns the exit code as well as passing it to `exit`, so a test can inject
 ## `@unconfirmed/sui-effect/testing`
 
 
-20 exported symbols.
+21 exported symbols.
 
 ### `CLOCK_TYPE` (const)
 
@@ -6949,6 +9548,15 @@ export interface FakeChange {
      */
     readonly inputVersion?: bigint;
     readonly owner?: SuiClientTypes.ObjectOwner;
+    /**
+     * The owner going **in**, for a transaction that moved the object: a transfer
+     * is `inputOwner` the sender and `owner` the recipient, which is what
+     * `checkClaims` and `transferred()` (on `Simulation` and `Executed`) read.
+     * Defaults to `owner`, an object that stayed put.
+     *
+     * @since 0.5.0
+     */
+    readonly inputOwner?: SuiClientTypes.ObjectOwner;
     /** `PackageWrite` marks a published package; `AccumulatorWriteV1` an accumulator write. */
     readonly outputState?: SuiClientTypes.ChangedObject["outputState"];
     /**
@@ -7054,6 +9662,21 @@ export interface FakeObject {
      * node that will not say, which is evidence of nothing.
      */
     readonly previousTransaction?: string;
+    /**
+     * The node's JSON rendering of the content, served when the caller includes
+     * `json` (`null` when this is left out, as a node with nothing to render
+     * answers).
+     *
+     * @since 0.5.0
+     */
+    readonly json?: Record<string, unknown>;
+    /**
+     * The Display output, served when the caller includes `display` (`null` when
+     * this is left out: the type has no Display template).
+     *
+     * @since 0.5.0
+     */
+    readonly display?: SuiClientTypes.Display;
 }
 ```
 
@@ -7250,6 +9873,12 @@ export interface FakeScript {
      * `failWith` here to make `Tx.build` fail with `SimulationFailed` without
      * touching the `simulate` script a later `Tx.verify` or `preflight` reads;
      * `timeoutThen` blocks the build until it is interrupted.
+     *
+     * Since 0.5.0 it also answers, in turn, an ordinary `simulateTransaction`
+     * when the `simulate` script is empty: a test that scripted the build's
+     * simulation alone no longer dies with `FakeUnimplemented` on the preflight
+     * simulate after it. With neither script, that simulate still dies, naming
+     * `simulate` / `SuiTest.scriptSimulate`.
      */
     readonly buildSimulate?: ReadonlyArray<FakeOutcome>;
     readonly execute?: ReadonlyArray<FakeOutcome>;
@@ -7297,6 +9926,13 @@ export interface FakeScript {
      * an epoch it does not name answers `NOT_FOUND`, the way a node that pruned
      * the epoch does. Unscripted, the client has no `ledgerService` at all, which
      * is what a JSON-RPC or GraphQL transport looks like.
+     *
+     * Scripted (`ledger: {}` is enough), the ledger service also answers
+     * `ListTransactions` with an `affectedAddress` predicate from the fake's
+     * transaction history — executed and `FakeScript.transactions` alike — which
+     * is what `Sui.streamTransactions({ affectedAddress })` reads (0.5.0). A
+     * transaction affects an address when the address sent it, a balance change
+     * names it, or an object it owned before or after changed.
      *
      * @since 0.4.0
      */
@@ -7494,6 +10130,17 @@ inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
 Every member requires `SuiCoreFake`, which `layerTest` and
 `layerExtensionTest` provide.
 
+### `TestServices` (type)
+
+```ts
+export type TestServices = Sui | SuiCore | SuiCoreFake;
+```
+
+What `layerTest` provides, under one name: `Sui`, `SuiCore` and the
+fake's handle, `SuiCoreFake`. A test helper that runs programs against the
+fake takes `Effect.Effect<A, E, TestServices>` instead of spelling the union
+out (an extension test adds its own service: `TestServices | Escrow`).
+
 ### `fakeCoin` (const)
 
 ```ts
@@ -7558,7 +10205,7 @@ operator service, a sibling extension's test layer).
 ### `layerTest` (const)
 
 ```ts
-declare const layerTest: (script?: FakeScript) => Layer.Layer<Sui | SuiCore | SuiCoreFake, NetworkMismatch | TransportError>
+declare const layerTest: (script?: FakeScript) => Layer.Layer<TestServices, NetworkMismatch | TransportError>
 ```
 
 The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test

@@ -35,11 +35,14 @@ import {
   SuiError,
   TransportError
 } from "../domain/errors.ts"
-import { EXECUTE_INCLUDE, Executed, fromTransactionResult } from "../domain/executed.ts"
+import type { Built } from "../domain/built.ts"
+import { type BuiltGas, BuiltGas as BuiltGasSchema, GasPaymentRef as GasPaymentRefSchema } from "../domain/built.ts"
+import { EXECUTE_INCLUDE, Executed, fromTransactionResult, type Simulation, withSender } from "../domain/executed.ts"
+import type { Intent, Parties, Verdict } from "../domain/intent.ts"
+import { checkClaims, describeClaims, describeEffects, Intent as IntentSchema, Verified } from "../domain/intent.ts"
 import * as Metrics from "../domain/metrics.ts"
 import { isUnresolved, JournalEntry } from "../domain/journal-entry.ts"
 import {
-  Built,
   chainOf,
   CoinType,
   Digest,
@@ -55,12 +58,14 @@ import {
   U32_MAX,
   Version
 } from "../domain/schemas.ts"
+import { Gate } from "./Gate.ts"
 import { Journal } from "./Journal.ts"
 import { defaultReadPolicy } from "./SuiCore.ts"
 import { verifyTransactionSignature } from "./Verify.ts"
 import type { Signer } from "./Signer.ts"
-import type { FoldPlan } from "./Fold.ts"
-import { fold, planFold, sendFunds } from "./Fold.ts"
+import type { FoldBatch, FoldPlan, SendAllSweep } from "./Fold.ts"
+import { fold, foldMovement, MAX_SWEEP_COINS, planFold, readSweep, sendFunds, sweep } from "./Fold.ts"
+import { verifySponsored } from "./Sponsored.ts"
 import { forgetEntry, recordEntry } from "./RunRecord.ts"
 import type { LockSenderPolicy, SubmitConfigService } from "./SubmitConfig.ts"
 import { SubmitConfig } from "./SubmitConfig.ts"
@@ -68,7 +73,7 @@ import type { Recipe } from "./Sui.ts"
 import { Sui } from "./Sui.ts"
 
 /** A transaction built into bytes, with the expiration the builder settled on. */
-export type { Built } from "../domain/schemas.ts"
+export type { Built } from "../domain/built.ts"
 
 /**
  * Signed bytes: everything `executeTransaction` needs, plus what `reconcile`
@@ -938,9 +943,23 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  *
  * `Built.gasOwner` is read out of the bytes: it is present whenever the bytes
  * name a gas owner other than the sender, whether `opts.gasOwner` or the
- * recipe set it.
+ * recipe set it. So is `Built.gas` (0.5.0): budget, price, payer, payment refs
+ * and their `source` — `"addressBalance"`, `"coinReservation"` or `"coins"`,
+ * the `sui.gas_payment` attribute. `Built.simulation` (0.5.0) is the explicit
+ * simulate above when it ran, which is a simulation of exactly the returned
+ * bytes; when the SDK's resolver simulated instead (always on gRPC) it
+ * simulated the transaction before its budget was set, and there is none.
+ *
+ * **`opts.maxEpoch` keeps the window inside a session** (0.5.0): the default
+ * expiration's `maxEpoch` is the current epoch plus one or the bound,
+ * whichever is lower, and a bound below the current epoch fails before
+ * anything resolves. `Tx.run` passes the signer's (and sponsor's)
+ * `Signer.maxEpoch` here. A recipe's own expiration is the recipe's choice
+ * and is not changed.
  *
  * Fails with: `BuildError` (the recipe threw, an input could not be resolved,
+ * the session bound `opts.maxEpoch` is below the current epoch — its `cause`
+ * is the `SigningError { reason: "expired" }` `Tx.run` reports instead,
  * the node refused to resolve the transaction, a zero-gas requirement was not
  * met, the payer's address balance cannot cover the budget and withdrawals,
  * coins were chosen under `gasPayment: "requireAddressBalance"`, or an
@@ -952,11 +971,24 @@ const toTransaction = (input: Recipe | Transaction): Effect.Effect<Transaction, 
  */
 export const build = Effect.fn("Tx.build")(function*(
   input: Recipe | Transaction,
-  opts: { readonly sender: SuiAddress; readonly gasOwner?: SuiAddress }
+  opts: {
+    readonly sender: SuiAddress
+    readonly gasOwner?: SuiAddress
+    /**
+     * The last epoch the transaction may be valid in: a signer's session
+     * bound (`Signer.maxEpoch`). The default expiration's `maxEpoch` is capped
+     * at it, and a bound already below the current epoch fails the build
+     * before anything resolves.
+     *
+     * @since 0.5.0
+     */
+    readonly maxEpoch?: bigint
+  }
 ): Effect.fn.Return<Built, BuildError | SimulationFailed | PolicyDenied | TransportError, Sui> {
   yield* Effect.annotateCurrentSpan({
     "sui.sender": opts.sender,
-    ...(opts.gasOwner === undefined ? {} : { "sui.gas_owner": opts.gasOwner })
+    ...(opts.gasOwner === undefined ? {} : { "sui.gas_owner": opts.gasOwner }),
+    ...(opts.maxEpoch === undefined ? {} : { "sui.session_max_epoch": Number(opts.maxEpoch) })
   })
   const started = yield* Clock.currentTimeMillis
   const sui = yield* Sui
@@ -970,14 +1002,19 @@ export const build = Effect.fn("Tx.build")(function*(
     catch: buildError("the transaction rejected its sender")
   })
 
-  if (tx.getData().expiration == null) {
-    const expiration = yield* defaultExpiration(sui, config)
-    if (expiration !== undefined) {
-      yield* Effect.try({
-        try: () => tx.setExpiration(expiration),
-        catch: buildError("the transaction rejected its expiration")
-      })
-    }
+  const defaulted = tx.getData().expiration == null
+  const expiration = defaulted ? yield* defaultExpiration(sui, config, opts.maxEpoch) : undefined
+  if (expiration !== undefined) {
+    yield* Effect.try({
+      try: () => tx.setExpiration(expiration),
+      catch: buildError("the transaction rejected its expiration")
+    })
+  }
+  if (opts.maxEpoch !== undefined && (!defaulted || config.expiration === "none")) {
+    // No default expiration read the epoch: one read, so a session that has
+    // already ended is refused before anything resolves.
+    const { systemState } = yield* sui.core.getCurrentSystemState()
+    yield* sessionOpen(yield* epochOf(systemState.epoch), opts.maxEpoch)
   }
 
   // Whether the payment was the recipe's choice: the address-balance checks
@@ -1035,26 +1072,18 @@ export const build = Effect.fn("Tx.build")(function*(
 
   const simulatedBy = simulated ? "sdk" : "explicit"
   yield* Effect.annotateCurrentSpan({ "sui.simulated_by": simulatedBy })
-  if (!simulated) {
-    // The SDK simulated nothing: it resolved nothing, or it ran the core
-    // resolver with a preset budget. One explicit simulate with checks enabled
-    // keeps the promise `Tx.run` is built on: nothing is signed that was not
-    // first shown to execute.
-    yield* sui.simulate(bytes)
-  }
+  // The SDK simulated nothing: it resolved nothing, or it ran the core
+  // resolver with a preset budget. One explicit simulate with checks enabled
+  // keeps the promise `Tx.run` is built on: nothing is signed that was not
+  // first shown to execute. It is a simulation of exactly these bytes, so it
+  // is kept on the result and reused by everything before signing.
+  const simulation = simulated ? undefined : yield* sui.simulate(bytes)
+  if (simulation !== undefined) BUILD_SIMULATIONS.add(simulation)
 
   const data = dataOfBytes(bytes)
   const budget = Option.getOrUndefined(Option.map(data, gasBudgetOf))
   if (budget !== undefined) yield* Effect.annotateCurrentSpan({ "sui.gas_budget": Number(budget) })
-  if (budget !== undefined && budget > config.maxGasBudget) {
-    // A configured limit refusing the transaction before it is signed is what
-    // `PolicyDenied` means; a `BuildError` whose cause was a bare `2988000n`
-    // told a sponsor nothing it could act on.
-    return yield* new PolicyDenied({
-      rule: "maxGasBudget",
-      message: `the gas budget ${budget} MIST exceeds SubmitConfig.maxGasBudget ${config.maxGasBudget} MIST`
-    })
-  }
+  yield* gasCeiling(budget, config)
 
   const gasOwner = Option.match(data, {
     // Bytes this version cannot read keep what the caller said.
@@ -1146,9 +1175,10 @@ export const build = Effect.fn("Tx.build")(function*(
       new BuildError({ message: `the built bytes have no readable digest: ${issue.message}`, cause: issue })
     )
   )
-  const expiration = Option.getOrUndefined(Option.map(data, expirationOf))
-  const maxEpoch = maxEpochOf(expiration)
+  const recorded = Option.getOrUndefined(Option.map(data, expirationOf))
+  const maxEpoch = maxEpochOf(recorded)
   if (maxEpoch !== undefined) yield* Effect.annotateCurrentSpan({ "sui.max_epoch": Number(maxEpoch) })
+  const gas = yield* gasOfBytes(data, opts.sender)
   const finished = yield* Clock.currentTimeMillis
   yield* Metrics.recordDuration(Metrics.buildDuration, Duration.millis(finished - started), {
     simulated_by: simulatedBy
@@ -1163,9 +1193,101 @@ export const build = Effect.fn("Tx.build")(function*(
     // expiration variants that name no chain themselves.
     chain: sui.chainId,
     ...(gasOwner === undefined ? {} : { gasOwner }),
-    ...(expiration === undefined ? {} : { expiration })
+    ...(recorded === undefined ? {} : { expiration: recorded }),
+    gas,
+    ...(simulation === undefined ? {} : { simulation })
   }
 })
+
+/**
+ * `SubmitConfig.maxGasBudget` over a budget the bytes carry. A configured
+ * limit refusing the transaction before it is signed is what `PolicyDenied`
+ * means; a `BuildError` whose cause was a bare `2988000n` told a sponsor
+ * nothing it could act on. Applied by `Tx.build` and, for bytes it did not
+ * build, by `Tx.prepare` and `Tx.verify`: the intent checks treat gas as
+ * bounded by this ceiling. Internal.
+ *
+ * Fails with: `PolicyDenied` (`maxGasBudget`).
+ */
+const gasCeiling = (budget: bigint | undefined, config: SubmitConfigService): Effect.Effect<void, PolicyDenied> =>
+  budget !== undefined && budget > config.maxGasBudget
+    ? Effect.fail(
+      new PolicyDenied({
+        rule: "maxGasBudget",
+        message: `the gas budget ${budget} MIST exceeds SubmitConfig.maxGasBudget ${config.maxGasBudget} MIST`
+      })
+    )
+    : Effect.void
+
+/** {@link gasCeiling} over the budget `bytes` carry; bytes with none, or unreadable, pass. */
+const gasCeilingOfBytes = (bytes: Uint8Array, config: SubmitConfigService): Effect.Effect<void, PolicyDenied> =>
+  gasCeiling(Option.getOrUndefined(Option.flatMap(dataOfBytes(bytes), (data) => Option.fromUndefinedOr(gasBudgetOf(data)))), config)
+
+/**
+ * The simulations `Tx.build` made of exactly the bytes it returned, by
+ * identity. `simulateBuilt` reuses `built.simulation` only when it is one of
+ * these: a `Built` decoded from somewhere else — a dapp's JSON, a queue — can
+ * carry any `simulation` it likes, and checking an intent against effects the
+ * bytes' author wrote would check nothing.
+ */
+const BUILD_SIMULATIONS = new WeakSet<Simulation>()
+
+const decodeBuiltGas = Schema.decodeUnknownOption(BuiltGasSchema)
+
+/**
+ * The gas data of parsed bytes as `Built.gas`: budget, price, the payer (the
+ * gas owner, or the sender), the payment refs and their source. `None` when
+ * the bytes carry no budget or price, or a ref this version cannot read.
+ * Never fails.
+ */
+const gasOf = (data: TransactionDataBuilder, sender: string): Option.Option<BuiltGas> => {
+  const budget = gasBudgetOf(data)
+  const price = gasPriceOf(data)
+  if (budget === undefined || price === undefined) return Option.none()
+  const owner = data.gasData.owner
+  return decodeBuiltGas({
+    budget: budget.toString(),
+    price: price.toString(),
+    owner: normalizeSuiAddress(typeof owner === "string" && owner.length > 0 ? owner : sender),
+    payment: (data.gasData.payment ?? []).map((ref): typeof GasPaymentRefSchema.Encoded => ({
+      objectId: normalizeSuiAddress(ref.objectId),
+      version: String(ref.version),
+      digest: ref.digest
+    })),
+    source: gasPaymentKindOf(data)
+  })
+}
+
+/** {@link gasOf}, or the `BuildError` for bytes whose gas cannot be read. */
+const gasOfBytes = (
+  data: Option.Option<TransactionDataBuilder>,
+  sender: string
+): Effect.Effect<BuiltGas, BuildError> =>
+  Option.match(Option.flatMap(data, (parsed) => gasOf(parsed, sender)), {
+    onNone: () =>
+      Effect.fail(
+        new BuildError({ message: "the transaction bytes carry no gas data this SDK can read", cause: sender })
+      ),
+    onSome: Effect.succeed
+  })
+
+/**
+ * Refuses a session bound that has already passed, as the `BuildError` whose
+ * cause is the `SigningError { reason: "expired" }` `Tx.run` reports: a signer
+ * whose `maxEpoch` is below the current epoch cannot sign anything a validator
+ * will accept.
+ */
+const sessionOpen = (epoch: bigint, bound: bigint): Effect.Effect<void, BuildError> =>
+  bound >= epoch ? Effect.void : Effect.fail(
+    new BuildError({
+      message: `the signer's session ended at epoch ${bound} and the network is at epoch ${epoch}:` +
+        " sign in again for a new session",
+      cause: new SigningError({
+        reason: "expired",
+        cause: `the session's maxEpoch ${bound} is below the current epoch ${epoch}`
+      })
+    })
+  )
 
 /** The epoch a system-state read reported, as a number the expiration can carry. */
 const epochOf = (epoch: string): Effect.Effect<bigint, TransportError> =>
@@ -1204,18 +1326,25 @@ const nonceOf = (config: SubmitConfigService): Effect.Effect<number, BuildError>
 /** The expiration `Tx.build` sets when the recipe set none. */
 const defaultExpiration = Effect.fnUntraced(function*(
   sui: Sui["Service"],
-  config: SubmitConfigService
+  config: SubmitConfigService,
+  bound: bigint | undefined
 ): Effect.fn.Return<SdkExpiration | undefined, BuildError | TransportError> {
   switch (config.expiration) {
     case "none":
       return undefined
     case "epoch": {
       const { systemState } = yield* sui.core.getCurrentSystemState()
+      if (bound !== undefined) yield* sessionOpen(yield* epochOf(systemState.epoch), bound)
       return { Epoch: systemState.epoch }
     }
     case "validDuring": {
       const { systemState } = yield* sui.core.getCurrentSystemState()
       const epoch = yield* epochOf(systemState.epoch)
+      if (bound !== undefined) yield* sessionOpen(epoch, bound)
+      // The current epoch and the next, unless a session ends sooner: a
+      // window past the signer's bound only delays the moment `Tx.reconcile`
+      // can call a lost transaction expired.
+      const last = bound !== undefined && bound < epoch + 1n ? bound : epoch + 1n
       const nonce = yield* nonceOf(config)
       const maxTimestamp = config.validFor === undefined
         ? null
@@ -1231,7 +1360,7 @@ const defaultExpiration = Effect.fnUntraced(function*(
           // and therefore has no gas coins either. Two epochs is the widest
           // the rule allows.
           minEpoch: epoch.toString(),
-          maxEpoch: (epoch + 1n).toString(),
+          maxEpoch: last.toString(),
           minTimestamp: null,
           // Null unless `SubmitConfig.validFor` asks for one: a live devnet
           // node refuses any transaction carrying a timestamp bound with
@@ -1450,11 +1579,16 @@ const requireZeroGasPlugin: TransactionPlugin = async (transactionData, options,
  * expiration names none (`Epoch`, `None`) cannot be checked, and are taken to
  * be for this chain.
  *
- * Unlike `Tx.build`, nothing is simulated: run `sui.simulate(built.bytes)` (or
- * a `SubmitConfig.preflight`) before co-signing bytes you did not build.
+ * `gas` is read out of the bytes too (budget, price, payer, payment and its
+ * source); there is never a `simulation`.
+ *
+ * Unlike `Tx.build`, nothing is simulated: `Tx.prepare(built, { sender })`
+ * simulates the bytes (with `preflight` and an intent) and shows them to an
+ * `approve` step, or run `sui.simulate(built.bytes)` before co-signing bytes
+ * you did not build.
  *
  * Fails with: `BuildError` (the bytes are not a full transaction this SDK can
- * read, name no sender, or are bound to another chain).
+ * read, name no sender or no gas data, or are bound to another chain).
  *
  * @since 0.4.0
  */
@@ -1489,13 +1623,15 @@ export const fromBytes = Effect.fn("Tx.fromBytes")(function*(
     })
   }
   const gasOwner = gasOwnerOf(data)
+  const gas = yield* gasOfBytes(Option.some(data), sender.value)
   return {
     digest,
     bytes,
     sender: sender.value,
     chain: sui.chainId,
     ...(gasOwner === undefined ? {} : { gasOwner }),
-    ...(expiration === undefined ? {} : { expiration })
+    ...(expiration === undefined ? {} : { expiration }),
+    gas
   }
 })
 
@@ -1671,8 +1807,11 @@ const unknownEntry = Effect.fnUntraced(function*(
  * this sender sees this one" true.
  *
  * **It never changes the outcome.** The transaction executed; that is a fact,
- * and a wait that times out or fails does not unmake it. The failure is logged
- * with the digest and `Tx.submit` returns the `Executed` it already has. Turn
+ * and a wait that times out or fails does not unmake it. `Tx.submit` returns
+ * the `Executed` it already has; the miss is the `Tx.awaitVisible` span's
+ * `sui.visibility` attribute (`"visible"`, `"timeout"`, `"failed"`), the
+ * visibility-wait metric's `result`, and a **debug** log line with the digest
+ * — debug since 0.5.0, so a default program's stdout stays clean. Turn
  * the wait off with `SubmitConfig.awaitVisibility: false` and bound it with
  * `SubmitConfig.visibilityTimeout`. Never fails.
  */
@@ -1685,8 +1824,13 @@ const awaitVisible = (
     .waitForTransaction({ digest })
     .pipe(
       Effect.timeoutOption(config.visibilityTimeout),
+      // At debug level, which Effect's default minimum level (`Info`) does not
+      // print: the default logger writes to stdout, and a warning here landed
+      // in the middle of a `--json` CLI's output for a run whose outcome
+      // stands. The fact stays observable as the span attribute
+      // `sui.visibility` and the `result` of the visibility-wait metric.
       Effect.flatMap((visible) =>
-        visible._tag === "Some" ? Effect.succeed("visible") : Effect.logWarning(
+        visible._tag === "Some" ? Effect.succeed("visible") : Effect.logDebug(
           "the transaction executed but did not become visible to reads within" +
             ` SubmitConfig.visibilityTimeout (${Duration.format(config.visibilityTimeout)}); the outcome stands`
         ).pipe(Effect.as("timeout"))
@@ -1696,11 +1840,12 @@ const awaitVisible = (
       // and the outcome it would be printed beside is going to stand anyway. A
       // **defect** is still a bug and is not caught.
       Effect.catch((error) =>
-        Effect.logWarning(
+        Effect.logDebug(
           "the transaction executed but waiting for it to become visible failed; the outcome" +
             ` stands: ${SuiError.describe(error)}`
         ).pipe(Effect.as("failed"))
       ),
+      Effect.tap((result) => Effect.annotateCurrentSpan({ "sui.visibility": result })),
       Effect.timed,
       Effect.flatMap(([duration, result]) => Metrics.recordDuration(Metrics.visibilityWait, duration, { result })),
       // An interrupt here is the caller's to make, and it wins — but the
@@ -1897,10 +2042,13 @@ const send = Effect.fnUntraced(function*(
     attempts,
     conflicted ? LOCK_CONFLICT_RECHECKS : 0
   )
-}, (effect) =>
+}, (effect, signed) =>
   // How the submit ended, on the enclosing `Tx.submit` / `Tx.resubmit` span
   // and in `sui_effect_tx_submit_total`. Interrupts and defects are neither.
+  // And the sender, which the bytes name and the execute include set does not
+  // return.
   effect.pipe(
+    Effect.map((executed) => withSender(executed, signed.sender)),
     Effect.tap(() => submitEnded("Executed")),
     Effect.tapError((error) => submitEnded(error._tag))
   ))
@@ -2049,7 +2197,7 @@ export const submitVia = Effect.fn("Tx.submitVia")(function*<E, R>(
     }
     if (decoded.success !== undefined) {
       yield* journalSettled(yield* executedEntry(decoded.success))
-      return decoded.success
+      return withSender(decoded.success, signed.sender)
     }
     return yield* reconcileSigned(
       signed,
@@ -2664,6 +2812,9 @@ const reconcileUnjournaled = Effect.fnUntraced(function*(
     "sui.evidence": signed === undefined ? "digest" : "signed"
   })
   return yield* recover(sui, config, digest, signed).pipe(
+    // The bytes name the sender; a `getTransaction` with the execute include
+    // set does not return it.
+    Effect.map((executed) => signed === undefined ? executed : withSender(executed, signed.sender)),
     Effect.catchTag("TransportError", (error) =>
       Effect.fail(
         new SubmissionUnknown({
@@ -2869,6 +3020,460 @@ const assertSponsor = (
   return Effect.succeed(sponsor)
 }
 
+/** The first line a screen scored under `minimum`, if any did. */
+const firstBelow = (
+  lines: ReadonlyArray<{ readonly text: string; readonly inScope: number }>,
+  minimum: number
+) => lines.find((line) => line.inScope < minimum)
+
+/** The intent exactly as its schema admits it, or `intent.invalid`. */
+const validIntent = Schema.decodeUnknownEffect(Schema.toType(IntentSchema))
+
+/**
+ * Refuses a signer that is already locked before anything is built: a
+ * `LockableSigner` (`Signer.fromMnemonic`, `Keystore.unlock`) whose
+ * `locked` answers `true` can only fail at `Tx.sign`, after a build and a
+ * simulate that cost reads for nothing. Read structurally, so any signer
+ * value with a `locked: Effect<boolean>` member is checked. Internal.
+ *
+ * Fails with: `SigningError` (`reason: "locked"`).
+ */
+export const requireUnlocked = (
+  signers: ReadonlyArray<Signer | undefined>
+): Effect.Effect<void, SigningError> =>
+  Effect.forEach(signers, (signer) => {
+    const locked: unknown = signer === undefined ? undefined : Reflect.get(signer, "locked")
+    if (!Effect.isEffect(locked)) return Effect.void
+    return Effect.flatMap(locked as Effect.Effect<unknown>, (isLocked) =>
+      isLocked === true
+        ? Effect.fail(
+          new SigningError({
+            reason: "locked",
+            cause: `the signer for ${signer!.address} is locked: its secret was dropped; open the account again`
+          })
+        )
+        : Effect.void)
+  }, { discard: true })
+
+/**
+ * `Gate.requireIntent`, as `Tx.run` (and `Enoki.run`) applies it before
+ * anything is built: a gate that requires an intent signs nothing that
+ * declares none. Internal.
+ *
+ * Fails with: `PolicyDenied` (`intent.required`).
+ */
+export const requireIntentOf = Effect.fnUntraced(function*(
+  intent: Intent | undefined
+): Effect.fn.Return<void, PolicyDenied> {
+  const gate = yield* Gate
+  if (gate.requireIntent && intent === undefined) {
+    return yield* new PolicyDenied({
+      rule: "intent.required",
+      message: "this gate signs nothing that does not declare an intent"
+    })
+  }
+})
+
+/**
+ * The sender and gas owner `built.bytes` name, after checking that the value's
+ * own `digest`, `sender` and `gasOwner` are the bytes'. Internal to
+ * {@link verifyAgainst}.
+ *
+ * Fails with: `PolicyDenied` (`intent.invalid`).
+ */
+const partiesOfBytes = (built: Built): Effect.Effect<Parties, PolicyDenied> =>
+  Effect.suspend((): Effect.Effect<Parties, PolicyDenied> => {
+    const deny = (message: string) => Effect.fail(new PolicyDenied({ rule: "intent.invalid", message }))
+    const data = dataOfBytes(built.bytes)
+    if (Option.isNone(data) || typeof data.value.sender !== "string" || data.value.sender.length === 0) {
+      return deny("these bytes are not a transaction this SDK can read, so nothing says whose they are")
+    }
+    const sender = normalizeSuiAddress(data.value.sender)
+    const owner = data.value.gasData.owner
+    const payer = typeof owner === "string" && owner.length > 0 ? normalizeSuiAddress(owner) : sender
+    const digest = Option.liftThrowable(TransactionDataBuilder.getDigestFromBytes)(built.bytes)
+    if (
+      Option.isNone(digest) || digest.value !== built.digest ||
+      normalizeSuiAddress(built.sender) !== sender ||
+      (built.gasOwner === undefined ? sender : normalizeSuiAddress(built.gasOwner)) !== payer
+    ) {
+      return deny(
+        "this Built's digest, sender or gas owner is not what its bytes say; take bytes from somewhere" +
+          " else through Tx.fromBytes"
+      )
+    }
+    return Effect.succeed({
+      sender: SuiAddress.make(sender),
+      ...(payer === sender ? {} : { gasOwner: SuiAddress.make(payer) })
+    })
+  })
+
+/**
+ * {@link verify} over a simulation the caller already has: the claims, in
+ * code, then the screen, when the gate in force has one.
+ *
+ * Fails with: `PolicyDenied`.
+ */
+const verifyAgainst = Effect.fn("Tx.verifyAgainst")(function*(
+  built: Built,
+  intent: Intent,
+  simulation: Simulation
+): Effect.fn.Return<Verified, PolicyDenied> {
+  const gate = yield* Gate
+  const deny = (rule: string, message: string) => Effect.fail(new PolicyDenied({ rule, message }))
+  // Checked first, so an intent the schema refuses is `intent.invalid`
+  // whatever the effects are, and nothing below reads a malformed one.
+  const declared = yield* validIntent(intent).pipe(
+    Effect.mapError((issue) =>
+      new PolicyDenied({ rule: "intent.invalid", message: `the intent is not valid: ${issue.message}` })
+    )
+  )
+  // Whose transaction it is comes from the bytes, never from the value's
+  // fields: a `Built` decoded from a queue or a dapp's JSON can name any
+  // sender, and the claims checked against the wrong one check nothing (the
+  // real sender's loss, or a gas the real sender never paid netted out of it).
+  // A value whose digest, sender or gas owner disagrees with its bytes is
+  // refused rather than corrected, because `Verified` carries those fields on
+  // to `Tx.sign` and the journal.
+  const parties = yield* partiesOfBytes(built)
+  const verified = (verdict: Verdict) =>
+    Effect.try({
+      try: () => Verified.make({ ...built, intent: declared, verdict }),
+      catch: (cause) =>
+        new PolicyDenied({ rule: "intent.invalid", message: `the intent is not valid: ${String(cause)}` })
+    })
+
+  const violations = checkClaims(declared, simulation, parties)
+  const violation = violations[0]
+  if (violation !== undefined) {
+    return yield* deny(
+      `intent.${violation.rule}`,
+      violations.map((each) => each.message).join("; ")
+    )
+  }
+
+  const screen = gate.screen
+  if (screen === undefined) {
+    return yield* verified({ _tag: "Unscreened", reason: "no screen is configured" })
+  }
+  const answer = yield* Effect.result(screen({
+    intent: declared,
+    effects: describeEffects(simulation, parties),
+    claims: describeClaims(declared)
+  }))
+  if (answer._tag === "Failure") {
+    const reason = SuiError.describe(answer.failure)
+    return yield* gate.onUnavailable === "deny"
+      ? deny("gate.unavailable", `the screen did not answer: ${reason}`)
+      : verified({ _tag: "Unscreened", reason })
+  }
+
+  const screening = answer.success
+  // Injection first: a summary that talks to the screen taints every other
+  // answer it gave, so none of them is read.
+  if (screening.injection > gate.maxInjection) {
+    return yield* deny("intent.injection", "the summary addresses whoever is screening it")
+  }
+  if (screening.specificity < gate.minSpecificity) {
+    return yield* deny("intent.vague", "the summary names nothing concrete, so it covers nothing")
+  }
+  const effect = firstBelow(screening.effects, gate.minEffectInScope)
+  if (effect !== undefined) {
+    return yield* deny("intent.effect", `outside the declared intent: ${effect.text}`)
+  }
+  const claim = firstBelow(screening.claims, gate.minClaimInScope)
+  if (claim !== undefined) {
+    return yield* deny("intent.claim", `the declared intent has no use for: ${claim.text}`)
+  }
+  return yield* verified({ _tag: "Screened", screening })
+})
+
+/**
+ * The one simulate of exactly `built.bytes` that everything before signing
+ * shares, and the single place a simulation the build already made of these
+ * bytes is reused: `built.simulation`, when `Tx.build` made it in this
+ * process ({@link BUILD_SIMULATIONS}) for this digest. Anything else —
+ * a `Built` from `Tx.fromBytes`, one decoded from JSON — is simulated here.
+ *
+ * Fails with: `SimulationFailed`, `BuildError`, `TransportError`.
+ */
+const simulateBuilt = Effect.fnUntraced(function*(
+  built: Built
+): Effect.fn.Return<Simulation, SimulationFailed | BuildError | TransportError, Sui> {
+  const own = built.simulation
+  // The digest is recomputed from the bytes: `built.digest` is a field, and a
+  // value spread from a real build with other bytes keeps it.
+  if (
+    own !== undefined && BUILD_SIMULATIONS.has(own) &&
+    own.digest === Option.getOrUndefined(Option.liftThrowable(TransactionDataBuilder.getDigestFromBytes)(built.bytes))
+  ) {
+    yield* Effect.annotateCurrentSpan({ "sui.simulation": "reused" })
+    return own
+  }
+  const sui = yield* Sui
+  return yield* sui.simulate(built.bytes)
+})
+
+/**
+ * Built bytes and what the lifecycle learned about them before anything is
+ * signed: the simulation of exactly those bytes, and the verified intent when
+ * one was declared. What {@link prepare} answers and what `Tx.run`'s
+ * `approve` is shown.
+ *
+ * `built.gas` is the gas the bytes carry (budget, price, payer, payment and
+ * where it comes from) and `built.gasOwner` the sponsor, when there is one;
+ * `simulation` has `Executed`'s accessors (`created`, `transferred`,
+ * `balanceChange`, ...), and `simulation.gasUsedTotal` is the gas it is
+ * expected to cost. `verified` is present exactly when an intent was given,
+ * and is the `Built` to sign when it is.
+ *
+ * @since 0.5.0
+ */
+export interface Prepared {
+  readonly built: Built
+  readonly simulation: Simulation
+  readonly verified?: Verified
+}
+
+/**
+ * The front half after the build: **one** simulate of exactly these bytes
+ * (reused from the build when it made one, {@link simulateBuilt}), shared by
+ * `SubmitConfig.preflight` and the intent check, then `preflight(simulation)`,
+ * then {@link verifyAgainst} when there is an intent. Nothing here signs,
+ * takes a lock or sends: the caller decides where it runs.
+ *
+ * Fails with: `SimulationFailed`, `BuildError`, `TransportError` (the
+ * simulate), `PolicyDenied` (preflight, the claims, the screen).
+ */
+const prepareBuilt = Effect.fnUntraced(function*(
+  built: Built,
+  intent: Intent | undefined
+): Effect.fn.Return<Prepared, PolicyDenied | SimulationFailed | BuildError | TransportError, Sui> {
+  const config = yield* SubmitConfig
+  // Before the simulate: bytes from elsewhere were never through `Tx.build`'s
+  // ceiling, and the claims below do not count gas.
+  yield* gasCeilingOfBytes(built.bytes, config)
+  const simulation = yield* simulateBuilt(built)
+  if (config.preflight !== undefined) yield* config.preflight(simulation)
+  const verified = intent === undefined ? undefined : yield* verifyAgainst(built, intent, simulation)
+  return { built, simulation, ...(verified === undefined ? {} : { verified }) }
+})
+
+/**
+ * The front half of `Tx.run` after the build: {@link prepareBuilt} when
+ * anything needs the simulation — `opts.simulate` (an `approve` step), a
+ * `SubmitConfig.preflight`, an intent — and nothing otherwise, so a run with
+ * none of them costs no simulate beyond the build's own. `Tx.run` runs it
+ * exactly where signing runs, under the lock when the bytes pin.
+ *
+ * Fails with: `SimulationFailed`, `BuildError`, `TransportError`, `PolicyDenied`.
+ */
+const frontHalf = Effect.fnUntraced(function*(
+  built: Built,
+  opts: { readonly intent?: Intent | undefined; readonly simulate?: boolean | undefined }
+): Effect.fn.Return<Prepared | undefined, PolicyDenied | SimulationFailed | BuildError | TransportError, Sui> {
+  const config = yield* SubmitConfig
+  if (opts.simulate !== true && config.preflight === undefined && opts.intent === undefined) return undefined
+  return yield* prepareBuilt(built, opts.intent)
+})
+
+/** Whether a lifecycle input is already-built bytes rather than something to build. */
+const isBuilt = (input: Recipe | Transaction | Built): input is Built =>
+  typeof input === "object" && input !== null && "bytes" in input && input.bytes instanceof Uint8Array
+
+/**
+ * A `Built` that `Tx.prepare` was handed, checked against the parties it was
+ * asked to prepare for, read out of the bytes rather than off the value.
+ *
+ * Fails with: `BuildError` (the bytes do not parse), `PolicyDenied`
+ * (`prepare.sender`, `prepare.gasOwner`).
+ */
+const preparedFor = (
+  built: Built,
+  opts: { readonly sender: SuiAddress; readonly gasOwner?: SuiAddress | undefined }
+): Effect.Effect<Built, BuildError | PolicyDenied> =>
+  Effect.suspend((): Effect.Effect<Built, BuildError | PolicyDenied> => {
+    const data = dataOfBytes(built.bytes)
+    if (Option.isNone(data)) {
+      return Effect.fail(new BuildError({ message: "these bytes are not a transaction this SDK can read", cause: built.digest }))
+    }
+    const sender = data.value.sender
+    if (typeof sender !== "string" || normalizeSuiAddress(sender) !== normalizeSuiAddress(opts.sender)) {
+      return Effect.fail(
+        new PolicyDenied({
+          rule: "prepare.sender",
+          message: `these bytes are sent by ${String(sender)}, not by ${opts.sender}: a wallet prepares only` +
+            " its own account's transactions"
+        })
+      )
+    }
+    if (opts.gasOwner !== undefined) {
+      const payer = data.value.gasData.owner ?? sender
+      if (normalizeSuiAddress(payer) !== normalizeSuiAddress(opts.gasOwner)) {
+        return Effect.fail(
+          new PolicyDenied({
+            rule: "prepare.gasOwner",
+            message: `these bytes are paid for by ${payer}, not by ${opts.gasOwner}`
+          })
+        )
+      }
+    }
+    return Effect.succeed(built)
+  })
+
+/**
+ * Build (or take) a transaction, simulate exactly its bytes, run
+ * `SubmitConfig.preflight` and, given an intent, `Tx.verify`'s checks — and
+ * sign nothing. The front half of `Tx.run`, for previews, dry runs, sign-only
+ * flows and transactions a dapp hands over; the answer is a {@link Prepared}
+ * to show a person, then `Tx.sign` (`prepared.verified ?? prepared.built`)
+ * and `Tx.submit`, `Tx.submitVia`, or another party's co-signature.
+ *
+ * **A `Built` is not rebuilt.** Bytes from `Tx.fromBytes` — a dapp's request,
+ * a sponsor's reply — are what is simulated and what will be signed;
+ * `opts.sender` must be the sender the bytes name and `opts.gasOwner`, when
+ * given, their payer, or it fails with `PolicyDenied` (`prepare.sender`,
+ * `prepare.gasOwner`) before anything is asked of the node. A recipe or a
+ * `Transaction` goes through `Tx.build` with `sender`, `gasOwner` and
+ * `maxEpoch`, and when the build already simulated exactly the bytes it
+ * returned (`built.simulation`), that simulation is the one used.
+ *
+ * **One simulate.** On gRPC the build's resolver simulates a pre-budget
+ * transaction, so a prepare costs that plus one simulate of the final bytes;
+ * off gRPC with a preset budget the build's own simulate is reused and the
+ * prepare costs one in all.
+ *
+ * **No sender lock**, unlike `Tx.run`: the answer is a value that may wait for
+ * a person, a second device or a sponsor for as long as it likes, and a lock
+ * held across that would stall every other transaction from the account. The
+ * cost is the one `Tx.build` already documents — two prepares from one sender
+ * can resolve the same gas coin or owned object, and the second to land fails
+ * — so a flow that signs straight after approval uses `Tx.run({ approve })`,
+ * which runs this same front half under the lock exactly when the bytes pin.
+ *
+ * **`Gate.requireIntent` does not apply**: it binds `Tx.run`, the call that
+ * signs. A prepare without an intent is how a wallet first sees a dapp's
+ * effects, to render them (`Intent.fromSimulation`) and ask; give the intent
+ * then — here, to `Tx.verify`, or to `Tx.run` — and `verified` is what gets
+ * signed.
+ *
+ * Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied` (the gas
+ * ceiling, `preflight`, the intent's rules, `prepare.sender`,
+ * `prepare.gasOwner`), `TransportError`.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { Tx, type Signer } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const signer: Signer
+ * declare const dappBytes: Uint8Array
+ *
+ * const program = Effect.gen(function*() {
+ *   const prepared = yield* Tx.prepare(yield* Tx.fromBytes(dappBytes), { sender: signer.address })
+ *   // show prepared.simulation.transferred(), balanceChange(...), prepared.built.gas, then:
+ *   return yield* Tx.submit(yield* Tx.sign(prepared.built, signer))
+ * })
+ * ```
+ */
+export const prepare = Effect.fn("Tx.prepare")(function*(
+  input: Recipe | Transaction | Built,
+  opts: {
+    readonly sender: SuiAddress
+    readonly gasOwner?: SuiAddress
+    /** What the transaction is declared to do; `verified` is present when given. */
+    readonly intent?: Intent
+    /** A session bound for what is built here (`Signer.maxEpoch`); see `Tx.build`. Ignored for a `Built`. */
+    readonly maxEpoch?: bigint
+  }
+): Effect.fn.Return<Prepared, BuildError | SimulationFailed | PolicyDenied | TransportError, Sui> {
+  yield* Effect.annotateCurrentSpan({ "sui.sender": opts.sender })
+  const built = isBuilt(input)
+    ? yield* preparedFor(input, opts)
+    : yield* build(input, {
+      sender: opts.sender,
+      ...(opts.gasOwner === undefined ? {} : { gasOwner: opts.gasOwner }),
+      ...(opts.maxEpoch === undefined ? {} : { maxEpoch: opts.maxEpoch })
+    })
+  yield* Effect.annotateCurrentSpan({ "sui.digest": built.digest })
+  return yield* prepareBuilt(built, opts.intent)
+})
+
+/**
+ * Checks built bytes against a declared intent, before anything is signed.
+ *
+ * One simulate of exactly `built.bytes`, then two checkers. The claims are
+ * compared with the simulated effects exactly, in code, deny by default (gas
+ * is never an outflow, whether a gas coin or the payer's address balance paid
+ * it; an address-balance withdrawal sent to someone is). Then `Gate.screen`,
+ * when the gate in force has one, reads the summary against the effects and
+ * the claims rendered as words, and `Gate`'s thresholds turn its
+ * probabilities into a refusal. With no screen configured the claims check
+ * stands alone and the verdict is `Unscreened`. `SubmitConfig.preflight` is
+ * not run here; `Tx.run` runs it on the same simulate.
+ *
+ * **Whose transaction it is comes from the bytes.** The sender and gas owner
+ * the claims are checked for are the ones `built.bytes` name, and a value whose
+ * `digest`, `sender` or `gasOwner` field disagrees with its bytes (spread from
+ * another build, decoded from a queue) is refused as `intent.invalid`; a
+ * `built.simulation` is reused only when `Tx.build` made it in this process
+ * for the digest of these bytes.
+ *
+ * The answer is structurally a `Built`, so it goes straight to `Tx.sign`. The
+ * explicit lifecycle is not gated: `Tx.sign` takes any `Built`, so a caller
+ * assembling `build`/`sign`/`submit` by hand calls this itself.
+ *
+ * **What it does not prove.** A simulation is one execution against the state
+ * the node had; a package that branches on a shared object, the clock or
+ * randomness can behave differently when the bytes land. The claims bound what
+ * was simulated, not what will execute.
+ *
+ * Gas is not counted because it is bounded: bytes whose budget is over
+ * `SubmitConfig.maxGasBudget` are refused (`maxGasBudget`) before the
+ * simulate, as `Tx.build` refuses them, whoever built them.
+ *
+ * Every refusal is a `PolicyDenied` whose `rule` says which check:
+ * `maxGasBudget`, `intent.invalid`, `intent.outflow`, `intent.recipient`, `intent.object`,
+ * `gate.unavailable`, `intent.injection`, `intent.vague`, `intent.effect`,
+ * `intent.claim`.
+ *
+ * Fails with: `PolicyDenied`, `SimulationFailed`, `BuildError`, `TransportError`.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { CoinType, type SuiAddress } from "@unconfirmed/sui-effect"
+ * import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const signer: Signer
+ * declare const cold: SuiAddress
+ *
+ * const program = Effect.gen(function*() {
+ *   const built = yield* Tx.build(Tx.sendFunds({ amount: 250_000_000_000n, recipient: cold }), {
+ *     sender: signer.address
+ *   })
+ *   const verified = yield* Tx.verify(built, {
+ *     summary: "Send 250 SUI to my cold wallet.",
+ *     author: "user",
+ *     claims: { outflows: [{ coinType: CoinType.SUI, max: 250_000_000_000n }], recipients: [cold], objects: [] }
+ *   })
+ *   return yield* Tx.submit(yield* Tx.sign(verified, signer))
+ * })
+ * ```
+ */
+export const verify = Effect.fn("Tx.verify")(function*(
+  built: Built,
+  intent: Intent
+): Effect.fn.Return<Verified, PolicyDenied | SimulationFailed | BuildError | TransportError, Sui> {
+  yield* Effect.annotateCurrentSpan({ "sui.digest": built.digest })
+  yield* gasCeilingOfBytes(built.bytes, yield* SubmitConfig)
+  return yield* verifyAgainst(built, intent, yield* simulateBuilt(built))
+})
+
 /**
  * Build, preflight, sign and submit, under the sender lock wherever two runs
  * could race.
@@ -2926,6 +3531,13 @@ const assertSponsor = (
  * where spend limits and target policies refuse a transaction before anything
  * is signed.
  *
+ * **`intent` puts the bytes through {@link verify} before anything is
+ * signed**, on the same simulate `preflight` uses — one extra simulate for
+ * either or both, run after the build exactly where signing runs (under the
+ * lock when the bytes pin). `Gate.requireIntent` makes it mandatory: a run
+ * that declares none fails with `PolicyDenied { rule: "intent.required" }`
+ * before the recipe is even applied.
+ *
  * **A sponsored run needs both signatures.** A transaction whose gas owner is
  * not its sender is signed by *both* parties; one signature is bytes a
  * validator rejects. So when `opts.gasOwner` differs from the signer's address
@@ -2952,12 +3564,32 @@ const assertSponsor = (
  * signature and before `Tx.submit`'s first `executeTransaction`, and failing it
  * fails the run with nothing sent.
  *
+ * **`approve` is the person in the loop** (0.5.0). After `preflight` and the
+ * intent, before the first signature, `approve` is shown the {@link Prepared}
+ * transaction — the same thing {@link prepare} answers — and refuses by
+ * failing with its own error, which is then `Tx.run`'s: nothing is signed,
+ * `onSigned` does not run and nothing is journalled. It runs under the lock
+ * exactly when signing does. A sponsored run approves too: `built.gasOwner`
+ * and `built.gas.owner` name the sponsor.
+ *
+ * **The session bound** (0.5.0). A signer with a `maxEpoch` (a zkLogin
+ * session) — and a sponsor with one — bounds the window the build sets:
+ * `Tx.build`'s `maxEpoch` is the earlier of the two, and a bound already below
+ * the current epoch fails with `SigningError { reason: "expired" }` before
+ * anything resolves.
+ *
+ * **A locked signer is refused first** (0.5.0). A `LockableSigner`
+ * (`Signer.fromMnemonic`, `Keystore.unlock`) — signer or sponsor — whose
+ * `locked` answers `true` fails the run with `SigningError { reason:
+ * "locked" }` before anything is built or simulated.
+ *
  * Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`,
  * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`,
  * `TransportError` (from the build reads; once bytes are sent, transport
- * failures become `SubmissionUnknown`).
+ * failures become `SubmissionUnknown`), and `E` — whatever `approve` fails
+ * with.
  */
-export const run = Effect.fn("Tx.run")(function*(
+export const run = Effect.fn("Tx.run")(function*<E = never>(
   recipe: Recipe | Transaction,
   opts: {
     readonly signer: Signer
@@ -2989,6 +3621,30 @@ export const run = Effect.fn("Tx.run")(function*(
      * @since 0.1.2
      */
     readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>
+    /**
+     * What this transaction is declared to do. When present, the built bytes
+     * go through {@link verify} before anything is signed, sharing its
+     * simulate with `SubmitConfig.preflight`. `Gate.requireIntent` makes it
+     * mandatory.
+     *
+     * @since 0.5.0
+     */
+    readonly intent?: Intent
+    /**
+     * Shown the {@link Prepared} transaction — the built bytes with their gas,
+     * the simulation of exactly those bytes, the verified intent — **after**
+     * `preflight` and the intent checks and **before the first signature**.
+     * Succeeding approves; failing refuses with the caller's own error (a
+     * wallet's `UserRejected`), which `Tx.run` fails with, nothing signed and
+     * nothing journalled. It runs where signing runs: under the sender lock
+     * when the bytes pin something, after it is released when they do not,
+     * so a person taking their time never holds an address-balance account's
+     * lock. Giving it always costs the simulate it is shown (the build's own,
+     * when the build made one of exactly these bytes).
+     *
+     * @since 0.5.0
+     */
+    readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>
   }
 ): Effect.fn.Return<
   Executed,
@@ -3000,12 +3656,16 @@ export const run = Effect.fn("Tx.run")(function*(
   | NotApplied
   | SubmissionUnknown
   | JournalError
-  | TransportError,
+  | TransportError
+  | E,
   Sui
 > {
   const sui = yield* Sui
   const config = yield* SubmitConfig
   const sender = opts.signer.address
+  // Before the recipe is applied: a gate that requires an intent has nothing
+  // to build for a run that declares none.
+  yield* requireIntentOf(opts.intent)
   // Applied before any lock is chosen, so what the recipe set — its own gas
   // owner, an address-balance payment — decides which locks the run needs.
   const tx = yield* toTransaction(recipe)
@@ -3036,20 +3696,35 @@ export const run = Effect.fn("Tx.run")(function*(
   if (payer !== undefined) {
     yield* assertSponsor(payer, opts.sponsor)
   }
+  // Nor can a signer that is already locked: refused before any read.
+  yield* requireUnlocked([opts.signer, opts.sponsor])
 
+  // The session bound: the earlier of the signer's and the sponsor's, so the
+  // window the build sets cannot outlive either signature.
+  const sessionBound = [opts.signer.maxEpoch, payer === undefined ? undefined : opts.sponsor?.maxEpoch]
+    .filter((bound): bound is bigint => bound !== undefined)
+    .reduce<bigint | undefined>((least, bound) => (least === undefined || bound < least ? bound : least), undefined)
   const buildIt = build(tx, {
     sender,
-    ...(opts.gasOwner === undefined ? {} : { gasOwner: opts.gasOwner })
-  })
+    ...(opts.gasOwner === undefined ? {} : { gasOwner: opts.gasOwner }),
+    ...(sessionBound === undefined ? {} : { maxEpoch: sessionBound })
+  }).pipe(
+    // A session that has already ended is the signer's failure, not the
+    // build's: the `SigningError { reason: "expired" }` the build carries.
+    Effect.catchTag("BuildError", (error): Effect.Effect<never, BuildError | SigningError> =>
+      error.cause instanceof SigningError ? Effect.fail(error.cause) : Effect.fail(error))
+  )
+  const approve = opts.approve
   // Everything after the build, which is what `"whenPinned"` runs outside the
   // lock when the bytes pin nothing and pay from an empty payment.
   const finish = (built: Built) =>
     Effect.gen(function*() {
-      const preflight = config.preflight
-      if (preflight !== undefined) {
-        const simulation = yield* sui.simulate(built.bytes)
-        yield* preflight(simulation)
-      }
+      // One simulate for preflight, the intent and the approval, here and
+      // nowhere else, so it runs exactly where signing does.
+      const prepared = yield* frontHalf(built, { intent: opts.intent, simulate: approve !== undefined })
+      // Before the first signature: a refusal leaves nothing signed, and
+      // nothing journalled, since `Tx.submit` journals.
+      if (approve !== undefined && prepared !== undefined) yield* approve(prepared)
       let signed = yield* sign(built, opts.signer)
       // Read back out of the bytes, so a recipe that set its own gas owner —
       // which `Tx.sponsored` does — is covered as well as the option.
@@ -3062,21 +3737,62 @@ export const run = Effect.fn("Tx.run")(function*(
       if (opts.onSigned !== undefined) yield* opts.onSigned(signed)
       return yield* submit(signed)
     })
-  const withLocks = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-    locked.reduceRight<Effect.Effect<A, E, R>>(
+  return yield* lockedRun({
+    sui,
+    policy: config.lockSender,
+    locked,
+    // A `tx.gas` run's reservation would take the payer's whole balance as of
+    // its build, so it waits for the lock-free runs on its payer first.
+    drains: usesGasCoin(tx) ? payer ?? sender : undefined,
+    build: buildIt,
+    keeps: keepsSenderLock,
+    inFlightOn: (built) => [sender, ...signersOfBytes(built.bytes)],
+    finish
+  })
+})
+
+/**
+ * `Tx.run`'s lock rule, for every run that builds, signs and submits under
+ * the sender lock — `Tx.run` itself and `Enoki.run`. Internal.
+ *
+ * Under `"whenPinned"` every build runs under the locks, and `keeps(built)`
+ * decides whether they are held on through `finish` (signing, submission);
+ * when they are not, the run is registered in flight on `inFlightOn(built)`
+ * before the locks are released, so a `drains` run — one whose recipe uses
+ * `tx.gas` and so reserves its payer's whole balance — waits for it.
+ * `"always"` holds the locks through `finish`, `"never"` takes none. The span
+ * attribute `sui.sender_lock` says which happened. Never fails beyond
+ * `build`'s and `finish`'s errors.
+ */
+export const lockedRun = <A, E1, E2, R1, R2>(opts: {
+  readonly sui: Sui["Service"]
+  readonly policy: unknown
+  /** The addresses to lock, in the order to take them. */
+  readonly locked: ReadonlyArray<SuiAddress>
+  /** The payer whose lock-free runs in flight to wait for before building, if any. */
+  readonly drains: SuiAddress | undefined
+  readonly build: Effect.Effect<Built, E1, R1>
+  readonly keeps: (bytes: Uint8Array) => boolean
+  readonly inFlightOn: (built: Built) => ReadonlyArray<string>
+  readonly finish: (built: Built) => Effect.Effect<A, E2, R2>
+}): Effect.Effect<A, E1 | E2, R1 | R2> => {
+  const { sui, locked, build: buildIt, finish } = opts
+  const withLocks = <B, E, R>(effect: Effect.Effect<B, E, R>): Effect.Effect<B, E, R> =>
+    locked.reduceRight<Effect.Effect<B, E, R>>(
       (inner, address) => sui.withSenderLock(address)(inner),
       effect
     )
-
-  switch (lockSenderPolicyOf(config.lockSender)) {
-    case "never": {
-      yield* Effect.annotateCurrentSpan({ "sui.sender_lock": "none" })
-      return yield* Effect.flatMap(buildIt, finish)
-    }
-    case "always": {
-      yield* Effect.annotateCurrentSpan({ "sui.sender_lock": "held" })
-      return yield* withLocks(Effect.flatMap(buildIt, finish))
-    }
+  switch (lockSenderPolicyOf(opts.policy)) {
+    case "never":
+      return Effect.andThen(
+        Effect.annotateCurrentSpan({ "sui.sender_lock": "none" }),
+        Effect.flatMap(buildIt, finish)
+      )
+    case "always":
+      return Effect.andThen(
+        Effect.annotateCurrentSpan({ "sui.sender_lock": "held" }),
+        withLocks(Effect.flatMap(buildIt, finish))
+      )
     case "whenPinned": {
       // Every build under the lock: whether the bytes will pin a coin or an
       // owned object, or carry a coin reservation, is known only once the
@@ -3087,31 +3803,45 @@ export const run = Effect.fn("Tx.run")(function*(
       // `tx.gas` run, whose reservation would take the whole balance as of its
       // build, waits for them first.
       const registry = inFlightRegistryOf(sui.withSenderLock)
-      const drainsPayer = usesGasCoin(tx)
+      const drains = opts.drains
       // The scope the in-flight registration lives in: this one, not the one
       // `Sui.withSenderLock` opens around its effect, which closes when the
       // lock is released — exactly when the run starts being in flight.
-      return yield* Effect.scoped(Effect.gen(function*() {
+      return Effect.scoped(Effect.gen(function*() {
         const scope = yield* Effect.scope
         const step = yield* withLocks(Effect.gen(function*() {
-          if (drainsPayer) yield* drainInFlight(registry, payer ?? sender)
+          if (drains !== undefined) yield* drainInFlight(registry, drains)
           const built = yield* buildIt
-          if (keepsSenderLock(built.bytes)) {
-            return { _tag: "Executed" as const, executed: yield* finish(built) }
+          if (opts.keeps(built.bytes)) {
+            return { _tag: "Done" as const, done: yield* finish(built) }
           }
           // Still under the lock, so a drainer holding it cannot miss this run.
-          yield* Scope.provide(scope)(registerInFlight(registry, [sender, ...signersOfBytes(built.bytes)]))
+          yield* Scope.provide(scope)(registerInFlight(registry, opts.inFlightOn(built)))
           return { _tag: "Built" as const, built }
         }))
-        // On `Tx.run`'s own span: inside the lock the current span is
+        // On the caller's own span: inside the lock the current span is
         // `Sui.withSenderLock`'s.
-        yield* Effect.annotateCurrentSpan({ "sui.sender_lock": step._tag === "Executed" ? "held" : "build" })
-        if (step._tag === "Executed") return step.executed
+        yield* Effect.annotateCurrentSpan({ "sui.sender_lock": step._tag === "Done" ? "held" : "build" })
+        if (step._tag === "Done") return step.done
         return yield* finish(step.built)
       }))
     }
   }
-})
+}
+
+/**
+ * Whether, under `"whenPinned"`, a run whose **gas is someone else's** — an
+ * Enoki-sponsored transaction, whose payment is the sponsor's coins — keeps
+ * the sender lock through signing and submission: the bytes pin an owned or
+ * receiving input, which is the sender's. The sponsor's gas coins are not the
+ * sender's to race. Bytes this version cannot read answer `true`. Internal;
+ * never fails.
+ */
+export const keepsSponsoredSenderLock = (bytes: Uint8Array): boolean =>
+  Option.match(dataOfBytes(bytes), {
+    onNone: () => true,
+    onSome: (data) => ownedInputsOf(data).length > 0
+  })
 
 /**
  * What the journal recorded for one digest, if anything.
@@ -3307,6 +4037,17 @@ export interface FoldResult {
 }
 
 /**
+ * The intent a fold declares for itself under `Gate.requireIntent`: the coins
+ * go into the owner's own address balance, so it claims no outflow, no
+ * recipient and no object, and anything else its simulation does is refused.
+ */
+const foldIntentOf = (batch: FoldBatch): Intent => ({
+  summary: `Fold ${batch.coins.length} coin object${batch.coins.length === 1 ? "" : "s"} into the owner's own address balance; nothing leaves the account.`,
+  author: "task",
+  claims: { outflows: [], recipients: [], objects: [] }
+})
+
+/**
  * Folds the signer's coin objects into its address balance: {@link planFold}
  * for `signer.address`, then one {@link run} of {@link fold} per batch, in
  * order — SUI first, paying for its own fold, so a fresh account whose SUI is
@@ -3321,37 +4062,214 @@ export interface FoldResult {
  * repeat. Dust that cannot pay for its own fold is in `plan.skipped`, and an
  * owner with no coins answers an empty plan with nothing executed.
  *
+ * **A previewed plan is run as given** (0.5.0). Pass the `plan` a person was
+ * shown and it is not re-planned — `coinType` and `maxCoinsPerTransaction` are
+ * then ignored — so what runs is exactly what was previewed; a coin in it that
+ * has moved since fails that batch's build with `BuildError`, as any pinned
+ * input does. A plan for another owner — the plan's or any batch's — is a
+ * `BuildError` before anything runs. `approve` is `Tx.run`'s, once per batch, shown the batch beside the
+ * prepared transaction: {@link foldMovement} of the two is what the fold
+ * moves from coins into the balance, which the simulation's balance changes
+ * alone do not show.
+ *
  * Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`,
  * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`,
- * `TransportError` — exactly {@link run}'s, for the batch that failed.
+ * `TransportError` — exactly {@link run}'s, for the batch that failed — and
+ * `E`, whatever `approve` fails with.
  *
  * @since 0.4.0
  */
-export const foldCoins = Effect.fn("Tx.foldCoins")(function*(opts: {
+export const foldCoins = Effect.fn("Tx.foldCoins")(function*<E = never>(opts: {
   readonly signer: Signer
   /** One coin type to fold; every coin type the signer holds coins of when omitted. */
   readonly coinType?: CoinType
   /** At most this many coins per transaction: 1 to 500, 500 by default. */
   readonly maxCoinsPerTransaction?: number
-}): Effect.fn.Return<FoldResult, RunError, Sui> {
-  const plan = yield* planFold({
+  /**
+   * A plan from `Tx.planFold`, run as given rather than re-planned.
+   *
+   * @since 0.5.0
+   */
+  readonly plan?: FoldPlan
+  /**
+   * `Tx.run`'s `approve`, per batch, with the batch it is about to fold.
+   *
+   * @since 0.5.0
+   */
+  readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>
+  /**
+   * The intent every batch is verified against, as `Tx.run`'s `intent`. When
+   * omitted and `Gate.requireIntent` is on, each batch declares the fold's own
+   * intent — a summary saying the coins go into the owner's own address
+   * balance, and **no claims**, so the claims check refuses a batch whose
+   * simulation moves anything out of the account. When omitted and the gate
+   * requires nothing, no intent is checked (0.4.0's cost: no extra simulate).
+   *
+   * @since 0.5.0
+   */
+  readonly intent?: Intent
+}): Effect.fn.Return<FoldResult, RunError | E, Sui> {
+  const gate = yield* Gate
+  // Every batch, not only the plan: `fold(batch)` deposits into
+  // `batch.owner`, so a plan that names the signer with a batch that names
+  // someone else would send the signer's coins to that address balance.
+  const signerAddress = normalizeSuiAddress(opts.signer.address)
+  const foreign = opts.plan === undefined
+    ? undefined
+    : [opts.plan.owner, ...opts.plan.batches.map((batch) => batch.owner)]
+      .find((owner) => normalizeSuiAddress(owner) !== signerAddress)
+  if (foreign !== undefined) {
+    return yield* new BuildError({
+      message: `this fold plan is for ${foreign}'s coins, and the signer is ${opts.signer.address}`,
+      cause: foreign
+    })
+  }
+  const plan = opts.plan ?? (yield* planFold({
     owner: opts.signer.address,
     ...(opts.coinType === undefined ? {} : { coinType: opts.coinType }),
     ...(opts.maxCoinsPerTransaction === undefined ? {} : { maxCoinsPerTransaction: opts.maxCoinsPerTransaction })
-  })
+  }))
+  const approve = opts.approve
   const executed: Array<Executed> = []
   for (const batch of plan.batches) {
-    executed.push(yield* run(fold(batch), { signer: opts.signer }))
+    const intent: Intent | undefined = opts.intent ?? (gate.requireIntent ? foldIntentOf(batch) : undefined)
+    executed.push(
+      yield* run(fold(batch), {
+        signer: opts.signer,
+        ...(approve === undefined ? {} : { approve: (prepared: Prepared) => approve(prepared, batch) }),
+        ...(intent === undefined ? {} : { intent })
+      })
+    )
   }
   return { plan, executed }
+})
+
+/**
+ * What {@link sendAll} did: the sweep it ran and the `Executed` it produced.
+ * `received` is what the recipient's balance of the coin type gained, read
+ * off the effects: for SUI, the sweep less the net gas (more than the sweep
+ * when the deleted coins' storage rebate beats the gas); for any other type,
+ * exactly `sweep.amount`.
+ *
+ * @since 0.5.0
+ */
+export interface SendAllResult {
+  readonly sweep: SendAllSweep
+  readonly executed: Executed
+  readonly received: bigint
+}
+
+/**
+ * Sends **everything** the signer holds of one coin type — every coin object
+ * and the whole address balance — into `recipient`'s address balance, in one
+ * {@link run}, and leaves the sender **nothing** of it: no coin, no balance,
+ * no dust.
+ *
+ * **SUI pays for its own sweep out of the sweep.** The gas coin is made to be
+ * everything — a coin reservation of the whole address balance with every
+ * coin merged into it, or, when the coins hold more, the coins as the gas
+ * payment with the balance redeemed and merged in — and
+ * `0x2::coin::send_funds<SUI>(GasCoin, recipient)` deposits it; gas is
+ * charged against that coin, so the recipient gets the rest and the sender
+ * keeps 0 (localnet, protocol 139: a coin-only, a balance-only and a mixed
+ * account all end at 0 coins and 0 balance). There is no budget to guess and
+ * no refund left behind, which is what a send of `balance − budget` from the
+ * address balance leaves (the unused budget comes back to the sender). **Any
+ * other coin type** sends every coin (`coin::send_funds`) and the whole
+ * balance (`balance::send_funds` of a `FundsWithdrawal`), and gas comes from
+ * the signer's SUI as usual, so the signer needs some.
+ *
+ * **What can remain**: anything that arrives after the read — a deposit into
+ * the balance, a coin — stays with the sender; a spend from the balance that
+ * lands after the read makes the withdrawal too large, and the sweep executes
+ * as a failure (`ExecutionFailed`, `InsufficientFundsForWithdraw`) or is
+ * refused at submit, moving nothing. A SUI sweep paid from a reservation holds
+ * the sender lock through submission and waits for lock-free runs in flight
+ * first, like every `tx.gas` run. More than 500 coin objects do not fit
+ * one transaction: `BuildError`, and `Tx.foldCoins` first.
+ * A SUI account worth less than about twice a budget cannot pay for its own
+ * sweep: that build fails.
+ *
+ * `intent`, `approve` (shown the sweep beside the prepared transaction) and
+ * `onSigned` are `Tx.run`'s.
+ *
+ * Fails with: `BuildError` (nothing to send, the signer is the recipient, too
+ * many coins, or the build), `SimulationFailed`, `PolicyDenied`,
+ * `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`,
+ * `JournalError`, `TransportError` — {@link run}'s — and `E`, whatever
+ * `approve` fails with.
+ *
+ * @since 0.5.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import type { SuiAddress } from "@unconfirmed/sui-effect"
+ * import { Tx, type Signer } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const signer: Signer
+ * declare const newWallet: SuiAddress
+ *
+ * const program = Effect.gen(function*() {
+ *   const { sweep, received } = yield* Tx.sendAll({
+ *     signer,
+ *     recipient: newWallet,
+ *     approve: (prepared, sweep) =>
+ *       Effect.log(`send all ${sweep.amount} of ${sweep.coinType}, gas ${prepared.simulation.gasUsedTotal}`)
+ *   })
+ *   return { swept: sweep.amount, received }
+ * })
+ * ```
+ */
+export const sendAll = Effect.fn("Tx.sendAll")(function*<E = never>(opts: {
+  readonly signer: Signer
+  readonly recipient: SuiAddress
+  /** The coin type to sweep. Default SUI. */
+  readonly coinType?: CoinType
+  /** What the sweep is declared to do; see `Tx.run`. */
+  readonly intent?: Intent
+  /** `Tx.run`'s `approve`, with the sweep it is about to send. */
+  readonly approve?: (prepared: Prepared, sweep: SendAllSweep) => Effect.Effect<void, E>
+  /** `Tx.run`'s `onSigned`. */
+  readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>
+}): Effect.fn.Return<SendAllResult, RunError | E, Sui> {
+  const owner = opts.signer.address
+  if (normalizeSuiAddress(opts.recipient) === normalizeSuiAddress(owner)) {
+    return yield* new BuildError({ message: `${owner} cannot send everything to itself`, cause: opts.recipient })
+  }
+  const plan = yield* readSweep({ owner, recipient: opts.recipient, coinType: opts.coinType ?? CoinType.SUI })
+  yield* Effect.annotateCurrentSpan({
+    "sui.sender": owner,
+    "sui.sweep.coins": plan.coins.length,
+    "sui.sweep.gas": plan.gas
+  })
+  if (plan.amount === 0n) {
+    return yield* new BuildError({ message: `${owner} holds no ${plan.coinType} to send`, cause: plan.coinType })
+  }
+  if (plan.coins.length > MAX_SWEEP_COINS) {
+    return yield* new BuildError({
+      message: `${owner} holds ${plan.coins.length} coin objects of ${plan.coinType}, more than the` +
+        ` ${MAX_SWEEP_COINS} one transaction takes: fold them into the address balance first (Tx.foldCoins), then sweep`,
+      cause: plan.coins.length
+    })
+  }
+  const approve = opts.approve
+  const executed = yield* run(sweep(plan), {
+    signer: opts.signer,
+    ...(opts.intent === undefined ? {} : { intent: opts.intent }),
+    ...(opts.onSigned === undefined ? {} : { onSigned: opts.onSigned }),
+    ...(approve === undefined ? {} : { approve: (prepared: Prepared) => approve(prepared, plan) })
+  })
+  return { sweep: plan, executed, received: executed.balanceChange(opts.recipient, plan.coinType) }
 })
 
 /**
  * The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
  * `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
  * `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
- * `Tx.foldCoins`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`,
- * `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+ * `Tx.foldCoins`, `Tx.foldMovement`, `Tx.sendAll`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`,
+ * `Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
+ * `Tx.reconcileAll`.
  */
 export const Tx = {
   build,
@@ -3365,8 +4283,13 @@ export const Tx = {
   planFold,
   fold,
   foldCoins,
+  foldMovement,
+  sendAll,
+  verifySponsored,
   submit,
   submitVia,
+  verify,
+  prepare,
   reconcile,
   resubmit,
   recorded,

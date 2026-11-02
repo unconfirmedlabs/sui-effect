@@ -10,7 +10,7 @@
  * @since 0.1.0
  */
 
-/** The credential value type and its five constructors. */
+/** The credential value type and its constructors. */
 export {
   ephemeral,
   fromConfig,
@@ -20,6 +20,17 @@ export {
   type RemoteSigner,
   Signer,
   type SignatureScheme
+} from "./services/Signer.ts"
+
+/** Keys the process holds: a checked mnemonic, an imported secret key, and the signer that can drop them. */
+export {
+  type FromMnemonicOptions,
+  fromMnemonic,
+  type FromSecretKeyOptions,
+  fromSecretKey,
+  type KeyScheme,
+  type LockableSigner,
+  type MnemonicLength
 } from "./services/Signer.ts"
 
 /** Signature verification: the Effect face of `@mysten/sui/verify`. */
@@ -42,7 +53,27 @@ export { Journal, type JournalService } from "./services/Journal.ts"
 /** The lifecycle as a serializable union, for what the journal holds. */
 export { isUnresolved, JournalEntry, UNRESOLVED_TAGS } from "./domain/journal-entry.ts"
 
-/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, reconcile, resubmit, run, foldCoins. */
+/** The intent policy and its optional screen; `@unconfirmed/sui-effect/gate` provides Jev. */
+export { Gate, type GateService, type ScreenRequest } from "./services/Gate.ts"
+
+/** A declared intent, the record of having checked it, and the pure checks. */
+export {
+  checkClaims,
+  type ClaimViolation,
+  describeClaims,
+  describeEffects,
+  Intent,
+  IntentAuthor,
+  IntentClaims,
+  OutflowClaim,
+  type Parties,
+  ScreenedLine,
+  Screening,
+  Verdict,
+  Verified
+} from "./domain/intent.ts"
+
+/** Build, sign, cosign, attach, fromBytes, canonical recipe helpers, submit, verify, prepare, reconcile, resubmit, run, foldCoins, sendAll. */
 export {
   attach,
   build,
@@ -52,6 +83,8 @@ export {
   type Built,
   foldCoins,
   type FoldResult,
+  type Prepared,
+  prepare,
   Reconciled,
   type ReconcileInput,
   type RunError,
@@ -61,6 +94,8 @@ export {
   reconcileAll,
   resubmit,
   run,
+  type SendAllResult,
+  sendAll,
   sign,
   Signed,
   sponsored,
@@ -68,11 +103,22 @@ export {
   type SubmitViaError,
   type SubmitViaReply,
   submitVia,
-  Tx
+  Tx,
+  verify
 } from "./services/Tx.ts"
 
 /** Folding coins into the address balance, and sending into one. */
-export { fold, type FoldBatch, type FoldGas, type FoldPlan, planFold, sendFunds } from "./services/Fold.ts"
+export {
+  fold,
+  type FoldBatch,
+  type FoldGas,
+  foldMovement,
+  type FoldMovement,
+  type FoldPlan,
+  planFold,
+  type SendAllSweep,
+  sendFunds
+} from "./services/Fold.ts"
 
 /** The expiration union and the bounds `Tx.reconcile` reasons about. */
 export {
@@ -82,3 +128,17 @@ export {
   Signature,
   TransactionExpiration
 } from "./domain/schemas.ts"
+
+/** Account signers (0.5.0): zkLogin sessions and their store, passkeys, Wallet Standard wallets. */
+export {
+  type SecretSealer,
+  ZkLogin,
+  ZkLoginSession,
+  ZkLoginSignatureInputs,
+  type ZkLoginSignerOptions,
+  ZkLoginStoredSession
+} from "./services/ZkLoginSigner.ts"
+export { type PasskeyProvider, type StandardWallet, type StandardWalletAccount } from "./services/AccountSigners.ts"
+
+/** The sender's check on sponsored bytes a service assembled. */
+export { verifySponsored } from "./services/Sponsored.ts"

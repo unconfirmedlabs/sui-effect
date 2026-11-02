@@ -75,10 +75,14 @@ with no handling lines anywhere.
 | Part | Import | One line |
 |---|---|---|
 | [The two tiers](#the-two-tiers) | `@unconfirmed/sui-effect` | `Sui` for reads (positional arguments, decoded content, `Option`, `Stream`); `SuiCore`, the SDK's Core API one-to-one (the SDK's options objects) |
-| [The transaction lifecycle](#the-transaction-lifecycle) | `@unconfirmed/sui-effect/tx` | `Tx.run`, or `build` / `sign` / `cosign` / `submit` / `reconcile` by hand; `fromBytes` / `attach` for a sponsor; `resubmit`; `Signer` values; `Verify` |
+| [The transaction lifecycle](#the-transaction-lifecycle) | `@unconfirmed/sui-effect/tx` | `Tx.run`, or `build` / `sign` / `cosign` / `submit` / `reconcile` by hand; `Tx.prepare` and `approve` for a person's yes; `fromBytes` / `attach` for a sponsor; `resubmit`; `Signer` values; `Verify` |
 | [`SubmitConfig`](#submitconfig) | `@unconfirmed/sui-effect/tx` | Every lifecycle decision, with defaults, overridable per effect or per layer |
-| [Fold your coins](#fold-your-coins) | `@unconfirmed/sui-effect/tx` | Move coin objects into the address balance, which pays gas by default; `Tx.sendFunds` |
+| [Fold your coins](#fold-your-coins) | `@unconfirmed/sui-effect/tx` | Move coin objects into the address balance, which pays gas by default; `Tx.sendFunds`, `Tx.sendAll` |
+| [Declared intents](#declared-intents) | `@unconfirmed/sui-effect/tx`, `/gate` | `Intent` claims checked against the simulation in code; `Tx.verify`; an optional semantic screen (`Gate`, Jev) |
+| [Accounts](#accounts) | `@unconfirmed/sui-effect/tx`, `/enoki` | zkLogin, passkeys and Wallet Standard wallets as `Signer` values; Enoki and your own sponsor, journalled |
+| [Keys at rest](#keys-at-rest) | `@unconfirmed/sui-effect/tx`, `/keystore` | Checked recovery phrases, imported keys, a sealed keystore, signers that lock |
 | [The journal](#the-journal) | `@unconfirmed/sui-effect/journal` | The record of signed bytes; in memory by default, durable over a `KeyValueStore` |
+| [Storage](#storage) | `@unconfirmed/sui-effect/storage` | `KeyValueStore` layers for IndexedDB, React Native (AsyncStorage, MMKV) and `chrome.storage` |
 | [Errors](#errors) | `@unconfirmed/sui-effect` | One flat tagged error per failure, `SuiError.outcome` and the exit codes |
 | [Scripts](#scripts) | `@unconfirmed/sui-effect/script` | `Script.run`: config from the environment, signals, stderr diagnostics, exit codes |
 | [Extensions](#extensions) | `@unconfirmed/sui-effect/extension` | A downstream SDK as an Effect service with a derived Promise face |
@@ -134,6 +138,25 @@ cannot page past the first page of a `pkg` or `pkg::module` filter, so the
 streams refuse those up front, and one page of one is
 `sui.core.listTransactions`.
 
+**An address's history includes what it received** (0.5.0). The SDK's
+`TransactionFilter` has only `sender` and `function`, and neither finds a
+transfer *to* an address; `{ affectedAddress }` is the gRPC ledger's own
+predicate — the address owned an object before or after, or its balance
+changed — on every transaction stream and tail:
+
+```ts
+const recent = sui.streamTransactions({ affectedAddress: owner }, { order: "descending" }).pipe(
+  Stream.take(20),
+  Stream.runCollect
+)
+```
+
+Each entry is read with `getTransaction`, so it is an `Executed` like any other
+(with its `sender`). A transport without the ledger service (JSON-RPC, GraphQL)
+fails it with a non-retryable `TransportError { status: "UNIMPLEMENTED" }`
+rather than answering with the outgoing half. A node keeps what it keeps: a
+localnet prunes within a few dozen checkpoints.
+
 **Ids from a user go through `.Strict`.** `Schema.decodeUnknownEffect(SuiAddress)`
 pads (`"2"` is `0x…02`), which is right for a node and wrong for a recipient a
 human typed; `SuiAddress.Strict` and `ObjectId.Strict` take exactly 64 hex
@@ -141,14 +164,18 @@ digits. `.normalize` is for a shorthand literal (`"0x6"`), `.make` for the
 padded form. Reads that take a Move type (`getBalance`, `streamCoins`,
 `getCoinMetadataOption`, `streamOwnedObjects({ type })`) and
 `executed.balanceChange` accept a plain string; `CoinType.SUI` is the padded
-SUI type.
+SUI type, and `CoinType.Strict` decodes one a person typed. A `Balance`'s and a
+`Coin`'s amounts are `CoinAmount`, a plain `bigint` in the coin's own smallest
+unit (0.5.0; they were branded `Mist` for every coin); `Mist` is for gas and
+budgets.
 
 ## The transaction lifecycle
 
 `Tx` is the lifecycle as functions — `build`, `sign`, `cosign`, `fromBytes`,
-`attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`,
-`fold`, `foldCoins`, `submit`, `submitVia`, `reconcile`, `resubmit`, `recorded`,
-`run`, `reconcileAll` — each with a closed error union and `R = Sui`. Gas comes
+`attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `sendAll`,
+`planFold`, `fold`, `foldCoins`, `foldMovement`, `submit`, `submitVia`, `verify`,
+`verifySponsored`, `prepare`, `reconcile`, `resubmit`, `recorded`, `run`,
+`reconcileAll` — each with a closed error union and `R = Sui`. Gas comes
 from the payer's SUI **address balance** by default, and from coins only when
 the balance cannot cover it ([Fold your coins](#fold-your-coins)). `Tx.run`
 holds the sender lock for every build, and through submit only when the bytes
@@ -263,6 +290,27 @@ joining the digest to a batch, an outbox, an idempotency key. Failing it fails
 the run with nothing sent; its error is `JournalError`, which is already in
 `Tx.run`'s union and already means "the record could not be written and nothing
 has gone out".
+
+**Prepare, approve, then sign** (0.5.0). `Tx.prepare(recipeOrBuilt, { sender, intent? })`
+is `Tx.run`'s front half without the signature: it builds (or, for bytes from
+`Tx.fromBytes`, takes them as they are), simulates exactly those bytes, runs
+`preflight` and the intent, and answers `{ built, simulation, verified? }` —
+`built.gas` for the fee line (budget, price, payer, and whether it is paid from
+the address balance, a coin reservation or coins), `simulation.created()`,
+`transferred()`, `balanceChange(...)` for the rest, the same accessors an
+`Executed` has. A wallet that signs straight after asking passes
+`approve` to `Tx.run` instead: it is shown the same value after the checks and
+before the first signature, refuses by failing with its own error (nothing
+signed, nothing journalled), and runs under the sender lock only when the bytes
+pin something. A signer with a session bound (`Signer.maxEpoch`) keeps the
+build's window inside it.
+
+```ts
+const executed = yield* Tx.run(recipe, {
+  signer,
+  approve: (prepared) => askThePerson(prepared) // Effect<void, UserRejected>
+})
+```
 
 **`Tx.submitVia(signed, send)` is the lifecycle when someone else submits.** A
 relay or a sponsorship service that holds the only key allowed to talk to the
@@ -434,7 +482,11 @@ payment takes at most 256), SUI first, and `skipped`, SUI dust worth less than
 the cost of folding it. `Tx.fold(batch)` is one batch's recipe, and
 `Tx.foldCoins({ signer })` plans for `signer.address` and runs every batch
 through `Tx.run`, answering `{ plan, executed }`; it stops at the first batch
-that fails, and calling it again re-plans from what is left.
+that fails, and calling it again re-plans from what is left. Given the `plan` a
+person previewed (0.5.0), it runs that plan as is and calls `approve(prepared,
+batch)` per batch; `Tx.foldMovement(batch, prepared.simulation)` is what the
+fold moves from coins into the balance, which its balance changes — the net
+gas only — do not show.
 
 **SUI pays for its own fold**, so a coin-only account needs nothing first: the
 batch is the gas payment and `0x2::coin::send_funds<SUI>` deposits the whole
@@ -468,12 +520,275 @@ const paid = yield* Tx.run((tx) => {
 }, { signer })
 ```
 
+**Send everything.** `Tx.sendAll({ signer, recipient, coinType?, intent?,
+approve? })` sweeps one coin type — every coin object and the whole address
+balance — into the recipient's balance in one `Tx.run`, and leaves the sender
+**0**. For SUI the gas coin is made to be everything (a reservation of the
+whole balance with the coins merged in, or the coins with the balance redeemed
+into them) and is deposited, so gas comes out of the sweep and no unused-budget
+refund is left behind; any other type sends its coins and its balance and pays
+gas from SUI. Proved on localnet for coin-only, balance-only and mixed SUI
+accounts and for a second coin type. What arrives after the read stays; more
+than 500 coin objects need `Tx.foldCoins` first.
+
+```ts
+const { sweep, received } = yield* Tx.sendAll({ signer, recipient: newWallet })
+```
+
 A wallet that wants the balance enforced sets
 `SubmitConfig.gasPayment: "requireAddressBalance"`: an unfolded account's
 transactions then fail with `BuildError` naming `Tx.foldCoins` instead of
 quietly paying with coins. And a flow that spends its balance down to zero sets
 `lockSender: "always"`, because lock-free runs from one sender can together
 overdraw it (`SubmitConfig`, above).
+
+## Declared intents
+
+A transaction can say what it is for, and `Tx.run` will refuse to sign one that
+does more. An `Intent` is one sentence plus exact claims:
+
+```ts
+import { Effect } from "effect"
+import { CoinType, type SuiAddress } from "@unconfirmed/sui-effect"
+import { type Intent, type Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+declare const signer: Signer
+declare const coldWallet: SuiAddress
+
+const intent: Intent = {
+  summary: "Send 250 SUI to my cold wallet.",
+  author: "user",
+  claims: {
+    outflows: [{ coinType: CoinType.SUI, max: 250_000_000_000n }],
+    recipients: [coldWallet],
+    objects: []
+  }
+}
+
+const sent = Tx.run(Tx.sendFunds({ amount: 250_000_000_000n, recipient: coldWallet }), { signer, intent })
+```
+
+The claims are compared with the simulated effects **in code**, deny by default:
+a coin that is not claimed may not decrease, an address that is not claimed may
+not receive anything, and an object that is not claimed may not leave the
+sender. Gas is never an outflow, whether a gas coin or the address balance paid
+it; anything else drawn from the address balance is. Every refusal is a
+`PolicyDenied` whose `rule` says which check (`intent.outflow`,
+`intent.recipient`, `intent.object`, ...), before anything is signed. `Tx.run`
+runs the check on the same simulate as `SubmitConfig.preflight`, where it signs:
+under the sender lock only when the bytes pin something.
+
+`Tx.verify(built, intent)` is the same check for the explicit lifecycle and
+answers a `Verified`, which `Tx.sign` takes as it is; the explicit lifecycle is
+not gated otherwise. For bytes somebody else built — a dapp's —
+`Intent.fromSimulation(simulation, built, { summary, author: "dapp" })` is the
+exact claims the simulation implies, to show a person and then verify:
+
+```ts
+import { Effect } from "effect"
+import { Sui } from "@unconfirmed/sui-effect"
+import { Intent, Tx } from "@unconfirmed/sui-effect/tx"
+
+declare const dappBytes: Uint8Array
+declare const dappSays: string
+
+const review = Effect.gen(function*() {
+  const sui = yield* Sui
+  const built = yield* Tx.fromBytes(dappBytes)
+  const claims = Intent.fromSimulation(yield* sui.simulate(built.bytes), built, {
+    summary: dappSays,
+    author: "dapp"
+  })
+  // ...show `claims` and ask...
+  return yield* Tx.verify(built, claims)
+})
+```
+
+The sentence is read by a **screen**, when one is configured.
+`@unconfirmed/sui-effect/gate` provides one that asks
+[Jev](https://docs.typesafe.ai), TypeSafe's System One model, whether each
+simulated effect and each claim — rendered as words, never as hex or base units
+— is something the sentence describes:
+
+```ts
+import { Layer } from "effect"
+import { FetchHttpClient } from "effect/http"
+import { layerJevConfig } from "@unconfirmed/sui-effect/gate"
+
+// TYPESAFE_API_KEY from the environment. `requireIntent` is the setting for a
+// wallet an agent drives: `Tx.run` signs nothing that declares no intent.
+const gate = layerJevConfig({ requireIntent: true }).pipe(Layer.provide(FetchHttpClient.layer))
+```
+
+The screen answers in probabilities and decides nothing; the thresholds that
+turn them into `intent.effect`, `intent.claim`, `intent.vague` and
+`intent.injection` are fields of `Gate`, in code. A screen that is down denies
+(`gate.unavailable`) unless `onUnavailable: "unscreened"`, and an unscreened
+verdict always says so. `Gate.with` merges over the gate in force, so it never
+drops a layer's screen.
+
+What it does not prove: a simulation is one execution against the state the
+node had, so a package that branches on a shared object can still behave
+differently when the bytes land.
+
+## Accounts
+
+An account a person signs in with is a `Signer` like a key is, and it **only
+signs**: building, the simulate, the intent, approval, the journal and
+submission stay `Tx`'s, so a zkLogin session or a browser wallet gets the same
+identical-bytes resend and the same reconcile as a key. Every Wallet Standard,
+WebAuthn and Enoki type is reached structurally — nothing depends on
+`@mysten/enoki`, `@mysten/wallet-standard`, a DOM type or a platform — so it
+runs in a browser, React Native and an extension alike.
+
+```ts
+import type { Signer as SdkSigner } from "@mysten/sui/cryptography"
+import { Effect } from "effect"
+import type { Recipe } from "@unconfirmed/sui-effect"
+import {
+  Signer,
+  type StandardWallet,
+  type StandardWalletAccount,
+  Tx,
+  type ZkLoginSignatureInputs
+} from "@unconfirmed/sui-effect/tx"
+
+declare const ephemeral: SdkSigner // the session's ephemeral key
+declare const proof: ZkLoginSignatureInputs // from the prover
+declare const wallet: StandardWallet // a connected Wallet Standard wallet
+declare const account: StandardWalletAccount
+declare const recipe: Recipe
+
+const asSession = Effect.gen(function*() {
+  const signer = yield* Signer.zkLogin({ session: { address: "0x…", maxEpoch: 812n, proof }, ephemeral })
+  return yield* Tx.run(recipe, { signer }) // the window is kept inside maxEpoch
+})
+
+const asWallet = Effect.gen(function*() {
+  const signer = yield* Signer.wallet({ wallet, account, chain: "sui:mainnet" })
+  return yield* Tx.run(recipe, { signer })
+})
+```
+
+- **`Signer.zkLogin`** wraps each ephemeral signature in the proof. A session
+  expires: the signer sets `maxEpoch`, `Tx.run` caps the build's window at it,
+  and past it (or past `expiresAt`) signing is `SigningError { reason:
+  "expired" }` before anything is built. `ZkLogin.save` / `load` / `remove`
+  keep a session in a `KeyValueStore` with the ephemeral seed written only
+  sealed, by a `SecretSealer` you supply — `Keystore.sealer(password)` is one
+  ([Keys at rest](#keys-at-rest)).
+- **`Signer.passkey({ publicKey, provider })`** is the SDK's `PasskeyKeypair`,
+  imported on first use; `Signer.createPasskey(provider)` registers one and
+  answers the public key to keep. A cancelled prompt is `reason: "rejected"`.
+- **`Signer.wallet`** signs through the wallet's `sui:signTransaction` (or
+  `sui:signTransactionBlock`) and `sui:signPersonalMessage`. A wallet that
+  answers **different bytes** than it was handed is refused with
+  `SigningError`, so the journal never records bytes nobody signed, and the
+  signature is verified locally for every scheme that needs no node. This is your app as a
+  **dapp** to the wallet; there are no provider-side handlers.
+
+**Sponsored by Enoki.** `@unconfirmed/sui-effect/enoki` turns Enoki's create →
+sign → execute into the explicit lifecycle, so it is journalled:
+`Enoki.sponsor` checks Enoki's bytes against what you asked for
+(`verifySponsored`: the sender, a distinct gas owner, the transaction kind byte
+for byte) before you sign, and `Enoki.execute` is `Tx.submitVia` over
+`executeSponsoredTransaction`. `Enoki.run` is all of it, with `Tx.run`'s
+`intent` and `approve`:
+
+```ts
+import { Enoki, type EnokiClient, type EnokiFlow } from "@unconfirmed/sui-effect/enoki"
+
+declare const enoki: EnokiClient // an `EnokiClient` from @mysten/enoki is one
+declare const flow: EnokiFlow
+
+const sponsoredRun = Effect.gen(function*() {
+  const signer = yield* Enoki.fromFlow(flow, { network: "testnet" })
+  return yield* Enoki.run(enoki, recipe, { signer, network: "testnet", approve: askThePerson })
+})
+```
+
+`EnokiError` declares its `outcome`: a refusal (a create 4xx other than 408 and
+429, an execute 401 or 403) fails as itself; anything else from execute may
+have reached the chain and is reconciled.
+
+**Sponsored by your own backend.** When the backend signs bytes the sender
+built, it is a `Signer.remote` sponsor: `Tx.run(Tx.sponsored({ sender, gasOwner
+})(recipe), { signer, sponsor })`. When the backend **builds** the bytes, hold
+them to what was asked before signing:
+
+```ts
+const viaBackend = Effect.gen(function*() {
+  const built = yield* Tx.fromBytes(bytesFromBackend)
+  yield* Tx.verifySponsored(built, { sender: signer.address, gasOwner: sponsorAddress, transactionKind: kindBytes })
+  const prepared = yield* Tx.prepare(built, { sender: signer.address })
+  yield* askThePerson(prepared)
+  const signed = yield* Tx.attach(yield* Tx.sign(prepared.built, signer), sponsorSignature)
+  return yield* Tx.submit(signed)
+})
+```
+
+A swapped sender or an added command is a `PolicyDenied` before the sender
+signs. Sender and sponsor never need to sign in one process; when the backend
+also submits, end in `Tx.submitVia(signed, send)` instead.
+
+## Keys at rest
+
+`Signer.fromMnemonic(phrase, { scheme?, account?, path? })` checks the BIP-39
+word list and checksum **before** deriving — the SDK's `deriveKeypair` checks
+neither, so a phrase with one word wrong derives a valid, empty account — on
+the standard Sui paths (`Signer.derivationPath`). `Signer.fromSecretKey` takes
+`suiprivkey1…`, a hex seed or bytes, and copies them. Both answer a
+`LockableSigner`: a `Signer` whose `lock` zeroes the key it owns, after which
+it refuses with `SigningError { reason: "locked" }` (`Signer.scoped` locks on
+scope close). A bad phrase is `KeyError`, naming a word's position and never
+the word.
+
+```ts
+import { Effect, Layer, Redacted } from "effect"
+import { Keystore } from "@unconfirmed/sui-effect/keystore"
+import { layerIndexedDb } from "@unconfirmed/sui-effect/storage"
+
+declare const phrase: Redacted.Redacted<string>
+declare const password: Redacted.Redacted<string>
+
+const fromPhrase = Effect.gen(function*() {
+  const signer = yield* Signer.fromMnemonic(phrase, { scheme: "ED25519" })
+  const executed = yield* Tx.run(recipe, { signer })
+  yield* signer.lock
+  return executed
+})
+
+const keystore = Keystore.layer().pipe(Layer.provide(layerIndexedDb({ databaseName: "my-wallet" })))
+
+const importThenSend = Effect.gen(function*() {
+  const keys = yield* Keystore
+  const account = yield* keys.importMnemonic(phrase, password, { label: "main" })
+  const signer = yield* keys.unlock(account.address, password)
+  return yield* Tx.run(recipe, { signer })
+}).pipe(Effect.provide(keystore))
+```
+
+`Keystore` seals one record per address over any `KeyValueStore`
+([Storage](#storage)): PBKDF2-SHA256 at 600 000 iterations, AES-256-GCM, and
+the address, scheme, source and path as additional data, so a record moved to
+another address or edited does not open, and a wrong password
+(`KeystoreError { reason: "wrongPassword" }`) is told apart from a damaged
+record (`"corrupt"`). `unlock` answers a `LockableSigner`; `Tx.run` refuses a
+locked one before it builds. It needs WebCrypto: browsers, extensions, Bun and
+Node 22+ have it, React Native needs a polyfill and otherwise fails with
+`reason: "unavailable"`. A zkLogin session's ephemeral seed is sealed the same
+way:
+
+```ts
+const sealer = Keystore.sealer(password)
+yield* ZkLogin.save(store, "zklogin", { session, ephemeralSecretKey, sealer })
+const restored = yield* ZkLogin.load(store, "zklogin", { sealer }) // Option<Signer>
+```
+
+What it protects is keys **at rest**, against someone who can read the store.
+It does not protect against code in the same JavaScript realm, and `lock` is
+best effort in a garbage-collected runtime: it zeroes every buffer the package
+and the SDK keypair own, not strings the caller passed in.
 
 ## The journal
 
@@ -503,10 +818,15 @@ entries; `"ignore"` builds and leaves them for `Tx.reconcileAll()`, the
 explicit startup call. Each entry is one key, and the journal lists them through
 `KeyValueStore.keys` — which every store has had to implement since effect 4.1 —
 so a custom store must implement `keys`, and several processes writing one
-prefix do not lose each other's entries. Listing is a scan, so a service that
-runs for months calls `pruneSettled(before)`, which deletes settled entries
-recorded before the cutoff and never an unresolved one. `makeKeyValueStore(store)`
-is the same journal as a plain `JournalService`.
+prefix do not lose each other's entries. A settled entry carries a
+`settled:<digest>` marker beside it (0.5.0), so a listing reads only the
+entries without one: one `keys` and one read per unresolved entry, however many
+settled ones the store keeps. A store 0.4 wrote has no markers and needs no
+migration — its first listing is the old scan and marks what it finds settled.
+`keys` still enumerates every entry, so a service that runs for months calls
+`pruneSettled(before)`, which deletes settled entries recorded before the
+cutoff and never an unresolved one. `makeKeyValueStore(store)` is the same
+journal as a plain `JournalService`.
 
 **A script with a durable journal** gives it to `Script.run` in
 `options.layer` (`Layer.merge(Script.layer, journal)`; the option accepts any
@@ -524,7 +844,38 @@ entry 0.4 wrote is invisible to a 0.3 `listUnresolved`, `Tx.reconcileAll` and
 cannot decode `NotApplied { evidence: "refused" }`, which 0.4 writes. Before
 rolling back, or while 0.3 and 0.4 processes share a store, drain it with
 `Tx.reconcileAll()` on 0.4 (or settle the entries by hand) and delete the
-`"refused"` entries.
+`"refused"` entries. Rolling back from 0.5 to 0.4 is safe (0.4 ignores the
+markers); running a 0.4 **writer** beside 0.5 is not, because a 0.4 process
+that re-signs a digest 0.5 had settled leaves its marker in place and hides the
+entry from `listUnresolved` — stop the 0.4 writers first.
+
+## Storage
+
+`@unconfirmed/sui-effect/storage` is a `KeyValueStore` layer for each platform a
+wallet runs on, so the durable journal (and anything else written over
+`KeyValueStore`) runs there unchanged. Every platform object is reached
+structurally: no DOM, React Native or `chrome` types, and no dependency.
+
+```ts
+import { Layer } from "effect"
+import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
+import { layerIndexedDb } from "@unconfirmed/sui-effect/storage"
+
+const journal = layerKeyValueStore({ onUnresolved: "ignore" }).pipe(
+  Layer.provide(layerIndexedDb({ databaseName: "my-wallet" }))
+)
+```
+
+| Layer | Over | Notes |
+|---|---|---|
+| `layerIndexedDb({ indexedDB?, databaseName?, storeName?, durability? })` | `globalThis.indexedDB` | Pages, workers, extension pages and MV3 service workers. One transaction per operation; writes resolve on commit, `"strict"` durability by default. |
+| `layerAsyncStorage(storage)` | `@react-native-async-storage/async-storage` | Strings; bytes as base64. |
+| `layerMmkv(mmkv)` | `react-native-mmkv` (2.x–4.x) | Synchronous. |
+| `layerChromeStorage(area)` | `chrome.storage.local` (promise form) | 10 MB without `"unlimitedStorage"`; `getKeys` when the browser has it. |
+
+`localStorage` is effect's own `KeyValueStore.layerStorage(() => localStorage)`:
+synchronous, about 5 MB, absent from workers and service workers — small data
+in a page only, not a journal.
 
 ## Extensions
 
@@ -569,6 +920,7 @@ and `journal` (e.g. a durable one) — and settles that journal at startup with
 And `SuiGraphQL` is sui-effect's tag over the SDK's `SuiGraphQLClient` — one
 client shared by every extension that reads GraphQL; sui-effect wraps no GraphQL
 API of its own.
+
 
 ## Errors
 
@@ -679,7 +1031,7 @@ bytes finish.
 |---|---|
 | 0 | success |
 | 1 | a defect, or an unclassified failure |
-| 2 | configuration: `ConfigError`, `NetworkMismatch`, `SchemaError`, the mainnet gate |
+| 2 | configuration: `ConfigError`, `NetworkMismatch`, `SchemaError`, the mainnet gate, an effect/cli parse error (`--help` alone is 0; a `UserError` exits as its cause) |
 | 3 | unknown outcome: reconcile before sending anything else |
 | 4 | nothing applied: safe to retry |
 | 5 | applied on chain: `ExecutionFailed` (gas charged) or `UnexpectedEffects` (it ran; the receipt is missing) |
@@ -698,13 +1050,20 @@ Ctrl-C after the execute answered must not read as "safe to retry". 1, 3 and 5
 are never rewritten. `Script.run` finds the journal wherever the program provided it, so
 this holds for a durable journal provided inside the program too.
 
-**`Script.report(exit, { stderr?, journal? })`** is those last two steps on
+**`Script.report(exit, { stderr?, journal?, applied? })`** is those last two steps on
 their own — the diagnostic lines and the unresolved entries, with the exit code
 as the answer — for a CLI that owns its own argv parsing and process. Assign it
 to `process.exitCode` rather than calling `process.exit`. It lists **every**
 unresolved entry of the journal it is given, another process's included in a
-shared store, and any one of them turns a would-be 2, 4 or 130 into 3; it has
-no count of what applied, so the "applied → 5" rule is `Script.run`'s alone.
+shared store, and any one of them turns a would-be 2, 4 or 130 into 3; it cannot
+count what applied, so a multi-command CLI passes `applied` (the transactions it
+saw execute) and gets the "applied → 5" rule too. Provide
+**`Script.layerStderrLogger()`** around the program: library log lines — a
+tail's retry warnings, a journal write that failed — go through Effect's
+logger, whose default writes to **stdout**, and would break a `--json`
+document. (The "did not become visible within `visibilityTimeout`" line is
+debug level since 0.5.0, so a default program never prints it; it is the
+`sui.visibility` span attribute.) `Script.run` installs it for you.
 `Script.run` lists, and counts, only the entries its own program wrote.
 `Script.layerNoDeps`, `layerWithSigner` and `layerReadOnlyNoDeps` take the
 network from the `SuiCore` underneath, not from `SUI_NETWORK`, so they build
@@ -800,7 +1159,8 @@ Every public member opens a span named after itself (`SuiCore.getObject`,
 `Tx.submit`); per-item helpers open none and annotate the enclosing span
 instead. A submission's spans carry `sui.digest`, `sui.attempt`, `sui.outcome`
 and, when they apply, `sui.refused`, `sui.lock_conflict` and
-`sui.not_applied.evidence`; `Tx.build`'s carry `sui.simulated_by`,
+`sui.not_applied.evidence`, and `Tx.awaitVisible`'s `sui.visibility`
+(`visible`, `timeout`, `failed`); `Tx.build`'s carry `sui.simulated_by`,
 `sui.gas_budget`, `sui.max_epoch` and `sui.gas_payment` (`addressBalance`,
 `coinReservation`, `coins`); `Tx.run`'s carries `sui.sender_lock` (`held`,
 `build`, `none`); `Sui.getObjects` carries
@@ -857,7 +1217,8 @@ scripts `getTransaction: [FakeOutcome.notFound()]`. A **sponsored** submit needs
 with a gRPC `INVALID_ARGUMENT`, the way a validator does. And the build's
 simulate is the resolver's — recorded, so `SuiTest.calls("simulateTransaction")`
 sees it, and answered by `FakeScript.buildSimulate` if there is one and by the
-ordered `simulate` script otherwise; like the SDK's core resolver, it runs only
+ordered `simulate` script otherwise (and a later simulate with no `simulate`
+script answers from `buildSimulate`); like the SDK's core resolver, it runs only
 when the recipe left the budget unset, and `Tx.build` simulates explicitly
 otherwise. An execute outcome scripted with a digest other than the bytes' own
 stops the test with a defect — a node never answers with another transaction's
@@ -880,9 +1241,22 @@ Executions charge gas to the balance, debit withdrawals and follow
 The fake also serves the ledger reads: `listTransactions` and `listEvents`
 page through every transaction it was scripted with or executed, filtered by
 the sender and Move calls in the bytes, and `FakeScript.scanLimit` makes pages
-come back short or empty the way a scan-limited node's do. `FakeScript.names`
+come back short or empty the way a scan-limited node's do. With a scripted
+`FakeScript.ledger` (`{}` is enough) it also answers the gRPC ledger's
+`affectedAddress` listing behind `sui.streamTransactions({ affectedAddress })`,
+which lists incoming transfers as well as an address's own transactions; without
+one the fake is a transport that cannot, and the stream fails with
+`TransportError { status: "UNIMPLEMENTED" }`, as it would on JSON-RPC or GraphQL.
+`TestServices` names what `layerTest` provides. To share one memory
+`KeyValueStore` between two journal layers, build it once —
+`Effect.provide(KeyValueStore.KeyValueStore, KeyValueStore.layerMemory)` — and
+give both `Layer.succeed(KeyValueStore.KeyValueStore, store)`. `FakeScript.names`
 answers the name-service reads, and `FakeScript.ledger` serves the pruning
-history reconcile asks a gRPC node for.
+history reconcile asks a gRPC node for. An object's `json` and `display`
+(`FakeObject.json` / `.display`) are served only when the include set asks for
+them, and a transaction's `bcs` is the bytes the fake executed (or, for one
+scripted by digest with a `sender`, a minimal transaction naming it), which is
+how `Executed.sender` is filled on the fake's reads.
 
 ## Versions
 
@@ -893,6 +1267,10 @@ history reconcile asks a gRPC node for.
 | `@mysten/bcs` | `^2.1.3` | `2.1.3` |
 | TypeScript | `5.9.x` to build | `5.9.3` |
 | Bun | `1.4.x` | `1.4.2` |
+
+The only direct dependencies are `@scure/bip39` and `@scure/bip32`, both
+`^2.3.0` (0.5.0, for the checked recovery phrase): exactly the range every
+`@mysten/sui` from 2.28 to 2.38 declares, so a consumer resolves one copy.
 
 The SDK row is a matrix, not a hope: CI builds, typechecks and runs the suite
 against `@mysten/sui` 2.30.0 and 2.38.0: the oldest version consumers pin and

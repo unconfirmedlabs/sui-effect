@@ -300,7 +300,7 @@ describe("the KeyValueStore journal", () => {
     expect(unresolved.map((entry) => entry.digest).sort()).toEqual([...digests].sort())
   })
 
-  test("building the layer makes no network calls: it lists the store and reads its entries", async () => {
+  test("building the layer makes no network calls: it lists the store and reads its unresolved entries", async () => {
     const reads: Array<string> = []
     let listed = 0
     const counting = Layer.effect(
@@ -331,10 +331,11 @@ describe("the KeyValueStore journal", () => {
       )
     )
     expect(listed).toBe(1)
-    expect(reads.sort()).toEqual([`entry:${OTHER}`, `entry:${DIGEST}`].sort())
+    // The settled entry carries its marker, so only the unresolved one is read.
+    expect(reads).toEqual([`entry:${DIGEST}`])
   })
 
-  test("a put is one write, and no index key is ever written", async () => {
+  test("a put writes its entry and, when terminal, the settled marker; no index key is ever written", async () => {
     const writes: Array<string> = []
     const recording = Layer.effect(
       KeyValueStore.KeyValueStore,
@@ -359,8 +360,8 @@ describe("the KeyValueStore journal", () => {
         return yield* store.keys
       }).pipe(Effect.provide(recording, { local: true }))
     )
-    expect(writes).toEqual([`p:entry:${DIGEST}`, `p:entry:${DIGEST}`])
-    expect(keys).toEqual([`p:entry:${DIGEST}`])
+    expect(writes).toEqual([`p:entry:${DIGEST}`, `p:entry:${DIGEST}`, `p:settled:${DIGEST}`])
+    expect([...keys].sort()).toEqual([`p:entry:${DIGEST}`, `p:settled:${DIGEST}`])
   })
 
   test("listUnresolved is oldest first whatever order keys come back in", async () => {
@@ -438,7 +439,11 @@ describe("pruneSettled", () => {
     )
     expect(result.pruned).toBe(3)
     expect(result.keys).toEqual(
-      ["index", ...[4, 5, 6, 7].map((seed) => `entry:${d(seed)}`)].sort()
+      [
+        "index",
+        ...[4, 5, 6, 7].map((seed) => `entry:${d(seed)}`),
+        ...[4, 5].map((seed) => `settled:${d(seed)}`)
+      ].sort()
     )
   })
 
@@ -453,7 +458,7 @@ describe("pruneSettled", () => {
       })
     )
     expect(result.pruned).toBe(1)
-    expect(result.keys).toEqual([`b:entry:${d(2)}`])
+    expect([...result.keys].sort()).toEqual([`b:entry:${d(2)}`, `b:settled:${d(2)}`])
   })
 
   test("an entry that does not decode fails the prune and deletes nothing", async () => {
@@ -467,6 +472,7 @@ describe("pruneSettled", () => {
       })
     )
     expect(result.error._tag).toBe("JournalError")
-    expect(result.size).toBe(2)
+    // The decodable entry, its marker, and the bad entry.
+    expect(result.size).toBe(3)
   })
 })
