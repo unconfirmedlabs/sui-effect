@@ -9,8 +9,9 @@ repository. Do not edit it by hand; a test fails when it is stale.
 @unconfirmed/sui-effect is a light Effect v4 wrapper around the official
 `@mysten/sui` SDK that makes it safer to use: `SuiCore` mirrors the SDK's Core
 API one-to-one, `Sui` adds decoded reads, a closed error union on every
-function, the transaction lifecycle as functions with typed outcomes, and an
-in-memory fake chain so every test runs with no network.
+function, the transaction lifecycle as functions with typed outcomes, and a
+scripted `SuiCore` for tests that answers reads from plain values and never
+pretends to be a chain.
 
 ```bash
 bun add @unconfirmed/sui-effect
@@ -34,13 +35,15 @@ examples come last.
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
 | `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `verifySponsored`, `submit`, `submitVia`, `reconcile`, `resubmit`, `run`, `reconcileAll`, `withSenderLock`), `Signer` and its constructors (`fromKeypair`, `fromSdkSigner`, `fromSecretKey`, `fromMnemonic`, `generateMnemonic`, `derivationPath`, `ephemeral`, `remote`, `zkLogin`, `multisig`, `alias`), `Prepared` (what `Tx.run`'s `approve` is shown), `AddressAlias` / `AddressAliases`, `Verify`, `verifySponsored`, `SubmitConfig`, `Journal`, `JournalEntry`, `FoldBatch` / `FoldPlan` / `FoldResult` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest`, `testSubmitConfig`, `TestServices`; the fake models address balances (`SuiTest.setAddressBalance`) and address alias sets (`FakeScript.addressAliases`, `SuiTest.setAddressAliases`) |
+| `@unconfirmed/sui-effect/testing` | `layerTest(script)` (the real `Sui` over `ScriptedSuiCore`, a `SuiCore` answering from a `FakeScript`: objects, dynamic fields, address balances, the clock, and scripted execute/simulate answers in order; it never applies or validates a transaction), `SuiTest` (`putObject`, `setClock`, `setAddressBalance`, `scriptExecute`, `scriptSimulate`, `calls`, `provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `FakeOutcome`, `fakeCoin`, `fakeDigest`, `testSubmitConfig`, `TestServices` |
 
 ## Recipes
 
-Each one is a file in this repository that typechecks and runs against the fake
-(`test/recipes.test.ts`); the relative `src/` imports are shown as the package
-subpaths they are.
+Each one is a file in this repository that typechecks. Those about decoding,
+mapping or failure handling run over scripted answers (`test/recipes.test.ts`);
+those about what a validator does run against a localnet
+(`test/live.localnet-recipes.test.ts`, behind `SUI_LOCALNET=1`). The relative
+`src/` imports are shown as the package subpaths they are.
 
 Read an object:
 
@@ -54,7 +57,7 @@ Fold coin objects into the address balance, once per coin-funded account:
 
 <!-- recipe: examples/recipes/fold-coins.ts -->
 
-The explicit lifecycle, for a sponsored transaction, and the coin-paid alternative:
+The explicit lifecycle, for a sponsored transaction, and the same in one process:
 
 <!-- recipe: examples/recipes/sponsored.ts -->
 
@@ -90,9 +93,9 @@ A resumable indexer over the SDK's own cursors:
 
 <!-- recipe: examples/recipes/indexer.ts -->
 
-A test on the fake:
+A test over the scripted `SuiCore`:
 
-<!-- recipe: test/recipes/fake.test.ts -->
+<!-- recipe: test/recipes/scripted.test.ts -->
 
 ## The two tiers
 

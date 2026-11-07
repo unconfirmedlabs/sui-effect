@@ -679,8 +679,8 @@ export interface SuiCoreService {
 
   /**
    * The transport's build plugin, which the transaction builder needs to
-   * resolve inputs. A pure value constructor, wrapped in an Effect only so the
-   * fake can refuse it. Never fails.
+   * resolve inputs. A pure value constructor, wrapped in an Effect so a stub
+   * can stand in for it. Never fails.
    */
   readonly resolveTransactionPlugin: () => Effect.Effect<TransactionPlugin>
 

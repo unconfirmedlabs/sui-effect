@@ -1,309 +1,203 @@
+/**
+ * `Executed` and `Simulation`: decoding an SDK result and the one accessor
+ * implementation both share.
+ */
 import { describe, expect, test } from "bun:test"
+import { bcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
-import { Effect, Exit, Result } from "effect"
-import { EXECUTE_INCLUDE, Executed, fromTransactionResult } from "../src/domain/executed.ts"
-import { CoinType, SuiAddress } from "../src/domain/schemas.ts"
-import { fakeDigest } from "../src/services/SuiCoreFake.ts"
+import { toBase64 } from "@mysten/sui/utils"
+import { Effect, Result } from "effect"
+import { bcs as suiSchemaBcs } from "../src/domain/bcs.ts"
+import { Executed, fromTransactionResult } from "../src/domain/executed.ts"
+import { ObjectId, SuiAddress, Version } from "../src/domain/schemas.ts"
+import { fromSimulationResult } from "../src/services/Sui.ts"
+import { type FakeChange, fakeDigest, type FakeExecution, FakeOutcome, transactionResultOf } from "../src/testing.ts"
 
 const PADDED = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
-const ALICE = PADDED("a11ce")
-const RECEIPT = PADDED("4ece")
-const ESCROW = PADDED("e5c")
-const COIN = PADDED("c01")
-const ACCUMULATOR = PADDED("acc")
-const PACKAGE = PADDED("9ac")
+const SENDER = PADDED("a11ce")
+const RECIPIENT = PADDED("b0b")
+const PKG = PADDED("b0a2d")
+const SUI = `${PADDED("2")}::sui::SUI`
 const DIGEST = fakeDigest(42)
+const ownedBy = (address: string): SuiClientTypes.ObjectOwner => ({ $kind: "AddressOwner", AddressOwner: address })
 
-const owner: SuiClientTypes.ObjectOwner = { $kind: "AddressOwner", AddressOwner: ALICE }
+const HERO = PADDED("4e70")
+const HERO_TYPE = `${PKG}::hero::Hero`
+const SWORD = PADDED("5a0d")
+const SHIELD = PADDED("5e1d")
+const GEM = PADDED("c41d")
+const ESCROW = PADDED("e5c")
+const GONE = PADDED("90e")
+const accumulator: FakeChange = { objectId: PADDED("acc"), type: `${PADDED("2")}::accumulator::U128`, outputState: "AccumulatorWriteV1" }
 
-const change = (
-  overrides: Partial<SuiClientTypes.ChangedObject> & { objectId: string }
-): SuiClientTypes.ChangedObject => ({
-  inputState: "DoesNotExist",
-  inputVersion: null,
-  inputDigest: null,
-  inputOwner: null,
-  outputState: "ObjectWrite",
-  outputVersion: "9",
-  outputDigest: fakeDigest(2),
-  outputOwner: owner,
-  idOperation: "Created",
-  ...overrides
+const effects: FakeExecution = {
+  created: [{ objectId: HERO, type: HERO_TYPE, version: 9n, owner: ownedBy(SENDER) }],
+  mutated: [
+    { objectId: SWORD, type: `${PKG}::hero::Sword`, version: 9n, inputOwner: ownedBy(SENDER), owner: ownedBy(RECIPIENT) },
+    { objectId: SHIELD, type: `${PKG}::hero::Shield`, version: 9n, inputOwner: ownedBy(SENDER), owner: { $kind: "Immutable", Immutable: true } },
+    { objectId: GEM, type: `${PKG}::hero::Gem`, version: 9n, inputOwner: ownedBy(SENDER), owner: { $kind: "ObjectOwner", ObjectOwner: HERO } },
+    { objectId: ESCROW, type: `${PKG}::escrow::Escrow`, version: 9n, owner: ownedBy(SENDER) },
+    accumulator
+  ],
+  deleted: [{ objectId: GONE, type: `${PKG}::hero::Potion`, version: 8n, inputVersion: 7n, owner: ownedBy(SENDER) }],
+  balanceChanges: [{ coinType: SUI, address: SENDER, amount: "-1000" }, { coinType: SUI, address: SENDER, amount: "-5" }]
+}
+
+const executedOf = (execution: FakeExecution) =>
+  Effect.runSync(fromTransactionResult(transactionResultOf(DIGEST, FakeOutcome.succeed(execution)) as never))
+const simulationOf = (execution: FakeExecution) =>
+  Effect.runSync(fromSimulationResult({ ...transactionResultOf(DIGEST, FakeOutcome.succeed(execution)), commandResults: [] } as never))
+
+const view = (changes: ReturnType<typeof executedOf> | ReturnType<typeof simulationOf>) => ({
+  created: changes.created().map((ref) => ref.id),
+  createdHero: changes.created("0xb0a2d::hero::Hero").map((ref) => ref.id),
+  mutated: changes.mutated().map((ref) => ref.id).sort(),
+  deleted: changes.deleted().map((ref) => [ref.id, ref.version]),
+  transferred: changes.transferred().map((ref) => [ref.id, ref.inputOwner.$kind, ref.owner.$kind]).sort(),
+  balance: changes.balanceChange(SuiAddress.make(SENDER), "0x2::sui::SUI"),
+  gas: changes.gasUsedTotal
 })
 
-/** A response shaped exactly like a real `executeTransaction` with the execute include set. */
-const result = (
-  success: boolean
-): SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE> => {
-  const transaction = {
-    digest: DIGEST,
-    signatures: ["sig"],
-    epoch: "412",
-    timestampMs: 1_700_000_000_000,
-    checkpoint: "88",
-    status: success
-      ? { success: true, error: null }
-      : {
-          success: false,
-          error: {
-            message: "MoveAbort",
-            command: 1,
-            $kind: "MoveAbort",
-            MoveAbort: { abortCode: "3", location: { module: "escrow", functionName: "claim" } }
-          }
-        },
-    balanceChanges: [
-      { coinType: "0x2::sui::SUI", address: ALICE, amount: "-1000" },
-      { coinType: "0x2::sui::SUI", address: ALICE, amount: "250" }
-    ],
-    effects: {
-      bcs: null,
-      version: 2,
-      status: success ? { success: true, error: null } : { success: false, error: null },
-      gasUsed: {
-        computationCost: "1000000",
-        storageCost: "2000000",
-        storageRebate: "980000",
-        nonRefundableStorageFee: "20000"
-      },
-      transactionDigest: DIGEST,
-      gasObject: null,
-      eventsDigest: null,
-      dependencies: [],
-      lamportVersion: "9",
-      changedObjects: [
-        change({ objectId: RECEIPT }),
-        change({
-          objectId: ESCROW,
-          inputState: "Exists",
-          inputVersion: "8",
-          inputDigest: fakeDigest(3),
-          inputOwner: owner,
-          idOperation: "None"
-        }),
-        change({
-          objectId: COIN,
-          inputState: "Exists",
-          inputVersion: "8",
-          inputDigest: fakeDigest(4),
-          inputOwner: owner,
-          outputState: "DoesNotExist",
-          outputVersion: null,
-          outputDigest: null,
-          outputOwner: null,
-          idOperation: "Deleted"
-        }),
-        change({ objectId: ACCUMULATOR, outputState: "AccumulatorWriteV1" }),
-        change({ objectId: PACKAGE, outputState: "PackageWrite" })
-      ],
-      unchangedConsensusObjects: [],
-      auxiliaryDataDigest: null
-    },
-    events: [],
-    objectTypes: {
-      [RECEIPT]: "0x2::escrow::Receipt",
-      [ESCROW]: "0x2::escrow::Escrow",
-      [COIN]: "0x2::coin::Coin<0x2::sui::SUI>",
-      [ACCUMULATOR]: "0x2::balance::Balance<0x2::sui::SUI>",
-      [PACKAGE]: "0x2::package::Package"
+describe("the shared accessors", () => {
+  test("a Simulation and the Executed it predicted answer the same, accumulator writes skipped", () => {
+    const executed = view(executedOf(effects))
+    expect(view(simulationOf(effects))).toEqual(executed)
+    expect(executed).toEqual({
+      created: [HERO],
+      createdHero: [HERO],
+      mutated: [ESCROW, GEM, SHIELD, SWORD].sort(),
+      deleted: [[GONE, 7n]],
+      transferred: [[SWORD, "AddressOwner", "AddressOwner"], [SHIELD, "AddressOwner", "Immutable"], [GEM, "AddressOwner", "ObjectOwner"]].sort(),
+      balance: -1005n,
+      gas: 2_020_000n
+    } as never)
+  })
+
+  test("expectCreated answers the one ref, and UnexpectedEffects for none or many", async () => {
+    const executed = executedOf(effects)
+    expect((await Effect.runPromise(executed.expectCreated(HERO_TYPE))).id).toBe(ObjectId.make(HERO))
+    const none = await Effect.runPromise(Effect.flip(executed.expectCreated(`${PKG}::hero::Missing`)))
+    expect([none._tag, none.found]).toEqual(["UnexpectedEffects", []])
+    const two = executedOf({ created: [effects.created![0]!, { objectId: PADDED("4e71"), type: HERO_TYPE }] })
+    expect((await Effect.runPromise(Effect.flip(two.expectCreated(HERO_TYPE)))).found).toHaveLength(2)
+  })
+
+  test("transferred: a consensus object whose start version moved, or an owner that stayed, is not a transfer", () => {
+    const change = (inputOwner: unknown, outputOwner: unknown) => ({
+      objectId: PADDED("1"), inputState: "Exists", inputVersion: "1", inputDigest: "d", inputOwner,
+      outputState: "ObjectWrite", outputVersion: "2", outputDigest: "e", outputOwner, idOperation: "None"
+    })
+    const consensus = (startVersion: string) => ({ $kind: "ConsensusAddressOwner", ConsensusAddressOwner: { startVersion, owner: SENDER } })
+    const transferred = (changes: ReadonlyArray<unknown>) =>
+      Effect.runSync(Executed.fromPartial({ digest: DIGEST, effects: { changedObjects: changes } })).transferred()
+    expect(transferred([change(ownedBy(SENDER), ownedBy(SENDER))])).toEqual([])
+    expect(transferred([change(consensus("1"), consensus("2"))])).toEqual([])
+    expect(transferred([change(ownedBy(SENDER), consensus("2"))])).toHaveLength(1)
+  })
+
+  test("a wrapped object is deleted() and wrapped(); a deletion only deleted()", () => {
+    const wrap = {
+      objectId: ESCROW, inputState: "Exists", inputVersion: "3", inputDigest: DIGEST, inputOwner: ownedBy(SENDER),
+      outputState: "DoesNotExist", outputVersion: null, outputDigest: null, outputOwner: null, idOperation: "None"
     }
-  }
-  return (
-    success
-      ? { $kind: "Transaction", Transaction: transaction }
-      : { $kind: "FailedTransaction", FailedTransaction: transaction }
-  ) as unknown as SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
-}
+    const of = (change: unknown) => Effect.runSync(Executed.fromPartial({ digest: DIGEST, effects: { changedObjects: [change] } }))
+    expect([of(wrap).deleted().length, of(wrap).wrapped().length]).toEqual([1, 1])
+    const deletion = { ...wrap, idOperation: "Deleted" }
+    expect([of(deletion).deleted().length, of(deletion).wrapped().length]).toEqual([1, 0])
+  })
+})
 
-const decode = (success: boolean) =>
-  Effect.runSync(Effect.result(fromTransactionResult(result(success))))
+describe("events", () => {
+  const PostedBcs = bcs.struct("Posted", { index: bcs.u64(), author: bcs.Address })
+  const Posted = suiSchemaBcs(PostedBcs, `${PKG}::board::Posted`)
+  const Wrapped = suiSchemaBcs(bcs.struct("Wrapped", { value: bcs.u64() }), `${PKG}::board::Wrapped`)
+  const posted = (index: number) => ({
+    packageId: PKG, module: "board", sender: SENDER, eventType: `${PKG}::board::Posted`,
+    bcs: PostedBcs.serialize({ index: String(index), author: SENDER }).toBytes()
+  })
+  const wrapped = { packageId: PKG, module: "board", sender: SENDER, eventType: `${PKG}::board::Wrapped<0x2::sui::SUI>`, bcs: bcs.u64().serialize("9").toBytes() }
 
-const executed = (): Executed => {
-  const value = decode(true)
-  if (!Result.isSuccess(value)) throw new Error(`fixture did not decode: ${JSON.stringify(value.failure)}`)
-  return value.success
-}
-
-describe("Executed", () => {
-  test("decodes a successful execute response", () => {
-    expect(executed().digest).toBe(DIGEST as never)
-    expect(executed().checkpoint).toBe(88n)
-    expect(executed().timestampMs).toBe(1_700_000_000_000)
+  test("eventsOf selects by the codec's type, a bare tag matching every instantiation, in emission order", async () => {
+    const executed = executedOf({ events: [posted(1), wrapped, posted(2)] })
+    expect((await Effect.runPromise(executed.eventsOf(Posted))).map((event) => event.index)).toEqual(["1", "2"])
+    expect((await Effect.runPromise(executed.eventsOf(Wrapped))).map((event) => event.value)).toEqual(["9"])
+    expect(await Effect.runPromise(executedOf({}).eventsOf(Posted))).toEqual([])
+    expect(await Effect.runPromise(executed.eventsOf(suiSchemaBcs(PostedBcs), `${PKG}::board::Posted`))).toHaveLength(2)
   })
 
-  test("created joins objectTypes and ignores accumulator writes and packages", () => {
-    const created = executed().created()
-    expect(created.map((ref) => ref.id)).toEqual([RECEIPT as never])
-    expect(created[0]?.type).toBe("0x0000000000000000000000000000000000000000000000000000000000000002::escrow::Receipt" as never)
-    expect(created[0]?.version).toBe(9n as never)
-    expect(created[0]?.owner?.$kind).toBe("AddressOwner")
+  test("a codec with no Move type is DecodeError { type }; bad bytes DecodeError { bytes }", async () => {
+    const executed = executedOf({ events: [posted(1)] })
+    expect((await Effect.runPromise(Effect.flip(executed.eventsOf(suiSchemaBcs(PostedBcs))))).kind).toBe("type")
+    const garbled = executedOf({ events: [{ ...posted(1), bcs: new Uint8Array([1, 2]) }] })
+    expect((await Effect.runPromise(Effect.flip(garbled.eventsOf(Posted)))).kind).toBe("bytes")
   })
 
-  test("created filters by type after normalization", () => {
-    expect(executed().created("0x2::escrow::Receipt")).toHaveLength(1)
-    expect(
-      executed().created(
-        "0x0000000000000000000000000000000000000000000000000000000000000002::escrow::Receipt"
-      )
-    ).toHaveLength(1)
-    expect(executed().created("0x2::escrow::Escrow")).toHaveLength(0)
+  test("expectEvent: exactly one, or UnexpectedEffects with the count", async () => {
+    expect((await Effect.runPromise(executedOf({ events: [posted(7)] }).expectEvent(Posted))).index).toBe("7")
+    const many = await Effect.runPromise(Effect.flip(executedOf({ events: [posted(1), posted(2)] }).expectEvent(Posted)))
+    expect(many._tag === "UnexpectedEffects" && many.found).toHaveLength(2)
   })
+})
 
-  test("mutated returns the objects changed in place", () => {
-    const mutated = executed().mutated()
-    expect(mutated.map((ref) => ref.id)).toEqual([ESCROW as never])
-  })
-
-  test("deleted returns refs carrying the input version", () => {
-    const deleted = executed().deleted()
-    expect(deleted).toHaveLength(1)
-    expect(deleted[0]?.version).toBe(8n as never)
-  })
-
-  test("packagesPublished returns full refs, not bare ids", () => {
-    const published = executed().packagesPublished()
-    expect(published).toHaveLength(1)
-    expect(published[0]?.id).toBe(PACKAGE as never)
-    expect(published[0]?.version).toBe(9n as never)
-    expect(published[0]?.digest).toBe(fakeDigest(2))
-  })
-
-  test("a package whose type is the literal `package` still produces a ref", () => {
-    const raw = result(true)
-    const transaction = raw.$kind === "Transaction" ? raw.Transaction : raw.FailedTransaction
-    const patched = {
-      ...raw,
-      Transaction: {
-        ...transaction,
-        objectTypes: { ...transaction.objectTypes, [PACKAGE]: "package" }
-      }
-    } as unknown as SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
-    const value = Effect.runSync(Effect.result(fromTransactionResult(patched)))
-    expect(Result.isSuccess(value)).toBe(true)
-    if (Result.isSuccess(value)) {
-      const published = value.success.packagesPublished()
-      expect(published).toHaveLength(1)
-      expect(published[0]?.type).toBe("package")
-    }
-  })
-
-  test("expectCreated fails with UnexpectedEffects when many match", async () => {
-    const raw = result(true)
-    const transaction = raw.$kind === "Transaction" ? raw.Transaction : raw.FailedTransaction
-    const second = PADDED("4ecf")
-    const patched = {
-      ...raw,
-      Transaction: {
-        ...transaction,
+describe("expectPublished", () => {
+  const NEW_PKG = PADDED("9ac")
+  const CAP = PADDED("ca9")
+  test("a publish answers the package and the created cap; an upgrade the mutated cap; neither is UnexpectedEffects", async () => {
+    const published = (capOperation: string, types: Record<string, string>) =>
+      Effect.runSync(Executed.fromPartial({
+        digest: DIGEST,
         effects: {
-          ...transaction.effects,
-          changedObjects: [...transaction.effects.changedObjects, change({ objectId: second })]
+          changedObjects: [
+            { objectId: NEW_PKG, idOperation: "Created", outputState: "PackageWrite", outputVersion: "1" },
+            { objectId: CAP, idOperation: capOperation, inputState: capOperation === "None" ? "Exists" : "DoesNotExist", outputState: "ObjectWrite" }
+          ]
         },
-        objectTypes: { ...transaction.objectTypes, [second]: "0x2::escrow::Receipt" }
-      }
-    } as unknown as SuiClientTypes.TransactionResult<typeof EXECUTE_INCLUDE>
-    const value = Effect.runSync(Effect.result(fromTransactionResult(patched)))
-    if (!Result.isSuccess(value)) throw new Error("fixture did not decode")
-    const error = await Effect.runPromise(
-      value.success.expectCreated("0x2::escrow::Receipt").pipe(Effect.flip)
-    )
-    expect(error._tag).toBe("UnexpectedEffects")
-    expect(error.found).toHaveLength(2)
-  })
-
-  test("balanceChange sums every delta for an address and coin type", () => {
-    expect(
-      executed().balanceChange(SuiAddress.make(ALICE), CoinType.make("0x2::sui::SUI"))
-    ).toBe(-750n)
-  })
-
-  test("gasUsedTotal is computation plus storage less rebate", () => {
-    expect(executed().gasUsedTotal).toBe(2_020_000n)
-  })
-
-  test("expectCreated returns the single ref", async () => {
-    const ref = await Effect.runPromise(executed().expectCreated("0x2::escrow::Receipt"))
-    expect(ref.id).toBe(RECEIPT as never)
-  })
-
-  test("expectCreated fails with UnexpectedEffects when nothing matches", async () => {
-    const exit = await Effect.runPromiseExit(executed().expectCreated("0x2::escrow::Missing"))
-    expect(Exit.isFailure(exit)).toBe(true)
-    const error = await Effect.runPromise(
-      executed().expectCreated("0x2::escrow::Missing").pipe(Effect.flip)
-    )
-    expect(error._tag).toBe("UnexpectedEffects")
-    expect(error.found).toEqual([])
-  })
-
-  test("a failed transaction becomes ExecutionFailed, never an Executed", () => {
-    const value = decode(false)
-    expect(Result.isFailure(value)).toBe(true)
-    if (Result.isFailure(value)) {
-      expect(value.failure._tag).toBe("ExecutionFailed")
-      if (value.failure._tag === "ExecutionFailed") {
-        expect(value.failure.command).toBe(1)
-        expect(value.failure.reason.$kind).toBe("MoveAbort")
-      }
+        objectTypes: types
+      }))
+    const types = { [NEW_PKG]: "package", [CAP]: "0x2::package::UpgradeCap" }
+    for (const operation of ["Created", "None"]) {
+      const answer = await Effect.runPromise(published(operation, types).expectPublished())
+      expect([answer.packageId, answer.upgradeCap.id, answer.package.type]).toEqual([ObjectId.make(NEW_PKG), ObjectId.make(CAP), "package"] as never)
     }
+    expect((await Effect.runPromise(Effect.flip(executedOf({}).expectPublished()))).expected).toBe("exactly one published package")
+    expect((await Effect.runPromise(Effect.flip(published("Created", { [NEW_PKG]: "package" }).expectPublished()))).expected).toBe(
+      "exactly one 0x2::package::UpgradeCap"
+    )
   })
 })
 
-/**
- * NB4: `DecodeError.issue` is one sentence; `issues` is the structured tree,
- * with every issue reported rather than only the first.
- */
-describe("DecodeError.issues", () => {
-  test("Executed.fromPartial reports one entry per bad field, with its path", async () => {
-    const result = await Effect.runPromise(
-      Effect.result(
-        Executed.fromPartial({
-          digest: DIGEST,
-          objectTypes: { [RECEIPT]: 5, [ESCROW]: 7 },
-          effects: {}
-        })
-      )
-    )
-    expect(result._tag).toBe("Failure")
-    if (result._tag !== "Failure") return
-    expect(result.failure.kind).toBe("shape")
-    expect(result.failure.issues).toHaveLength(2)
-    expect(result.failure.issues?.map((issue) => issue.path)).toEqual([
-      ["objectTypes", RECEIPT],
-      ["objectTypes", ESCROW]
-    ])
-    // `issue` still describes exactly **one** issue. `{ errors: "all" }` makes
-    // the formatter join every issue into one paragraph, and `issue` is the
-    // sentence a human reads, so it is cut back to the first block: the
-    // message plus the indented `at [...]` line under it, and nothing after.
-    expect(result.failure.issue).toBe(
-      `this is not an execute envelope Executed can be built from: Expected string\n  at ["objectTypes"]["${RECEIPT}"]`
-    )
-    expect(result.failure.issue.split("\n")).toHaveLength(2)
-    expect(result.failure.issue.endsWith(`["${ESCROW}"]`)).toBe(false)
-    // And its first line carries the first entry of `issues`.
-    expect(result.failure.issue.split("\n")[0]).toEndWith(
-      result.failure.issues?.[0]?.message ?? ""
-    )
+describe("decoding", () => {
+  test("a failed transaction is ExecutionFailed with its reason and command, never an Executed", () => {
+    const failed = Effect.runSync(Effect.result(fromTransactionResult(transactionResultOf(DIGEST, FakeOutcome.failWith({
+      $kind: "MoveAbort", message: "MoveAbort", command: 1, MoveAbort: { abortCode: "3", location: { module: "escrow", functionName: "claim" } }
+    } as unknown as SuiClientTypes.ExecutionError)) as never)))
+    const error = Result.isFailure(failed) ? failed.failure : undefined
+    expect(error?._tag === "ExecutionFailed" && [error.reason.$kind, error.command]).toEqual(["MoveAbort", 1])
   })
 
-  test("a single-issue failure is byte-identical to what 0.1.2 produced", async () => {
-    // The check message NB3 did not touch, so this string can be compared to
-    // 0.1.2's output directly: `{ errors: "all" }` must not have changed it.
-    const result = await Effect.runPromise(
-      Effect.result(Executed.fromPartial({ digest: "zz", effects: {} }))
-    )
-    expect(result._tag).toBe("Failure")
-    if (result._tag !== "Failure") return
-    expect(result.failure.issue).toBe(
-      "this is not an execute envelope Executed can be built from: " +
-        `Expected a base58 32-byte transaction digest\n  at ["digest"]`
-    )
-    // Two fields failed on the same rule, and `issues` says so while `issue`
-    // stays one sentence.
-    expect(result.failure.issues?.map((issue) => issue.path)).toEqual([
-      ["digest"],
-      ["effects", "transactionDigest"]
-    ])
+  test("fromPartial accepts a relay's reduced envelope, leaving what it was not told Unknown", async () => {
+    const executed = await Effect.runPromise(Executed.fromPartial({
+      digest: DIGEST,
+      sender: "0x2",
+      checkpoint: 42,
+      timestampMs: "1700000000000",
+      objectTypes: { [HERO]: HERO_TYPE },
+      balanceChanges: [{ coinType: SUI, address: SENDER, amount: -5 }],
+      events: [{ packageId: PKG, module: "board", sender: SENDER, eventType: `${PKG}::board::Posted`, bcs: toBase64(new Uint8Array([1, 2, 3])) }],
+      effects: { changedObjects: [{ objectId: HERO, idOperation: "Created", outputVersion: 4 }] }
+    }))
+    expect(executed.created(HERO_TYPE)[0]?.version).toBe(Version.make(4n))
+    expect(executed.effects.changedObjects[0]?.inputState).toBe("Unknown")
+    expect([executed.sender, executed.checkpoint, executed.timestampMs]).toEqual([SuiAddress.make(PADDED("2")), 42n, 1_700_000_000_000])
+    expect(executed.events[0]?.bcs).toEqual(new Uint8Array([1, 2, 3]))
+    expect(executed.balanceChange(SuiAddress.make(SENDER), SUI)).toBe(-5n)
+  })
+
+  test("fromPartial reports every bad field in issues, and one sentence in issue", async () => {
+    const error = await Effect.runPromise(Effect.flip(Executed.fromPartial({ digest: DIGEST, objectTypes: { [HERO]: 5, [ESCROW]: 7 }, effects: {} })))
+    expect(error.kind).toBe("shape")
+    expect(error.issues?.map((issue) => issue.path)).toEqual([["objectTypes", HERO], ["objectTypes", ESCROW]])
+    expect(error.issue.split("\n")).toHaveLength(2)
+    expect((await Effect.runPromiseExit(Executed.fromPartial({ effects: {} })))._tag).toBe("Failure")
   })
 })

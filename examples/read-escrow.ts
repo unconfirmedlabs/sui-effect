@@ -19,7 +19,7 @@ const Escrow = SuiSchema.bcs(
   `${PACKAGE}::escrow::Escrow`
 )
 
-/** The program itself, exported so a test can run it against the fake. */
+/** The program itself, exported so a test can run it over scripted answers. */
 export const program = Effect.gen(function*() {
   const sui = yield* Sui
   const id = yield* Config.schema(ObjectId, "ESCROW_ID")

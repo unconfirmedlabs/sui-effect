@@ -1,9 +1,9 @@
 /**
- * Regressions from the 0.5.0 pre-merge review of the durable journal's settled
- * markers: a terminal put racing an unresolved put of the same digest (another
- * tab, another extension context), and a listing whose re-read fails after it
- * wrote a marker. Both hid a `Signed` entry from `listUnresolved` before the
- * fix.
+ * The durable journal under races and faults: a terminal put racing an
+ * unresolved put of the same digest (another tab, another extension context),
+ * a listing whose re-read fails after it wrote a marker — both hid a `Signed`
+ * entry from `listUnresolved` before they were fixed — and a terminal write
+ * that fails.
  */
 import { describe, expect, test } from "bun:test"
 import { DateTime, Effect, Option } from "effect"
@@ -11,7 +11,7 @@ import { KeyValueStore } from "effect/persistence"
 import { JournalEntry } from "../src/domain/journal-entry.ts"
 import { Digest, Signature, SuiAddress } from "../src/domain/schemas.ts"
 import { make } from "../src/services/JournalKeyValueStore.ts"
-import { fakeDigest } from "../src/services/SuiCoreFake.ts"
+import { fakeDigest } from "../src/testing.ts"
 
 type KV = KeyValueStore.KeyValueStore
 const SENDER = SuiAddress.make(`0x${"ab".repeat(32)}`)
@@ -104,5 +104,24 @@ describe("a listing that marks an unmarked settled entry", () => {
     }))
     expect(out.stage).toBe(2)
     expect(out.listed).toEqual([d(1)])
+  })
+})
+
+describe("a terminal write that fails", () => {
+  test("leaves the Signed entry unresolved for recovery, under its one key", async () => {
+    const { kv, data } = memStore()
+    let failing = false
+    const journal = make(wrap(kv, (phase, method) => failing && phase === "before" && method === "set" ? Effect.fail(crash("set")) : Effect.void))
+    const outcome = await Effect.runPromise(Effect.gen(function*() {
+      yield* journal.put(signedEntry(2))
+      failing = true
+      const crashed = yield* Effect.result(journal.put(executedEntry(2)))
+      failing = false
+      return { crashed, entry: yield* journal.get(d(2)), unresolved: yield* journal.listUnresolved }
+    }))
+    expect(outcome.crashed._tag).toBe("Failure")
+    expect(Option.map(outcome.entry, (entry) => entry._tag)).toEqual(Option.some("Signed"))
+    expect(tags(outcome.unresolved)).toEqual([d(2)])
+    expect([...data.keys()]).toEqual([`entry:${d(2)}`])
   })
 })

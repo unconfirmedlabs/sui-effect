@@ -223,7 +223,7 @@ const parseSafe = (value: string): ReturnType<typeof parseStructTag> | undefined
  *
  * One rule, used everywhere a Move type is checked — the BCS bridge, the
  * `expectedType` option of `Sui.getObject`, `getObjectOption` and `getObjects`,
- * `SuiSchema.decode`, and the fake's owned-object filter:
+ * `SuiSchema.decode`, and the scripted `SuiCore`'s owned-object filter:
  *
  * - **An expected tag with no type arguments names the generic itself**, so
  *   `pkg::m::Composition` matches every instantiation:

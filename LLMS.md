@@ -9,8 +9,9 @@ repository. Do not edit it by hand; a test fails when it is stale.
 @unconfirmed/sui-effect is a light Effect v4 wrapper around the official
 `@mysten/sui` SDK that makes it safer to use: `SuiCore` mirrors the SDK's Core
 API one-to-one, `Sui` adds decoded reads, a closed error union on every
-function, the transaction lifecycle as functions with typed outcomes, and an
-in-memory fake chain so every test runs with no network.
+function, the transaction lifecycle as functions with typed outcomes, and a
+scripted `SuiCore` for tests that answers reads from plain values and never
+pretends to be a chain.
 
 ```bash
 bun add @unconfirmed/sui-effect
@@ -34,13 +35,15 @@ examples come last.
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
 | `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `verifySponsored`, `submit`, `submitVia`, `reconcile`, `resubmit`, `run`, `reconcileAll`, `withSenderLock`), `Signer` and its constructors (`fromKeypair`, `fromSdkSigner`, `fromSecretKey`, `fromMnemonic`, `generateMnemonic`, `derivationPath`, `ephemeral`, `remote`, `zkLogin`, `multisig`, `alias`), `Prepared` (what `Tx.run`'s `approve` is shown), `AddressAlias` / `AddressAliases`, `Verify`, `verifySponsored`, `SubmitConfig`, `Journal`, `JournalEntry`, `FoldBatch` / `FoldPlan` / `FoldResult` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest`, `testSubmitConfig`, `TestServices`; the fake models address balances (`SuiTest.setAddressBalance`) and address alias sets (`FakeScript.addressAliases`, `SuiTest.setAddressAliases`) |
+| `@unconfirmed/sui-effect/testing` | `layerTest(script)` (the real `Sui` over `ScriptedSuiCore`, a `SuiCore` answering from a `FakeScript`: objects, dynamic fields, address balances, the clock, and scripted execute/simulate answers in order; it never applies or validates a transaction), `SuiTest` (`putObject`, `setClock`, `setAddressBalance`, `scriptExecute`, `scriptSimulate`, `calls`, `provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `FakeOutcome`, `fakeCoin`, `fakeDigest`, `testSubmitConfig`, `TestServices` |
 
 ## Recipes
 
-Each one is a file in this repository that typechecks and runs against the fake
-(`test/recipes.test.ts`); the relative `src/` imports are shown as the package
-subpaths they are.
+Each one is a file in this repository that typechecks. Those about decoding,
+mapping or failure handling run over scripted answers (`test/recipes.test.ts`);
+those about what a validator does run against a localnet
+(`test/live.localnet-recipes.test.ts`, behind `SUI_LOCALNET=1`). The relative
+`src/` imports are shown as the package subpaths they are.
 
 Read an object:
 
@@ -112,36 +115,30 @@ export const foldAll = (signer: Signer) =>
   )
 ```
 
-The explicit lifecycle, for a sponsored transaction, and the coin-paid alternative:
+The explicit lifecycle, for a sponsored transaction, and the same in one process:
 
 ```ts
 // The explicit lifecycle, for two parties: the sender signs, the sponsor pays.
 import { Effect } from "effect"
-import type { ObjectId } from "@unconfirmed/sui-effect"
+import type { SuiAddress } from "@unconfirmed/sui-effect"
 import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
-
-const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
 
 // `Tx.sponsored` sets sender, gas owner and an empty gas payment: gas comes from the sponsor's
 // SUI ADDRESS balance, which must cover the budget or `Tx.build` fails with `BuildError` before
 // anything is signed. Fund it from a coin with `coin::into_balance` + `balance::send_funds<SUI>`.
-export const sponsoredIncrement = (sender: Signer, sponsor: Signer, counter: ObjectId) =>
+export const sponsoredSend = (sender: Signer, sponsor: Signer, recipient: SuiAddress, amount: bigint) =>
   Effect.gen(function*() {
     const parties = { sender: sender.address, gasOwner: sponsor.address }
-    const recipe = Tx.sponsored(parties)((tx) => {
-      tx.moveCall({ target: `${PKG}::counter::increment`, arguments: [tx.object(counter)] })
-    })
-    const built = yield* Tx.build(recipe, parties)
+    const built = yield* Tx.build(Tx.sponsored(parties)(Tx.sendFunds({ amount, recipient })), parties)
     const signed = yield* Tx.cosign(yield* Tx.sign(built, sender), sponsor)
     return yield* Tx.submit(signed)
   })
 
-// The coin-paid alternative, both signers in one process: no `Tx.sponsored`, just a gas owner.
-// Gas is the sponsor's coins, so `Tx.run` also takes the sponsor's lock (only when coins pay).
-export const coinPaidIncrement = (sender: Signer, sponsor: Signer, counter: ObjectId) =>
-  Tx.run((tx) => {
-    tx.moveCall({ target: `${PKG}::counter::increment`, arguments: [tx.object(counter)] })
-  }, { signer: sender, sponsor, gasOwner: sponsor.address })
+// Both signers in one process: no `Tx.sponsored`, just a gas owner. Gas comes from the
+// sponsor's address balance when it covers the budget and from its coins otherwise, and
+// `Tx.run` also takes the sponsor's sender lock when its coins pay.
+export const sponsoredRun = (sender: Signer, sponsor: Signer, recipient: SuiAddress, amount: bigint) =>
+  Tx.run(Tx.sendFunds({ amount, recipient }), { signer: sender, sponsor, gasOwner: sponsor.address })
 ```
 
 A stateless sponsor service, handed someone else's bytes:
@@ -380,10 +377,10 @@ export const indexPosts = <E>(
   })
 ```
 
-A test on the fake:
+A test over the scripted `SuiCore`:
 
 ```ts
-// A test on the in-memory fake: the real `Sui` over a scripted `SuiCore`, no network.
+// A test over the scripted SuiCore: the real `Sui`, objects served from a script, no network.
 import { expect, test } from "bun:test"
 import { bcs } from "@mysten/sui/bcs"
 import { Effect, Option } from "effect"
@@ -394,7 +391,7 @@ const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
 const CounterBcs = bcs.struct("Counter", { id: bcs.Address, value: bcs.u64() })
 const Counter = SuiSchema.bcs(CounterBcs, `${PKG}::counter::Counter`)
 
-test("a counter the fake serves decodes, and a missing one is None", async () => {
+test("a counter the script serves decodes, and a missing one is None", async () => {
   const id = ObjectId.normalize("0xc0")
   const content = CounterBcs.serialize({ id, value: 7n }).toBytes()
   const [found, missing] = await Effect.gen(function*() {
@@ -723,26 +720,25 @@ The full entries follow under "API".
 
 ### `@unconfirmed/sui-effect/testing`
 
-- `CLOCK_TYPE` — The Move type of the Clock object.
-- `ClockBcs` — The BCS layout of `0x2::clock::Clock`.
-- `DEFAULT_EPOCH` — The epoch the fake reports when a script does not set one.
-- `FakeBalance` — A balance the fake serves, optionally for one owner.
-- `FakeChange` — A created, mutated or deleted object in a scripted execution.
-- `FakeEvent` — An event in a scripted execution: the SDK's `SuiClientTypes.Event` with `json` **optional**, because the library's own `Event` treats it as the node's rendering and never reads it.
-- `FakeExecution` — What a scripted success returns.
-- `FakeObject` — An object the fake serves.
-- `FakeOutcome` — One scripted outcome of a call.
-- `FakeScript` — Everything the fake serves.
-- `FakeUnimplemented` — Thrown, and re-thrown as a defect, when a test reaches an unscripted method.
-- `RecordedCall` — One call the fake received, in order.
-- `SuiCoreFake` — The in-memory `SuiCore`.
-- `SuiCoreFakeState` — What a test can do to the fake while it runs.
-- `SuiTest` — The harness: everything a test needs to drive the fake from inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
-- `TestServices` — What `layerTest` provides, under one name: `Sui`, `SuiCore` and the fake's handle, `SuiCoreFake`.
-- `fakeCoin` — A gas coin for `FakeScript.coins`, in the SDK's `SuiClientTypes.Coin` shape, with the fields a fixture rarely cares about filled in: `coinType` defaults to SUI, `version` to 1 and `digest` to a `fakeDigest`.
-- `fakeDigest` — A deterministic base58 32-byte digest, for fixtures, already branded as a `Digest` so it compares with `executed.digest` and fills any field typed `Digest` without a cast.
-- `layerTest` — The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test can script outcomes and inspect what the fake received.
-- `testSubmitConfig` — The lifecycle settings every test layer puts in force: `SubmitConfig.defaults` with the re-send schedule a fake has no use for taken out: re-sends of identical bytes follow each other with no delay (still `resubmitAttempts` of them), so a test that drives a `SubmissionUnknown` takes milliseconds on the real clock — it took seconds on the production schedule — and needs no `TestClock.adjust` for the re-sends.
+- `DEFAULT_CHAIN_ID` — The chain identifier the responder reports when the script names none.
+- `DEFAULT_EPOCH` — The epoch the responder reports when the script names none.
+- `FakeChange` — An object a scripted answer reports as created, mutated or deleted.
+- `FakeEvent` — An event in a scripted answer; `json` is optional.
+- `FakeExecution` — The effects a scripted execute or simulate answer reports.
+- `FakeObject` — An object the responder serves: its exact Move type and BCS content.
+- `FakeOutcome` — One scripted answer of `executeTransaction` or `simulateTransaction`.
+- `FakeScript` — Everything the responder answers.
+- `RecordedCall` — One call the responder received.
+- `ScriptedSuiCore` — The scripted `SuiCore`: `SuiCore.layerFromClient` over an SDK `CoreClient` whose reads answer from a `FakeScript`, so the production `SuiCore` (error mapping, read retries, request timeouts, spans) runs over it.
+- `ScriptedSuiCoreService` — The handle a test drives the responder with.
+- `SuiTest` — The helpers that drive the responder from inside an Effect.
+- `TestServices` — What `layerTest` provides: `Sui`, `SuiCore` and the responder's handle.
+- `Unscripted` — Thrown, and re-thrown by `SuiCore` as a defect, when a test reaches an unscripted method.
+- `fakeCoin` — A `0x2::coin::Coin<T>` object with real BCS content, owned by `owner`: `listCoins` and `getBalance`'s `coinBalance` read it like any other object.
+- `fakeDigest` — A deterministic base58 32-byte digest, for fixtures, already branded as a `Digest`.
+- `layerTest` — The real `Sui` over the scripted `SuiCore`, with `testSubmitConfig` in force.
+- `testSubmitConfig` — The lifecycle settings every test layer puts in force: `SubmitConfig.defaults` with a re-send schedule that does not wait, so a test that drives a `SubmissionUnknown` does not sleep on the real clock.
+- `transactionResultOf` — The SDK `TransactionResult` a scripted success or failure stands for, for the transaction with this digest.
 
 # API
 
@@ -2765,8 +2761,8 @@ export interface SuiCoreService {
     };
     /**
      * The transport's build plugin, which the transaction builder needs to
-     * resolve inputs. A pure value constructor, wrapped in an Effect only so the
-     * fake can refuse it. Never fails.
+     * resolve inputs. A pure value constructor, wrapped in an Effect so a stub
+     * can stand in for it. Never fails.
      */
     readonly resolveTransactionPlugin: () => Effect.Effect<TransactionPlugin>;
     /**
@@ -3112,7 +3108,7 @@ Whether an object's type tag satisfies an expected type.
 
 One rule, used everywhere a Move type is checked — the BCS bridge, the
 `expectedType` option of `Sui.getObject`, `getObjectOption` and `getObjects`,
-`SuiSchema.decode`, and the fake's owned-object filter:
+`SuiSchema.decode`, and the scripted `SuiCore`'s owned-object filter:
 
 - **An expected tag with no type arguments names the generic itself**, so
   `pkg::m::Composition` matches every instantiation:
@@ -6713,26 +6709,15 @@ same `prefix`. The dead `index` key a 0.3 journal kept is not touched.
 ## `@unconfirmed/sui-effect/testing`
 
 
-20 exported symbols.
+19 exported symbols.
 
-### `CLOCK_TYPE` (const)
-
-```ts
-declare const CLOCK_TYPE = "0x2::clock::Clock"
-```
-
-The Move type of the Clock object.
-
-### `ClockBcs` (const)
+### `DEFAULT_CHAIN_ID` (const)
 
 ```ts
-declare const ClockBcs: import("@mysten/bcs").BcsStruct<{
-    id: import("@mysten/bcs").BcsType<string, string | Uint8Array<ArrayBufferLike>, "bytes[32]">;
-    timestamp_ms: import("@mysten/bcs").BcsType<string, string | number | bigint, "u64">;
-}, string>
+declare const DEFAULT_CHAIN_ID = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
 ```
 
-The BCS layout of `0x2::clock::Clock`.
+The chain identifier the responder reports when the script names none.
 
 ### `DEFAULT_EPOCH` (const)
 
@@ -6740,29 +6725,7 @@ The BCS layout of `0x2::clock::Clock`.
 declare const DEFAULT_EPOCH = 100n
 ```
 
-The epoch the fake reports when a script does not set one.
-
-### `FakeBalance` (interface)
-
-```ts
-export interface FakeBalance extends SuiClientTypes.Balance {
-    readonly owner?: string;
-}
-```
-
-A balance the fake serves, optionally for one owner.
-
-`owner` is the address this balance belongs to. Left out, the entry answers
-for **any** owner, which is what every script written before 0.1.2 assumed.
-
-Since 0.4.0 `addressBalance` is a **seed**, not a constant: it is the
-starting value of the fake's address balance for that owner and coin type,
-which an execution then moves (gas paid from the balance, `FundsWithdrawal`
-debits, `send_funds` deposits) and `SuiTest.setAddressBalance` replaces. An
-owner-specific entry seeds its owner; otherwise the first owner-less entry of
-the coin type seeds every owner. `coinBalance` is served as written, and
-`balance` is served as `balance - addressBalance + <current address balance>`,
-so an entry nothing has touched comes back verbatim.
+The epoch the responder reports when the script names none.
 
 ### `FakeChange` (interface)
 
@@ -6770,46 +6733,19 @@ so an entry nothing has touched comes back verbatim.
 export interface FakeChange {
     readonly objectId: string;
     readonly type: string;
+    /** The output version; defaults to 2. */
     readonly version?: bigint;
-    /**
-     * The version this transaction took the object at, which is what
-     * `Tx.reconcile` reads to decide that a **different** transaction consumed
-     * the version a set of bytes pinned.
-     *
-     * Sui stamps every output with the transaction's Lamport version —
-     * `max(input versions) + 1` across all of its inputs — so the input version
-     * is not "the output version minus one" on a real network, and a test that
-     * means "this transaction consumed version 3" has to say 3. It defaults to
-     * `version - 1` for a mutated or deleted object, and is `null` for a created
-     * one.
-     */
+    /** The version the transaction took the object at; defaults to `version - 1`, `null` when created. */
     readonly inputVersion?: bigint;
     readonly owner?: SuiClientTypes.ObjectOwner;
-    /**
-     * The owner going **in**, for a transaction that moved the object: a transfer
-     * is `inputOwner` the sender and `owner` the recipient, which is what
-     * `checkClaims` and `transferred()` (on `Simulation` and `Executed`) read.
-     * Defaults to `owner`, an object that stayed put.
-     *
-     * @since 0.5.0
-     */
+    /** The owner going in; defaults to `owner`. */
     readonly inputOwner?: SuiClientTypes.ObjectOwner;
-    /** `PackageWrite` marks a published package; `AccumulatorWriteV1` an accumulator write. */
+    /** `PackageWrite` marks a published package. */
     readonly outputState?: SuiClientTypes.ChangedObject["outputState"];
-    /**
-     * The balance this coin has **after** the transaction, in MIST.
-     *
-     * Only meaningful for a `0x2::coin::Coin<...>`: a created coin joins the
-     * fake's coin set with this balance and a mutated one has its balance
-     * rewritten, so a test that splits a coin and then builds again sees the gas
-     * selection the split left behind. Leave it out for anything that is not a
-     * coin.
-     */
-    readonly balance?: bigint;
 }
 ```
 
-A created, mutated or deleted object in a scripted execution.
+An object a scripted answer reports as created, mutated or deleted.
 
 ### `FakeEvent` (type)
 
@@ -6819,65 +6755,26 @@ export type FakeEvent = Omit<SuiClientTypes.Event, "json"> & {
 };
 ```
 
-An event in a scripted execution: the SDK's `SuiClientTypes.Event` with
-`json` **optional**, because the library's own `Event` treats it as
-the node's rendering and never reads it. Leave it out; give it only to test
-code that reads `event.json` off a listing.
+An event in a scripted answer; `json` is optional.
 
 ### `FakeExecution` (interface)
 
 ```ts
 export interface FakeExecution {
-    /**
-     * The transaction's digest. Leave it out for an `execute` outcome: the fake
-     * derives the digest from the bytes it was handed, as a node does, and an
-     * execute scripted with a **different** digest dies naming both. Give it for
-     * a `simulate` of an unbuilt transaction, for a transaction scripted by
-     * digest, or for a `getTransaction` answer.
-     */
-    readonly digest?: string;
     readonly created?: ReadonlyArray<FakeChange>;
     readonly mutated?: ReadonlyArray<FakeChange>;
     readonly deleted?: ReadonlyArray<FakeChange>;
-    /**
-     * The events the execution emitted. `json` may be left out (see
-     * `FakeEvent`); `bcs` is what `Executed.eventsOf` decodes.
-     */
     readonly events?: ReadonlyArray<FakeEvent>;
     readonly balanceChanges?: ReadonlyArray<SuiClientTypes.BalanceChange>;
-    /**
-     * The per-command results a simulation reports.
-     *
-     * Both arrays of `SuiClientTypes.CommandResult` are required on the wire and
-     * either may be left out here: a missing one defaults to empty, which is what
-     * the node reports for a command that returned nothing. Giving only
-     * `returnValues` used to fail the whole `Simulation` decode with an issue
-     * naming `mutatedReferences`, a field the test never mentioned.
-     */
+    /** Per-command results of a simulation; a missing array defaults to `[]`. */
     readonly commandResults?: ReadonlyArray<Partial<SuiClientTypes.CommandResult>>;
     readonly gasUsed?: SuiClientTypes.GasCostSummary;
     readonly checkpoint?: string;
     readonly timestampMs?: number;
-    /**
-     * The sender `listTransactions`' `sender` filter matches, for a transaction
-     * scripted by digest (`FakeScript.transactions`). A transaction the fake
-     * executed takes its sender from its bytes, and this is ignored.
-     *
-     * @since 0.4.0
-     */
-    readonly sender?: string;
-    /**
-     * The Move calls, as `package::module::function`, that `listTransactions`'
-     * `function` filter matches, for a transaction scripted by digest. A
-     * transaction the fake executed takes them from its bytes' commands.
-     *
-     * @since 0.4.0
-     */
-    readonly moveCalls?: ReadonlyArray<string>;
 }
 ```
 
-What a scripted success returns. Everything is optional and defaulted.
+The effects a scripted execute or simulate answer reports. Every field is optional.
 
 ### `FakeObject` (interface)
 
@@ -6888,36 +6785,18 @@ export interface FakeObject {
     readonly version: bigint;
     readonly content: Uint8Array;
     readonly digest?: string;
+    /** Defaults to `AddressOwner` `0x1`. */
     readonly owner?: SuiClientTypes.ObjectOwner;
-    /**
-     * The digest of the transaction that last mutated this object, served when
-     * the caller includes `previousTransaction`.
-     *
-     * This is the field `Tx.reconcile` reads to tell "someone else spent our
-     * input" from "we spent it ourselves and this node has not caught up", so a
-     * test that bumps a version has to say who bumped it. `undefined` models a
-     * node that will not say, which is evidence of nothing.
-     */
+    /** Served when the read includes `previousTransaction`; `null` otherwise. */
     readonly previousTransaction?: string;
-    /**
-     * The node's JSON rendering of the content, served when the caller includes
-     * `json` (`null` when this is left out, as a node with nothing to render
-     * answers).
-     *
-     * @since 0.5.0
-     */
+    /** Served when the read includes `json`; `null` when left out. */
     readonly json?: Record<string, unknown>;
-    /**
-     * The Display output, served when the caller includes `display` (`null` when
-     * this is left out: the type has no Display template).
-     *
-     * @since 0.5.0
-     */
+    /** Served when the read includes `display`; `null` when left out. */
     readonly display?: SuiClientTypes.Display;
 }
 ```
 
-An object the fake serves.
+An object the responder serves: its exact Move type and BCS content.
 
 ### `FakeOutcome` (type + const)
 
@@ -6934,45 +6813,30 @@ export type FakeOutcome = {
     readonly status: string;
     readonly message?: string;
 } | {
-    readonly _tag: "notFound";
-} | {
-    readonly _tag: "timeoutThen";
-    readonly found: boolean;
+    readonly _tag: "hang";
 };
 ```
 
-One scripted outcome of a call. The last entry of a script repeats forever.
+One scripted answer of `executeTransaction` or `simulateTransaction`.
 
 ```ts
 declare const FakeOutcome: {
-    /** The call succeeds with these effects. */
-    succeed: (value?: FakeExecution) => FakeOutcome;
+    /** The transaction succeeds with these effects. */
+    succeed: (value?: FakeExecution) => Extract<FakeOutcome, {
+        readonly _tag: "succeed";
+    }>;
     /**
-     * The call resolves with an on-chain failure (`FailedTransaction`).
-     *
-     * `reason` may be the SDK's `SuiClientTypes.ExecutionError` — the wire shape,
-     * with a top-level `message` and an `abortCode` **string** — or sui-effect's
-     * decoded `ExecutionReason`, whose `abortCode` is a `bigint` and which
-     * carries no `message`. The second is encoded into the first here; a value
-     * that is neither throws immediately, naming the two shapes, rather than
-     * failing a decode several calls later.
+     * The transaction fails on chain (`FailedTransaction`). `reason` is the
+     * SDK's `ExecutionError` or sui-effect's decoded `ExecutionReason`; the
+     * second is encoded into the first. Throws on a value that is neither.
      */
-    failWith: (reason: SuiClientTypes.ExecutionError | ExecutionReason, value?: FakeExecution) => FakeOutcome;
-    /**
-     * The call rejects with a gRPC status, as `RpcError` would. `message` is the
-     * node's text, for a test about what a refusal *says* — a validator's
-     * "already locked by a different transaction" is a `FAILED_PRECONDITION`
-     * whose message names the conflicting digest.
-     */
+    failWith: (reason: SuiClientTypes.ExecutionError | ExecutionReason, value?: FakeExecution) => Extract<FakeOutcome, {
+        readonly _tag: "failWith";
+    }>;
+    /** The call rejects with this gRPC status, as the SDK's `RpcError` does. */
     transportError: (status: string, message?: string) => FakeOutcome;
-    /** The call rejects the way a missing transaction does. */
-    notFound: () => FakeOutcome;
-    /**
-     * The call never settles until the caller's `AbortSignal` fires, then rejects
-     * with a `DEADLINE_EXCEEDED`. `found` says whether a later `getTransaction`
-     * for the same digest should find the transaction.
-     */
-    timeoutThen: (found: boolean) => FakeOutcome;
+    /** The call never answers; it rejects with `DEADLINE_EXCEEDED` once the caller's signal aborts. */
+    hang: () => FakeOutcome;
 }
 ```
 
@@ -6982,238 +6846,39 @@ Builders for `FakeOutcome`.
 
 ```ts
 export interface FakeScript {
+    /** Defaults to `DEFAULT_CHAIN_ID`. */
     readonly chainId?: string;
+    /** Defaults to `localnet`. */
     readonly network?: SuiClientTypes.Network;
+    /** The epoch `getCurrentSystemState` reports; defaults to `DEFAULT_EPOCH`. */
+    readonly epoch?: bigint;
+    /** Defaults to 1000. */
     readonly referenceGasPrice?: bigint;
-    /** The timestamp the Clock object `0x6` reports, in milliseconds. */
+    /** The timestamp the Clock object `0x6` reports, in milliseconds; defaults to 0. */
     readonly clockTimestampMs?: bigint;
     readonly objects?: ReadonlyArray<FakeObject>;
-    /**
-     * The coins `listCoins` serves and the fake's resolve plugin picks gas
-     * payment from. `type` is the full object type, `0x2::coin::Coin<T>`, the
-     * way the node reports it.
-     */
-    readonly coins?: ReadonlyArray<SuiClientTypes.Coin>;
-    /** The gas budget the resolve plugin sets when a transaction has none. */
-    readonly gasBudget?: bigint;
-    /**
-     * The balances `getBalance` and `listBalances` serve, and the seeds of the
-     * fake's **address balances**.
-     *
-     * Keyed by **owner and coin type**: an entry with an `owner` answers only for
-     * that address, and one without answers for any, which is what a script
-     * written before 0.1.2 meant. An owner-specific entry wins over an owner-less
-     * one of the same coin type.
-     *
-     * Since 0.4.0 the fake keeps one address balance per owner and coin type,
-     * seeded lazily from the entry's `addressBalance` (0 when no entry names the
-     * type) and moved by every execution it settles (see `FakeBalance`).
-     * For an owner and coin type no entry names, `coinBalance` is the sum of the
-     * owner's coins of that type in the fake's coin set and `balance` is that
-     * plus the address balance — so an address that holds none of the coin
-     * answers zero, the way a node does. `listBalances` serves the matching
-     * entries, then every coin type the owner holds coins of or has a non-zero
-     * address balance in that no entry names.
-     */
-    readonly balances?: ReadonlyArray<FakeBalance>;
-    /**
-     * Scripted outcomes for `getObject`, oldest first; the last repeats forever.
-     *
-     * This is transport-error injection on a **read**: `FakeOutcome.transportError`
-     * and `FakeOutcome.timeoutThen` are what it is for, and they are how a test
-     * drives `SuiCore`'s read retry policy or a program's own fallback.
-     * `FakeOutcome.notFound` answers the way a missing object does
-     * (`ObjectNotFound`). A `succeed` entry — and an empty or exhausted script —
-     * means "serve the object map", which is the normal behaviour.
-     *
-     * @since 0.1.2
-     */
-    readonly getObject?: ReadonlyArray<FakeOutcome>;
-    /**
-     * What `getCoinMetadata` answers, keyed by coin type.
-     *
-     * Unscripted, the method dies naming itself the way every uncovered method
-     * does. Scripted, a coin type the record does not name answers
-     * `{ coinMetadata: null }` — which is what a node says about a type that has
-     * no metadata object, and the case a program that formats balances has to
-     * handle.
-     *
-     * @since 0.1.1
-     */
-    readonly coinMetadata?: Readonly<Record<string, SuiClientTypes.CoinMetadata>>;
-    /**
-     * The dynamic fields of each parent, keyed by parent id.
-     *
-     * An entry of `$kind: "DynamicObject"` is a dynamic **object** field:
-     * `getDynamicObjectField` finds it by the key's own type and bytes (or by
-     * the `0x2::dynamic_object_field::Wrapper<…>` of that type, which is how a
-     * node lists it) and serves the object its `childId` names from the object
-     * map.
-     */
+    /** The dynamic fields of each parent, keyed by parent id. */
     readonly dynamicFields?: Readonly<Record<string, ReadonlyArray<SuiClientTypes.DynamicFieldEntry>>>;
     /**
      * The value `getDynamicField` serves for an entry of `dynamicFields`,
-     * keyed by that entry's **`fieldId`** (not by the parent, and not by the
-     * key). `type` is the value's Move type and `bcs` its BCS bytes — what
-     * `sui.getDynamicField(parent, name, { schema })` decodes. An entry with no
-     * value here is served with empty bytes and its own `valueType`, which
-     * decodes only as an empty layout. Dynamic **object** fields do not use it:
-     * their value is the object `childId` names in the object map.
+     * keyed by the entry's `fieldId`. An entry with none is served with empty
+     * bytes. A `DynamicObject` entry's value is the object its `childId` names.
      */
     readonly dynamicFieldValues?: Readonly<Record<string, SuiClientTypes.DynamicFieldValue>>;
-    /** How many items a list method returns per page. Defaults to 50. */
-    readonly pageSize?: number;
-    /**
-     * How many ledger items one `listEvents` or `listTransactions` request
-     * **examines**, matching or not. Unset, a request scans as far as it needs.
-     *
-     * This is the gRPC server's scan bound: with a filter that matches rarely, a
-     * page can come back short — even empty — with `hasNextPage: true`, and
-     * continuing from `endCursor` still makes progress. Set it to prove a
-     * consumer paginates on `hasNextPage` rather than on the item count.
-     *
-     * @since 0.4.0
-     */
-    readonly scanLimit?: number;
-    /**
-     * The SuiNS names the fake knows, name to target address.
-     * `resolveNameServiceAddress` answers `null` for a name the record does not
-     * hold, and `defaultNameServiceName` answers the **first** name that targets
-     * the address, or `null`. Unscripted, both die naming themselves.
-     *
-     * @since 0.4.0
-     */
-    readonly names?: Readonly<Record<string, string>>;
-    /**
-     * The epoch `getCurrentSystemState` reports. Defaults to
-     * `DEFAULT_EPOCH`.
-     *
-     * This one is defaulted rather than left to die unscripted, because it is an
-     * ambient fact about the chain the way `chainId` and the reference gas price
-     * are, not an outcome a test is asserting on: `Tx.build` reads it for every
-     * default `ValidDuring` expiration, which bounds a transaction to this epoch
-     * and the next. Set it when the epoch is what the test is about.
-     */
-    readonly epoch?: bigint;
+    /** Address balances; `coinType` defaults to SUI. An owner with none has zero. */
+    readonly addressBalances?: ReadonlyArray<{
+        readonly owner: string;
+        readonly coinType?: string;
+        readonly amount: bigint;
+    }>;
+    /** `simulateTransaction`'s answers, oldest first; the last repeats. */
     readonly simulate?: ReadonlyArray<FakeOutcome>;
-    /**
-     * What the resolve plugin's budget simulation answers during
-     * `transaction.build({ client })` — which `Tx.build` always reaches, since
-     * it sets no budget up front.
-     *
-     * The resolver simulates whenever the transaction has no gas budget yet, and
-     * that call is **always recorded** as a `simulateTransaction` with
-     * `resolver: true`, scripted or not. It is answered by this script when it
-     * has entries, else by the ordered `simulate` script (so
-     * `simulate: [FakeOutcome.failWith(...)]` surfaces through `Tx.build` too),
-     * else not at all, and the budget comes from `gasBudget`. Script
-     * `failWith` here to make `Tx.build` fail with `SimulationFailed` without
-     * touching the `simulate` script a later `approve` or `preflight` reads;
-     * `timeoutThen` blocks the build until it is interrupted.
-     *
-     * Since 0.5.0 it also answers, in turn, an ordinary `simulateTransaction`
-     * when the `simulate` script is empty: a test that scripted the build's
-     * simulation alone no longer dies with `FakeUnimplemented` on the preflight
-     * simulate after it. With neither script, that simulate still dies, naming
-     * `simulate` / `SuiTest.scriptSimulate`.
-     */
-    readonly buildSimulate?: ReadonlyArray<FakeOutcome>;
+    /** `executeTransaction`'s answers, oldest first; the last repeats. */
     readonly execute?: ReadonlyArray<FakeOutcome>;
-    readonly getTransaction?: ReadonlyArray<FakeOutcome>;
-    /**
-     * Transactions the node knows **by digest**, served before the ordered
-     * `getTransaction` script is consulted.
-     *
-     * The ordered script answers "what does the node say the next time it is
-     * asked", which is what a reconcile test drives. This answers "what does the
-     * node say about *that* transaction", which is what `Tx.reconcile` needs when
-     * it follows a pinned object's `previousTransaction` to find out which
-     * version the consuming transaction actually took: the answer has to depend
-     * on the digest, not on the call count.
-     *
-     * Give the consuming transaction's effects with an explicit `inputVersion` on
-     * the object in question — that equality is the whole of the
-     * `NotApplied { inputConsumed }` rule.
-     */
-    readonly transactions?: Readonly<Record<string, FakeOutcome>>;
-    /**
-     * How long `waitForTransaction` takes to see a transaction this fake
-     * executed, in **real** milliseconds, or `"never"`: the wait does not settle
-     * until the caller's `AbortSignal` fires (a `SubmitConfig.visibilityTimeout`
-     * on a `TestClock`, or an interruption). Unset, a transaction is visible the
-     * moment it executes.
-     *
-     * This is how a test reaches the window between "the node answered the
-     * execute" and "the transaction is visible to reads" — the window `Tx.submit`
-     * spends in its visibility wait, where an interrupt or a timeout must not
-     * lose the `Executed` it already has. Change it mid-test with
-     * `SuiTest.setVisibilityDelay`.
-     *
-     * @since 0.4.0
-     */
-    readonly visibilityDelay?: number | "never";
-    /**
-     * The history the node still holds, served through `client.ledgerService`
-     * the way a gRPC node serves `GetServiceInfo.lowestAvailableCheckpoint` and
-     * `GetEpoch.firstCheckpoint`.
-     *
-     * `Tx.reconcile` reads it before it calls a `getTransaction` miss evidence
-     * of expiry: a node that has pruned into a transaction's validity window
-     * misses transactions that did apply. `firstCheckpoints` is keyed by epoch;
-     * an epoch it does not name answers `NOT_FOUND`, the way a node that pruned
-     * the epoch does. Unscripted, the client has no `ledgerService` at all, which
-     * is what a JSON-RPC or GraphQL transport looks like.
-     *
-     * Scripted (`ledger: {}` is enough), the ledger service also answers
-     * `ListTransactions` with an `affectedAddress` predicate from the fake's
-     * transaction history — executed and `FakeScript.transactions` alike — which
-     * is what `Sui.streamTransactions({ affectedAddress })` reads (0.5.0). A
-     * transaction affects an address when the address sent it, a balance change
-     * names it, or an object it owned before or after changed.
-     *
-     * @since 0.4.0
-     */
-    readonly ledger?: {
-        readonly lowestAvailableCheckpoint?: bigint;
-        readonly firstCheckpoints?: Readonly<Record<string, bigint>>;
-    };
-    /**
-     * The read options the fake's `SuiCore` is built with — what
-     * `SuiCore.layerGrpc(..., { readRetry, requestTimeout })` would be given —
-     * so a test can prove a read, or `Tx.build`'s resolver retry, runs under a
-     * custom `readRetry`. Unscripted, the defaults.
-     *
-     * @since 0.4.0
-     */
-    readonly readOptions?: SuiCoreReadOptions;
-    /**
-     * Address alias sets (`0x2::address_alias`), keyed by address: each becomes
-     * the address's `AddressAliases` object at its derived id (BCS content,
-     * party-owned by the address), which is what `AddressAlias.getAliases` reads
-     * and what the fake's signature check consults. An address not named here
-     * has not enabled aliases. Executions of `0x2::address_alias::enable`, `add`,
-     * `remove` and `replace_all` then edit the sets, and
-     * `SuiTest.setAddressAliases` replaces one.
-     *
-     * @since 0.6.0
-     */
-    readonly addressAliases?: Readonly<Record<string, ReadonlyArray<string>>>;
 }
 ```
 
-Everything the fake serves. Every field is optional.
-
-### `FakeUnimplemented` (class)
-
-```ts
-export declare class FakeUnimplemented extends Error {
-    readonly method: string;
-    readonly [DefectMarker] = true;
-    constructor(method: string);
-}
-```
-
-Thrown, and re-thrown as a defect, when a test reaches an unscripted method.
+Everything the responder answers. Every field is optional.
 
 ### `RecordedCall` (interface)
 
@@ -7224,189 +6889,103 @@ export interface RecordedCall {
 }
 ```
 
-One call the fake received, in order.
+One call the responder received.
 
-### `SuiCoreFake` (class)
+### `ScriptedSuiCore` (class)
 
 ```ts
-export declare class SuiCoreFake extends SuiCoreFake_base {
-    /**
-     * Provides both `SuiCore` (backed by the fake) and `SuiCoreFake` (the handle a
-     * test drives it with). Never fails.
-     */
-    static readonly layer: (script?: FakeScript) => Layer.Layer<SuiCore | SuiCoreFake>;
+export declare class ScriptedSuiCore extends ScriptedSuiCore_base {
+    /** The handle over a fresh responder for `script`. Never fails. */
+    static readonly make: (script?: FakeScript) => Effect.Effect<ScriptedSuiCoreService>;
+    /** Provides `SuiCore` over the responder and the handle that drives it. Never fails. */
+    static readonly layer: (script?: FakeScript) => Layer.Layer<SuiCore | ScriptedSuiCore>;
 }
 ```
 
-The in-memory `SuiCore`.
+The scripted `SuiCore`: `SuiCore.layerFromClient` over an SDK `CoreClient`
+whose reads answer from a `FakeScript`, so the production `SuiCore`
+(error mapping, read retries, request timeouts, spans) runs over it.
 
-What a test has to know about it, because none of it is visible from the
-outside:
+It serves objects with their exact type and bytes (`getObject`,
+`getObjects`, `listOwnedObjects` with a `typeMatches` type filter), coins
+as the `Coin<T>` objects among them (`listCoins`, and `getBalance`'s
+`coinBalance`), dynamic fields matched on the key's type and bytes, address
+balances, the Clock object `0x6`, a fixed chain id, epoch and reference gas
+price, and the scripted `executeTransaction` / `simulateTransaction`
+answers in order, each stamped with the digest of the bytes it was handed.
+`getTransaction` serves an execute answer it gave by that digest. A build
+runs the SDK's own core resolver over these reads (a Move call whose object
+inputs need `getMoveFunction` is not scripted). Every other method dies
+naming itself.
 
-- **Its `client` implements `$extend`.** `SuiCoreFakeState.client` is a
-  `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` runs an
-  SDK client extension over the fake exactly the way a consumer writes it,
-  with no network.
-- **`listOwnedObjects` filters like a node.** The `type` option goes through
-  the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
-  instantiation of a generic rather than only its own spelling.
-- **`getDynamicField` matches on `name.type` *and* `name.bcs`**, the type
-  under the same `typeMatches` rule, so a short and a padded spelling of one
-  key type are the same key. An entry
-  scripted without `bcs` still matches any key of its type, which is what a
-  test that only cares about the type wants; two entries of one type on one
-  parent are told apart by their bytes, so a test can prove which key encoding
-  a lookup used.
-- **Call recording is reached through `SuiTest.calls`.** Every call the fake
-  received, oldest first, optionally filtered by method:
-  `yield* SuiTest.calls("getDynamicField")`. That is how a test asserts what
-  a program *sent* — the include set on a read, the fact that a recipe
-  fragment reached exactly one `executeTransaction` — rather than only what it
-  got back.
-- **`getTransaction` can be answered by digest.** `FakeScript.transactions`
-  (and `SuiTest.recordTransaction`) answers a specific digest before the
-  ordered `getTransaction` script is consulted, which is what `Tx.reconcile`
-  needs when it follows a pinned object's `previousTransaction` to find out
-  which version the consuming transaction took. `FakeChange.inputVersion` is
-  how a test says which version that was.
-- **An execute's digest is the bytes' own.** The fake derives it with
-  `TransactionDataBuilder.getDigestFromBytes`, the way a node does, and an
-  execute outcome scripted with a different `digest` is a broken fixture: the
-  call dies saying so rather than handing `Tx.submit` another transaction.
-- **It models address balances** (since 0.4.0): one per owner and coin type,
-  seeded from `FakeScript.balances` and set with `SuiTest.setAddressBalance`.
-  The resolver pays gas from it the way the SDK does, an execution it cannot
-  fund is refused with `INVALID_ARGUMENT` like a node refuses it, and a
-  settled execution moves it (gas, `FundsWithdrawal`, `send_funds`) — see
-  `applyBalanceEffects` for exactly which shapes it follows without Move.
-- **Visibility is instant unless scripted.** `FakeScript.visibilityDelay`
-  (or `SuiTest.setVisibilityDelay`) holds `waitForTransaction` for an executed
-  transaction, which is how a test reaches the window after the execute
-  answered and before `Tx.submit` returns.
-
-### `SuiCoreFakeState` (interface)
+### `ScriptedSuiCoreService` (interface)
 
 ```ts
-export interface SuiCoreFakeState {
-    /**
-     * The SDK client object the fake implements, for the one place a test needs
-     * it directly: `transaction.build({ client })`. Its
-     * `core.resolveTransactionPlugin()` is the fake's own resolver, so a
-     * transaction resolves against the fake's objects, gas price and coins with
-     * no network.
-     */
+export interface ScriptedSuiCoreService {
+    /** The `SuiCore` over the responder's client. */
+    readonly core: SuiCoreService;
+    /** The SDK client the responder implements, for `transaction.build({ client })` or `$extend`. */
     readonly client: ClientWithCoreApi;
-    /** Every call the fake has received, oldest first. */
+    /** Every call received, oldest first. */
     readonly calls: Effect.Effect<ReadonlyArray<RecordedCall>>;
-    /** How many calls were aborted by interruption or timeout. */
-    readonly aborted: Effect.Effect<number>;
-    /** Inserts or replaces an object. */
-    readonly setObject: (object: FakeObject) => Effect.Effect<void>;
-    /**
-     * The object the fake currently serves for this id, `None` when there is
-     * none. What a helper that has to change an object relative to its current
-     * state (bumping a version, rewriting content) reads first.
-     */
-    readonly readObject: (objectId: string) => Effect.Effect<Option.Option<FakeObject>>;
-    /** Removes an object, so a later read reports it deleted. */
-    readonly deleteObject: (objectId: string) => Effect.Effect<void>;
-    /** Moves the Clock object forward or back. */
+    readonly putObject: (object: FakeObject) => Effect.Effect<void>;
     readonly setClock: (timestampMs: bigint) => Effect.Effect<void>;
-    /** Moves the epoch `getCurrentSystemState` reports. */
-    readonly setEpoch: (epoch: bigint) => Effect.Effect<void>;
-    /**
-     * Replaces `FakeScript.visibilityDelay`; `undefined` makes executed
-     * transactions visible at once again.
-     *
-     * @since 0.4.0
-     */
-    readonly setVisibilityDelay: (delay: number | "never" | undefined) => Effect.Effect<void>;
-    /**
-     * Teaches the fake about one transaction **by digest**, the way
-     * `FakeScript.transactions` does for a script written up front.
-     */
-    readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void>;
-    /**
-     * Replaces the fake's address balance of one owner in one coin type (a full
-     * coin type, e.g. `0x2::sui::SUI`). Never fails.
-     *
-     * @since 0.4.0
-     */
     readonly setAddressBalance: (owner: string, coinType: string, amount: bigint) => Effect.Effect<void>;
-    /**
-     * The fake's current address balance of one owner in one coin type: the
-     * value an execution or `setAddressBalance` last wrote, else the scripted
-     * seed, else 0. Never fails.
-     *
-     * @since 0.4.0
-     */
-    readonly readAddressBalance: (owner: string, coinType: string) => Effect.Effect<bigint>;
-    /**
-     * Replaces `address`'s alias set: its `AddressAliases` object at the derived
-     * id, at the next version. `undefined` removes the object, so the address is
-     * back to signing only for itself (which no chain allows; a test may).
-     * Never fails.
-     *
-     * @since 0.6.0
-     */
-    readonly setAddressAliases: (address: string, aliases: ReadonlyArray<string> | undefined) => Effect.Effect<void>;
-    /**
-     * `address`'s alias set as the fake holds it, `None` when it has not enabled
-     * aliases. Never fails.
-     *
-     * @since 0.6.0
-     */
-    readonly readAddressAliases: (address: string) => Effect.Effect<Option.Option<ReadonlyArray<string>>>;
-    /** Replaces the remaining scripted outcomes of a method. */
-    readonly setOutcomes: (method: "simulate" | "execute" | "getTransaction" | "buildSimulate" | "getObject", outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void>;
+    readonly setOutcomes: (method: "simulate" | "execute", outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void>;
 }
 ```
 
-What a test can do to the fake while it runs.
+The handle a test drives the responder with.
 
 ### `SuiTest` (const)
 
 ```ts
 declare const SuiTest: {
-    readonly putObject: (object: FakeObject) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly bumpVersion: (objectId: string, opts?: {
-        readonly content?: Uint8Array;
-        readonly consumedBy?: string;
-    }) => Effect.Effect<bigint, never, SuiCoreFake>;
-    readonly recordTransaction: (digest: string, outcome: FakeOutcome) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly deleteObject: (objectId: string) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly setClock: (timestampMs: bigint) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly setEpoch: (epoch: bigint) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly scriptExecute: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly scriptSimulate: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly scriptGetTransaction: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly scriptGetObject: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly setVisibilityDelay: (delay: number | "never" | undefined) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly setAddressBalance: (owner: string, amount: bigint, coinType?: string) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly addressBalance: (owner: string, coinType?: string) => Effect.Effect<bigint, never, SuiCoreFake>;
-    readonly setAddressAliases: (address: string, aliases: ReadonlyArray<string> | undefined) => Effect.Effect<void, never, SuiCoreFake>;
-    readonly addressAliases: (address: string) => Effect.Effect<Option.Option<ReadonlyArray<string>>, never, SuiCoreFake>;
-    readonly calls: (method?: string) => Effect.Effect<ReadonlyArray<RecordedCall>, never, SuiCoreFake>;
+    /** Inserts or replaces an object. Never fails. */
+    readonly putObject: (object: FakeObject) => Effect.Effect<void, never, ScriptedSuiCore>;
+    /** Sets the timestamp the Clock object `0x6` reports, which `Sui.chainTime` reads. Never fails. */
+    readonly setClock: (timestampMs: bigint) => Effect.Effect<void, never, ScriptedSuiCore>;
+    /** Sets `owner`'s address balance of `coinType` (default SUI). Never fails. */
+    readonly setAddressBalance: (owner: string, amount: bigint, coinType?: string) => Effect.Effect<void, never, ScriptedSuiCore>;
+    /** Replaces the remaining `executeTransaction` answers. Never fails. */
+    readonly scriptExecute: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, ScriptedSuiCore>;
+    /** Replaces the remaining `simulateTransaction` answers. Never fails. */
+    readonly scriptSimulate: (outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void, never, ScriptedSuiCore>;
+    /** Every call received, oldest first, optionally of one method. Never fails. */
+    readonly calls: (method?: string) => Effect.Effect<ReadonlyArray<RecordedCall>, never, ScriptedSuiCore>;
+    /**
+     * Provides `layer` plus a fresh `Journal.layerMemory` and `TestClock`,
+     * built locally (`{ local: true }`), so nothing is shared with another test.
+     *
+     * Fails with: whatever the program and the layer fail with.
+     */
     readonly provide: <ROut, E>(layer: Layer.Layer<ROut, E>) => <A, E2, R>(effect: Effect.Effect<A, E2, R>) => Effect.Effect<A, E | E2, Exclude<R, ROut | TestClock.TestClock>>;
 }
 ```
 
-The harness: everything a test needs to drive the fake from
-inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
-
-Every member requires `SuiCoreFake`, which `layerTest` provides.
+The helpers that drive the responder from inside an Effect. Every member but
+`provide` requires `ScriptedSuiCore`, which `layerTest` provides.
 
 ### `TestServices` (type)
 
 ```ts
-export type TestServices = Sui | SuiCore | SuiCoreFake;
+export type TestServices = Sui | SuiCore | ScriptedSuiCore;
 ```
 
-What `layerTest` provides, under one name: `Sui`, `SuiCore` and the
-fake's handle, `SuiCoreFake`. A test helper that runs programs against the
-fake takes `Effect.Effect<A, E, TestServices>` instead of spelling the union
-out (a test of a service built on `Sui` adds it: `TestServices | Escrow`,
-over `Escrow.layer.pipe(Layer.provideMerge(layerTest(script)))`).
+What `layerTest` provides: `Sui`, `SuiCore` and the responder's
+handle.
+
+### `Unscripted` (class)
+
+```ts
+export declare class Unscripted extends Error {
+    readonly method: string;
+    readonly [DefectMarker] = true;
+    constructor(method: string);
+}
+```
+
+Thrown, and re-thrown by `SuiCore` as a defect, when a test reaches an unscripted method.
 
 ### `fakeCoin` (const)
 
@@ -7417,14 +6996,12 @@ declare const fakeCoin: (options: {
     readonly balance: bigint;
     readonly coinType?: string;
     readonly version?: bigint;
-    readonly digest?: string;
-}) => SuiClientTypes.Coin
+}) => FakeObject
 ```
 
-A gas coin for `FakeScript.coins`, in the SDK's `SuiClientTypes.Coin`
-shape, with the fields a fixture rarely cares about filled in: `coinType`
-defaults to SUI, `version` to 1 and `digest` to a `fakeDigest`. `owner`
-is an address; the coin is `AddressOwner`-owned by it.
+A `0x2::coin::Coin<T>` object with real BCS content, owned by `owner`:
+`listCoins` and `getBalance`'s `coinBalance` read it like any other object.
+`coinType` defaults to SUI.
 
 **Never fails.**
 
@@ -7435,8 +7012,7 @@ declare const fakeDigest: (seed: number) => Digest
 ```
 
 A deterministic base58 32-byte digest, for fixtures, already branded as a
-`Digest` so it compares with `executed.digest` and fills any field
-typed `Digest` without a cast.
+`Digest`.
 
 **Never fails.**
 
@@ -7446,26 +7022,13 @@ typed `Digest` without a cast.
 declare const layerTest: (script?: FakeScript) => Layer.Layer<TestServices, NetworkMismatch | TransportError>
 ```
 
-The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test
-can script outcomes and inspect what the fake received.
+The real `Sui` over the scripted `SuiCore`, with `testSubmitConfig` in
+force. A service built on `Sui` tests over
+`MyService.layer.pipe(Layer.provideMerge(layerTest(script)))`. It provides no
+journal: a test that submits provides `Journal.layerMemory`, or runs through
+`SuiTest.provide`.
 
-**It also puts `testSubmitConfig` in force** (a `Context.Reference`, so
-it does not show in the layer's type): a resubmit path does not sleep
-through the production schedule on the real clock. A `SubmitConfig` the
-test provides *inside* — `SubmitConfig.with(...)` — wins over it.
-
-It does **not** provide a journal: the default one is process-wide, so a test
-that submits provides `Journal.layerMemory` itself, or runs through
-`SuiTest.provide`, which does.
-
-This is `Sui.layerNoDeps`, the production layer, so the chain-id rules are
-the production rules: a script whose `network` is `mainnet` or `testnet` must
-report that network's identifier, and any other network asserts nothing. A
-test that wants the assertion on a custom network builds
-`Sui.layerNoDepsWith({ chainId })` over `SuiCoreFake.layer(script)` itself,
-rather than having the fake compared against its own script.
-
-**Fails with: `NetworkMismatch`, `TransportError` — both only when the script asks for them.**
+**Fails with: `NetworkMismatch` (a `mainnet` or `testnet` script whose chain id is not that network's), `TransportError`.**
 
 ### `testSubmitConfig` (const)
 
@@ -7474,20 +7037,27 @@ declare const testSubmitConfig: Partial<typeof SubmitConfig.defaults>
 ```
 
 The lifecycle settings every test layer puts in force: `SubmitConfig.defaults`
-with the re-send schedule a fake has no use for taken out: re-sends of
-identical bytes follow each other with no delay (still `resubmitAttempts` of
-them), so a test that drives a `SubmissionUnknown` takes milliseconds on the
-real clock — it took seconds on the production schedule — and needs no
-`TestClock.adjust` for the re-sends. Everything else — the execute timeout,
-the expiry recheck, the visibility timeout, the gas ceiling — is the
-production default.
+with a re-send schedule that does not wait, so a test that drives a
+`SubmissionUnknown` does not sleep on the real clock. A test that is about
+the schedule sets it with `SubmitConfig.with`.
 
-A test that is *about* one of these sets it with `SubmitConfig.with`.
+### `transactionResultOf` (const)
+
+```ts
+declare const transactionResultOf: (digest: string, outcome: Extract<FakeOutcome, {
+    readonly value: FakeExecution;
+}>) => SuiClientTypes.TransactionResult<SuiClientTypes.TransactionInclude>
+```
+
+The SDK `TransactionResult` a scripted success or failure stands for, for
+the transaction with this digest.
+
+**Never fails.**
 
 # Examples
 
-Every file below is typechecked, and each one is exercised by a test against
-the in-memory fake.
+Every file below is typechecked; the read examples and the recipes are
+exercised by tests over scripted answers or against a localnet.
 
 ### `examples/compare-read.effect.ts`
 
@@ -7521,7 +7091,7 @@ const Escrow = SuiSchema.bcs(
 const Note = SuiSchema.bcs(bcs.u64())
 const NOTE_NAME = { type: "u64", bcs: bcs.u64().serialize(0).toBytes() }
 
-/** The program itself, exported so a test can run it against the fake. */
+/** The program itself, exported so a test can run it over scripted answers. */
 export const program = Effect.gen(function*() {
   const sui = yield* Sui
   const id = yield* Config.schema(ObjectId, "ESCROW_ID")
@@ -7655,7 +7225,7 @@ const Escrow = SuiSchema.bcs(
 )
 
 /**
- * The program itself, exported so a test can run it against the fake. Every
+ * The program itself. Every
  * failure it can produce is in the generator's inferred error type, with no
  * handling lines anywhere in this file: `ObjectNotFound`, `ObjectDeleted`,
  * `ObjectUnavailable`, `DecodeError`, `TransportError`, `BuildError`,
@@ -7809,7 +7379,7 @@ const Escrow = SuiSchema.bcs(
   `${PACKAGE}::escrow::Escrow`
 )
 
-/** The program itself, exported so a test can run it against the fake. */
+/** The program itself, exported so a test can run it over scripted answers. */
 export const program = Effect.gen(function*() {
   const sui = yield* Sui
   const id = yield* Config.schema(ObjectId, "ESCROW_ID")

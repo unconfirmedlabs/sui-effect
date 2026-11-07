@@ -806,8 +806,8 @@ export const render = (): string => {
     api,
     "# Examples",
     "",
-    "Every file below is typechecked, and each one is exercised by a test against",
-    "the in-memory fake.",
+    "Every file below is typechecked; the read examples and the recipes are",
+    "exercised by tests over scripted answers or against a localnet.",
     "",
     renderFiles(examples)
   ].join("\n")

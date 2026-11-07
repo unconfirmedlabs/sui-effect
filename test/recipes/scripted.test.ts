@@ -1,4 +1,4 @@
-// A test on the in-memory fake: the real `Sui` over a scripted `SuiCore`, no network.
+// A test over the scripted SuiCore: the real `Sui`, objects served from a script, no network.
 import { expect, test } from "bun:test"
 import { bcs } from "@mysten/sui/bcs"
 import { Effect, Option } from "effect"
@@ -9,7 +9,7 @@ const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
 const CounterBcs = bcs.struct("Counter", { id: bcs.Address, value: bcs.u64() })
 const Counter = SuiSchema.bcs(CounterBcs, `${PKG}::counter::Counter`)
 
-test("a counter the fake serves decodes, and a missing one is None", async () => {
+test("a counter the script serves decodes, and a missing one is None", async () => {
   const id = ObjectId.normalize("0xc0")
   const content = CounterBcs.serialize({ id, value: 7n }).toBytes()
   const [found, missing] = await Effect.gen(function*() {

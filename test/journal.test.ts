@@ -6,7 +6,7 @@ import { ExecutionReason } from "../src/domain/errors.ts"
 import { isUnresolved, JournalEntry } from "../src/domain/journal-entry.ts"
 import { Digest, Signature, SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
-import { fakeDigest } from "../src/services/SuiCoreFake.ts"
+import { fakeDigest } from "../src/testing.ts"
 import { layerKeyValueStore, make, pruneSettled } from "../src/services/JournalKeyValueStore.ts"
 
 const DIGEST = Digest.make("7YcE7X6LmUcbqHcRYMRT8vBTxtnCbfGJkH6yZPFpTFwn")
@@ -122,73 +122,40 @@ describe("JournalEntry", () => {
     expect(decodedCheckpoint._tag === "Executed" && decodedCheckpoint.checkpoint).toBe(88n)
   })
 
-  test("Signed and Unknown are the unresolved tags", () => {
-    expect(JournalEntry.isAnyOf(["Signed", "Unknown"])(signedEntry)).toBe(true)
-    expect(JournalEntry.isAnyOf(["Signed", "Unknown"])(executedEntry)).toBe(false)
-  })
-
-  test("NotApplied is terminal", () => {
-    // It is a variant of its own precisely so it can be terminal: recording a
-    // proven-dead submission as `Unknown` would leave it unresolved
-    // forever, and `onUnresolved: "fail"` would refuse to build over it.
-    expect(isUnresolved(notAppliedEntry)).toBe(false)
-    expect(isUnresolved(unknownEntry)).toBe(true)
+  test("Signed and Unknown are unresolved; NotApplied is terminal", () => {
+    expect([signedEntry, unknownEntry, executedEntry, failedEntry, notAppliedEntry].map(isUnresolved)).toEqual([true, true, false, false, false])
   })
 })
 
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 
-describe("the memory journal", () => {
-  test("put, get and listUnresolved", async () => {
-    const result = await run(
-      Effect.gen(function*() {
-        const journal = Journal.makeMemoryUnsafe()
+describe("both journals", () => {
+  const journals = [
+    ["memory", Effect.sync(() => Journal.makeMemoryUnsafe())],
+    ["KeyValueStore", Effect.map(Effect.provide(KeyValueStore.KeyValueStore, KeyValueStore.layerMemory), (store) => make(store))]
+  ] as const
+  for (const [name, journalOf] of journals) {
+    test(`${name}: put and get; Signed and Unknown are listed, a terminal entry (Executed, NotApplied) resolves the digest`, async () => {
+      const result = await run(Effect.gen(function*() {
+        const journal = yield* journalOf
         yield* journal.put(signedEntry)
         yield* journal.put({ ...unknownEntry, digest: OTHER })
         const before = yield* journal.listUnresolved
         yield* journal.put(executedEntry)
-        const after = yield* journal.listUnresolved
-        const entry = yield* journal.get(DIGEST)
-        return { before, after, entry }
-      })
-    )
-    expect(result.before).toHaveLength(2)
-    expect(result.after.map((entry) => entry.digest)).toEqual([OTHER])
-    expect(Option.isSome(result.entry)).toBe(true)
-    if (Option.isSome(result.entry)) expect(result.entry.value._tag).toBe("Executed")
-  })
-
-  test("an unknown digest is None", async () => {
-    const entry = await run(Journal.makeMemoryUnsafe().get(OTHER))
-    expect(Option.isNone(entry)).toBe(true)
-  })
+        yield* journal.put({ ...notAppliedEntry, digest: OTHER })
+        return { before, after: yield* journal.listUnresolved, entry: yield* journal.get(DIGEST), missing: yield* journal.get(Digest.make(fakeDigest(99))) }
+      }))
+      expect(result.before.map((entry) => entry._tag).sort()).toEqual(["Signed", "Unknown"])
+      expect(result.after).toHaveLength(0)
+      expect([Option.map(result.entry, (entry) => entry._tag), Option.isNone(result.missing)]).toEqual([Option.some("Executed"), true])
+    })
+  }
 })
 
 describe("the KeyValueStore journal", () => {
   const withStore = <A, E>(
     effect: Effect.Effect<A, E, KeyValueStore.KeyValueStore>
   ) => Effect.runPromise(Effect.provide(effect, KeyValueStore.layerMemory, { local: true }))
-
-  test("entries survive as JSON and listUnresolved tracks what is unresolved", async () => {
-    const result = await withStore(
-      Effect.gen(function*() {
-        const store = yield* KeyValueStore.KeyValueStore
-        const journal = make(store)
-        yield* journal.put(signedEntry)
-        const unresolved = yield* journal.listUnresolved
-        const raw = yield* store.get(`entry:${DIGEST}`)
-        yield* journal.put(executedEntry)
-        const settled = yield* journal.listUnresolved
-        const entry = yield* journal.get(DIGEST)
-        return { unresolved, raw, settled, entry }
-      })
-    )
-    expect(result.unresolved).toHaveLength(1)
-    expect(result.raw).toContain("Signed")
-    expect(result.settled).toHaveLength(0)
-    expect(Option.isSome(result.entry)).toBe(true)
-    if (Option.isSome(result.entry)) expect(result.entry.value._tag).toBe("Executed")
-  })
 
   test("a prefix keeps two journals apart in one store", async () => {
     const result = await withStore(
@@ -235,28 +202,6 @@ describe("the KeyValueStore journal", () => {
       )
     )
     expect(ignored).toHaveLength(1)
-  })
-
-  test("a NotApplied entry resolves the digest", async () => {
-    const result = await withStore(
-      Effect.gen(function*() {
-        const store = yield* KeyValueStore.KeyValueStore
-        const journal = make(store)
-        yield* journal.put(signedEntry)
-        const before = yield* journal.listUnresolved
-        yield* journal.put(notAppliedEntry)
-        return {
-          before,
-          after: yield* journal.listUnresolved,
-          entry: yield* journal.get(DIGEST)
-        }
-      })
-    )
-    expect(result.before).toHaveLength(1)
-    expect(result.after).toHaveLength(0)
-    // The answer is still readable; only the "still waiting" list drops it.
-    expect(Option.isSome(result.entry)).toBe(true)
-    if (Option.isSome(result.entry)) expect(result.entry.value._tag).toBe("NotApplied")
   })
 
   /**

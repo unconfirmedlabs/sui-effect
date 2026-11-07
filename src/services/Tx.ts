@@ -2731,8 +2731,8 @@ type History =
  * no lowest checkpoint, the window's epoch no longer served — is `Pruned`,
  * because "I cannot tell" is not evidence.
  *
- * A transport that exposes no such call (JSON-RPC, GraphQL, the test fake
- * unless `FakeScript.ledger` is set) is `Unreported`, and the rule runs as it
+ * A transport that exposes no such call (JSON-RPC, GraphQL, the scripted
+ * `SuiCore` of `/testing`) is `Unreported`, and the rule runs as it
  * always has: behind a pruning node on those transports set
  * `SubmitConfig.expiryEvidence: "never"`.
  *

@@ -29,7 +29,7 @@ const Escrow = SuiSchema.bcs(
 )
 
 /**
- * The program itself, exported so a test can run it against the fake. Every
+ * The program itself. Every
  * failure it can produce is in the generator's inferred error type, with no
  * handling lines anywhere in this file: `ObjectNotFound`, `ObjectDeleted`,
  * `ObjectUnavailable`, `DecodeError`, `TransportError`, `BuildError`,

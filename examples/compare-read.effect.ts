@@ -27,7 +27,7 @@ const Escrow = SuiSchema.bcs(
 const Note = SuiSchema.bcs(bcs.u64())
 const NOTE_NAME = { type: "u64", bcs: bcs.u64().serialize(0).toBytes() }
 
-/** The program itself, exported so a test can run it against the fake. */
+/** The program itself, exported so a test can run it over scripted answers. */
 export const program = Effect.gen(function*() {
   const sui = yield* Sui
   const id = yield* Config.schema(ObjectId, "ESCROW_ID")

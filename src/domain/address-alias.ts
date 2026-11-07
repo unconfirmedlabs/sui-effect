@@ -2,7 +2,7 @@
  * The pure half of Sui's address aliases (`0x2::address_alias`): the derived
  * id of an address's `AddressAliases` object, its BCS, the decoded set and
  * the membership rule. The reads, the check and the recipes are
- * `services/AddressAlias.ts`; the fake uses this half to model alias sets.
+ * `services/AddressAlias.ts`.
  *
  * @since 0.6.0
  */
