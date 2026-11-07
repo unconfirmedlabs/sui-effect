@@ -1,22 +1,21 @@
 /**
- * The two failures of keys at rest: `KeyError` (a phrase, a secret key or a
- * derivation path that is not one) and `KeystoreError` (the sealed keystore).
+ * `KeyError`: a phrase, a secret key, a derivation path or a multisig member
+ * set that is not one.
  *
- * Neither is in the closed transaction taxonomy, because neither can happen
- * once anything has been sent: both **declare** `outcome: "not_applied"`, so
- * `SuiError.outcome` and `Script.exitCode` place them without a special case.
+ * It is not in the closed transaction taxonomy, because it cannot happen once
+ * anything has been sent: it **declares** `outcome: "not_applied"`, so
+ * `SuiError.outcome` places it without a special case.
  *
  * **No message here ever contains secret material.** A BIP-39 failure names
  * the position of a bad word, never the word; a secret-key failure names the
- * spelling it expected, never the input; a keystore failure names the address
- * and the reason. That is a rule, not a habit: the Bech32 decoder quotes its
- * whole input on a bad checksum, so its message is dropped, never forwarded.
+ * spelling it expected, never the input. That is a rule, not a habit: the
+ * Bech32 decoder quotes its whole input on a bad checksum, so its message is
+ * dropped, never forwarded.
  *
  * @since 0.5.0
  */
 import { Schema } from "effect"
 import type { Outcome } from "./errors.ts"
-import { SuiAddress } from "./schemas.ts"
 
 /**
  * Why a phrase, a secret key or a path was refused.
@@ -33,6 +32,9 @@ import { SuiAddress } from "./schemas.ts"
  *   `scheme` option that contradicts the key's own flag.
  * - `unavailable`: the platform has no `crypto.getRandomValues`, which a fresh
  *   mnemonic needs (React Native without a CSPRNG polyfill).
+ * - `invalidMultisig` (0.6.0): `Signer.multisig` was given a signer that is
+ *   not a member of the multisig, two signers for one member, or members whose
+ *   weights do not reach the threshold.
  *
  * @since 0.5.0
  */
@@ -41,7 +43,8 @@ export const KeyErrorReason = Schema.Literals([
   "invalidSecretKey",
   "invalidPath",
   "unsupportedScheme",
-  "unavailable"
+  "unavailable",
+  "invalidMultisig"
 ])
 /** @since 0.5.0 */
 export type KeyErrorReason = typeof KeyErrorReason.Type
@@ -61,78 +64,4 @@ export class KeyError extends Schema.TaggedError<KeyError>()("KeyError", {
 }) {
   /** Nothing was derived or sent. */
   readonly outcome: Outcome = "not_applied"
-  /**
-   * `Script.exitCode`'s answer: 2, like a `ConfigError`. Every reason is input
-   * (or a platform) a person has to fix; retrying the same call cannot succeed.
-   *
-   * @since 0.5.0
-   */
-  get exitCode(): number {
-    return 2
-  }
-}
-
-/**
- * Why a keystore operation failed.
- *
- * - `wrongPassword`: the password does not open this account's record (its
- *   key-check value does not match).
- * - `invalidPassword`: a new password is empty.
- * - `notFound`: no record for this address.
- * - `exists`: a record for this address is already stored (`import*`).
- * - `noMnemonic`: `exportMnemonic` of an account imported from a secret key.
- * - `corrupt`: the record does not decode, was moved onto another address, was
- *   edited (the AES-GCM tag over the ciphertext and its bound metadata does not
- *   verify under a password whose check value matched), or holds a key that is
- *   not the address's key.
- * - `unsupported`: the record was written by a newer format version, or names
- *   a KDF or cipher this version does not know.
- * - `unavailable`: the platform has no WebCrypto (`crypto.subtle` or
- *   `crypto.getRandomValues`), which React Native lacks without a polyfill.
- * - `storage`: the `KeyValueStore` failed; `cause` is its error.
- *
- * @since 0.5.0
- */
-export const KeystoreErrorReason = Schema.Literals([
-  "wrongPassword",
-  "invalidPassword",
-  "notFound",
-  "exists",
-  "noMnemonic",
-  "corrupt",
-  "unsupported",
-  "unavailable",
-  "storage"
-])
-/** @since 0.5.0 */
-export type KeystoreErrorReason = typeof KeystoreErrorReason.Type
-
-/**
- * A keystore operation failed. Nothing was sent: outcome `not_applied`.
- *
- * A wrong password is this error with `reason: "wrongPassword"`, never a
- * defect. `message` never contains the password or anything sealed.
- *
- * @since 0.5.0
- */
-export class KeystoreError extends Schema.TaggedError<KeystoreError>()("KeystoreError", {
-  reason: KeystoreErrorReason,
-  message: Schema.String,
-  address: Schema.optionalKey(SuiAddress),
-  cause: Schema.optionalKey(Schema.Defect())
-}) {
-  /** Nothing was sent. */
-  readonly outcome: Outcome = "not_applied"
-  /**
-   * `Script.exitCode`'s answer: 2, like a `ConfigError`, for every reason a
-   * person has to fix (a wrong password, a missing or existing account, a
-   * corrupt or newer record, no WebCrypto); `undefined` for `"storage"`, a
-   * store failure that may pass on retry, which therefore exits 4 like any
-   * other `not_applied` failure.
-   *
-   * @since 0.5.0
-   */
-  get exitCode(): number | undefined {
-    return this.reason === "storage" ? undefined : 2
-  }
 }

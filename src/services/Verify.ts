@@ -24,8 +24,10 @@ import { parseSerializedSignature } from "@mysten/sui/cryptography"
 import { MultiSigPublicKey } from "@mysten/sui/multisig"
 import { publicKeyFromRawBytes } from "@mysten/sui/verify"
 import { Effect } from "effect"
+import type { PolicyDenied } from "../domain/errors.ts"
 import { SigningError, TransportError } from "../domain/errors.ts"
-import type { SuiAddress } from "../domain/schemas.ts"
+import { SuiAddress } from "../domain/schemas.ts"
+import { requireSigner } from "./AddressAlias.ts"
 import { Sui } from "./Sui.ts"
 
 /** The options both verifiers take. */
@@ -37,6 +39,27 @@ export interface VerifyOptions {
    * shorthand with `SuiAddress.normalize` first.
    */
   readonly address?: SuiAddress
+}
+
+/**
+ * The options of {@link verifyTransactionSignature}: {@link VerifyOptions},
+ * plus whether `address` is checked through its address aliases.
+ *
+ * @since 0.6.0
+ */
+export interface VerifyTransactionOptions extends VerifyOptions {
+  /**
+   * Check `address` the way a validator checks a sender: the signature must be
+   * by a member of `address`'s alias set (`0x2::address_alias`), read from its
+   * `AddressAliases` object — or by `address` itself while it has not enabled
+   * aliases. One object read, made even when the signature is `address`'s own,
+   * since an address that removed itself from its set no longer signs for
+   * itself. A signer that is neither is `PolicyDenied { rule: "alias.signer" }`.
+   * Requires `address`.
+   *
+   * @since 0.6.0
+   */
+  readonly checkAddressAliases?: boolean
 }
 
 /** The two intents a signature can be made under. */
@@ -132,7 +155,8 @@ const verifyWith = (
   intent: Intent,
   bytes: Uint8Array,
   signature: string,
-  options: VerifyOptions
+  options: VerifyOptions,
+  requireAddress = true
 ): Effect.Effect<PublicKey, SigningError | TransportError, Sui> =>
   Effect.gen(function*() {
     const sui = yield* Sui
@@ -163,7 +187,7 @@ const verifyWith = (
               : "the signature is not valid for this personal message"
           }
         }
-        if (options.address !== undefined && !parsed.publicKey.verifyAddress(options.address)) {
+        if (requireAddress && options.address !== undefined && !parsed.publicKey.verifyAddress(options.address)) {
           return {
             _tag: "Invalid",
             reason: `the signature was made by ${parsed.publicKey.toSuiAddress()}, not ${options.address}`
@@ -194,24 +218,69 @@ const verifyWith = (
  * what a sponsor checks before it co-signs a sender's bytes. A multisig or
  * zkLogin signature is checked through the node; every other scheme locally.
  *
+ * With `address` and **`checkAddressAliases: true`** (0.6.0), the signature
+ * must instead be one a validator accepts for a transaction whose sender is
+ * `address`: by a member of `address`'s alias set (`0x2::address_alias`), read
+ * from its `AddressAliases` object, or by `address` itself while it has not
+ * enabled aliases. The answer is then the alias's key (a multisig's, say), and
+ * a valid signature by anyone else is `PolicyDenied { rule: "alias.signer" }`.
+ *
  * ```ts
  * const publicKey = yield* Verify.verifyTransactionSignature(bytes, senderSignature, {
  *   address: sender
  * })
+ * const aliasKey = yield* Verify.verifyTransactionSignature(bytes, multisigSignature, {
+ *   address: account,
+ *   checkAddressAliases: true
+ * })
  * ```
  *
  * Fails with: `SigningError` (the signature does not parse, is not valid for
- * these bytes, or was made by another address), `TransportError` (a zkLogin or
- * multisig check could not reach a usable answer — the signature was neither
- * accepted nor refused).
+ * these bytes, or — without `checkAddressAliases` — was made by another
+ * address), `PolicyDenied` (with `checkAddressAliases`: `alias.signer`, the
+ * signer is neither `address` nor one of its aliases), `TransportError` (a
+ * zkLogin or multisig check, or the alias read, could not reach a usable
+ * answer — the signature was neither accepted nor refused).
  */
-export const verifyTransactionSignature = Effect.fn("Verify.verifyTransactionSignature")(function*(
-  bytes: Uint8Array,
-  signature: string,
-  options: VerifyOptions = {}
-): Effect.fn.Return<PublicKey, SigningError | TransportError, Sui> {
-  return yield* verifyWith("verifyTransactionSignature", "TransactionData", bytes, signature, options)
-})
+export const verifyTransactionSignature: VerifyTransactionSignature = Effect.fn("Verify.verifyTransactionSignature")(
+  function*(
+    bytes: Uint8Array,
+    signature: string,
+    options: VerifyTransactionOptions = {}
+  ): Effect.fn.Return<PublicKey, SigningError | PolicyDenied | TransportError, Sui> {
+    const aliased = options.checkAddressAliases === true && options.address !== undefined
+    const publicKey = yield* verifyWith(
+      "verifyTransactionSignature",
+      "TransactionData",
+      bytes,
+      signature,
+      options,
+      !aliased
+    )
+    if (aliased) yield* requireSigner(options.address!, SuiAddress.normalize(publicKey.toSuiAddress()))
+    return publicKey
+  }
+) as VerifyTransactionSignature
+
+/**
+ * The overloads of {@link verifyTransactionSignature}: `PolicyDenied` is in
+ * the union exactly when `checkAddressAliases: true` is. Pass the literal; a
+ * `boolean` variable matches neither.
+ *
+ * @since 0.6.0
+ */
+export type VerifyTransactionSignature = {
+  (
+    bytes: Uint8Array,
+    signature: string,
+    options: VerifyTransactionOptions & { readonly address: SuiAddress; readonly checkAddressAliases: true }
+  ): Effect.Effect<PublicKey, SigningError | PolicyDenied | TransportError, Sui>
+  (
+    bytes: Uint8Array,
+    signature: string,
+    options?: VerifyOptions & { readonly checkAddressAliases?: false }
+  ): Effect.Effect<PublicKey, SigningError | TransportError, Sui>
+}
 
 /**
  * Verifies a signature over a personal message, made under the
@@ -235,7 +304,8 @@ export const verifyPersonalMessageSignature = Effect.fn("Verify.verifyPersonalMe
 
 /**
  * Signature verification, namespaced the way the SDK spells it:
- * `Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
+ * `Verify.verifyTransactionSignature` (alias-aware with
+ * `checkAddressAliases`, 0.6.0), `Verify.verifyPersonalMessageSignature`.
  * Both have `R = Sui`.
  */
 export const Verify = {

@@ -1,457 +1,240 @@
+/**
+ * `SuiCore`: the error mapping, the read policy (retries, request timeout,
+ * cancellation) and the layers, each over a stub SDK client whose one method
+ * answers or fails as the test says.
+ */
 import { describe, expect, test } from "bun:test"
-import { bcs } from "@mysten/sui/bcs"
-import { SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
-import { Cause, Effect, Exit, Fiber, Layer } from "effect"
-import { TestClock } from "effect/testing"
-import { ConfigProvider } from "effect"
-import {
-  defaultGrpcUrl,
-  mapSdkError,
-  RETRYABLE_GRPC_STATUSES,
-  SuiCore
-} from "../src/services/SuiCore.ts"
-import {
-  ClockBcs,
-  FakeOutcome,
-  fakeDigest,
-  SuiCoreFake
-} from "../src/services/SuiCoreFake.ts"
+import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
+import { Cause, Clock, ConfigProvider, Effect, Exit, Fiber, Layer, Logger, References, Schedule } from "effect"
+import { TestClock } from "effect/testing"
+import type { TransportError } from "../src/domain/errors.ts"
+import { defaultGrpcUrl, mapSdkError, readSchedule, SuiCore } from "../src/services/SuiCore.ts"
 
-const PADDED = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
-const ESCROW = PADDED("e5c")
-const Escrow = bcs.struct("Escrow", { id: bcs.Address, amount: bcs.U64 })
+const OBJECT = `0x${"0".repeat(63)}7`
+const DIGEST = "11111111111111111111111111111111"
 
-const script = {
-  chainId: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
-  clockTimestampMs: 1_700_000_000_000n,
-  objects: [
-    {
-      objectId: ESCROW,
-      type: "0x2::escrow::Escrow",
-      version: 3n,
-      content: Escrow.serialize({ id: ESCROW, amount: "5" }).toBytes()
+const rpc = (status: string) => Object.assign(new Error(status), { code: status, name: "RpcError" })
+
+/** A client whose `core` has exactly the methods given. */
+const stubClient = (core: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+  ({ network: "localnet", core, ...extra }) as unknown as ClientWithCoreApi
+
+/** Runs `f` over `SuiCore.layerFromClient(client)` under a `TestClock` advanced far enough for every retry. */
+const withCore = <A, E>(
+  client: ClientWithCoreApi,
+  f: (core: SuiCore["Service"]) => Effect.Effect<A, E>,
+  options?: Parameters<typeof SuiCore.layerFromClient>[1],
+  extra: Layer.Layer<never> = Layer.empty
+) =>
+  Effect.gen(function*() {
+    const fiber = yield* Effect.forkChild(Effect.exit(Effect.flatMap(SuiCore, f)))
+    yield* TestClock.adjust("1 hour")
+    return yield* Fiber.join(fiber)
+  }).pipe(
+    Effect.provide(Layer.mergeAll(SuiCore.layerFromClient(client, options), TestClock.layer(), extra), { local: true }),
+    Effect.runPromise
+  )
+
+/** A `getObject` that fails with `cause` every time, counting calls and aborts. */
+const counting = (answer: (options: { readonly signal: AbortSignal }) => Promise<unknown>) => {
+  const state = { calls: 0, aborted: 0 }
+  const client = stubClient({
+    getObject: (options: { readonly signal: AbortSignal }) => {
+      state.calls += 1
+      options.signal.addEventListener("abort", () => (state.aborted += 1))
+      return answer(options)
     }
-  ]
+  })
+  return { state, client }
 }
-
-const run = <A, E>(
-  effect: Effect.Effect<A, E, SuiCore | SuiCoreFake>,
-  layer = SuiCoreFake.layer(script)
-) => Effect.runPromise(Effect.provide(effect, layer, { local: true }))
-
-const runExit = <A, E>(
-  effect: Effect.Effect<A, E, SuiCore | SuiCoreFake>,
-  layer = SuiCoreFake.layer(script)
-) => Effect.runPromiseExit(Effect.provide(effect, layer, { local: true }))
+const hang = (options: { readonly signal: AbortSignal }) =>
+  new Promise((_, reject) => options.signal.addEventListener("abort", () => reject(new Error("aborted"))))
 
 describe("mapSdkError", () => {
-  test("maps ObjectError by reason", () => {
-    const notFound = mapSdkError(
-      "getObject",
-      new ObjectError("notFound", "missing", { reason: "notFound", objectId: ESCROW })
-    )
-    expect(notFound._tag).toBe("ObjectNotFound")
-    const deleted = mapSdkError(
-      "getObject",
-      new ObjectError("deleted", "gone", { reason: "deleted", objectId: ESCROW })
-    )
-    expect(deleted._tag).toBe("ObjectDeleted")
-    const unknown = mapSdkError(
-      "getObject",
-      new ObjectError("unknown", "?", { reason: "unknown", objectId: ESCROW })
-    )
-    expect(unknown._tag).toBe("ObjectUnavailable")
+  /** A class from a second copy of the SDK: the same name and fields, another identity. */
+  const otherCopy = (name: string, fields: Record<string, unknown>) => Object.assign(new Error(name), { name, ...fields })
+  const cases: ReadonlyArray<readonly [string, unknown, string, (string | boolean | undefined)?, boolean?]> = [
+    ["ObjectError notFound", new ObjectError("notFound", "x", { reason: "notFound", objectId: OBJECT }), "ObjectNotFound"],
+    ["ObjectError deleted", new ObjectError("deleted", "x", { reason: "deleted", objectId: OBJECT }), "ObjectDeleted"],
+    ["ObjectError unknown", new ObjectError("unknown", "x", { reason: "unknown", objectId: OBJECT }), "ObjectUnavailable"],
+    ["an ObjectError from another SDK copy", otherCopy("ObjectError", { reason: "deleted", objectId: OBJECT }), "ObjectDeleted"],
+    ["TransactionError", new TransactionError("notFound", DIGEST), "TransactionNotFound"],
+    ["a TransactionError from another SDK copy", otherCopy("TransactionError", { reason: "notFound", digest: DIGEST }), "TransactionNotFound"],
+    ["a SimulationError carrying an executionError", new SimulationError("aborted", { cause: rpc("UNAVAILABLE"), executionError: { $kind: "MoveAbort", message: "x", MoveAbort: { abortCode: "7" } } as unknown as SuiClientTypes.ExecutionError }), "SimulationFailed"],
+    ["a SimulationError wrapping an RpcError (the resolver's transport failure)", new SimulationError("resolution failed", { cause: rpc("UNAVAILABLE") }), "TransportError", "UNAVAILABLE", true],
+    ["a SimulationError wrapping an HTTP 502", new SimulationError("resolution failed", { cause: Object.assign(new Error("bad gateway"), { status: 502 }) }), "TransportError", "502", true],
+    ["a retryable gRPC status", rpc("UNAVAILABLE"), "TransportError", "UNAVAILABLE", true],
+    ["INTERNAL, a refused fetch", rpc("INTERNAL"), "TransportError", "INTERNAL", true],
+    ["UNKNOWN, an HTTP 500 under grpc-web", rpc("UNKNOWN"), "TransportError", "UNKNOWN", true],
+    ["an answer from the node", rpc("INVALID_ARGUMENT"), "TransportError", "INVALID_ARGUMENT", false],
+    ["a timeout", { _tag: "TimeoutError" }, "TransportError", "DEADLINE_EXCEEDED", true],
+    ["anything else", "a string", "TransportError", undefined, false],
+    ["a reason with no id is not the SDK's", { reason: "notFound" }, "TransportError", undefined, false]
+  ]
+  for (const [name, cause, tag, status, retryable] of cases) {
+    test(name, () => {
+      const error = mapSdkError("m", cause)
+      expect<string>(error._tag).toBe(tag)
+      if (error._tag === "TransportError") expect([error.status, error.retryable]).toEqual([status, retryable])
+    })
+  }
+
+  test("a SimulationFailed parses the executionError", () => {
+    const error = mapSdkError("simulateTransaction", new SimulationError("aborted", { executionError: { $kind: "MoveAbort", message: "x", command: 1, MoveAbort: { abortCode: "7" } } as never }))
+    expect(error._tag === "SimulationFailed" && error.reason.$kind === "MoveAbort" && error.reason.MoveAbort.abortCode).toBe(7n)
+  })
+})
+
+describe("the read policy", () => {
+  test("a retryable failure is retried: five attempts in all by default, then the failure", async () => {
+    const { state, client } = counting(() => Promise.reject(rpc("UNAVAILABLE")))
+    const exit = await withCore(client, (core) => core.getObject({ objectId: OBJECT }))
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(state.calls).toBe(5)
   })
 
-  test("maps TransactionError to TransactionNotFound", () => {
-    const error = mapSdkError("getTransaction", new TransactionError("notFound", fakeDigest(3)))
-    expect(error._tag).toBe("TransactionNotFound")
+  test("a non-retryable failure is not retried", async () => {
+    const { state, client } = counting(() => Promise.reject(rpc("INVALID_ARGUMENT")))
+    await withCore(client, (core) => core.getObject({ objectId: OBJECT }))
+    expect(state.calls).toBe(1)
   })
 
-  test("maps SimulationError and parses its executionError", () => {
-    const error = mapSdkError(
-      "simulateTransaction",
-      new SimulationError("aborted", {
-        executionError: {
-          message: "MoveAbort",
-          command: 1,
-          $kind: "MoveAbort",
-          MoveAbort: { abortCode: "7" }
-        } as never
-      })
-    )
-    expect(error._tag).toBe("SimulationFailed")
-    if (error._tag === "SimulationFailed") {
-      expect(error.reason.$kind).toBe("MoveAbort")
-      if (error.reason.$kind === "MoveAbort") {
-        expect(error.reason.MoveAbort.abortCode).toBe(7n)
+  test("executeTransaction is never retried", async () => {
+    let calls = 0
+    const client = stubClient({
+      executeTransaction: () => {
+        calls += 1
+        return Promise.reject(rpc("UNAVAILABLE"))
       }
-    }
+    })
+    await withCore(client, (core) => core.executeTransaction({ transaction: new Uint8Array([1]), signatures: [] }))
+    expect(calls).toBe(1)
   })
 
-  test("maps gRPC statuses into retryable and non-retryable TransportErrors", () => {
-    for (const status of ["UNAVAILABLE", "DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED"]) {
-      const error = mapSdkError("getObject", Object.assign(new Error(status), { code: status }))
-      expect(error._tag).toBe("TransportError")
-      if (error._tag === "TransportError") {
-        expect(error.retryable).toBe(true)
-        expect(error.status).toBe(status)
-      }
-    }
-    const notFound = mapSdkError(
-      "getObject",
-      Object.assign(new Error("NOT_FOUND"), { code: "NOT_FOUND" })
-    )
-    expect(notFound._tag === "TransportError" && notFound.retryable).toBe(false)
-  })
-
-  test("a transport-level gRPC failure is retryable", () => {
-    // `@protobuf-ts/grpcweb-transport` reports a refused connection or a DNS
-    // failure as INTERNAL, and maps HTTP 500 to UNKNOWN. Neither reached a
-    // node, so a read may try again.
-    for (const status of ["INTERNAL", "UNKNOWN"]) {
-      const error = mapSdkError("getObject", Object.assign(new Error(status), { code: status }))
-      expect(error._tag).toBe("TransportError")
-      if (error._tag === "TransportError") {
-        expect(error.retryable).toBe(true)
-        expect(error.status).toBe(status)
-      }
-    }
-    expect([...RETRYABLE_GRPC_STATUSES].sort()).toEqual([
+  test("an attempt that never answers is aborted at requestTimeout and retried as a retryable DEADLINE_EXCEEDED", async () => {
+    const { state, client } = counting(hang)
+    const exit = await withCore(client, (core) => core.getObject({ objectId: OBJECT }), {
+      requestTimeout: "2 seconds",
+      readRetry: Schedule.recurs(2)
+    })
+    const error = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : undefined
+    expect(error?._tag === "Some" && [(error.value as TransportError).status, (error.value as TransportError).retryable]).toEqual([
       "DEADLINE_EXCEEDED",
-      "INTERNAL",
-      "RESOURCE_EXHAUSTED",
-      "UNAVAILABLE",
-      "UNKNOWN"
+      true
     ])
+    expect([state.calls, state.aborted]).toEqual([3, 3])
   })
 
-  test("an answer from the node is not retryable", () => {
-    for (const status of ["NOT_FOUND", "INVALID_ARGUMENT", "PERMISSION_DENIED", "ABORTED"]) {
-      const error = mapSdkError("getObject", Object.assign(new Error(status), { code: status }))
-      expect(error._tag === "TransportError" && error.retryable).toBe(false)
-    }
+  test("the default request timeout is thirty seconds", async () => {
+    const { state, client } = counting(hang)
+    const seen = await Effect.gen(function*() {
+      const fiber = yield* Effect.forkChild(Effect.exit(Effect.flatMap(SuiCore, (core) => core.getObject({ objectId: OBJECT }))))
+      yield* TestClock.adjust("29 seconds")
+      const before = state.aborted
+      yield* TestClock.adjust("2 seconds")
+      const after = state.aborted
+      yield* Fiber.interrupt(fiber)
+      return [before, after]
+    }).pipe(Effect.provide(Layer.merge(SuiCore.layerFromClient(client), TestClock.layer()), { local: true }), Effect.runPromise)
+    expect(seen).toEqual([0, 1])
   })
 
-  test("maps HTTP statuses", () => {
-    const server = mapSdkError("getObject", Object.assign(new Error("boom"), { status: 503 }))
-    expect(server._tag === "TransportError" && server.retryable).toBe(true)
-    const rateLimited = mapSdkError("getObject", Object.assign(new Error("slow"), { status: 429 }))
-    expect(rateLimited._tag === "TransportError" && rateLimited.retryable).toBe(true)
-    const badRequest = mapSdkError("getObject", Object.assign(new Error("bad"), { status: 400 }))
-    expect(badRequest._tag === "TransportError" && badRequest.retryable).toBe(false)
+  test("each retry is logged at debug level, naming the method", async () => {
+    const logged: Array<string> = []
+    const { client } = counting(() => Promise.reject(rpc("UNAVAILABLE")))
+    await withCore(client, (core) => core.getObject({ objectId: OBJECT }), { readRetry: Schedule.recurs(2) }, Layer.mergeAll(
+      Logger.layer([Logger.map(Logger.formatLogFmt, (line) => logged.push(line))]),
+      Layer.succeed(References.MinimumLogLevel, "Debug")
+    ) as Layer.Layer<never>)
+    const retries = logged.filter((line) => line.includes("SuiCore.getObject: retrying"))
+    expect(retries).toHaveLength(2)
+    expect(retries[0]).toContain("level=DEBUG")
   })
 
-  test("maps a timeout to a retryable DEADLINE_EXCEEDED", () => {
-    const error = mapSdkError("getObject", { _tag: "TimeoutError" })
-    expect(error._tag === "TransportError" && error.retryable).toBe(true)
-    expect(error._tag === "TransportError" && error.status).toBe("DEADLINE_EXCEEDED")
+  test("the schedule doubles from 250ms, caps at 10s, and jitters within 0.8x to 1.2x", async () => {
+    const gaps = await Effect.gen(function*() {
+      const times: Array<number> = []
+      const attempt = Effect.flatMap(Clock.currentTimeMillis, (now) => {
+        times.push(now)
+        return Effect.fail("again" as const)
+      })
+      const fiber = yield* Effect.forkChild(Effect.ignore(Effect.retry(attempt, { schedule: readSchedule, times: 8 })))
+      yield* TestClock.adjust("10 minutes")
+      yield* Fiber.join(fiber)
+      return times.slice(1).map((time, index) => time - times[index]!)
+    }).pipe(Effect.provide(TestClock.layer()), Effect.runPromise)
+    const bases = [250, 500, 1_000, 2_000, 4_000, 8_000, 10_000, 10_000]
+    expect(gaps).toHaveLength(bases.length)
+    gaps.forEach((gap, index) => {
+      expect(gap).toBeGreaterThanOrEqual(bases[index]! * 0.8)
+      expect(gap).toBeLessThanOrEqual(bases[index]! * 1.2)
+    })
   })
 
-  test("maps anything else to a non-retryable TransportError", () => {
-    const error = mapSdkError("getObject", "a string")
-    expect(error._tag === "TransportError" && error.retryable).toBe(false)
+  test("an SDK argument refusal is a defect carrying the SDK's sentence, not a TransportError", async () => {
+    const client = stubClient({
+      listEvents: async () => {
+        throw new Error(`Invalid eventType filter "pkg": expected "package::module" or a fully qualified type name`)
+      }
+    })
+    const exit = await withCore(client, (core) => core.listEvents({ filter: { eventType: "pkg" } }))
+    expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Invalid eventType filter")
+  })
+})
+
+describe("use", () => {
+  test("hands over the client and the Effect's signal, and maps what the call throws", async () => {
+    let signal: unknown
+    const client = stubClient({})
+    const exit = await withCore(client, (core) =>
+      core.use(async (_client, abort) => {
+        signal = abort
+        throw new ObjectError("notFound", "x", { reason: "notFound", objectId: OBJECT })
+      }))
+    expect(signal).toBeInstanceOf(AbortSignal)
+    expect(Exit.isFailure(exit) && Cause.findErrorOption(exit.cause)).toMatchObject({ value: { _tag: "ObjectNotFound" } })
+  })
+})
+
+describe("getServiceInfo", () => {
+  test("reads gRPC LedgerService.GetServiceInfo; another transport is a non-retryable UNIMPLEMENTED", async () => {
+    const grpc = stubClient({}, {
+      ledgerService: {
+        getServiceInfo: async () => ({
+          response: { chainId: "c", epoch: 7n, checkpointHeight: 120n, lowestAvailableCheckpoint: 80n, timestamp: { seconds: 2n, nanos: 5_000_000 } }
+        })
+      }
+    })
+    const info = await withCore(grpc, (core) => core.getServiceInfo())
+    expect(Exit.isSuccess(info) && info.value).toEqual({ chainId: "c", epoch: 7n, checkpointHeight: 120n, lowestAvailableCheckpoint: 80n, timestampMs: 2005 })
+    const other = await withCore(stubClient({}), (core) => Effect.flip(core.getServiceInfo()))
+    expect(Exit.isSuccess(other) && [other.value.status, other.value.retryable]).toEqual(["UNIMPLEMENTED", false])
   })
 })
 
 describe("layers", () => {
   test("the default gRPC URL table covers the four known networks", () => {
-    expect(defaultGrpcUrl("mainnet")).toBe("https://fullnode.mainnet.sui.io:443")
-    expect(defaultGrpcUrl("testnet")).toBe("https://fullnode.testnet.sui.io:443")
-    expect(defaultGrpcUrl("devnet")).toBe("https://fullnode.devnet.sui.io:443")
-    expect(defaultGrpcUrl("localnet")).toBe("http://127.0.0.1:9000")
-    expect(defaultGrpcUrl("staging")).toBe(undefined)
+    expect(["mainnet", "testnet", "devnet", "localnet", "staging"].map(defaultGrpcUrl)).toEqual([
+      "https://fullnode.mainnet.sui.io:443",
+      "https://fullnode.testnet.sui.io:443",
+      "https://fullnode.devnet.sui.io:443",
+      "http://127.0.0.1:9000",
+      undefined
+    ])
   })
 
-  test("layerConfig requires SUI_NETWORK", async () => {
-    const exit = await Effect.runPromiseExit(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        return core.network
-      }).pipe(
-        Effect.provide(
-          SuiCore.layerConfig.pipe(
-            Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord({})))
-          )
-        )
-      )
-    )
-    expect(Exit.isFailure(exit)).toBe(true)
-  })
-
-  test("layerConfig defaults SUI_RPC_URL from the table", async () => {
-    const network = await Effect.runPromise(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        return core.network
-      }).pipe(
-        Effect.provide(
-          SuiCore.layerConfig.pipe(
-            Layer.provide(
-              ConfigProvider.layer(ConfigProvider.fromEnvRecord({ SUI_NETWORK: "testnet" }))
-            )
-          )
-        )
-      )
-    )
-    expect(network).toBe("testnet")
-  })
-
-  test("layerConfig fails when a custom network has no URL and none is given", async () => {
-    const exit = await Effect.runPromiseExit(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        return core.network
-      }).pipe(
-        Effect.provide(
-          SuiCore.layerConfig.pipe(
-            Layer.provide(
-              ConfigProvider.layer(ConfigProvider.fromEnvRecord({ SUI_NETWORK: "staging" }))
-            )
-          )
-        )
-      )
-    )
-    expect(Exit.isFailure(exit)).toBe(true)
-  })
-
-  test("layerGrpc builds a client without touching the network", async () => {
-    const network = await Effect.runPromise(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        return core.network
-      }).pipe(
-        Effect.provide(
-          SuiCore.layerGrpc({ network: "testnet", baseUrl: "https://fullnode.testnet.sui.io:443" })
-        )
-      )
-    )
-    expect(network).toBe("testnet")
-  })
-})
-
-describe("the fake", () => {
-  test("serves an object with its BCS content", async () => {
-    const object = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const { object } = yield* core.getObject({
-          objectId: ESCROW,
-          include: { content: true }
-        })
-        return object
-      })
-    )
-    expect(object.type).toBe("0x2::escrow::Escrow")
-    expect(Escrow.parse(object.content).amount).toBe("5")
-  })
-
-  test("serves the Clock object 0x6", async () => {
-    const timestamp = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const { object } = yield* core.getObject({
-          objectId: SUI_CLOCK_OBJECT_ID,
-          include: { content: true }
-        })
-        return ClockBcs.parse(object.content).timestamp_ms
-      })
-    )
-    expect(timestamp).toBe("1700000000000")
-  })
-
-  test("a missing object fails with ObjectNotFound", async () => {
-    const exit = await runExit(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        return yield* core.getObject({ objectId: PADDED("dead") })
-      })
-    )
-    expect(Exit.isFailure(exit)).toBe(true)
-    if (Exit.isFailure(exit)) {
-      expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "ObjectNotFound" })
-    }
-  })
-
-  test("a deleted object fails with ObjectDeleted", async () => {
-    const exit = await runExit(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const fake = yield* SuiCoreFake
-        yield* fake.deleteObject(ESCROW)
-        return yield* core.getObject({ objectId: ESCROW })
-      })
-    )
-    expect(Exit.isFailure(exit)).toBe(true)
-    if (Exit.isFailure(exit)) {
-      expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "ObjectDeleted" })
-    }
-  })
-
-  test("getObjects reports per-item failures in the result array", async () => {
-    const objects = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const { objects } = yield* core.getObjects({
-          objectIds: [ESCROW, PADDED("dead")],
-          include: { content: true }
-        })
-        return objects
-      })
-    )
-    expect(objects).toHaveLength(2)
-    expect(objects[1]).toBeInstanceOf(Error)
-  })
-
-  test("an unscripted method dies with a message naming it", async () => {
-    const exit = await runExit(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        return yield* core.getProtocolConfig()
-      })
-    )
-    expect(Exit.isFailure(exit)).toBe(true)
-    if (Exit.isFailure(exit)) {
-      expect(String(Cause.squash(exit.cause))).toContain("getProtocolConfig")
-    }
-  })
-
-  test("records the options every call received", async () => {
-    const calls = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const fake = yield* SuiCoreFake
-        yield* core.getObject({ objectId: ESCROW, include: { content: true } })
-        return yield* fake.calls
-      })
-    )
-    expect(calls).toHaveLength(1)
-    expect(calls[0]?.method).toBe("getObject")
-    expect(calls[0]?.options).toMatchObject({ include: { content: true } })
-  })
-})
-
-describe("use", () => {
-  test("runs mapSdkError on whatever the call throws", async () => {
-    const error = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        return yield* core
-          .use(async (client) => client.core.getObject({ objectId: PADDED("dead") }))
-          .pipe(Effect.flip)
-      })
-    )
-    expect(error._tag).toBe("ObjectNotFound")
-  })
-
-  test("passes the client object and an AbortSignal through", async () => {
-    const chainId = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        return yield* core.use(async (client, signal) => {
-          expect(signal).toBeInstanceOf(AbortSignal)
-          const { chainIdentifier } = await client.core.getChainIdentifier({ signal })
-          return chainIdentifier
-        })
-      })
-    )
-    expect(chainId).toBe(script.chainId)
-  })
-})
-
-describe("retries", () => {
-  const flaky = SuiCoreFake.layer({
-    ...script,
-    getTransaction: [
-      FakeOutcome.transportError("UNAVAILABLE"),
-      FakeOutcome.transportError("UNAVAILABLE"),
-      FakeOutcome.succeed({ digest: fakeDigest(9) })
-    ]
-  })
-
-  test("a read retries a retryable TransportError and succeeds on the third attempt", async () => {
-    const program = Effect.gen(function*() {
-      const core = yield* SuiCore
-      const fake = yield* SuiCoreFake
-      const fiber = yield* Effect.forkChild(core.getTransaction({ digest: fakeDigest(9) }))
-      yield* TestClock.adjust("1 minute")
-      const exit = yield* Fiber.await(fiber)
-      const calls = yield* fake.calls
-      return { exit, attempts: calls.filter((call) => call.method === "getTransaction").length }
-    })
-    const result = await Effect.runPromise(
-      Effect.provide(program, Layer.merge(flaky, TestClock.layer()), { local: true })
-    )
-    expect(Exit.isSuccess(result.exit)).toBe(true)
-    expect(result.attempts).toBe(3)
-  })
-
-  test("a non-retryable TransportError is not retried", async () => {
-    const layer = SuiCoreFake.layer({
-      ...script,
-      getTransaction: [FakeOutcome.transportError("INVALID_ARGUMENT")]
-    })
-    const exit = await runExit(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const fake = yield* SuiCoreFake
-        const result = yield* Effect.exit(core.getTransaction({ digest: fakeDigest(9) }))
-        const calls = yield* fake.calls
-        return { result, attempts: calls.length }
-      }),
-      layer
-    )
-    expect(Exit.isSuccess(exit)).toBe(true)
-    if (Exit.isSuccess(exit)) {
-      expect(exit.value.attempts).toBe(1)
-    }
-  })
-
-  test("executeTransaction is never retried", async () => {
-    const layer = SuiCoreFake.layer({
-      ...script,
-      execute: [
-        FakeOutcome.transportError("UNAVAILABLE"),
-        FakeOutcome.succeed({ digest: fakeDigest(4) })
-      ]
-    })
-    const attempts = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const fake = yield* SuiCoreFake
-        yield* Effect.exit(
-          core.executeTransaction({ transaction: new Uint8Array([1]), signatures: [] })
-        )
-        const calls = yield* fake.calls
-        return calls.filter((call) => call.method === "executeTransaction").length
-      }),
-      layer
-    )
-    expect(attempts).toBe(1)
-  })
-})
-
-describe("interruption", () => {
-  test("a timeout aborts the fake's pending promise", async () => {
-    const layer = SuiCoreFake.layer({
-      ...script,
-      execute: [FakeOutcome.timeoutThen(false)]
-    })
-    const result = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const fake = yield* SuiCoreFake
-        const exit = yield* Effect.exit(
-          core
-            .executeTransaction({ transaction: new Uint8Array([1]), signatures: [] })
-            .pipe(Effect.timeout("50 millis"))
-        )
-        return { failed: Exit.isFailure(exit), aborted: yield* fake.aborted }
-      }),
-      layer
-    )
-    expect(result.failed).toBe(true)
-    expect(result.aborted).toBe(1)
+  test("layerConfig: SUI_NETWORK is required, SUI_RPC_URL defaults from the table, SUI_RPC_TIMEOUT is a duration", async () => {
+    const builds = (env: Record<string, string>) =>
+      Effect.runPromiseExit(
+        Effect.scoped(Layer.build(SuiCore.layerConfig)).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown(env)))
+      ).then(Exit.isSuccess)
+    expect(await builds({})).toBe(false)
+    expect(await builds({ SUI_NETWORK: "testnet" })).toBe(true)
+    expect(await builds({ SUI_NETWORK: "staging" })).toBe(false)
+    expect(await builds({ SUI_NETWORK: "staging", SUI_RPC_URL: "http://127.0.0.1:1" })).toBe(true)
+    expect(await builds({ SUI_NETWORK: "localnet", SUI_RPC_TIMEOUT: "5 seconds" })).toBe(true)
+    expect(await builds({ SUI_NETWORK: "localnet", SUI_RPC_TIMEOUT: "soon" })).toBe(false)
   })
 })

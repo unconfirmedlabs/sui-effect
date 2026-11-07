@@ -1,1205 +1,421 @@
+/**
+ * `Sui`, the convenience tier: decoded reads, the chain-id rules, batch
+ * integrity, pagination, tails, simulate and view. Objects come from the
+ * scripted responder; a method whose answer is the point of a test is stubbed.
+ */
 import { describe, expect, test } from "bun:test"
 import { bcs as suiBcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
-import { Transaction } from "@mysten/sui/transactions"
-import { normalizeStructTag, SUI_CLOCK_OBJECT_ID } from "@mysten/sui/utils"
-import {
-  DateTime,
-  Deferred,
-  Effect,
-  Exit,
-  Fiber,
-  Latch,
-  Layer,
-  Option,
-  Result,
-  Schema,
-  SchemaTransformation,
-  Stream
-} from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Result, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { bcs } from "../src/domain/bcs.ts"
-import {
-  CoinType,
-  KNOWN_CHAIN_IDS,
-  ObjectId,
-  StructTag,
-  SuiAddress
-} from "../src/domain/schemas.ts"
+import { ObjectDeleted } from "../src/domain/errors.ts"
+import { KNOWN_CHAIN_IDS, ObjectId, StructTag, SuiAddress } from "../src/domain/schemas.ts"
 import { Sui } from "../src/services/Sui.ts"
 import { SuiCore } from "../src/services/SuiCore.ts"
-import { FakeOutcome, fakeDigest, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
-import { fromSimulationResult, SIMULATE_INCLUDE } from "../src/internal.ts"
-import { layerTest } from "../src/testing.ts"
+import { DEFAULT_CHAIN_ID, fakeDigest, FakeOutcome, ScriptedSuiCore, SuiTest } from "../src/testing.ts"
+import { bytes, digestOf, fail, resultOf, run, sequence, signer, type Stubs, transport } from "./support.ts"
 
 const PADDED = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
-const ALICE = PADDED("a11ce")
-const ESCROW_TYPE = "0x2::escrow::Escrow"
-const CHAIN_ID = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
-
+const ALICE = SuiAddress.make(PADDED("a11ce"))
+const ESCROW_TYPE = `${PADDED("2")}::escrow::Escrow`
 const EscrowBcs = suiBcs.struct("Escrow", { id: suiBcs.Address, amount: suiBcs.U64 })
 const Escrow = bcs(EscrowBcs, ESCROW_TYPE)
-const U64 = bcs(suiBcs.U64, "u64")
-
-const owner: SuiClientTypes.ObjectOwner = { $kind: "AddressOwner", AddressOwner: ALICE }
-
 const escrow = (suffix: string, amount: string) => ({
   objectId: PADDED(suffix),
   type: ESCROW_TYPE,
   version: 3n,
-  owner,
+  owner: { $kind: "AddressOwner" as const, AddressOwner: ALICE },
   content: EscrowBcs.serialize({ id: PADDED(suffix), amount }).toBytes()
 })
+const objects = [escrow("e1", "5"), escrow("e2", "7")]
+const id = (suffix: string) => ObjectId.make(PADDED(suffix))
+const collect = <A, E, R>(stream: Stream.Stream<A, E, R>) => Effect.map(Stream.runCollect(stream), (chunk) => [...chunk])
+const sui = Sui
 
-const baseScript = {
-  chainId: CHAIN_ID,
-  clockTimestampMs: 1_700_000_000_000n,
-  objects: [escrow("e1", "5"), escrow("e2", "7")]
+/** A stub of one list method over a fixed (or growing) list, `limit` per page, cursors as indexes. */
+const pager = <A>(items: () => ReadonlyArray<A>, key: string, limit = 2) => {
+  const calls: Array<Record<string, unknown>> = []
+  const stub = (options: Record<string, unknown> = {}) =>
+    Effect.sync(() => {
+      calls.push(options)
+      const all = items()
+      const after = options["after"] ?? options["cursor"]
+      const start = after === undefined || after === null ? 0 : Number(after) + 1
+      const page = all.slice(start, start + ((options["limit"] as number | undefined) ?? limit))
+      const end = start + page.length
+      return {
+        [key]: page,
+        hasNextPage: end < all.length,
+        cursor: end < all.length ? String(end - 1) : null,
+        startCursor: page.length > 0 ? String(start) : null,
+        endCursor: page.length > 0 ? String(end - 1) : null
+      }
+    })
+  return { stub: stub as never, calls }
 }
 
-/**
- * A `SuiCore` that answers `getObjects` however the test says, so the response
- * integrity checks can be driven past what the fake is able to produce.
- */
-const mockCore = (getObjects: () => Effect.Effect<{ objects: ReadonlyArray<unknown> }>) =>
-  Layer.mock(SuiCore, {
-    network: "localnet" as never,
-    mvr: {} as never,
-    getChainIdentifier: () => Effect.succeed({ chainIdentifier: CHAIN_ID }),
-    getObjects: getObjects as never
+const event = (n: number, type = `${PADDED("b0a")}::game::Ping`): SuiClientTypes.EventEntry => ({
+  packageId: PADDED("b0a"),
+  module: "game",
+  sender: ALICE,
+  eventType: type,
+  bcs: suiBcs.U64.serialize(n).toBytes(),
+  json: null,
+  checkpoint: String(n),
+  transactionDigest: fakeDigest(n),
+  eventIndex: 0
+} as unknown as SuiClientTypes.EventEntry)
+
+describe("the layer", () => {
+  test("reads the chain id once; mainnet and testnet must report theirs", async () => {
+    const calls = await run(Effect.flatMap(sui, (s) => Effect.as(SuiTest.calls("getChainIdentifier"), s.chainId)), { objects })
+    expect(calls).toBe(DEFAULT_CHAIN_ID)
+    const mainnet = (chainId: string) =>
+      Effect.runPromise(Effect.flip(Effect.provide(sui, Sui.layerNoDeps.pipe(Layer.provide(ScriptedSuiCore.layer({ network: "mainnet", chainId }))))))
+    expect(KNOWN_CHAIN_IDS["mainnet"]).toBe(DEFAULT_CHAIN_ID)
+    expect(await mainnet(fakeDigest(99))).toMatchObject({ _tag: "NetworkMismatch", expected: DEFAULT_CHAIN_ID, actual: fakeDigest(99) })
   })
 
-const run = <A, E>(
-  effect: Effect.Effect<A, E, Sui | SuiCore | SuiCoreFake>,
-  layer = layerTest(baseScript)
-) => Effect.runPromise(Effect.provide(effect, layer, { local: true }))
-
-describe("layer build", () => {
-  test("reads the chain id once and exposes it", async () => {
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        const calls = yield* fake.calls
-        return {
-          chainId: sui.chainId,
-          identifierCalls: calls.filter((call) => call.method === "getChainIdentifier").length
-        }
-      })
-    )
-    expect(result.chainId).toBe(CHAIN_ID)
-    expect(result.identifierCalls).toBe(1)
-  })
-
-  test("asserts the known chain id for mainnet and testnet by default", async () => {
-    const good = await Effect.runPromise(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return sui.chainId
-      }).pipe(
-        Effect.provide(layerTest({ ...baseScript, network: "mainnet", chainId: CHAIN_ID }), {
-          local: true
-        })
-      )
-    )
-    expect(good).toBe(KNOWN_CHAIN_IDS["mainnet"]!)
-
-    const error = await Effect.runPromise(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return sui.chainId
-      }).pipe(
-        Effect.provide(
-          layerTest({ ...baseScript, network: "mainnet", chainId: fakeDigest(99) }),
-          { local: true }
-        ),
-        Effect.flip
-      )
-    )
-    expect(error._tag).toBe("NetworkMismatch")
-    if (error._tag === "NetworkMismatch") {
-      expect(error.expected).toBe(KNOWN_CHAIN_IDS["mainnet"]!)
-      expect(error.actual).toBe(fakeDigest(99))
-    }
-  })
-
-  test("records the observed chain id for a network with no fixed one", async () => {
-    const chainId = await Effect.runPromise(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return sui.chainId
-      }).pipe(
-        Effect.provide(
-          layerTest({ ...baseScript, network: "localnet", chainId: fakeDigest(77) }),
-          { local: true }
-        )
-      )
-    )
-    expect(chainId).toBe(fakeDigest(77))
-  })
-
-  test("an explicit chainId overrides the table", async () => {
-    const ok = await Effect.runPromise(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return sui.chainId
-      }).pipe(
-        Effect.provide(
-          Sui.layerNoDepsWith({ chainId: fakeDigest(77) }).pipe(
-            Layer.provide(
-              SuiCoreFake.layer({ ...baseScript, network: "mainnet", chainId: fakeDigest(77) })
-            )
-          ),
-          { local: true }
-        )
-      )
-    )
-    expect(ok).toBe(fakeDigest(77))
-  })
-
-  test("fails with NetworkMismatch when the node reports another chain", async () => {
-    const exit = await Effect.runPromiseExit(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return sui.chainId
-      }).pipe(
-        Effect.provide(
-          Sui.layerNoDepsWith({ chainId: fakeDigest(99) }).pipe(
-            Layer.provide(SuiCoreFake.layer(baseScript))
-          ),
-          { local: true }
-        )
-      )
-    )
-    expect(Exit.isFailure(exit)).toBe(true)
-    const error = await Effect.runPromise(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return sui.chainId
-      }).pipe(
-        Effect.provide(
-          Sui.layerNoDepsWith({ chainId: fakeDigest(99) }).pipe(
-            Layer.provide(SuiCoreFake.layer(baseScript))
-          ),
-          { local: true }
-        ),
-        Effect.flip
-      )
-    )
-    expect(error._tag).toBe("NetworkMismatch")
+  test("an explicit chainId is asserted on any network; localnet records what it observes", async () => {
+    const layered = (chainId: string, network: SuiClientTypes.Network, expected?: string) =>
+      Effect.runPromise(Effect.exit(Effect.map(sui, (s) => s.chainId).pipe(
+        Effect.provide((expected === undefined ? Sui.layerNoDeps : Sui.layerNoDepsWith({ chainId: expected })).pipe(
+          Layer.provide(ScriptedSuiCore.layer({ network, chainId }))
+        ))
+      )))
+    expect(await layered(fakeDigest(77), "localnet")).toEqual(Exit.succeed(fakeDigest(77)))
+    expect(await layered(fakeDigest(77), "mainnet", fakeDigest(77))).toEqual(Exit.succeed(fakeDigest(77)))
+    expect(Exit.isFailure(await layered(fakeDigest(77), "localnet", fakeDigest(99)))).toBe(true)
   })
 })
 
-describe("reads", () => {
-  test("getObject decodes content with the schema", async () => {
-    const object = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObject(ObjectId.make(PADDED("e1")), { schema: Escrow })
-      })
-    )
+describe("object reads", () => {
+  test("getObject decodes with the schema after checking the type, asking for the fixed include set", async () => {
+    const [object, call] = await run(Effect.gen(function*() {
+      const object = yield* (yield* sui).getObject(id("e1"), { schema: Escrow })
+      return [object, (yield* SuiTest.calls("getObjects"))[0]] as const
+    }), { objects })
     expect(object.content.amount).toBe("5")
-    expect(object.ref.version).toBe(3n as never)
-  })
-
-  test("getObject asks for the fixed include set", async () => {
-    const calls = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        yield* sui.getObject(ObjectId.make(PADDED("e1")))
-        return yield* fake.calls
-      })
-    )
-    const call = calls.find((entry) => entry.method === "getObject")
     expect(call?.options).toMatchObject({ include: { content: true } })
   })
 
-  test("getObject rejects a schema whose type does not match the object", async () => {
-    const error = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObject(ObjectId.make(PADDED("e1")), {
-          schema: bcs(EscrowBcs, "0x2::other::Thing")
-        }).pipe(Effect.flip)
-      })
-    )
-    expect(error._tag).toBe("DecodeError")
+  test("a schema for another type is DecodeError { type }; an expectedType overrides the codec's", async () => {
+    const other = bcs(EscrowBcs, "0x2::other::Thing")
+    const wrong = await fail(Effect.flatMap(sui, (s) => s.getObject(id("e1"), { schema: other })), { objects })
+    expect([wrong._tag, wrong._tag === "DecodeError" && wrong.kind]).toEqual(["DecodeError", "type"])
+    const overridden = await run(Effect.flatMap(sui, (s) => s.getObject(id("e1"), { schema: other, expectedType: ESCROW_TYPE })), { objects })
+    expect(overridden.content.amount).toBe("5")
   })
 
-  test("getObjectOption maps not found and deleted to None", async () => {
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        const missing = yield* sui.getObjectOption(ObjectId.make(PADDED("dead")))
-        yield* fake.deleteObject(PADDED("e2"))
-        const deleted = yield* sui.getObjectOption(ObjectId.make(PADDED("e2")))
-        const present = yield* sui.getObjectOption(ObjectId.make(PADDED("e1")))
-        return { missing, deleted, present }
-      })
-    )
-    expect(Option.isNone(result.missing)).toBe(true)
-    expect(Option.isNone(result.deleted)).toBe(true)
-    expect(Option.isSome(result.present)).toBe(true)
-  })
-
-  test("getObjects returns one Result per id, in order", async () => {
-    const results = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObjects(
-          [PADDED("e1"), PADDED("dead"), PADDED("e2")].map((id) => ObjectId.make(id)),
-          { schema: Escrow }
-        )
-      })
-    )
-    expect(results).toHaveLength(3)
-    expect(Result.isSuccess(results[0]!)).toBe(true)
-    expect(Result.isFailure(results[1]!)).toBe(true)
-    if (Result.isFailure(results[1]!)) {
-      expect(results[1]!.failure._tag).toBe("ObjectNotFound")
-    }
-    if (Result.isSuccess(results[2]!)) {
-      expect(results[2]!.success.content.amount).toBe("7")
-    }
-  })
-
-  test("getObjects chunks by 50", async () => {
-    const many = Array.from({ length: 120 }, (_, index) =>
-      escrow(`${(index + 16).toString(16)}0`, String(index)))
-    const layer = layerTest({ ...baseScript, objects: many })
-    const calls = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        yield* sui.getObjects(many.map((object) => ObjectId.make(object.objectId)))
-        return yield* fake.calls
-      }),
-      layer
-    )
-    const batches = calls.filter((call) => call.method === "getObjects")
-    expect(batches).toHaveLength(3)
-    expect(
-      batches.map((batch) => (batch.options as { objectIds: Array<string> }).objectIds.length)
-    ).toEqual([50, 50, 20])
-  })
-
-  // NB5: the chunks go out concurrently, bounded by CHUNK_CONCURRENCY (4).
-  test("getObjects sends chunks concurrently", async () => {
-    const ids = Array.from(
-      { length: 120 },
-      (_, index) => ObjectId.make(PADDED(`${(index + 16).toString(16)}0`))
-    )
-    const latch = Effect.runSync(Latch.make(false))
-    const arrived: Array<number> = []
-    const result = await Effect.runPromise(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fiber = yield* Effect.forkChild(sui.getObjects(ids))
-        // The latch opens only once two chunk calls have been *recorded*, so a
-        // sequential implementation deadlocks here rather than passing.
-        yield* Latch.await(latch)
-        return yield* Fiber.join(fiber)
-      }).pipe(
-        Effect.provide(
-          Sui.layerNoDeps.pipe(
-            Layer.provide(
-              mockCore(() =>
-                Effect.suspend(() => {
-                  arrived.push(arrived.length)
-                  if (arrived.length >= 2) latch.openUnsafe()
-                  return Effect.as(Latch.await(latch), { objects: [] as ReadonlyArray<unknown> })
-                })
-              )
-            )
-          ),
-          { local: true }
-        ),
-        Effect.flip
-      )
-    )
-    // Two chunk calls were in flight at once before either could answer.
-    expect(arrived.length).toBeGreaterThanOrEqual(2)
-    // The empty answers then fail the integrity check, which is the point of
-    // the next test: the first failure escapes and no partial array does.
-    expect(result._tag).toBe("TransportError")
-  })
-
-  // NB5: first-failure semantics survive the concurrency. Nothing is asserted
-  // about whether chunk 3 was sent — under concurrency it may already be in
-  // flight — only that the failure escapes and no partial array comes back.
-  test("getObjects fails the whole read on a non-retryable failure in one chunk", async () => {
-    const many = Array.from({ length: 120 }, (_, index) =>
-      escrow(`${(index + 16).toString(16)}0`, String(index)))
-    let call = 0
-    const error = await Effect.runPromise(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObjects(many.map((object) => ObjectId.make(object.objectId)))
-      }).pipe(
-        Effect.provide(
-          Sui.layerNoDeps.pipe(
-            Layer.provide(
-              mockCore(() =>
-                Effect.suspend(() => {
-                  call += 1
-                  // The second chunk answers for too few objects, which is the
-                  // integrity check's non-retryable `TransportError`.
-                  return Effect.succeed({
-                    objects: call === 2 ? [] : new globalThis.Array(50).fill(undefined)
-                  })
-                })
-              )
-            )
-          ),
-          { local: true }
-        ),
-        Effect.flip
-      )
-    )
-    expect(error._tag).toBe("TransportError")
-    if (error._tag === "TransportError") expect(error.retryable).toBe(false)
-  })
-
-  test("getObjects deduplicates the request and answers once per id asked", async () => {
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        const results = yield* sui.getObjects([
-          ObjectId.make(PADDED("e1")),
-          ObjectId.make(PADDED("e2")),
-          ObjectId.make(PADDED("e1"))
-        ], { schema: Escrow })
-        const calls = yield* fake.calls
-        const request = calls.find((call) => call.method === "getObjects")
-        return { results, requested: (request?.options as { objectIds: Array<string> }).objectIds }
-      })
-    )
-    expect(result.requested).toHaveLength(2)
-    expect(result.results).toHaveLength(3)
-    expect(Result.isSuccess(result.results[0]!)).toBe(true)
-    expect(Result.isSuccess(result.results[2]!)).toBe(true)
-    if (Result.isSuccess(result.results[0]!) && Result.isSuccess(result.results[2]!)) {
-      expect(result.results[2]!.success.content.amount).toBe(
-        result.results[0]!.success.content.amount
-      )
-    }
-  })
-
-  test("getObjects normalizes ids before matching the node's answer", async () => {
-    const results = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        // The short spelling of an id the fake stores padded.
-        return yield* sui.getObjects(["0xe1" as never, PADDED("e2") as never])
-      })
-    )
-    expect(results).toHaveLength(2)
-    expect(Result.isSuccess(results[0]!)).toBe(true)
-    expect(Result.isSuccess(results[1]!)).toBe(true)
-  })
-
-  test("getObjects fails with TransportError when the node answers for another id", async () => {
-    const wrong = mockCore(() =>
-      Effect.succeed({
-        objects: [{ ...escrow("e2", "7"), version: "3", content: new Uint8Array() }]
-      }))
-    const error = await Effect.runPromise(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObjects([ObjectId.make(PADDED("e1"))]).pipe(Effect.flip)
-      }).pipe(
-        Effect.provide(Sui.layerNoDeps.pipe(Layer.provide(wrong)), { local: true })
-      )
-    )
-    expect(error._tag).toBe("TransportError")
-    expect(String(error.cause)).toContain("answered for")
-  })
-
-  test("getObjects fails with TransportError when the node answers for too few", async () => {
-    const short = mockCore(() => Effect.succeed({ objects: [] }))
-    const error = await Effect.runPromise(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObjects([ObjectId.make(PADDED("e1"))]).pipe(Effect.flip)
-      }).pipe(
-        Effect.provide(Sui.layerNoDeps.pipe(Layer.provide(short)), { local: true })
-      )
-    )
-    expect(error._tag).toBe("TransportError")
-    expect(String(error.cause)).toContain("answered for 0")
-  })
-
-  test("getBalance decodes the balance response", async () => {
-    const layer = layerTest({
-      ...baseScript,
-      balances: [
-        { coinType: "0x2::sui::SUI", balance: "10", coinBalance: "6", addressBalance: "4" }
-      ]
-    })
-    const balance = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getBalance(SuiAddress.make(ALICE), CoinType.make("0x2::sui::SUI"))
-      }),
-      layer
-    )
-    expect(balance.balance).toBe(10n as never)
-  })
-
-  test("chainTime decodes the Clock object", async () => {
-    const time = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.chainTime
-      })
-    )
-    expect(DateTime.toEpochMillis(time)).toBe(1_700_000_000_000)
-  })
-
-  test("chainTime is never cached", async () => {
-    const reads = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        yield* sui.chainTime
-        yield* fake.setClock(1_700_000_060_000n)
-        const second = yield* sui.chainTime
-        const calls = yield* fake.calls
-        return {
-          second: DateTime.toEpochMillis(second),
-          clockReads: calls.filter(
-            (call) =>
-              call.method === "getObject" &&
-              (call.options as { objectId: string }).objectId === SUI_CLOCK_OBJECT_ID
-          ).length
-        }
-      })
-    )
-    expect(reads.second).toBe(1_700_000_060_000)
-    expect(reads.clockReads).toBe(2)
+  test("a bare codec decodes an instantiation; an expectedType with type arguments is compared in full", async () => {
+    const GENERIC = `${PADDED("c0de")}::composition::Composition`
+    const Composition = bcs(suiBcs.struct("Composition", { id: suiBcs.Address }), GENERIC)
+    const instance = { objectId: PADDED("c1"), type: `${GENERIC}<0x2::sui::SUI>`, version: 1n, content: suiBcs.Address.serialize(PADDED("c1")).toBytes() }
+    const object = await run(Effect.flatMap(sui, (s) => s.getObject(id("c1"), { schema: Composition })), { objects: [instance] })
+    expect(object.type).toBe(StructTag.normalize(instance.type))
+    const refused = await fail(Effect.flatMap(sui, (s) => s.getObject(id("c1"), { schema: Composition, expectedType: `${GENERIC}<u64>` })), { objects: [instance] })
+    expect(refused._tag).toBe("DecodeError")
   })
 
   test("a package object is readable: its type is the literal `package`", async () => {
-    const layer = layerTest({
-      ...baseScript,
-      objects: [
-        ...baseScript.objects,
-        {
-          objectId: PADDED("9ac"),
-          type: "package",
-          version: 1n,
-          owner: { $kind: "Immutable" as const, Immutable: true },
-          content: new Uint8Array([1, 2, 3])
-        }
+    const pkg = { objectId: PADDED("9ac"), type: "package", version: 1n, owner: { $kind: "Immutable" as const, Immutable: true as const }, content: new Uint8Array([1, 2, 3]) }
+    const object = await run(Effect.flatMap(sui, (s) => s.getObject(id("9ac"))), { objects: [pkg] })
+    expect([object.type, object.ref.type, Array.from(object.content)]).toEqual(["package", "package", [1, 2, 3]] as never)
+  })
+
+  test("getObjectOption is None for a missing or deleted object", async () => {
+    const deleted: Stubs = { getObject: (() => Effect.fail(new ObjectDeleted({ objectId: id("e1") }))) as never }
+    expect(Option.isNone(await run(Effect.flatMap(sui, (s) => s.getObjectOption(id("dead")))))).toBe(true)
+    expect(Option.isNone(await run(Effect.flatMap(sui, (s) => s.getObjectOption(id("e1"))), { objects }, deleted))).toBe(true)
+  })
+
+  test("getObjects: one Result per id asked, in order, deduplicated and normalized on the wire", async () => {
+    const [results, requested] = await run(Effect.gen(function*() {
+      const results = yield* (yield* sui).getObjects([id("e1"), id("dead"), "0xe2" as ObjectId, id("e1")], { schema: Escrow })
+      return [results, (yield* SuiTest.calls("getObjects"))[0]?.options] as const
+    }), { objects })
+    expect(results.map((r) => Result.isSuccess(r) ? r.success.content.amount : r.failure._tag)).toEqual(["5", "ObjectNotFound", "7", "5"])
+    expect((requested as { objectIds: Array<string> }).objectIds).toHaveLength(3)
+  })
+
+  test("getObjects reads in chunks of 50", async () => {
+    const many = Array.from({ length: 120 }, (_, i) => escrow((i + 0x100).toString(16), String(i)))
+    const sizes = await run(Effect.gen(function*() {
+      yield* (yield* sui).getObjects(many.map((o) => ObjectId.make(o.objectId)))
+      return (yield* SuiTest.calls("getObjects")).map((call) => (call.options as { objectIds: Array<string> }).objectIds.length)
+    }), { objects: many })
+    expect(sizes).toEqual([50, 50, 20])
+  })
+
+  test("an answer for another id, or for too few, fails the whole read", async () => {
+    const answering = (answer: ReadonlyArray<unknown>): Stubs => ({ getObjects: (() => Effect.succeed({ objects: answer })) as never })
+    const other = await fail(Effect.flatMap(sui, (s) => s.getObjects([id("e1")])), {}, answering([{ ...escrow("e2", "7"), version: "3" }]))
+    expect([other._tag, String(other.cause)]).toEqual(["TransportError", expect.stringContaining("answered for")])
+    const short = await fail(Effect.flatMap(sui, (s) => s.getObjects([id("e1")])), {}, answering([]))
+    expect(short._tag === "TransportError" && short.retryable).toBe(false)
+  })
+
+  test("getObjectsStrict answers in order, or fails with the first item error", async () => {
+    const found = await run(Effect.flatMap(sui, (s) => s.getObjectsStrict([id("e2"), id("e1")], { schema: Escrow })), { objects })
+    expect(found.map((o) => o.content.amount)).toEqual(["7", "5"])
+    expect((await fail(Effect.flatMap(sui, (s) => s.getObjectsStrict([id("e1"), id("dead")])), { objects }))._tag).toBe("ObjectNotFound")
+  })
+
+  test("chainTime decodes the Clock object and is never cached", async () => {
+    const times = await run(Effect.gen(function*() {
+      const s = yield* sui
+      const first = yield* s.chainTime
+      yield* SuiTest.setClock(2_000n)
+      return [first, yield* s.chainTime].map((t) => t.epochMilliseconds)
+    }), { clockTimestampMs: 1_000n })
+    expect(times).toEqual([1_000, 2_000])
+  })
+
+  test("getBalance decodes amounts as bigints and takes a plain coin type", async () => {
+    const balance = await run(Effect.flatMap(sui, (s) => s.getBalance(ALICE, "0x2::sui::SUI")), { addressBalances: [{ owner: ALICE, amount: 4n }] })
+    expect([balance.addressBalance, balance.coinBalance, balance.balance]).toEqual([4n, 0n, 4n] as never)
+  })
+})
+
+describe("dynamic fields", () => {
+  const PARENT = PADDED("aa")
+  const Post = bcs(suiBcs.struct("Post", { likes: suiBcs.u64() }), `${PADDED("b0a")}::board::Post`)
+  const name = { type: "u64", bcs: suiBcs.u64().serialize(7).toBytes() }
+  const script = {
+    dynamicFields: {
+      [PARENT]: [
+        { $kind: "DynamicField" as const, fieldId: PADDED("f0"), type: `0x2::dynamic_field::Field<u64, ${PADDED("b0a")}::board::Post>`, name, valueType: `${PADDED("b0a")}::board::Post` },
+        { $kind: "DynamicObject" as const, fieldId: PADDED("f1"), type: "0x2::dynamic_field::Field<u8, ID>", name: { type: "u8", bcs: new Uint8Array([1]) }, valueType: "ID", childId: PADDED("e1") }
       ]
-    })
-    const object = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObject(ObjectId.make(PADDED("9ac")))
-      }),
-      layer
-    )
-    expect(object.type).toBe("package")
-    expect(object.ref.type).toBe("package")
-    expect(Array.from(object.content)).toEqual([1, 2, 3])
+    },
+    dynamicFieldValues: { [PADDED("f0")]: { type: `${PADDED("b0a")}::board::Post`, bcs: suiBcs.u64().serialize(3).toBytes() } },
+    objects
+  }
+
+  test("getDynamicFieldOption decodes the value after checking its type, and is None when absent", async () => {
+    const [found, wrong, missing] = await run(Effect.gen(function*() {
+      const s = yield* sui
+      return [
+        yield* s.getDynamicFieldOption(ObjectId.make(PARENT), name, { schema: Post }),
+        yield* Effect.flip(s.getDynamicFieldOption(ObjectId.make(PARENT), name, { schema: Escrow })),
+        yield* s.getDynamicFieldOption(ObjectId.make(PARENT), { type: "u64", bcs: new Uint8Array(8) })
+      ] as const
+    }), script)
+    expect(Option.getOrThrow(found).content).toEqual({ likes: "3" })
+    expect(wrong._tag === "DecodeError" && wrong.kind).toBe("type")
+    expect(Option.isNone(missing)).toBe(true)
   })
 
-  test("an explicit expectedType overrides what the codec recorded", async () => {
-    const bare = bcs(EscrowBcs, "0x2::other::Thing")
-    const error = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui
-          .getObject(ObjectId.make(PADDED("e1")), { schema: bare, expectedType: ESCROW_TYPE })
-          .pipe(Effect.result)
-      })
-    )
-    expect(Result.isSuccess(error)).toBe(true)
-
-    const rejected = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui
-          .getObject(ObjectId.make(PADDED("e1")), {
-            schema: Escrow,
-            expectedType: "0x2::other::Thing"
-          })
-          .pipe(Effect.flip)
-      })
-    )
-    expect(rejected._tag).toBe("DecodeError")
-  })
-
-  test("a composed codec keeps the type check the bridge recorded", async () => {
-    class Wallet extends Schema.Class<Wallet>("Wallet")({
-      id: Schema.String,
-      amount: Schema.String
-    }) {}
-    const compose = (codec: typeof Escrow) =>
-      codec.pipe(
-        Schema.decodeTo(
-          Wallet,
-          SchemaTransformation.transform({
-            decode: (value: { id: string; amount: string }) => new Wallet(value),
-            encode: (wallet: Wallet) => ({ id: wallet.id, amount: wallet.amount })
-          })
-        )
-      )
-    const ok = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObject(ObjectId.make(PADDED("e1")), { schema: compose(Escrow) })
-      })
-    )
-    expect(ok.content).toBeInstanceOf(Wallet)
-    expect(ok.content.amount).toBe("5")
-
-    const rejected = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui
-          .getObject(ObjectId.make(PADDED("e1")), {
-            schema: compose(bcs(EscrowBcs, "0x2::other::Thing"))
-          })
-          .pipe(Effect.flip)
-      })
-    )
-    expect(rejected._tag).toBe("DecodeError")
-  })
-
-  test("getDynamicFieldOption decodes the SDK's runtime shape (value.type, no valueType)", async () => {
-    const parent = PADDED("e1")
-    const layer = layerTest({
-      ...baseScript,
-      dynamicFields: {
-        [parent]: [{
-          fieldId: PADDED("f1"),
-          type: "0x2::dynamic_field::Field<u64, u64>",
-          name: { type: "u64", bcs: new Uint8Array([7]) },
-          valueType: "u64",
-          $kind: "DynamicField"
-        }]
-      }
-    })
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getDynamicFieldOption(ObjectId.make(parent), {
-          type: "u64",
-          bcs: new Uint8Array([7])
-        })
-      }),
-      layer
-    )
-    expect(Option.isSome(result)).toBe(true)
-    if (Option.isSome(result)) expect(result.value.valueType).toBe("u64")
-  })
-
-  test("getDynamicFieldOption is None when the field is missing", async () => {
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getDynamicFieldOption(ObjectId.make(PADDED("e1")), {
-          type: "u64",
-          bcs: new Uint8Array([1])
-        })
-      })
-    )
-    expect(Option.isNone(result)).toBe(true)
+  test("getDynamicObjectFieldOption decodes the child object", async () => {
+    const child = await run(Effect.flatMap(sui, (s) => s.getDynamicObjectFieldOption(ObjectId.make(PARENT), { type: "u8", bcs: new Uint8Array([1]) }, { schema: Escrow })), script)
+    expect(Option.getOrThrow(child).content.amount).toBe("5")
   })
 })
 
 describe("streams", () => {
-  const field = (index: number): SuiClientTypes.DynamicFieldEntry => ({
-    fieldId: PADDED(`d${index.toString(16)}0`),
-    type: "0x2::dynamic_field::Field<u64, u64>",
-    name: { type: "u64", bcs: new Uint8Array([index]) },
-    valueType: "u64",
-    $kind: "DynamicField"
+  test("streamOwnedObjects follows hasNextPage, passing the type filter and the include set", async () => {
+    const owned = pager(() => [escrow("f1", "1"), escrow("f2", "2"), escrow("f3", "3")].map((o) => ({ ...o, version: "3", digest: fakeDigest(1) })), "objects")
+    const items = await run(Effect.flatMap(sui, (s) => collect(s.streamOwnedObjects(ALICE, { type: StructTag.make(ESCROW_TYPE) }))), {}, { listOwnedObjects: owned.stub })
+    expect(items.map((o) => o.id)).toEqual([id("f1"), id("f2"), id("f3")])
+    expect(owned.calls).toHaveLength(2)
+    expect(owned.calls[0]).toMatchObject({ include: { content: true }, type: ESCROW_TYPE })
   })
 
-  test("streamOwnedObjects paginates until hasNextPage is false", async () => {
-    const objects = Array.from({ length: 7 }, (_, index) =>
-      escrow(`${(index + 16).toString(16)}0`, String(index)))
-    const layer = layerTest({ ...baseScript, objects, pageSize: 3 })
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        const items = yield* Stream.runCollect(sui.streamOwnedObjects(SuiAddress.make(ALICE)))
-        const calls = yield* fake.calls
-        return {
-          items: items.length,
-          pages: calls.filter((call) => call.method === "listOwnedObjects").length
-        }
-      }),
-      layer
-    )
-    expect(result.items).toBe(7)
-    expect(result.pages).toBe(3)
-  })
-
-  test("streamOwnedObjects filters by type and asks for the fixed include set", async () => {
-    const objects = [
-      escrow("f1", "1"),
-      { ...escrow("f2", "2"), type: "0x2::escrow::Receipt" },
-      escrow("f3", "3")
-    ]
-    const layer = layerTest({ ...baseScript, objects })
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        const items = yield* Stream.runCollect(
-          sui.streamOwnedObjects(SuiAddress.make(ALICE), { type: StructTag.make(ESCROW_TYPE) })
-        )
-        const calls = yield* fake.calls
-        return { items, call: calls.find((call) => call.method === "listOwnedObjects") }
-      }),
-      layer
-    )
-    expect(result.items.map((object) => object.id)).toEqual([
-      PADDED("f1") as never,
-      PADDED("f3") as never
+  test("streamEvents continues past an empty page that has a next page, and normalizes a full eventType", async () => {
+    const pages = sequence([
+      () => Effect.succeed({ events: [event(1)], hasNextPage: true, endCursor: "0" }),
+      () => Effect.succeed({ events: [], hasNextPage: true, endCursor: "5" }),
+      () => Effect.succeed({ events: [event(2)], hasNextPage: false, endCursor: "6" })
     ])
-    expect(result.call?.options).toMatchObject({
-      include: { content: true },
-      type: ESCROW_TYPE
-    })
+    const items = await run(Effect.flatMap(sui, (s) => collect(s.streamEvents({ eventType: "0x2::coin::CoinMetadata<0x2::sui::SUI>" }))), {}, { listEvents: pages.stub })
+    expect(items.map((e) => e.transactionDigest)).toEqual([fakeDigest(1), fakeDigest(2)])
+    expect(pages.calls[0]).toMatchObject({ filter: { eventType: `${PADDED("2")}::coin::CoinMetadata<${PADDED("2")}::sui::SUI>` } })
+    expect(pages.calls.map((call) => (call as { after?: string }).after)).toEqual([undefined, "0", "5"])
   })
 
-  test("streamDynamicFields paginates", async () => {
-    const layer = layerTest({
-      ...baseScript,
-      pageSize: 2,
-      dynamicFields: { [PADDED("e1")]: [field(1), field(2), field(3), field(4), field(5)] }
-    })
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        const items = yield* Stream.runCollect(
-          sui.streamDynamicFields(ObjectId.make(PADDED("e1")))
-        )
-        const calls = yield* fake.calls
-        return {
-          items: items.length,
-          pages: calls.filter((call) => call.method === "listDynamicFields").length
-        }
-      }),
-      layer
-    )
-    expect(result.items).toBe(5)
-    expect(result.pages).toBe(3)
+  test("`after` starts at a cursor; `before` reads from that cursor down, as the SDK does", async () => {
+    const events = pager(() => [1, 2, 3, 4].map((n) => event(n)), "events")
+    const resumed = await run(Effect.flatMap(sui, (s) => collect(s.streamEvents(undefined, { after: "1" }))), {}, { listEvents: events.stub })
+    expect(resumed.map((e) => e.transactionDigest)).toEqual([fakeDigest(3), fakeDigest(4)])
+    const descending = sequence([() => Effect.succeed({ events: [], hasNextPage: false, endCursor: null })])
+    await run(Effect.flatMap(sui, (s) => collect(s.streamEvents(undefined, { before: "3" }))), {}, { listEvents: descending.stub })
+    expect(descending.calls[0]).toEqual({ before: "3" })
+  })
+
+  test("streamTransactions yields an on-chain failure as a Result failure, with the read include set", async () => {
+    const failed = { $kind: "MoveAbort", message: "x", MoveAbort: { abortCode: "3" } } as unknown as SuiClientTypes.ExecutionError
+    const pages = sequence([() => Effect.succeed({ transactions: [resultOf(fakeDigest(1)), resultOf(fakeDigest(2), {}, failed)], hasNextPage: false, endCursor: "1" })])
+    const items = await run(Effect.flatMap(sui, (s) => collect(s.streamTransactions({ sender: ALICE }))), {}, { listTransactions: pages.stub })
+    expect(items.map((item) => item._tag)).toEqual(["Success", "Failure"])
+    expect(pages.calls[0]).toMatchObject({ filter: { sender: ALICE }, include: { effects: true, bcs: true } })
+  })
+
+  test("a function filter that cannot be paginated is refused before the first request", async () => {
+    const pages = sequence([() => Effect.succeed({ transactions: [], hasNextPage: false, endCursor: null })])
+    const exit = await run(Effect.exit(Effect.flatMap(sui, (s) => collect(s.streamTransactions({ function: `${PADDED("b0a")}::vault` })))), {}, { listTransactions: pages.stub })
+    expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause) && Cause.pretty(exit.cause)).toContain("package::module::function")
+    expect(pages.calls).toHaveLength(0)
+  })
+
+  test("affectedAddress on a transport without the gRPC ledger is UNIMPLEMENTED, never a sender-only answer", async () => {
+    const error = await fail(Effect.flatMap(sui, (s) => collect(s.streamTransactions({ affectedAddress: ALICE }))))
+    expect(error._tag === "TransportError" && [error.status, error.retryable]).toEqual(["UNIMPLEMENTED", false])
+  })
+})
+
+describe("tails", () => {
+  const tail = <A>(stream: (s: Sui["Service"]) => Stream.Stream<A, unknown>, take: number, between: Effect.Effect<void>, stubs: Stubs) =>
+    run(Effect.gen(function*() {
+      const s = yield* sui
+      const fiber = yield* Effect.forkChild(collect(stream(s).pipe(Stream.take(take))))
+      yield* TestClock.adjust("1 second")
+      yield* between
+      yield* TestClock.adjust("1 second")
+      yield* TestClock.adjust("1 second")
+      return yield* Fiber.join(fiber)
+    }), {}, stubs)
+
+  test("a tail follows the ledger past the point it caught up, polling", async () => {
+    const ledger = [event(1), event(2)]
+    const events = pager(() => ledger, "events")
+    const items = await tail((s) => s.tailEvents(), 4, Effect.sync(() => ledger.push(event(3), event(4))), { listEvents: events.stub })
+    expect(items.map((e) => e.transactionDigest)).toEqual([1, 2, 3, 4].map(fakeDigest))
+  })
+
+  test("a tail retries a retryable failure from its last cursor instead of ending", async () => {
+    let failures = 0
+    const events = pager(() => [event(1), event(2), event(3)], "events", 1)
+    const flaky = (options: { readonly after?: string }) =>
+      Effect.suspend(() =>
+        options.after === "0" && failures < 2
+          ? Effect.sync(() => failures++).pipe(Effect.andThen(Effect.fail(transport("listEvents", "UNAVAILABLE", true))))
+          : (events.stub as (o: unknown) => Effect.Effect<unknown>)(options)
+      )
+    const items = await tail((s) => s.tailEvents(undefined, { poll: "1 second" }), 3, Effect.void, { listEvents: flaky as never })
+    expect(failures).toBe(2)
+    expect(items).toHaveLength(3)
+  })
+
+  test("a caught-up filtered tail moves its cursor to the unfiltered head, read before the page", async () => {
+    const afters: Array<unknown> = []
+    const listEvents = (options: { readonly filter?: unknown; readonly after?: string; readonly order?: string }) =>
+      Effect.sync(() => {
+        if (options.order === "descending") return { events: [event(9)], hasNextPage: true, startCursor: "8", endCursor: "8" }
+        afters.push(options.after)
+        return afters.length === 1
+          ? { events: [event(1)], hasNextPage: false, startCursor: "0", endCursor: "0" }
+          : { events: [], hasNextPage: false, startCursor: null, endCursor: null }
+      })
+    await run(Effect.gen(function*() {
+      const s = yield* sui
+      const fiber = yield* Effect.forkChild(collect(s.tailEvents({ eventType: `${PADDED("b0a")}::game::Ping` })))
+      for (let i = 0; i < 3; i++) yield* TestClock.adjust("1 second")
+      yield* Fiber.interrupt(fiber)
+    }), {}, { listEvents: listEvents as never })
+    expect(afters.slice(0, 3)).toEqual([undefined, "0", "8"])
   })
 })
 
 describe("simulate and view", () => {
-  const simulateLayer = (commandResults: Array<SuiClientTypes.CommandResult>) =>
-    layerTest({
-      ...baseScript,
-      simulate: [FakeOutcome.succeed({ digest: fakeDigest(50), commandResults })]
-    })
+  const U64 = bcs(suiBcs.U64, "u64")
+  const results = (...values: ReadonlyArray<number>) =>
+    FakeOutcome.succeed({ commandResults: values.map((v) => ({ returnValues: [{ bcs: suiBcs.U64.serialize(v).toBytes() }] })) })
 
-  test("simulate asks for the fixed include set and decodes the result", async () => {
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        const simulation = yield* sui.simulate(() => {})
-        const calls = yield* fake.calls
-        return { simulation, call: calls.find((call) => call.method === "simulateTransaction") }
-      }),
-      simulateLayer([])
-    )
-    expect(result.simulation.digest).toBe(fakeDigest(50) as never)
-    expect(result.call?.options).toMatchObject({
-      include: {
-        effects: true,
-        events: true,
-        balanceChanges: true,
-        objectTypes: true,
-        commandResults: true
-      },
+  test("simulate asks for the fixed include set with checks enabled; view decodes a return value with checks off", async () => {
+    const [simulation, last, first, calls] = await run(Effect.gen(function*() {
+      const s = yield* sui
+      return [yield* s.simulate(() => {}), yield* s.view(() => {}, U64), yield* s.view(() => {}, suiBcs.U64, { command: 0 }), yield* SuiTest.calls("simulateTransaction")] as const
+    }), { simulate: [results(1, 42)] })
+    expect(simulation.effects.status.success).toBe(true)
+    expect([last, first]).toEqual(["42", "1"])
+    expect(calls[0]?.options).toMatchObject({
+      include: { effects: true, events: true, balanceChanges: true, objectTypes: true, commandResults: true },
       checksEnabled: true
     })
+    expect(calls[1]?.options).toMatchObject({ checksEnabled: false })
   })
 
-  test("simulation falls back to effects.transactionDigest when the top-level digest is absent", async () => {
-    const expected = fakeDigest(52)
-    const simulation = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const raw = yield* core.simulateTransaction({
-          transaction: new Transaction(),
-          include: SIMULATE_INCLUDE
-        })
-        if (raw.$kind !== "Transaction") return yield* Effect.die("expected a successful simulation")
-        const transaction = { ...raw.Transaction } as { digest?: string }
-        delete transaction.digest
-        return yield* fromSimulationResult({
-          ...raw,
-          Transaction: transaction
-        } as typeof raw)
-      }),
-      layerTest({
-        ...baseScript,
-        simulate: [FakeOutcome.succeed({ digest: expected })]
-      })
-    )
-    expect(simulation.digest).toBe(expected as never)
+  test("an on-chain failure is SimulationFailed, a throwing recipe BuildError, a missing return value DecodeError", async () => {
+    const aborted = FakeOutcome.failWith({ $kind: "MoveAbort", message: "x", command: 0, MoveAbort: { abortCode: "3" } } as unknown as SuiClientTypes.ExecutionError)
+    expect((await fail(Effect.flatMap(sui, (s) => s.simulate(() => {})), { simulate: [aborted] }))._tag).toBe("SimulationFailed")
+    expect((await fail(Effect.flatMap(sui, (s) => s.simulate(() => {
+      throw new Error("bad recipe")
+    })), { simulate: [results()] }))._tag).toBe("BuildError")
+    expect((await fail(Effect.flatMap(sui, (s) => s.view(() => {}, U64)), { simulate: [results()] }))._tag).toBe("DecodeError")
   })
 
-  test("simulation refuses different top-level and effects digests", async () => {
-    const topLevel = fakeDigest(53)
-    const effects = fakeDigest(54)
-    const error = await run(
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const raw = yield* core.simulateTransaction({
-          transaction: new Transaction(),
-          include: SIMULATE_INCLUDE
-        })
-        if (raw.$kind !== "Transaction") return yield* Effect.die("expected a successful simulation")
-        return yield* fromSimulationResult({
-          ...raw,
-          Transaction: {
-            ...raw.Transaction,
-            digest: topLevel,
-            effects: { ...raw.Transaction.effects, transactionDigest: effects }
-          }
-        }).pipe(Effect.flip)
-      }),
-      layerTest({
-        ...baseScript,
-        simulate: [FakeOutcome.succeed({ digest: topLevel })]
-      })
-    )
-    expect(error._tag).toBe("TransportError")
-    expect(String(error.cause)).toContain(topLevel)
-    expect(String(error.cause)).toContain(effects)
-  })
-
-  test("simulate decodes a publish, whose object type is the literal `package`", async () => {
-    const layer = layerTest({
-      ...baseScript,
-      simulate: [
-        FakeOutcome.succeed({
-          digest: fakeDigest(51),
-          created: [
-            { objectId: PADDED("9ac"), type: "package", version: 1n, outputState: "PackageWrite" }
-          ]
-        })
-      ]
-    })
-    const simulation = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.simulate(() => {})
-      }),
-      layer
-    )
-    expect(simulation.objectTypes[PADDED("9ac")]).toBe("package")
-  })
-
-  test("simulate maps an on-chain failure to SimulationFailed", async () => {
-    const layer = layerTest({
-      ...baseScript,
-      simulate: [
-        FakeOutcome.failWith({
-          message: "MoveAbort",
-          command: 0,
-          $kind: "MoveAbort",
-          MoveAbort: { abortCode: "3" }
-        } as SuiClientTypes.ExecutionError)
-      ]
-    })
-    const error = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.simulate(() => {}).pipe(Effect.flip)
-      }),
-      layer
-    )
-    expect(error._tag).toBe("SimulationFailed")
-  })
-
-  test("a recipe that throws becomes a BuildError", async () => {
-    const error = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui
-          .simulate(() => {
-            throw new Error("bad recipe")
-          })
-          .pipe(Effect.flip)
-      }),
-      simulateLayer([])
-    )
-    expect(error._tag).toBe("BuildError")
-  })
-
-  test("view decodes return value 0 of the last command and disables checks", async () => {
-    const layer = simulateLayer([
-      { returnValues: [{ bcs: suiBcs.U64.serialize("1").toBytes() }], mutatedReferences: [] },
-      { returnValues: [{ bcs: suiBcs.U64.serialize("42").toBytes() }], mutatedReferences: [] }
-    ])
-    const result = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        const value = yield* sui.view(() => {}, U64)
-        const calls = yield* fake.calls
-        return { value, call: calls.find((call) => call.method === "simulateTransaction") }
-      }),
-      layer
-    )
-    expect(result.value).toBe("42")
-    expect(result.call?.options).toMatchObject({ checksEnabled: false })
-  })
-
-  test("view can address an earlier command", async () => {
-    const layer = simulateLayer([
-      { returnValues: [{ bcs: suiBcs.U64.serialize("1").toBytes() }], mutatedReferences: [] },
-      { returnValues: [{ bcs: suiBcs.U64.serialize("42").toBytes() }], mutatedReferences: [] }
-    ])
-    const value = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.view(() => {}, U64, { command: 0 })
-      }),
-      layer
-    )
-    expect(value).toBe("1")
-  })
-
-  test("view fails with DecodeError when the command has no such return value", async () => {
-    const layer = simulateLayer([{ returnValues: [], mutatedReferences: [] }])
-    const error = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.view(() => {}, U64).pipe(Effect.flip)
-      }),
-      layer
-    )
-    expect(error._tag).toBe("DecodeError")
+  test("a reply whose top-level and effects digests differ is a TransportError", async () => {
+    const twoDigests: Stubs = {
+      simulateTransaction: (() => {
+        const result = resultOf(fakeDigest(53)) as { Transaction: { effects: object } }
+        return Effect.succeed({ ...result, Transaction: { ...result.Transaction, effects: { ...result.Transaction.effects, transactionDigest: fakeDigest(54) } }, commandResults: [] })
+      }) as never
+    }
+    const error = await fail(Effect.flatMap(sui, (s) => s.simulate(() => {})), {}, twoDigests)
+    expect([error._tag, String(error._tag === "TransportError" && error.cause)]).toEqual(["TransportError", expect.stringContaining(fakeDigest(54))])
   })
 })
 
 describe("getTransaction", () => {
-  test("returns an Executed for a successful transaction", async () => {
-    const layer = layerTest({
-      ...baseScript,
-      getTransaction: [
-        FakeOutcome.succeed({
-          digest: fakeDigest(31),
-          created: [{ objectId: PADDED("4ece"), type: "0x2::escrow::Receipt", version: 9n }]
-        })
-      ]
-    })
-    const executed = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getTransaction(fakeDigest(31) as never)
-      }),
-      layer
-    )
+  test("an Executed with the execute include set, ExecutionFailed for an on-chain failure, TransactionNotFound for none", async () => {
+    const answers = sequence<unknown, never>([
+      () => Effect.succeed(resultOf(fakeDigest(31), { created: [{ objectId: PADDED("4ece"), type: "0x2::escrow::Receipt" }] })),
+      () => Effect.succeed(resultOf(fakeDigest(32), {}, { $kind: "MoveAbort", message: "x", MoveAbort: { abortCode: "3" } } as never))
+    ])
+    const [executed, failed, missing] = await run(Effect.gen(function*() {
+      const s = yield* sui
+      return [
+        yield* s.getTransaction(fakeDigest(31)),
+        yield* Effect.flip(s.getTransaction(fakeDigest(32))),
+        yield* Effect.flip(Effect.provideService(s.getTransaction(fakeDigest(33)), SuiCore, s.core))
+      ] as const
+    }), {}, { getTransaction: answers.stub })
     expect(executed.created("0x2::escrow::Receipt")).toHaveLength(1)
-  })
-
-  test("getTransaction asks for the fixed execute include set", async () => {
-    const layer = layerTest({
-      ...baseScript,
-      getTransaction: [FakeOutcome.succeed({ digest: fakeDigest(34) })]
-    })
-    const call = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        yield* sui.getTransaction(fakeDigest(34) as never)
-        const calls = yield* fake.calls
-        return calls.find((entry) => entry.method === "getTransaction")
-      }),
-      layer
-    )
-    expect(call?.options).toMatchObject({
-      include: { effects: true, events: true, balanceChanges: true, objectTypes: true }
-    })
-  })
-
-  test("a historical failure is an ExecutionFailed, not an Executed", async () => {
-    const layer = layerTest({
-      ...baseScript,
-      getTransaction: [
-        FakeOutcome.failWith({
-          message: "MoveAbort",
-          command: 1,
-          $kind: "MoveAbort",
-          MoveAbort: { abortCode: "3" }
-        } as SuiClientTypes.ExecutionError, { digest: fakeDigest(32) })
-      ]
-    })
-    const error = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getTransaction(fakeDigest(32) as never).pipe(Effect.flip)
-      }),
-      layer
-    )
-    expect(error._tag).toBe("ExecutionFailed")
-  })
-
-  test("an unknown digest is a TransactionNotFound", async () => {
-    const layer = layerTest({ ...baseScript, getTransaction: [FakeOutcome.notFound()] })
-    const error = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getTransaction(fakeDigest(33) as never).pipe(Effect.flip)
-      }),
-      layer
-    )
-    expect(error._tag).toBe("TransactionNotFound")
+    expect(answers.calls[0]).toMatchObject({ include: { effects: true, events: true, balanceChanges: true, objectTypes: true } })
+    expect(failed._tag).toBe("ExecutionFailed")
+    expect(missing._tag).toBe("ExecutionFailed")
+    expect((await fail(Effect.flatMap(sui, (s) => s.getTransaction(fakeDigest(33)))))._tag).toBe("TransactionNotFound")
   })
 })
 
-describe("withSenderLock", () => {
-  test("serializes two fibers on the same sender", async () => {
-    const program = Effect.gen(function*() {
-      const sui = yield* Sui
-      const gate = yield* Deferred.make<void>()
-      const order: Array<string> = []
-      const lock = sui.withSenderLock(SuiAddress.make(ALICE))
-      const first = yield* Effect.forkChild(
-        lock(
-          Effect.gen(function*() {
-            order.push("first-in")
-            yield* Deferred.await(gate)
-            yield* Effect.sleep("1 second")
-            order.push("first-out")
-          })
-        )
-      )
-      yield* TestClock.adjust("1 milli")
-      const second = yield* Effect.forkChild(
-        lock(
-          Effect.sync(() => {
-            order.push("second")
-          })
-        )
-      )
-      yield* TestClock.adjust("1 milli")
-      yield* Deferred.succeed(gate, undefined)
-      yield* TestClock.adjust("2 seconds")
-      yield* Fiber.await(first)
-      yield* Fiber.await(second)
-      return order
-    })
-    const order = await Effect.runPromise(
-      Effect.provide(program, Layer.merge(layerTest(baseScript), TestClock.layer()), {
-        local: true
-      })
-    )
-    expect(order).toEqual(["first-in", "first-out", "second"])
-  })
-
-  test("does not serialize two different senders", async () => {
-    const program = Effect.gen(function*() {
-      const sui = yield* Sui
-      const gate = yield* Deferred.make<void>()
-      const order: Array<string> = []
-      const first = yield* Effect.forkChild(
-        sui.withSenderLock(SuiAddress.make(ALICE))(
-          Effect.gen(function*() {
-            yield* Deferred.await(gate)
-            order.push("alice")
-          })
-        )
-      )
-      yield* TestClock.adjust("1 milli")
-      const second = yield* Effect.forkChild(
-        sui.withSenderLock(SuiAddress.make(PADDED("b0b")))(
-          Effect.sync(() => {
-            order.push("bob")
-          })
-        )
-      )
-      yield* TestClock.adjust("1 milli")
-      yield* Deferred.succeed(gate, undefined)
-      yield* Fiber.await(first)
-      yield* Fiber.await(second)
-      return order
-    })
-    const order = await Effect.runPromise(
-      Effect.provide(program, Layer.merge(layerTest(baseScript), TestClock.layer()), {
-        local: true
-      })
-    )
-    expect(order).toEqual(["bob", "alice"])
+describe("Executed.sender on a read", () => {
+  test("getTransaction asks for the transaction's bcs and reads the sender out of it", async () => {
+    const raw = await bytes()
+    const withBcs = (() => {
+      const result = resultOf(digestOf(raw)) as { Transaction: object }
+      return { ...result, Transaction: { ...result.Transaction, bcs: raw } }
+    })()
+    const read = sequence([() => Effect.succeed(withBcs)])
+    const executed = await run(Effect.flatMap(sui, (s) => s.getTransaction(digestOf(raw))), {}, { getTransaction: read.stub })
+    expect(read.calls[0]).toMatchObject({ include: { bcs: true } })
+    expect(executed.sender).toBe(signer.address)
   })
 })
 
-
-describe("generic Move types", () => {
-  const GENERIC = "0xc0de::composition::Composition"
-  const INSTANTIATED = `${GENERIC}<0x5ha4e::share::Share>`.replace("0x5ha4e", PADDED("5aae"))
-  const CompositionBcs = suiBcs.struct("Composition", { id: suiBcs.Address })
-  const Composition = bcs(CompositionBcs, GENERIC)
-
-  const instantiated = (suffix: string) => ({
-    objectId: PADDED(suffix),
-    type: INSTANTIATED,
-    version: 1n,
-    owner,
-    content: CompositionBcs.serialize({ id: PADDED(suffix) }).toBytes()
+describe("name service and coin metadata", () => {
+  test("UNIMPLEMENTED or NOT_FOUND is None from the Option faces", async () => {
+    const none: Stubs = {
+      resolveNameServiceAddress: (() => Effect.fail(transport("resolveNameServiceAddress", "UNIMPLEMENTED"))) as never,
+      defaultNameServiceName: (() => Effect.fail(transport("defaultNameServiceName", "NOT_FOUND"))) as never
+    }
+    const [address, name] = await run(Effect.gen(function*() {
+      const s = yield* sui
+      return [yield* s.resolveNameServiceAddressOption("alice.sui"), yield* s.defaultNameServiceNameOption(ALICE)] as const
+    }), {}, none)
+    expect([Option.isNone(address), Option.isNone(name)]).toEqual([true, true])
   })
 
-  const layer = layerTest({ ...baseScript, objects: [instantiated("c1"), instantiated("c2")] })
-
-  test("a codec built for the bare tag decodes an instantiation", async () => {
-    const object = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObject(ObjectId.make(PADDED("c1")), { schema: Composition })
-      }),
-      layer
-    )
-    expect(object.content.id).toBe(PADDED("c1"))
-    // The object keeps the type it actually has, instantiation and all.
-    expect(object.type).toBe(normalizeStructTag(INSTANTIATED) as never)
+  test("getCoinMetadataOption is Some for a known type and None for one with no metadata", async () => {
+    const metadata = { id: PADDED("ee"), decimals: 9, name: "Sui", symbol: "SUI", description: "", iconUrl: null }
+    const stub: Stubs = {
+      getCoinMetadata: ((options: { coinType: string }) =>
+        Effect.succeed({ coinMetadata: options.coinType.endsWith("::sui::SUI") ? metadata : null })) as never
+    }
+    const [sui_, other] = await run(Effect.gen(function*() {
+      const s = yield* sui
+      return [yield* s.getCoinMetadataOption("0x2::sui::SUI"), yield* s.getCoinMetadataOption("0x2::other::X")] as const
+    }), {}, stub)
+    expect([Option.getOrThrow(sui_).decimals, Option.isNone(other)]).toEqual([9, true])
   })
-
-  test("an expectedType with type arguments is still compared in full", async () => {
-    const error = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui
-          .getObject(ObjectId.make(PADDED("c1")), {
-            schema: Composition,
-            expectedType: `${GENERIC}<0x2::sui::SUI>`
-          })
-          .pipe(Effect.flip)
-      }),
-      layer
-    )
-    expect(error._tag).toBe("DecodeError")
-  })
-
-  test("streamOwnedObjects filters a bare tag against every instantiation", async () => {
-    const items = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* Stream.runCollect(
-          sui.streamOwnedObjects(SuiAddress.make(ALICE), { type: StructTag.make(GENERIC) })
-        )
-      }),
-      layer
-    )
-    expect(items.length).toBe(2)
-  })
-
-  test("streamOwnedObjects with a tag nothing instantiates sees nothing", async () => {
-    const items = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* Stream.runCollect(
-          sui.streamOwnedObjects(SuiAddress.make(ALICE), {
-            type: StructTag.make("0xc0de::composition::Draft")
-          })
-        )
-      }),
-      layer
-    )
-    expect(items.length).toBe(0)
-  })
-})
-
-describe("getObjectsStrict", () => {
-  test("returns the objects in the order of the ids", async () => {
-    const objects = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.getObjectsStrict(
-          [ObjectId.make(PADDED("e2")), ObjectId.make(PADDED("e1"))],
-          { schema: Escrow }
-        )
-      })
-    )
-    expect(objects.map((object) => object.content.amount)).toEqual(["7", "5"])
-  })
-
-  test("fails with the first item error instead of a Result", async () => {
-    const error = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui
-          .getObjectsStrict([ObjectId.make(PADDED("e1")), ObjectId.make(PADDED("404"))])
-          .pipe(Effect.flip)
-      })
-    )
-    expect(error._tag).toBe("ObjectNotFound")
-  })
-})
-
-describe("view and simulate senders", () => {
-  const simulateOnly = (commandResults: Array<SuiClientTypes.CommandResult>) =>
-    layerTest({
-      ...baseScript,
-      simulate: [FakeOutcome.succeed({ digest: fakeDigest(60), commandResults })]
-    })
-
-  test("view takes a bare BcsType, with no invented type tag", async () => {
-    const value = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        return yield* sui.view(() => {}, suiBcs.Address)
-      }),
-      simulateOnly([
-        { returnValues: [{ bcs: suiBcs.Address.serialize(ALICE).toBytes() }], mutatedReferences: [] }
-      ])
-    )
-    expect(value).toBe(ALICE)
-  })
-
-  test("view sets the sender it was given", async () => {
-    const call = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        yield* sui.view(() => {}, suiBcs.U64, { sender: SuiAddress.make(ALICE) })
-        const calls = yield* fake.calls
-        return calls.find((call) => call.method === "simulateTransaction")
-      }),
-      simulateOnly([
-        { returnValues: [{ bcs: suiBcs.U64.serialize("1").toBytes() }], mutatedReferences: [] }
-      ])
-    )
-    const options = call?.options as { readonly transaction: { getData: () => { sender: string } } }
-    expect(options.transaction.getData().sender).toBe(ALICE)
-  })
-
-  test("a recipe's own sender wins over opts.sender", async () => {
-    const call = await run(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const fake = yield* SuiCoreFake
-        yield* sui.simulate((tx) => tx.setSender(PADDED("b0b")), {
-          sender: SuiAddress.make(ALICE)
-        })
-        const calls = yield* fake.calls
-        return calls.find((call) => call.method === "simulateTransaction")
-      }),
-      simulateOnly([])
-    )
-    const options = call?.options as { readonly transaction: { getData: () => { sender: string } } }
-    expect(options.transaction.getData().sender).toBe(PADDED("b0b"))
-  })
-})
-
-test("getObjectsOrFail is gone in 0.4.0: getObjectsStrict is the one name", async () => {
-  const sui = await run(Effect.service(Sui))
-  expect("getObjectsOrFail" in sui).toBe(false)
 })

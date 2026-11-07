@@ -32,8 +32,8 @@ const sameBytes = (left: Uint8Array, right: Uint8Array): boolean =>
  * Checks that sponsored bytes a service assembled are the transaction the
  * sender asked to have sponsored, before the sender signs them.
  *
- * A sponsorship service (Enoki's `createSponsoredTransaction`, or an
- * application's own sponsor) takes a transaction **kind** and answers full
+ * A sponsorship service (a hosted sponsor such as Enoki, or an application's
+ * own) takes a transaction **kind** and answers full
  * bytes with its gas data added. Those bytes are what the sender's signature
  * will authorize, so they are read back, not trusted:
  *
@@ -45,7 +45,8 @@ const sameBytes = (left: Uint8Array, right: Uint8Array): boolean =>
  *   command, swap an input or change an argument and still get a signature.
  *
  * The chain is `Tx.fromBytes`'s check, which made the `Built`. Simulating the
- * bytes before signing them is still the caller's (or `Tx.prepare`'s) job.
+ * bytes before signing them (`sui.simulate(built.bytes)`) is still the
+ * caller's job.
  *
  * Fails with: `PolicyDenied` (rule `sponsored.sender`, `sponsored.gasOwner` or
  * `sponsored.kind`).

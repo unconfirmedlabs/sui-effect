@@ -3,6 +3,306 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
+## 0.6.0
+
+**sui-effect narrows to its purpose**: an Effect program to interact with the
+Sui blockchain, a light wrapper around the official `@mysten/sui` SDK that makes
+it safer to use and takes advantage of Effect for reliability, convenience and
+a better developer experience. 0.5.0 had grown a wallet core around that
+wrapper; 0.6.0 removes it (it moves to the miso wallet's own codebase) and
+keeps `SuiCore`, `Sui`, the domain layer, the `Tx` lifecycle, signers, the
+journal, `SubmitConfig`, `SuiGraphQL` and the metrics.
+
+It also stops simulating a chain in tests. `SuiCoreFake` — 3.2k lines that
+applied scripted effects, moved address balances, followed alias edits and
+checked signatures like a validator — is replaced by `ScriptedSuiCore`, a
+`SuiCore` that answers from a script of plain values and never executes,
+applies or validates a transaction. What a transaction does on chain, and what
+a validator accepts, is proved against a localnet; failure handling is tested
+with per-test stubs of the `SuiCore` method involved; pure code is tested
+directly. The suite shrinks from 18.7k to about 6.5k lines.
+
+It also adds **address aliases**: an account can be signed for by another
+address — a weighted multisig of a passkey, a zkLogin key, a recovery phrase
+and a watchdog key, say — through Sui's `0x2::address_alias`, and the whole
+lifecycle (`Tx.run`, the sender lock, the journal, `Tx.attach`, `Verify`) keeps
+the account as the sender while the alias signs. `Signer.multisig` combines its
+members' signatures in the multisig's member order, which a validator requires.
+
+Six subpaths are gone (`/gate`, `/keystore`, `/storage`, `/enoki`,
+`/extension`, `/script`); the four that remain are `.`, `/tx`, `/journal` and
+`/testing`. Peer dependencies are unchanged: `effect` `>=4.1.1 <4.2`,
+`@mysten/sui` `^2.28` (CI proves 2.30.0 and 2.38.0). `@scure/bip32` is no
+longer a dependency. Read "Migrating from 0.5.x" below; every removed or
+renamed export is in its table.
+
+### Removed
+
+- **`/keystore`**: `Keystore` (sealed keys at rest over `KeyValueStore`),
+  `Keystore.sealer`, `KeystoreError`, `KeystoreAccount`, `SealedKey`,
+  `SealedSecret` and the constants. Key storage is an application concern.
+- **`/storage`**: `layerIndexedDb`, `layerAsyncStorage`, `layerMmkv`,
+  `layerChromeStorage` and their structural platform types. The durable
+  journal runs over any `KeyValueStore`; one over a platform's storage is a few
+  lines with Effect's `KeyValueStore.makeStringOnly`.
+- **`/enoki`**: `Enoki` (`fromFlow`, `fromWallet`, `sponsor`, `execute`, `run`),
+  `EnokiError`. A hosted sponsor is `verifySponsored` + `Tx.attach` +
+  `Tx.submitVia`, which stay.
+- **`/script`**: `Script`, `ScriptReadOnly`, `Script.run`, `Script.report`,
+  `Script.exitCode`, `Script.layerStderrLogger`, and with them every error's
+  `exitCode` (`KeyError.exitCode`). A process entrypoint is the application's
+  (`BunRuntime.runMain`, `NodeRuntime.runMain`).
+- **`/extension`**: `SuiExtension.fromService` (the Promise face for
+  `client.$extend`), `SuiExtension.leaf`, `PromiseFace`, `FaceValue`,
+  `ExtensionNotReady`; the extension template under `examples/`, its guide
+  (`docs/extensions.md`) and generator; `layerExtensionTest` in `/testing`; and
+  `Sui.layerNoDepsPinned`, which existed only for a warm registration.
+- **`/gate` and declared intents**: `Gate`, the Jev screen (`layerJev`,
+  `layerJevConfig`, `makeJev`), `Intent`, `IntentClaims`, `OutflowClaim`,
+  `Verified`, `Verdict`, `Screening`, `checkClaims`, `describeEffects`,
+  `describeClaims`, `Tx.verify`, `Tx.run`'s and `Tx.foldCoins`' `intent`
+  option, and the public `Tx.prepare` (`Prepared` stays, as what `approve` is
+  shown, without `verified`).
+- **Account signers and key machinery**: `Signer.passkey`,
+  `Signer.createPasskey`, `Signer.wallet` (Wallet Standard), `PasskeyProvider`,
+  `StandardWallet`, `StandardWalletAccount`; `ZkLogin.save`/`load`/`remove`,
+  `ZkLoginSession`, `ZkLoginStoredSession`, `SecretSealer`; `Signer.fromConfig`;
+  `Signer.scoped`, `LockableSigner` and the held/wiped key machinery behind it,
+  and the `"locked"` `SigningFailureReason`. The SDK's `PasskeyKeypair` still
+  works, through `Signer.fromSdkSigner`.
+- **`Tx.sendAll`** (`SendAllSweep`, `SendAllResult`) and **`Tx.foldMovement`**
+  (`FoldMovement`): `FoldBatch.amount` is what a fold moves into the balance.
+- **`Tx.recorded`**: it was exactly `Journal.get`.
+- **The `…Pages` streams**: `Sui.streamEventPages`, `tailEventPages`,
+  `streamTransactionPages`, `tailTransactionPages` and the `ListPage` type. A
+  reader that commits its cursor pages through `sui.core.listEvents` /
+  `sui.core.listTransactions`, whose pages carry `endCursor`
+  (`examples/recipes/indexer.ts`); `tailEvents` / `tailTransactions` stay.
+
+- **The simulated chain in `/testing`**: `SuiCoreFake` (its `layer`, handle
+  and `SuiCoreFakeState`), `FakeUnimplemented`, `ClockBcs`, `CLOCK_TYPE`,
+  `FakeBalance`; `SuiTest.bumpVersion`, `recordTransaction`, `deleteObject`,
+  `setEpoch`, `scriptGetObject`, `scriptGetTransaction`, `setVisibilityDelay`,
+  `addressBalance`, `setAddressAliases` and `addressAliases`;
+  `FakeOutcome.notFound` and `timeoutThen`; and the `FakeScript` fields that
+  drove the simulation — `coins`, `balances`, `gasBudget`, `getObject`,
+  `coinMetadata`, `names`, `pageSize`, `scanLimit`, `buildSimulate`,
+  `getTransaction`, `transactions`, `visibilityDelay`, `ledger`,
+  `readOptions`, `addressAliases`. Nothing in the package executes a
+  transaction, moves a balance or checks a signature in place of a validator
+  any more.
+
+### Changed (breaking)
+
+- **`Tx.withSenderLock(address)(effect)` replaces `sui.withSenderLock(address)`.**
+  The lock is a lifecycle concern; `R` gains `Sui`. The locks are one
+  reference-counted semaphore per address per `SuiCore`, dropped as soon as
+  nobody holds or waits for one (an `RcMap` with a one-minute idle TTL
+  before). The span is `Tx.withSenderLock`; the metric is unchanged.
+- **`Tx.sendFunds` draws from the address balance only**: a `FundsWithdrawal`
+  (`tx.withdrawal`), `0x2::balance::redeem_funds`, `0x2::balance::send_funds`.
+  No coin or gas-coin fallback, and no `useGasCoin` option: a balance that
+  does not cover the amount is a `BuildError` ("Invalid withdraw
+  reservation") with nothing signed. Fold first (`Tx.foldCoins`), or write a
+  coin transfer with the SDK.
+- **`Signer.zkLogin` takes the SDK's option names and nothing about sessions**:
+  `Signer.zkLogin({ address, ephemeralSigner, inputs, maxEpoch })` (was
+  `{ session: { address, maxEpoch, proof, expiresAt? }, ephemeral }`). It is
+  signature assembly only; the wall-clock `expiresAt` check is gone, and a
+  passed `maxEpoch` is still refused (`SigningError { reason: "expired" }` for
+  bytes that cannot start in time, and before the build in `Tx.run`).
+- **`Signer.fromMnemonic` and `Signer.fromSecretKey` answer a plain `Signer`**
+  (was `LockableSigner`). The phrase is still checked (word count, word list,
+  checksum) before anything is derived; the derivation is now the SDK's own
+  `deriveKeypair`. `fromSecretKey` now also reads an `MLDSA65` Bech32 key
+  (imported on demand), which only `fromConfig` did.
+- **`Tx.attach` refuses a signer outside the sender's and gas owner's alias
+  sets with `PolicyDenied { rule: "alias.signer" }`**, where it failed with
+  `SigningError` before. It now also **accepts** a valid signature by a member
+  of the sender's or the gas owner's alias set (one `AddressAliases` read per
+  address, made only for a signature by neither). Its union is
+  `SigningError | PolicyDenied | TransportError`.
+- **`KeyErrorReason` gains `"invalidMultisig"`** (`Signer.multisig`).
+- `SigningFailureReason` is `"expired" | "rejected" | "unavailable"`.
+
+- **`/testing` answers from a script and simulates nothing.** `layerTest`,
+  `SuiTest.putObject` / `setClock` / `setAddressBalance` / `scriptExecute` /
+  `scriptSimulate` / `calls` / `provide`, `FakeScript.objects` /
+  `dynamicFields` / `dynamicFieldValues` / `chainId` / `network` / `epoch` /
+  `referenceGasPrice` / `clockTimestampMs` / `simulate` / `execute`,
+  `FakeObject`, `FakeChange`, `FakeExecution`, `FakeEvent`, `fakeDigest`,
+  `testSubmitConfig` and `TestServices` keep their names; what changed is
+  that an execute answer no longer changes any object or balance, signatures
+  are not checked, a second execute of the same bytes takes the next scripted
+  answer rather than the recorded one, list methods answer in one page, and
+  builds run the SDK's own resolver (so a Move call whose object inputs need
+  `getMoveFunction` dies unscripted). Address balances are
+  `FakeScript.addressBalances: [{ owner, coinType?, amount }]` (was
+  `balances`, the SDK's `Balance` shape); coins are `fakeCoin(...)` objects in
+  `FakeScript.objects` (was `FakeScript.coins`; `fakeCoin` now answers a
+  `FakeObject` with real BCS content). `TestServices` is
+  `Sui | SuiCore | ScriptedSuiCore` (was `… | SuiCoreFake`). `FakeChange.balance`
+  is gone.
+
+### Added
+
+- **`Signer.alias(address, signer)`**: a signer that signs transactions **as**
+  `address` with `signer`'s key, for an address whose alias set lists that key
+  — "sender A, signed by M". Its `address` is A and its `alias` the key's
+  address (the `Signer` interface gains an optional `alias?: SuiAddress`).
+  Everything keyed on the sender is A's: `Tx.run`'s build, **the sender lock**
+  and the in-flight registry, `Built.sender`, the journal's `signed.sender`,
+  `onSigned` and `approve`'s `built.sender`. Personal messages are refused
+  (`SigningError { reason: "unavailable" }`): aliases cover transactions only.
+- **`Tx.run` checks an alias signer against the chain before building**: one
+  read of the account's `AddressAliases` object per `Signer.alias` (signer, or
+  a sponsor given as `Signer.alias(gasOwner, key)`), and a key the set does not
+  list is `PolicyDenied { rule: "alias.signer" }` with nothing built,
+  simulated, signed or journalled. A plain signer costs no read. Span attribute
+  `sui.signer_alias` on `Tx.run`, `Tx.sign` and `Tx.cosign`.
+- **`Signer.multisig(publicKey, signers)`**: a `MultiSig` signer over member
+  signers of any scheme (keys, the SDK's `PasskeyKeypair`, `Signer.zkLogin`,
+  `Signer.remote`), signing sequentially and combining the partial signatures
+  **in the multisig's member order** whatever order the signers are given in —
+  the SDK's `combinePartialSignatures` keeps the order it is handed and a
+  validator pairs the n-th signature with the n-th bitmap bit, so the SDK's own
+  `MultiSigSigner` builds signatures a validator refuses unless its signers are
+  passed in member order. A non-member, a duplicate member or too little weight
+  is `KeyError { reason: "invalidMultisig" }`. `maxEpoch` is the earliest
+  member's.
+- **`AddressAlias`** on `/tx`, named after `sui::address_alias`:
+  `aliasesId(address)` (the object derived from `0xa` at `AliasKey(address)`),
+  `getAliases(address)` answering `AddressAliases` (`NotEnabled` or
+  `Enabled { id, version, aliases }`), the pure `allows(aliases, signer)`,
+  `requireSigner(address, signer)`, the constants `ADDRESS_ALIAS_STATE_ID`,
+  `ADDRESS_ALIASES_TYPE`, `MAX_ALIASES` and `AddressAliasesBcs`, and the
+  recipes `enable()`, `add({ address, alias })`, `remove({ address, alias })`
+  and `replaceAll({ address, aliases })`. Every check reads the **object**,
+  never transaction history.
+- **`Verify.verifyTransactionSignature(bytes, signature, { address,
+  checkAddressAliases: true })`**: a validator's sender check — the signer must
+  be in `address`'s alias set (or be `address` while it has none), always one
+  read — failing with `PolicyDenied { rule: "alias.signer" }`; `PolicyDenied`
+  is in the union only under that literal. `@mysten/sui/verify` has no
+  alias-aware option (2.38).
+- **`ScriptedSuiCore`** in `/testing`: `ScriptedSuiCore.layer(script)` (and
+  `ScriptedSuiCore.make`) is the production `SuiCore` over an SDK `CoreClient`
+  that answers from a `FakeScript` — objects with their exact type and BCS
+  (`listOwnedObjects` filtering under `typeMatches`), the `Coin<T>` objects
+  among them as coins, dynamic fields matched on the key's type and bytes,
+  address balances, the clock `0x6`, a fixed chain id, epoch and gas price,
+  and only when scripted the next `execute` / `simulate` answers, in order,
+  stamped with the digest of the bytes handed over. Anything unscripted dies
+  naming the method (`Unscripted`). Builds run the SDK's own core resolver over
+  its reads. `FakeOutcome.hang()` is an answer that never comes;
+  `transactionResultOf(digest, outcome)` is the SDK result a stub returns;
+  `DEFAULT_CHAIN_ID` and `DEFAULT_EPOCH` are the constants it reports.
+- `Tx.withSenderLock` (see above); `Signer.zkLogin`'s options type
+  `ZkLoginSignerOptions` and `ZkLoginSignatureInputs` stay on `/tx`.
+- Recipes: `examples/recipes/account-alias.ts` (hand an account over to a
+  multisig, then pay as the account), `examples/recipes/durable-journal.ts`
+  (was `durable-journal-script.ts`, now without `Script`), and the indexer
+  recipe over `sui.core.listEvents`.
+
+### Docs
+
+- README, `DESIGN.md` (renumbered: §12 `SuiGraphQL`, §13 testing, §14 address
+  aliases, §15 out of scope), `AGENTS.md` and `docs/llms-head.md` are
+  rewritten around the narrower purpose; `LLMS.md` is regenerated. The
+  historical work plan, debate log, research notes and review reports under
+  `docs/` are removed (git history keeps them).
+
+### Testing
+
+- **Three kinds of test** (DESIGN §13). Chain semantics only against a
+  localnet; failure handling with per-test stubs of the one `SuiCore` method a
+  path reads (`test/support.ts`); pure code directly, table-driven where cases
+  repeat. `test/` goes from 18.7k to about 6.5k lines, of which 1.7k are the
+  live suites; `src/services/SuiCoreFake.ts` (3.2k lines) is replaced by 0.8k
+  lines of `src/testing.ts`, about half of them documentation.
+- Deleted: the version-named review files (`release-0-*`, `review-*`,
+  `codex-audit`, `final-batch`, the `*-0-4-0` / `*-0-5-0` / `*-0-6-0` files),
+  whose cases are folded into one file per area or dropped as duplicates;
+  every test of the fake's own modelling (`SuiCoreFake.test`,
+  `fake-address-balance`, the fake's alias and signature checks); tests of
+  private helpers; and tests that pinned README, CI or JSDoc text (the
+  `LLMS.md` staleness test stays).
+- Kept, rewritten over stubs or as pure tests: multisig member order (a
+  reversed SDK combine fails `Verify`), alias resolution read from the
+  object, `requireZeroGas`, `verifySponsored`, identical-bytes resubmit, the
+  outcome classification, an expired zkLogin `maxEpoch` refused, reconcile's
+  ordered expiry rule and `inputConsumed` on an exact `inputVersion`, the
+  sender lock and its policies, the journal under faults and races, metrics and
+  spans, and no output on a successful run.
+- **Moved to a localnet** (`SUI_LOCALNET=1`), the behaviours the fake modelled
+  and no live suite proved: `test/live.localnet-recipes.test.ts` runs
+  fold-coins, build-and-submit, both sponsored recipes (and a sponsored
+  submission missing the sponsor's signature, refused by the validator) and
+  account-alias; `test/live.localnet.test.ts` proves `NotApplied
+  { inputConsumed }` on the chain's own effects and a stale coin reservation
+  refused. `test/live.localnet-alias.test.ts` proves aliases and multisig
+  member order on a validator, `test/live.localnet-signers.test.ts` the
+  signers, sponsorship, the durable journal and the zkLogin `maxEpoch` bound
+  (now waiting for epoch 1 on a freshly regenesised localnet).
+
+**Not proven**: a zkLogin member's signature accepted on chain (no prover); a
+real WebAuthn authenticator (a software P-256 authenticator signs in the
+tests).
+
+### Migrating from 0.5.x
+
+Every removed or renamed export, and its replacement. "Application concern"
+means the code moves to your application (the miso wallet takes 0.5.0's from
+git history).
+
+| 0.5.x | 0.6.0 |
+|---|---|
+| `sui.withSenderLock(address)(effect)` | `Tx.withSenderLock(address)(effect)` (`R` gains `Sui`) |
+| `sui.streamEventPages(filter, opts)` / `sui.tailEventPages` | `sui.core.listEvents({ filter, after })`, committing `endCursor`; `sui.streamEvents` / `sui.tailEvents` for items |
+| `sui.streamTransactionPages` / `sui.tailTransactionPages` | `sui.core.listTransactions({ filter, after })`; `sui.streamTransactions` / `sui.tailTransactions` for items |
+| `ListPage` | the SDK's `ListEventsResponse` / `ListTransactionsResponse` |
+| `Sui.layerNoDepsPinned(chainId)` | `Sui.layerNoDepsWith({ chainId })` (asks the node once) |
+| `Tx.recorded(digest)` | `Journal.get`: `(yield* Journal).get(digest)` |
+| `Tx.prepare(input, opts)` | `Tx.build(input, opts)` then `sui.simulate(built.bytes)`; or `Tx.run(recipe, { approve })` |
+| `Prepared.verified` | removed: there is no verified intent |
+| `Tx.verify`, `Intent`, `IntentAuthor`, `IntentClaims`, `OutflowClaim`, `Verified`, `Verdict`, `Parties`, `ClaimViolation`, `checkClaims`, `describeEffects`, `describeClaims`, `Screening`, `ScreenedLine` | application concern: removed (check `prepared.simulation` inside `approve`) |
+| `Tx.run({ intent })`, `Tx.foldCoins({ intent })` | removed; use `approve` |
+| `Gate`, `GateService`, `ScreenRequest`, `/gate` (`layerJev`, `layerJevConfig`, `makeJev`, `JevOptions`) | application concern: removed |
+| `Tx.sendAll(opts)`, `SendAllSweep`, `SendAllResult` | application concern: removed (`Tx.foldCoins` then `Tx.sendFunds`, or a recipe of your own) |
+| `Tx.foldMovement(batch, effects)`, `FoldMovement` | `batch.amount` (what moves into the balance) and `simulation.balanceChange(owner, coinType)` (the net gas) |
+| `Tx.sendFunds({ …, useGasCoin })` | `Tx.sendFunds({ coinType?, amount, recipient })`, address balance only; a coin transfer is the SDK's `tx.splitCoins` / `tx.transferObjects` |
+| `Signer.fromConfig(name?)` | `Config.Redacted(name).pipe(Effect.flatMap(Signer.fromSecretKey))` (fails with `ConfigError` or `KeyError`) |
+| `Signer.scoped(acquire)`, `LockableSigner`, `signer.lock`, `signer.locked` | removed: `fromMnemonic` / `fromSecretKey` answer a plain `Signer` |
+| `SigningError { reason: "locked" }` | removed |
+| `Signer.passkey({ publicKey, provider })` | `Signer.fromSdkSigner(new PasskeyKeypair(publicKey, provider))` (the official SDK: `@mysten/sui/keypairs/passkey`) |
+| `Signer.createPasskey(provider)`, `PasskeyProvider` | the official SDK: `PasskeyKeypair.getPasskeyInstance(provider)`, `PasskeyProvider` from `@mysten/sui/keypairs/passkey` |
+| `Signer.wallet({ wallet, account, chain })`, `StandardWallet`, `StandardWalletAccount` | application concern: removed (the wallet signs bytes you `Tx.attach`, or wrap it in `Signer.remote`) |
+| `Signer.zkLogin({ session: { address, maxEpoch, proof, expiresAt }, ephemeral })` | `Signer.zkLogin({ address, maxEpoch, inputs: proof, ephemeralSigner: ephemeral })` |
+| `ZkLogin.save` / `load` / `remove`, `ZkLoginSession`, `ZkLoginStoredSession`, `SecretSealer` | application concern: removed |
+| `/keystore`: `Keystore`, `Keystore.sealer`, `KeystoreError`, `KeystoreErrorReason`, `KeystoreAccount`, `KeystoreOptions`, `KeystoreService`, `SealedKey`, `SealedSecret`, `DEFAULT_ITERATIONS`, `DEFAULT_PREFIX`, `KEYSTORE_VERSION`, `MIN_LAYER_ITERATIONS` | application concern: removed |
+| `KeyError`, `KeyErrorReason` from `/keystore` | the same names from `@unconfirmed/sui-effect` |
+| `KeyError.exitCode` | removed (with `Script`) |
+| `/storage`: `layerIndexedDb`, `layerAsyncStorage`, `layerMmkv`, `layerChromeStorage` and their `…Like` / `IndexedDb…` types | application concern: removed (`KeyValueStore.makeStringOnly` over the platform's store) |
+| `/enoki`: `Enoki` (`fromFlow`, `fromWallet`, `sponsor`, `execute`, `run`), `EnokiClient`, `EnokiFlow`, `EnokiError` | application concern: removed (`verifySponsored`, `Tx.attach`, `Tx.submitVia`) |
+| `/script`: `Script`, `ScriptReadOnly`, `ScriptService`, `ScriptReadOnlyService`, `Script.run`, `report`, `exitCode`, `readNetwork`, `ScriptRunOptions`, `ReportOptions`, `SignalSource`, `Script.layerStderrLogger` | application concern: removed (`Sui.layerConfig` + `BunRuntime.runMain`; `SuiError.outcome` for the exit axis) |
+| `/extension`: `SuiExtension`, `SuiExtensionOptions`, `fromService`, `leaf`, `Leaf`, `PromiseFace`, `FaceValue`, `ExtensionFace` | removed: an Effect service built on `Sui` is the library; a Promise face is the consumer's `ManagedRuntime` |
+| `ExtensionNotReady` | removed |
+| `layerExtensionTest(layer, script, { extra })` | `layer.pipe(Layer.provideMerge(layerTest(script)))` (plus `SuiGraphQL.layerUnavailable` when the layer needs it) |
+| `Tx.attach` failing with `SigningError` for a wrong party | `PolicyDenied { rule: "alias.signer" }` |
+| an exhaustive match on `KeyError.reason` | add `"invalidMultisig"` |
+| signing as an aliased account through the SDK client directly | `Tx.run(recipe, { signer: Signer.alias(account, yield* Signer.multisig(publicKey, members)) })` |
+| `SuiCoreFake.layer(script)`, `SuiCoreFake` (the handle) | `ScriptedSuiCore.layer(script)`, `ScriptedSuiCore` (`TestServices` names it) |
+| `FakeScript.balances: [{ owner?, coinType, balance, coinBalance, addressBalance }]` | `FakeScript.addressBalances: [{ owner, coinType?, amount }]`; `coinBalance` is the sum of the owner's `Coin<T>` objects |
+| `FakeScript.coins: [fakeCoin(…)]` | `FakeScript.objects: [fakeCoin(…)]` (`fakeCoin` answers a `FakeObject` with BCS content) |
+| `SuiTest.addressBalance(owner)` | `(yield* Sui).getBalance(owner)` |
+| `FakeOutcome.timeoutThen(found)` | `FakeOutcome.hang()`; what a later read finds is a stub of that read |
+| `FakeOutcome.notFound()`, `FakeScript.getTransaction` / `transactions`, `SuiTest.scriptGetTransaction` / `recordTransaction` | a stub: `{ ...core, getTransaction: () => Effect.fail(new TransactionNotFound({ digest })) }` |
+| `FakeScript.getObject`, `SuiTest.scriptGetObject`, `bumpVersion`, `deleteObject` | `SuiTest.putObject` for what a read serves; a stub of `getObject` for a fault |
+| `FakeScript.buildSimulate` | `FakeScript.simulate` (the SDK's resolver simulates through it) |
+| `FakeScript.epoch` with `SuiTest.setEpoch`, `visibilityDelay`, `ledger`, `names`, `coinMetadata`, `scanLimit`, `pageSize`, `readOptions`, `gasBudget` | `FakeScript.epoch` (fixed for the run); a stub of the method involved for the rest |
+| `FakeScript.addressAliases`, `SuiTest.setAddressAliases` / `addressAliases` | `SuiTest.putObject` of the `AddressAliases` object at `AddressAlias.aliasesId(address)` (`AddressAliasesBcs`) |
+| a test that relied on an execute changing objects or balances, or on the fake refusing a signature | a localnet test: nothing in `/testing` executes a transaction |
+
 ## 0.5.0
 
 The wallet core: a transaction can declare what it is for and is refused when

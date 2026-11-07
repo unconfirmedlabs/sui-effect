@@ -25,7 +25,7 @@ const EscrowBcs = bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() })
 // The scheme flag on a Bech32 key names one of four keypair classes and
 // nothing decodes it for you. ML-DSA-65's class (2.36+) is left out so this
 // file compiles on every SDK the peer range admits; sui-effect's
-// `Signer.fromConfig` loads it on demand where it exists.
+// `Signer.fromSecretKey` loads it on demand where it exists.
 const KEYPAIR_FOR: Record<string, undefined | ((secretKey: Uint8Array) => Keypair)> = {
   ED25519: Ed25519Keypair.fromSecretKey,
   Secp256k1: Secp256k1Keypair.fromSecretKey,
@@ -36,8 +36,7 @@ const KEYPAIR_FOR: Record<string, undefined | ((secretKey: Uint8Array) => Keypai
  * Reads the escrow, claims it, and returns the created receipt's object id.
  *
  * Builds, signs and executes as three explicit steps rather than the
- * one-call `signAndExecuteTransaction`, so this can run against an in-memory
- * client with no live network or signer behind it.
+ * one-call `signAndExecuteTransaction`, so each step is visible.
  */
 export const claimEscrow = async (
   client: ClientWithCoreApi,

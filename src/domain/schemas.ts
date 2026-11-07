@@ -398,7 +398,7 @@ const CoinTypeStrict = Schema.String.annotate({
  * `Schema.decodeSync` — so it is for literals and configuration a caller
  * controls. A coin type a person typed goes through
  * `Schema.decodeUnknownEffect(CoinType.Strict)`, which puts the refusal in the
- * error channel (a `SchemaError`, exit 2 under `Script`) instead of a defect.
+ * error channel (a `SchemaError`) instead of a defect.
  *
  * @since 0.4.0
  *

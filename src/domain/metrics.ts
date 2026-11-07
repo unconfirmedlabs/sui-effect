@@ -109,12 +109,12 @@ export const requestTimeouts = Metric.counter("sui_effect_core_request_timeouts_
 })
 
 /**
- * How long `Sui.withSenderLock` waited for a sender's permit — the time a
+ * How long `Tx.withSenderLock` waited for a sender's permit — the time a
  * `Tx.run` spent queued behind another from the same sender. No attributes:
  * the sender is never one. Milliseconds.
  */
 export const senderLockWait = Metric.timer("sui_effect_sender_lock_wait", {
-  description: "Time spent waiting for a sender's lock in Sui.withSenderLock"
+  description: "Time spent waiting for a sender's lock in Tx.withSenderLock"
 })
 
 /** Adds one to a counter, under the given attributes. Never fails. */

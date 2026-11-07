@@ -96,7 +96,7 @@ export const bcs = <T extends Input, Input>(
 /**
  * A BCS layout plus the mapping into a domain value, as one codec.
  *
- * This is the shape every extension writes by hand and writes slightly
+ * This is the shape every library writes by hand and writes slightly
  * differently: parse the bytes with a layout, then hand the raw struct to a
  * constructor or a mapping function that may throw (an id that has to be
  * branded, a `bigint` that has to be range-checked, a discriminant that has to
@@ -223,7 +223,7 @@ const parseSafe = (value: string): ReturnType<typeof parseStructTag> | undefined
  *
  * One rule, used everywhere a Move type is checked — the BCS bridge, the
  * `expectedType` option of `Sui.getObject`, `getObjectOption` and `getObjects`,
- * `SuiSchema.decode`, and the fake's owned-object filter:
+ * `SuiSchema.decode`, and the scripted `SuiCore`'s owned-object filter:
  *
  * - **An expected tag with no type arguments names the generic itself**, so
  *   `pkg::m::Composition` matches every instantiation:
@@ -268,7 +268,7 @@ export const typeMatches = (expected: string, actual: string): boolean => {
  * This is what `Sui.getObject(id, { schema })` does after it has checked the
  * object's type tag, exposed as `SuiSchema.decode` for the places that already
  * have bytes: a dynamic field's value, an event payload, a `Stream` of
- * envelopes an extension decodes itself. Without it every caller reinvents the
+ * envelopes a library decodes itself. Without it every caller reinvents the
  * same `Schema.decodeUnknownEffect(...).pipe(Effect.mapError(...))`, and the
  * `DecodeError` it produces is worse than this one.
  *

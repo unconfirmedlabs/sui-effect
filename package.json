@@ -1,7 +1,7 @@
 {
   "name": "@unconfirmed/sui-effect",
-  "version": "0.5.0",
-  "description": "An opinionated Effect v4 layer over @mysten/sui: two client tiers, closed error unions, and a typed transaction lifecycle.",
+  "version": "0.6.0",
+  "description": "A light Effect v4 wrapper around @mysten/sui: typed errors, cancellation and spans on every call, and a crash-safe transaction lifecycle.",
   "license": "MIT",
   "type": "module",
   "exports": {
@@ -17,30 +17,6 @@
       "types": "./dist/journal.d.ts",
       "import": "./dist/journal.js"
     },
-    "./gate": {
-      "types": "./dist/gate.d.ts",
-      "import": "./dist/gate.js"
-    },
-    "./keystore": {
-      "types": "./dist/keystore.d.ts",
-      "import": "./dist/keystore.js"
-    },
-    "./storage": {
-      "types": "./dist/storage.d.ts",
-      "import": "./dist/storage.js"
-    },
-    "./enoki": {
-      "types": "./dist/enoki.d.ts",
-      "import": "./dist/enoki.js"
-    },
-    "./extension": {
-      "types": "./dist/extension.d.ts",
-      "import": "./dist/extension.js"
-    },
-    "./script": {
-      "types": "./dist/script.d.ts",
-      "import": "./dist/script.js"
-    },
     "./testing": {
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js"
@@ -53,21 +29,15 @@
     "LICENSE",
     "LLMS.md",
     "AGENTS.md",
-    "DESIGN.md",
-    "docs/extensions.md",
-    "examples/extension-template",
-    "!examples/extension-template/dist"
+    "DESIGN.md"
   ],
   "scripts": {
     "prepare": "effect-language-service patch",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "bun test test/",
-    "test:template": "cd examples/extension-template && bun test",
-    "check:template": "cd examples/extension-template && tsc --noEmit && bun test && bun scripts/check-package.ts",
     "llms": "bun scripts/llms.ts",
-    "docs:extensions": "bun scripts/extensions.ts",
-    "check": "tsc --noEmit && bun run build && bun test test/ && bun run check:template"
+    "check": "tsc --noEmit && bun run build && bun test test/"
   },
   "repository": {
     "type": "git",
@@ -88,7 +58,6 @@
   },
   "packageManager": "bun@1.4.2",
   "dependencies": {
-    "@scure/bip32": "^2.3.0",
     "@scure/bip39": "^2.3.0"
   },
   "peerDependencies": {

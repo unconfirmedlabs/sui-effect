@@ -79,8 +79,8 @@ export interface BuiltGas extends BuiltGasType {}
  * explicit simulate it runs when the SDK's resolver did not (a preset budget
  * off gRPC, or nothing to resolve). On gRPC the resolver simulates the
  * transaction before its budget is set, which is a different transaction, so
- * there is no `simulation` there. The lifecycle reuses it (`Tx.run`,
- * `Tx.prepare`, `Tx.verify`) only when it is the very object `Tx.build` made
+ * there is no `simulation` there. `Tx.run` reuses it (for `preflight` and
+ * `approve`) only when it is the very object `Tx.build` made
  * in this process; one that arrived inside a decoded `Built` is simulated
  * again. Neither field is carried into `Signed` or the journal.
  */

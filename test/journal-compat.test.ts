@@ -4,7 +4,7 @@ import { KeyValueStore } from "effect/persistence"
 import { ExecutionReason } from "../src/domain/errors.ts"
 import { JournalEntry } from "../src/domain/journal-entry.ts"
 import { Digest, Signature, SuiAddress } from "../src/domain/schemas.ts"
-import { fakeDigest } from "../src/services/SuiCoreFake.ts"
+import { fakeDigest } from "../src/testing.ts"
 import { make } from "../src/services/JournalKeyValueStore.ts"
 
 /**

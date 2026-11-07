@@ -15,7 +15,6 @@ import { Transaction } from "@mysten/sui/transactions"
 import { fromBase64, normalizeSuiAddress, SUI_CLOCK_OBJECT_ID, toBase64 } from "@mysten/sui/utils"
 import {
   Array,
-  Clock,
   Config,
   Context,
   DateTime,
@@ -23,11 +22,9 @@ import {
   Effect,
   Layer,
   Option,
-  RcMap,
   Result,
   Schedule,
   Schema,
-  Semaphore,
   Stream
 } from "effect"
 import { bcs as bcsCodec, decodeContent, typeMatches } from "../domain/bcs.ts"
@@ -45,7 +42,6 @@ import {
   TransportError
 } from "../domain/errors.ts"
 import { EXECUTE_INCLUDE, Executed, fromTransactionResult, READ_INCLUDE, Simulation } from "../domain/executed.ts"
-import * as Metrics from "../domain/metrics.ts"
 import {
   Balance,
   Coin,
@@ -138,20 +134,13 @@ interface RawPage<A> {
 }
 
 /**
- * One page of a ledger listing (`streamEventPages`, `streamTransactionPages`,
- * `tailEventPages`, `tailTransactionPages`): its items, and the cursor to
- * resume from once they are processed.
- *
- * Commit `endCursor` **with** the items — in the same database transaction —
- * and a restarted reader that passes it back as `after` (`before` for a
- * descending read) neither skips nor repeats a page. Unlike the SDK's own
- * `endCursor`, it is never `null` once there is a position to resume from: an
- * empty page keeps the cursor it was read from, and a tail that has caught up
- * on a filtered listing moves it to the ledger head (see `tailEvents`).
- *
- * @since 0.4.0
+ * One page of a ledger listing, inside the stream and tail loops: its items,
+ * and the cursor to continue from. An empty page keeps the cursor it was read
+ * from, and a tail that has caught up on a filtered listing moves it to the
+ * ledger head (see `tailEvents`). Internal: a reader that commits cursors
+ * pages through `sui.core.listEvents` / `sui.core.listTransactions` itself.
  */
-export interface ListPage<A> {
+interface ListPage<A> {
   readonly items: ReadonlyArray<A>
   /** Where to resume: pass as `after` (or `before` when descending). `null` only before any position is known. */
   readonly endCursor: string | null
@@ -229,7 +218,7 @@ const DEFAULT_POLL: Duration.Input = "1 second"
  * permanently, since the tail never reads behind its cursor. A filtered tail
  * whose completeness matters belongs on a single (sticky) node. The behaviour
  * is deliberate (without it a pruning node strands the cursor) and documented
- * on `tailEvents` / `tailTransactions` and their `…Pages`.
+ * on `tailEvents` / `tailTransactions`.
  */
 const tailOf = <A>(
   span: string,
@@ -435,15 +424,6 @@ const unimplementedAffectedAddress = (): Error =>
   )
 
 /**
- * The sender locks: one reference-counted semaphore per address, released a
- * minute after its last holder leaves.
- */
-const makeSenderLocks = RcMap.make({
-  lookup: (_address: string) => Effect.succeed(Semaphore.makeUnsafe(1)),
-  idleTimeToLive: "1 minute"
-})
-
-/**
  * Decodes the SDK's simulation envelope into sui-effect's stable shape.
  *
  * Mainnet gRPC can omit `Transaction.digest` from a successful simulation
@@ -572,8 +552,8 @@ export type ListOrder = "ascending" | "descending"
 /**
  * Where a ledger listing starts and which way it reads. The SDK's own
  * pagination options, under its own names: `after` resumes an ascending read
- * strictly after a cursor (a `ListPage.endCursor` you committed), `before` a
- * descending one; `before` implies `order: "descending"`. Give at most one.
+ * strictly after a cursor (an `endCursor` from `sui.core.listEvents` or
+ * `sui.core.listTransactions`), `before` a descending one; `before` implies `order: "descending"`. Give at most one.
  *
  * @since 0.4.0
  */
@@ -588,15 +568,15 @@ export interface ListOptions {
 /**
  * Where a tail starts and how often it asks once it has caught up.
  *
- * `after` is a cursor to resume strictly after — a `ListPage.endCursor` the
- * caller committed — and, omitted, the tail starts at the beginning of the
+ * `after` is a cursor to resume strictly after — an `endCursor` from
+ * `sui.core.listEvents` / `sui.core.listTransactions` — and, omitted, the tail starts at the beginning of the
  * history the node serves. `poll` is the wait between requests while there is
  * nothing new, one second unless given.
  *
  * @since 0.4.0
  */
 export interface TailOptions {
-  /** Resume strictly after this cursor (a committed `ListPage.endCursor`); `null` is the start. */
+  /** Resume strictly after this cursor (a `sui.core.list…` `endCursor`); `null` is the start. */
   readonly after?: string | null
   readonly poll?: Duration.Input
 }
@@ -966,8 +946,9 @@ export interface SuiService {
    * entry.eventType })`. The stream follows `hasNextPage`, not the item count,
    * so a scan-limited server's empty pages do not end it early, and it **ends**
    * once it has caught up — `tailEvents` is the one that follows the chain.
-   * `opts.after` / `opts.before` resume from a committed cursor; to commit one,
-   * read `streamEventPages` instead, which carries it.
+   * `opts.after` / `opts.before` resume from a cursor; a reader that commits
+   * its position page by page uses `sui.core.listEvents`, whose pages carry
+   * `endCursor`.
    *
    * A malformed filter is a defect carrying the SDK's sentence, not a
    * `TransportError`. Fails with: `TransportError` (an `OUT_OF_RANGE` status
@@ -981,27 +962,13 @@ export interface SuiService {
   ) => Stream.Stream<EventEntry, TransportError>
 
   /**
-   * `streamEvents` a page at a time, each page carrying the cursor to resume
-   * from: commit `page.endCursor` with the page's items and pass it back as
-   * `after`.
-   *
-   * Fails with: `TransportError`.
-   *
-   * @since 0.4.0
-   */
-  readonly streamEventPages: (
-    filter?: EventFilter,
-    opts?: ListOptions
-  ) => Stream.Stream<ListPage<EventEntry>, TransportError>
-
-  /**
    * Every event matching `filter`, oldest first, **without end**: once caught
    * up it waits `opts.poll` (one second) and asks again from its last cursor.
    *
    * It survives a node restart: a retryable `TransportError` is retried every
    * `poll` from the last cursor, logged at warning level. On a filtered tail it
-   * also keeps its cursor near the ledger head while nothing matches (see
-   * `ListPage`), so a pruning node does not prune past it. **That reads the
+   * also keeps its cursor near the ledger head while nothing matches, so a
+   * pruning node does not prune past it. **That reads the
    * unfiltered head and the filtered page as two requests**, which agree only
    * when they reach the same node (or nodes at the same height): behind a
    * load-balanced endpoint such as a public fullnode, a head from a node that
@@ -1009,9 +976,9 @@ export interface SuiService {
    * matches the lagging node had not reached, and they are never read. Point a
    * filtered tail whose completeness matters at a single (sticky) node.
    * `Stream.retry` on
-   * the result starts again from `opts.after`, not from where it stopped: for a
-   * restartable indexer use `tailEventPages` and commit each page's
-   * `endCursor`.
+   * the result starts again from `opts.after`, not from where it stopped: a
+   * restartable indexer that commits its cursor pages through
+   * `sui.core.listEvents` itself.
    *
    * Fails with: `TransportError`, only when it is not retryable (a cursor the
    * node has pruned past answers `OUT_OF_RANGE`).
@@ -1022,24 +989,6 @@ export interface SuiService {
     filter?: EventFilter,
     opts?: TailOptions
   ) => Stream.Stream<EventEntry, TransportError>
-
-  /**
-   * `tailEvents` a page at a time, each page carrying the cursor to resume
-   * from. A caught-up filtered tail emits an **empty** page whenever it moves
-   * its cursor to the ledger head, so that position can be committed too —
-   * with `tailEvents`' caveat: that move is sound only when the head and the
-   * page come from one node (or nodes at the same height), so a filtered tail
-   * whose completeness matters uses a single (sticky) node, not a
-   * load-balanced endpoint.
-   *
-   * Fails with: `TransportError`, only when it is not retryable.
-   *
-   * @since 0.4.0
-   */
-  readonly tailEventPages: (
-    filter?: EventFilter,
-    opts?: TailOptions
-  ) => Stream.Stream<ListPage<EventEntry>, TransportError>
 
   /**
    * Every transaction matching `filter` (all transactions when omitted),
@@ -1082,19 +1031,6 @@ export interface SuiService {
   ) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>
 
   /**
-   * `streamTransactions` a page at a time, each page carrying the cursor to
-   * resume from (see `streamEventPages`).
-   *
-   * Fails with: `TransportError`.
-   *
-   * @since 0.4.0
-   */
-  readonly streamTransactionPages: (
-    filter?: TransactionFilter | AffectedAddressFilter,
-    opts?: ListOptions
-  ) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>
-
-  /**
    * Every transaction matching `filter`, oldest first, without end — the
    * transaction twin of `tailEvents`, with the same polling, retry and
    * filtered-cursor behaviour, and `streamTransactions`' rule for function
@@ -1113,28 +1049,6 @@ export interface SuiService {
     opts?: TailOptions
   ) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>
 
-  /**
-   * `tailTransactions` a page at a time (see `tailEventPages`), with the
-   * same caveat: a filtered tail whose completeness matters uses a single
-   * (sticky) node, because its move to the head is sound only when the head
-   * and the page come from the same ledger height.
-   *
-   * Fails with: `TransportError`, only when it is not retryable.
-   *
-   * @since 0.4.0
-   */
-  readonly tailTransactionPages: (
-    filter?: TransactionFilter | AffectedAddressFilter,
-    opts?: TailOptions
-  ) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>
-
-  /**
-   * Serializes work for one sender, so two transactions from the same address
-   * cannot pick the same gas coin. Adds no failures of its own.
-   */
-  readonly withSenderLock: (
-    address: SuiAddress
-  ) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 }
 
 const CHUNK = 50
@@ -1180,11 +1094,7 @@ const keyOf = (id: string): string => {
   }
 }
 
-const makeSui = (
-  core: SuiCore["Service"],
-  chainId: string,
-  locks: RcMap.RcMap<string, Semaphore.Semaphore>
-): SuiService => {
+const makeSui = (core: SuiCore["Service"], chainId: string): SuiService => {
   const envelopeOf = (object: SuiClientTypes.Object<typeof OBJECT_INCLUDE>) =>
     decodeEnvelope(object).pipe(Effect.mapError(boundaryError("getObject")))
 
@@ -1772,23 +1682,17 @@ const makeSui = (
     .listTransactions({ order: "descending", limit: 1 })
     .pipe(Effect.map((response) => response.startCursor ?? null))
 
-  const streamEventPages = (filter?: EventFilter, opts?: ListOptions) =>
-    pagesOf("Sui.streamEventPages", startOf(opts), eventsPage(filter, directionOf(opts)))
-
   const streamEvents = (filter?: EventFilter, opts?: ListOptions) =>
     paginated("Sui.streamEvents", eventsPage(filter, directionOf(opts)), startOf(opts))
 
-  const tailEventPages = (filter?: EventFilter, opts?: TailOptions) =>
+  const tailEvents = (filter?: EventFilter, opts?: TailOptions) =>
     tailOf(
       "Sui.tailEvents",
       opts?.after ?? null,
       opts?.poll ?? DEFAULT_POLL,
       eventsPage(filter, "ascending"),
       filter === undefined ? undefined : eventsHead
-    )
-
-  const tailEvents = (filter?: EventFilter, opts?: TailOptions) =>
-    tailEventPages(filter, opts).pipe(Stream.map((page) => page.items), Stream.flattenIterable)
+    ).pipe(Stream.map((page) => page.items), Stream.flattenIterable)
 
   /** A stream that refuses an unpaginable function filter when it is run. */
   const checked = <A, E>(
@@ -1801,14 +1705,6 @@ const makeSui = (
       return stream()
     })
 
-  const streamTransactionPages = (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) =>
-    checked("Sui.streamTransactionPages", filter, () =>
-      pagesOf(
-        "Sui.streamTransactionPages",
-        startOf(opts),
-        transactionsPage(filter, directionOf(opts))
-      ))
-
   const streamTransactions = (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) =>
     checked("Sui.streamTransactions", filter, () =>
       paginated(
@@ -1817,7 +1713,7 @@ const makeSui = (
         startOf(opts)
       ))
 
-  const tailTransactionPages = (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) =>
+  const tailTransactions = (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) =>
     checked("Sui.tailTransactions", filter, () =>
       tailOf(
         "Sui.tailTransactions",
@@ -1825,44 +1721,7 @@ const makeSui = (
         opts?.poll ?? DEFAULT_POLL,
         transactionsPage(filter, "ascending"),
         filter === undefined ? undefined : transactionsHead
-      ))
-
-  const tailTransactions = (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) =>
-    tailTransactionPages(filter, opts).pipe(Stream.map((page) => page.items), Stream.flattenIterable)
-
-  const withSenderLock = (address: SuiAddress) =>
-    Effect.fn("Sui.withSenderLock")(function*<A, E, R>(
-      effect: Effect.Effect<A, E, R>
-    ): Effect.fn.Return<A, E, R> {
-      yield* Effect.annotateCurrentSpan({ "sui.sender": address })
-      // The semaphore is reference counted: whoever is inside the lock holds a
-      // reference, so a sender's semaphore cannot be dropped while it is in
-      // use, and an idle one is released a minute after the last holder leaves
-      // rather than sitting in the map for the life of the process. A service
-      // that sponsors thousands of addresses therefore holds entries for the
-      // senders it is actually working for, not for every sender it has ever
-      // seen.
-      //
-      // The time spent queued for the permit is `sui_effect_sender_lock_wait`,
-      // measured from asking for the semaphore to holding the permit; the
-      // sender is deliberately not an attribute.
-      const asked = yield* Clock.currentTimeMillis
-      const held = Clock.currentTimeMillis.pipe(
-        Effect.flatMap((now) => Metrics.recordDuration(Metrics.senderLockWait, Duration.millis(now - asked)))
-      )
-      //
-      // The key is the normalized spelling, not the raw string: `SuiAddress
-      // .make` validates without decoding, so an upper-case `0xAAAA…` is a
-      // valid brand of the same sender, and keying on the raw string would
-      // give that sender two semaphores — the gas-coin equivocation this lock
-      // exists to stop.
-      return yield* Effect.scoped(
-        Effect.flatMap(
-          RcMap.get(locks, normalizeSuiAddress(address)),
-          (semaphore) => Semaphore.withPermit(semaphore, Effect.andThen(held, effect))
-        )
-      )
-    })
+      ).pipe(Stream.map((page) => page.items), Stream.flattenIterable))
 
   const chainTime = core
     .getObject({ objectId: SUI_CLOCK_OBJECT_ID, include: OBJECT_INCLUDE })
@@ -1919,14 +1778,9 @@ const makeSui = (
     streamOwnedObjects,
     streamDynamicFields,
     streamEvents,
-    streamEventPages,
     tailEvents,
-    tailEventPages,
     streamTransactions,
-    streamTransactionPages,
-    tailTransactions,
-    tailTransactionPages,
-    withSenderLock
+    tailTransactions
   }
 }
 
@@ -1966,9 +1820,7 @@ export interface SuiLayerOptions {
    * every later use of that runtime fails with the same stale
    * `TransportError`, until something disposes it. A short schedule here is the
    * cheap half of the cure; disposing the runtime when its build failed is the
-   * other half (see the guide's "Application consumers" section), and
-   * `layerNoDepsPinned` avoids the read altogether when the chain id is already
-   * known.
+   * other half.
    *
    * Unset, the read is made once, as it always was.
    *
@@ -2018,32 +1870,7 @@ export class Sui extends Context.Service<Sui, SuiService>()("@unconfirmed/sui-ef
         if (expected !== undefined && expected !== chainIdentifier) {
           return yield* new NetworkMismatch({ expected, actual: chainIdentifier })
         }
-        const locks = yield* makeSenderLocks
-        return makeSui(core, chainIdentifier, locks)
-      })
-    )
-
-  /**
-   * `Sui` over whatever `SuiCore` is provided, **without reading the chain
-   * identifier**: the one given is taken as the chain's.
-   *
-   * This exists for one caller: `SuiExtension.fromService` with `warm`, which
-   * builds its runtime synchronously inside `register` and therefore cannot
-   * await a `getChainIdentifier` round trip. Nothing is asserted, because
-   * nothing is asked — a node on another chain is not detected here. What still
-   * protects a warm registration is the chain itself: `Tx.build` stamps this id
-   * on the transaction's `ValidDuring` expiration, and a validator refuses
-   * bytes signed for another chain.
-   *
-   * Prefer {@link layerNoDeps}, which asks. Never fails.
-   */
-  static readonly layerNoDepsPinned = (chainId: string): Layer.Layer<Sui, never, SuiCore> =>
-    Layer.effect(
-      Sui,
-      Effect.gen(function*() {
-        const core = yield* SuiCore
-        const locks = yield* makeSenderLocks
-        return makeSui(core, chainId, locks)
+        return makeSui(core, chainIdentifier)
       })
     )
 

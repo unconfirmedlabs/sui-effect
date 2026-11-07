@@ -23,4 +23,3 @@ export {
   readSchedule,
   RETRYABLE_GRPC_STATUSES
 } from "./services/SuiCore.ts"
-export { fromRedactedSecret } from "./services/Signer.ts"

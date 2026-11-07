@@ -6,10 +6,12 @@ repository. Do not edit it by hand; a test fails when it is stale.
 
 ## Start here
 
-@unconfirmed/sui-effect is an opinionated Effect v4 layer over `@mysten/sui`.
-Two client tiers (`SuiCore` mirrors the SDK, `Sui` makes the decisions), a
-closed error union on every function, the transaction lifecycle as functions
-with typed outcomes, and an in-memory fake so every test runs with no network.
+@unconfirmed/sui-effect is a light Effect v4 wrapper around the official
+`@mysten/sui` SDK that makes it safer to use: `SuiCore` mirrors the SDK's Core
+API one-to-one, `Sui` adds decoded reads, a closed error union on every
+function, the transaction lifecycle as functions with typed outcomes, and a
+scripted `SuiCore` for tests that answers reads from plain values and never
+pretends to be a chain.
 
 ```bash
 bun add @unconfirmed/sui-effect
@@ -22,30 +24,26 @@ and `instanceof` checks stop matching. A library built on this package puts all
 of them in its own `peerDependencies` and `devDependencies`, never in
 `dependencies`.
 
-`AGENTS.md` has the invariants, `README.md` the tour, `docs/extensions.md` the
-contract for an extension package. The API reference follows this section,
-subpath by subpath; the examples and the extension template come last.
+`AGENTS.md` has the invariants, `README.md` the tour, `DESIGN.md` the
+specification. The API reference follows this section, subpath by subpath; the
+examples come last.
 
 ## Subpaths
 
 | Import | What it exports |
 |---|---|
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
-| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `foldMovement`, `sendAll`, `verifySponsored`, `submit`, `submitVia`, `verify`, `prepare`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, `fromMnemonic`, `fromSecretKey`, `zkLogin`, `passkey`, `wallet`, …), `LockableSigner`, `ZkLogin`, `verifySponsored`, `Intent`, `Verified`, `Gate`, `checkClaims`, `Verify`, `SubmitConfig`, `SubmitConfigOverrides`, `LockSenderPolicy` and `GasPaymentPolicy`, `FoldBatch` / `FoldPlan` / `FoldGas` / `FoldResult`, `Journal`, `JournalEntry` |
+| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `verifySponsored`, `submit`, `submitVia`, `reconcile`, `resubmit`, `run`, `reconcileAll`, `withSenderLock`), `Signer` and its constructors (`fromKeypair`, `fromSdkSigner`, `fromSecretKey`, `fromMnemonic`, `generateMnemonic`, `derivationPath`, `ephemeral`, `remote`, `zkLogin`, `multisig`, `alias`), `Prepared` (what `Tx.run`'s `approve` is shown), `AddressAlias` / `AddressAliases`, `Verify`, `verifySponsored`, `SubmitConfig`, `Journal`, `JournalEntry`, `FoldBatch` / `FoldPlan` / `FoldResult` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
-| `@unconfirmed/sui-effect/gate` | The Jev screen for `Tx.verify` over `effect/http`: `layerJev`, `layerJevConfig`, `makeJev` (0.5.0) |
-| `@unconfirmed/sui-effect/enoki` | Enoki sponsorship through the journal: `Enoki.fromFlow`, `fromWallet`, `sponsor`, `execute`, `run`, `EnokiError` (0.5.0) |
-| `@unconfirmed/sui-effect/keystore` | `Keystore` (sealed keys at rest over `KeyValueStore`, WebCrypto), `Keystore.sealer` for zkLogin sessions, `KeyError`, `KeystoreError` (0.5.0) |
-| `@unconfirmed/sui-effect/storage` | `KeyValueStore` layers: `layerIndexedDb`, `layerAsyncStorage`, `layerMmkv`, `layerChromeStorage` (0.5.0) |
-| `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)` (an `Effect<Option<A>>` member becomes `Promise<A \| undefined>`, `FaceValue`), and `SuiExtension.leaf` |
-| `@unconfirmed/sui-effect/script` | `Script` / `ScriptReadOnly` (layers that read `SUI_NETWORK`, `SUI_PRIVATE_KEY`, …), `Script.run`, `Script.report`, `Script.exitCode` |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig`; the fake models address balances (`SuiTest.setAddressBalance`, `SuiTest.addressBalance`) |
+| `@unconfirmed/sui-effect/testing` | `layerTest(script)` (the real `Sui` over `ScriptedSuiCore`, a `SuiCore` answering from a `FakeScript`: objects, dynamic fields, address balances, the clock, and scripted execute/simulate answers in order; it never applies or validates a transaction), `SuiTest` (`putObject`, `setClock`, `setAddressBalance`, `scriptExecute`, `scriptSimulate`, `calls`, `provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `FakeOutcome`, `fakeCoin`, `fakeDigest`, `testSubmitConfig`, `TestServices` |
 
 ## Recipes
 
-Each one is a file in this repository that typechecks and runs against the fake
-(`test/recipes.test.ts`); the relative `src/` imports are shown as the package
-subpaths they are.
+Each one is a file in this repository that typechecks. Those about decoding,
+mapping or failure handling run over scripted answers (`test/recipes.test.ts`);
+those about what a validator does run against a localnet
+(`test/live.localnet-recipes.test.ts`, behind `SUI_LOCALNET=1`). The relative
+`src/` imports are shown as the package subpaths they are.
 
 Read an object:
 
@@ -59,7 +57,7 @@ Fold coin objects into the address balance, once per coin-funded account:
 
 <!-- recipe: examples/recipes/fold-coins.ts -->
 
-The explicit lifecycle, for a sponsored transaction, and the coin-paid alternative:
+The explicit lifecycle, for a sponsored transaction, and the same in one process:
 
 <!-- recipe: examples/recipes/sponsored.ts -->
 
@@ -67,13 +65,17 @@ A stateless sponsor service, handed someone else's bytes:
 
 <!-- recipe: examples/recipes/sponsored-stateless.ts -->
 
+An account signed for by its alias, a multisig (address aliases, 0.6.0):
+
+<!-- recipe: examples/recipes/account-alias.ts -->
+
 Re-sending a lost submission:
 
 <!-- recipe: examples/recipes/resubmit.ts -->
 
-A script with a durable journal:
+A durable journal, swept before anything new is sent:
 
-<!-- recipe: examples/recipes/durable-journal-script.ts -->
+<!-- recipe: examples/recipes/durable-journal.ts -->
 
 Publish a package, then upgrade it:
 
@@ -87,71 +89,56 @@ Map a Move abort to your own error:
 
 <!-- recipe: examples/recipes/move-abort.ts -->
 
-A resumable indexer:
+A resumable indexer over the SDK's own cursors:
 
 <!-- recipe: examples/recipes/indexer.ts -->
 
-An extension and its Promise face:
+A test over the scripted `SuiCore`:
 
-<!-- recipe: examples/recipes/extension.ts -->
-
-Calling a Promise face from plain TypeScript:
-
-<!-- recipe: examples/recipes/promise-face.ts -->
-
-A test on the fake:
-
-<!-- recipe: test/recipes/fake.test.ts -->
+<!-- recipe: test/recipes/scripted.test.ts -->
 
 ## The two tiers
 
 - `SuiCore` is a 1:1 Effect wrap of the SDK's `ClientWithCoreApi`: one member per transport method, the SDK's `Include` generics, every call cancellable, reads retried on a retryable `TransportError`.
-- `Sui` is the opinionated tier over it: fixed include sets, BCS content decoded through a schema after the Move type is checked, `Option` where absence is normal, chunked batch reads, `Stream` pagination, one sender lock. Application and extension code reads through `Sui`.
+- `Sui` is the convenience tier over it: fixed include sets, BCS content decoded through a schema after the Move type is checked, `Option` where absence is normal, chunked batch reads, `Stream` pagination. Application code reads through `Sui`.
 - **`Sui` members are positional** — `sui.getObject(id, { schema })`, `sui.getBalance(owner, coinType)`. **`SuiCore` members take the SDK's options object** — `core.getObject({ objectId, include })`. Writing `sui.getObject({ objectId })` is the SDK habit, and it does not typecheck.
-- **The SDK's `listX` is `Sui.streamX`**, a `Stream` that follows every page and ends once caught up; `tailX` never ends and polls: `listOwnedObjects` → `streamOwnedObjects`, `listCoins` → `streamCoins`, `listBalances` → `streamBalances`, `listDynamicFields` → `streamDynamicFields`, `listEvents` → `streamEvents` / `tailEvents`, `listTransactions` → `streamTransactions` / `tailTransactions`. The `…Pages` forms (`streamEventPages`, `tailEventPages`, …) carry each page's `endCursor` for a resumable reader; `{ after }` resumes from one.
+- **The SDK's `listX` is `Sui.streamX`**, a `Stream` that follows every page and ends once caught up; `tailX` never ends and polls: `listOwnedObjects` → `streamOwnedObjects`, `listCoins` → `streamCoins`, `listBalances` → `streamBalances`, `listDynamicFields` → `streamDynamicFields`, `listEvents` → `streamEvents` / `tailEvents`, `listTransactions` → `streamTransactions` / `tailTransactions`. `{ after }` starts one at a cursor; a reader that commits its own cursor pages through `sui.core.listEvents` / `sui.core.listTransactions`, whose pages carry `endCursor`.
 - **A transaction `function` filter must be fully qualified** (`package::module::function`) on `streamTransactions` and `tailTransactions`: the SDK cannot continue a `package` or `package::module` filter past its first page, so it is refused up front. For one page of a module filter, call `sui.core.listTransactions`.
 - **Ids:** `ObjectId.Strict` / `SuiAddress.Strict` (through `Schema.decodeUnknownEffect`) for what a person typed — exactly 64 hex digits; `.normalize` for a shorthand literal such as `"0x6"`; `.make` for the padded form only. Decoding refuses `""` and a bare `"0x"`.
 - `sui.core` is the `SuiCore` a `Sui` was built over, which is why every `Tx.*` function needs only `R = Sui`.
 - Reads go through `Sui`; writes go through `Tx`. Nothing calls `SuiCore.executeTransaction` directly.
 - `Signer` is a value, never a service: pass it as a parameter. `SubmitConfig` and `Journal` are `Context.Reference`s with working defaults.
+- `Tx.withSenderLock(address)(effect)` is the sender lock `Tx.run` takes, for a program that assembles `build → sign → submit` by hand.
 
 ## Gas and the address balance
 
 - **Gas comes from the payer's SUI address balance by default** (`SubmitConfig.gasPayment: "preferAddressBalance"`): the resolver pays from it when it covers the budget and the transaction does not use `tx.gas`, and from coins otherwise. The `Tx.build` span attribute `sui.gas_payment` names the choice (`addressBalance`, `coinReservation`, `coins`). `"requireAddressBalance"` makes coins a `BuildError`.
 - **Bytes that pin nothing do not hold the sender lock past their build.** Under `lockSender: "whenPinned"` (the default) `Tx.run` locks every build, and keeps the lock through submit only when the bytes pin an owned input, a gas coin or a coin reservation (what a `tx.gas` user paying from a balance gets: it reserves the whole balance, so such a run also waits for the lock-free runs in flight before it builds). Lock-free runs can together overdraw a balance, budgets counted in full (refused at submission when the shortfall is already there; otherwise the overdrawing one is `ExecutionFailed`, `InsufficientFundsForWithdraw`, no gas charged): a spend-to-zero flow sets `lockSender: "always"`.
 - **Fold coins into the balance** with `Tx.foldCoins({ signer })`: `Tx.planFold` (reads only) then one `Tx.run(Tx.fold(batch))` per batch, SUI first. SUI pays for its own fold, so a coin-only account needs nothing first. Preview a batch with `Tx.build(Tx.fold(batch), { sender })` and `sui.simulate(built.bytes)`. The localnet faucet (V2) pays coins, so fold first; the devnet/testnet faucet (V3) pays the balance.
-- **Transfer into a balance** with `Tx.sendFunds({ coinType?, amount, recipient })` (`balance::send_funds`; keep `useGasCoin` at its default `true`, `false` under `Tx.sponsored`). In your own recipes prefer `tx.coin({ balance })` / `tx.balance(...)` to `tx.splitCoins(tx.gas, ...)`, which pays gas with a coin.
-- Address-balance gas is checked before signing: an explicit empty payment needs the budget plus the payer's SUI withdrawals in the balance, and with no owned input a `ValidDuring` expiration (the default), and must not use `tx.gas` (its coin is empty: the simulate passes, execution fails and charges gas); each miss is a `BuildError`. A sponsored recipe uses `tx.coin({ balance, useGasCoin: false })` / `Tx.sendFunds({ ..., useGasCoin: false })`, never `tx.splitCoins(tx.gas, ...)`.
+- **Transfer between balances** with `Tx.sendFunds({ coinType?, amount, recipient })`: a `FundsWithdrawal` from the sender's address balance, `balance::redeem_funds`, `balance::send_funds`. Address balances only — no coin fallback; a balance short of the amount is a `BuildError` ("Invalid withdraw reservation"). In your own recipes prefer `tx.coin({ balance })` / `tx.balance(...)` to `tx.splitCoins(tx.gas, ...)`, which pays gas with a coin.
+- Address-balance gas is checked before signing: an explicit empty payment needs the budget plus the payer's SUI withdrawals in the balance, and with no owned input a `ValidDuring` expiration (the default), and must not use `tx.gas` (its coin is empty: the simulate passes, execution fails and charges gas); each miss is a `BuildError`. A sponsored recipe uses `tx.coin({ balance, useGasCoin: false })` or `Tx.sendFunds`, never `tx.splitCoins(tx.gas, ...)`.
 
 ## Errors
 
 Every failure is one flat `Schema.TaggedError`. `SuiError.outcome(e)` puts it on
-the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
+the axis a caller acts on.
 
-| Tag | Outcome | Exit | Means |
-|---|---|---|---|
-| `TransportError` | `not_applied` | 4 | The request did not reach a usable answer; `retryable` says whether a read may try again |
-| `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | `not_applied` | 4 | The three `ObjectError.reason` values |
-| `TransactionNotFound` | `not_applied` | 4 | No transaction with that digest is known |
-| `NetworkMismatch` | `not_applied` | 2 | The node is on another chain than the layer was built for |
-| `DecodeError` | `not_applied` | 4 | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
-| `SimulationFailed` | `not_applied` | 4 | Simulation reported an execution failure; no gas charged |
-| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, and the gas ceiling as `rule: "maxGasBudget"`); the journal write before the first send |
-| `GraphQLUnavailable` / `ExtensionNotReady` | `not_applied` | 4 | No usable GraphQL endpoint; a synchronous Promise-face member called before its runtime existed |
-| `NotApplied` | `not_applied` | 4 | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
-| `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged (none for `InsufficientFundsForWithdraw`, an overdrawn balance) |
-| `UnexpectedEffects` | `applied` | 5 | It ran; the effects lack what the caller expected (`expectCreated`) |
-| `SubmissionUnknown` | `unknown` | 3 | Bytes may have been sent; the outcome is unknown. Carries the signed bytes |
-| anything else, with no `outcome` field | `unknown` | 1 | Unclassified; declare `outcome` on every extension error |
-
-`ConfigError` (whose one line names the variable) and `SchemaError` also exit 2;
-a defect exits 1, an interrupt with nothing outstanding 130. An error that
-declares an integer `exitCode` from 1 to 255 — the plain field, or Effect's
-`[Runtime.errorExitCode]` marker — exits with it. **Once a
-transaction of this run applied**, a failure that would exit 2, 4 or 130 exits
-5 instead, because a retry would send a second transaction; **while an entry of
-this run is unresolved**, the same failure exits 3 instead, applied or not,
-because an outstanding submission means "reconcile before anything else".
+| Tag | Outcome | Means |
+|---|---|---|
+| `TransportError` | `not_applied` | The request did not reach a usable answer; `retryable` says whether a read may try again |
+| `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | `not_applied` | The three `ObjectError.reason` values |
+| `TransactionNotFound` | `not_applied` | No transaction with that digest is known |
+| `NetworkMismatch` | `not_applied` | The node is on another chain than the layer was built for |
+| `DecodeError` | `not_applied` | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
+| `SimulationFailed` | `not_applied` | Simulation reported an execution failure; no gas charged |
+| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, the gas ceiling as `rule: "maxGasBudget"`, a signer that is neither the address nor in its alias set as `rule: "alias.signer"`, `sponsored.*`); the journal write before the first send |
+| `KeyError` | `not_applied` | A phrase, secret key, derivation path or multisig member set that is not one |
+| `GraphQLUnavailable` | `not_applied` | No usable GraphQL endpoint |
+| `NotApplied` | `not_applied` | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
+| `ExecutionFailed` | `applied` | Applied on chain and failed; gas charged (none for `InsufficientFundsForWithdraw`, an overdrawn balance) |
+| `UnexpectedEffects` | `applied` | It ran; the effects lack what the caller expected (`expectCreated`) |
+| `SubmissionUnknown` | `unknown` | Bytes may have been sent; the outcome is unknown. Carries the signed bytes |
+| anything else, with no `outcome` field | `unknown` | Unclassified; declare `outcome` on every error of your own |
 
 Three rules:
 
@@ -221,6 +208,8 @@ process-wide.
 8. Every SDK call forwards the Effect's `AbortSignal`, so `Effect.timeout` and interruption cancel the request.
 9. One Move type rule everywhere: a bare expected tag matches every instantiation of the generic; a parameterized one is compared in full.
 10. A test that runs `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default journal is process-wide; `layerTest` is the production `Sui`, so fixtures use `localnet`.
+11. **The sender is the account, never the alias key** (0.6.0). `Tx.run(recipe, { signer: Signer.alias(A, m) })` builds, locks and journals as A and signs with `m`; A's `AddressAliases` object — never transaction history — is read once before the build, and an `m` it does not list is `PolicyDenied { rule: "alias.signer" }`. `Signer.multisig` combines its members' signatures in the multisig's member order, which is the order a validator pairs them with the bitmap in.
+12. **Evidence comes from objects, never from transaction history**: reconcile's `inputConsumed`, the alias check, `Tx.attach`'s signer check. A history listing is a convenience read, never proof.
 
 ## Index
 
