@@ -10,10 +10,12 @@ import { describe, expect, test } from "bun:test"
 import { bcs } from "@mysten/sui/bcs"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
+import { MultiSigPublicKey } from "@mysten/sui/multisig"
 import type { Transaction } from "@mysten/sui/transactions"
 import { Effect, Fiber, Layer, Option, Ref, Stream } from "effect"
 import { KeyValueStore } from "effect/persistence"
 import { TestClock } from "effect/testing"
+import { handOver, payAs } from "../examples/recipes/account-alias.ts"
 import { pay } from "../examples/recipes/build-and-submit.ts"
 import { durableJournal, payOnce } from "../examples/recipes/durable-journal-script.ts"
 import { foldAll, previewFold } from "../examples/recipes/fold-coins.ts"
@@ -179,6 +181,40 @@ describe("docs/llms-head.md recipes", () => {
       }).pipe(SuiTest.provide(layerTest(script)))
     )
     expect(error._tag).toBe("PolicyDenied")
+  })
+
+  test("account-alias: hand the account over to a multisig, then pay as the account, signed by it", async () => {
+    const members = [31, 32, 33].map((fill) => Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(fill)))
+    const publicKey = MultiSigPublicKey.fromPublicKeys({
+      threshold: 2,
+      publicKeys: members.map((member) => ({ publicKey: member.getPublicKey(), weight: 1 }))
+    })
+    const multisig = SuiAddress.normalize(publicKey.toSuiAddress())
+    const recipient = SuiAddress.normalize("0xb0b")
+    const aliasScript: FakeScript = {
+      balances: [{
+        owner: signer.address,
+        coinType: "0x2::sui::SUI",
+        balance: "1000000000",
+        coinBalance: "0",
+        addressBalance: "1000000000"
+      }],
+      execute: [FakeOutcome.succeed(), FakeOutcome.succeed(), FakeOutcome.succeed(), FakeOutcome.succeed()]
+    }
+    const [aliases, executed, refused] = await run(
+      Effect.gen(function*() {
+        yield* handOver(signer, multisig)
+        const aliases = yield* SuiTest.addressAliases(signer.address)
+        // Members given out of order; the third alone would be below the threshold.
+        const executed = yield* payAs(signer.address, publicKey, [fromKeypair(members[2]!), fromKeypair(members[0]!)], recipient)
+        // The account's own key no longer signs for it: the node refuses it.
+        const refused = yield* Effect.flip(Tx.run(Tx.sendFunds({ amount: 1n, recipient }), { signer }))
+        return [aliases, executed, refused] as const
+      }).pipe(SuiTest.provide(layerTest(aliasScript)))
+    )
+    expect(aliases).toEqual(Option.some([multisig]))
+    expect(executed.sender).toBe(signer.address)
+    expect(refused._tag).toBe("TransportError")
   })
 
   test("extension: the Effect service and its derived Promise face agree", async () => {

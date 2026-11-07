@@ -330,6 +330,34 @@ const addressBalance = (
   withFake((fake) => fake.readAddressBalance(owner, coinType))
 
 /**
+ * Sets `address`'s address alias set (`0x2::address_alias`) in the fake: its
+ * `AddressAliases` object at the derived id, at the next version, which is
+ * what `AddressAlias.getAliases`, `Tx.run`'s check of a `Signer.alias` and the
+ * fake's signature check read. `undefined` removes it (aliases not enabled).
+ * The fake also follows executed `enable`/`add`/`remove`/`replace_all` calls,
+ * so a test may set the set up either way. Never fails.
+ *
+ * @since 0.6.0
+ */
+const setAddressAliases = (
+  address: string,
+  aliases: ReadonlyArray<string> | undefined
+): Effect.Effect<void, never, SuiCoreFake> =>
+  withFake((fake) => fake.setAddressAliases(address, aliases))
+
+/**
+ * `address`'s alias set as the fake holds it now, `None` when it has not
+ * enabled aliases: what a test reads after running an
+ * `AddressAlias.enable`/`add`/`remove` recipe. Never fails.
+ *
+ * @since 0.6.0
+ */
+const addressAliases = (
+  address: string
+): Effect.Effect<Option.Option<ReadonlyArray<string>>, never, SuiCoreFake> =>
+  withFake((fake) => fake.readAddressAliases(address))
+
+/**
  * The whole wiring of one test, as one `.pipe` step: provides `layer` (a
  * {@link layerTest} or {@link layerExtensionTest}) plus a **fresh**
  * `Journal.layerMemory` and `TestClock.layer()`, built **locally** —
@@ -400,6 +428,8 @@ export const SuiTest = {
   setVisibilityDelay,
   setAddressBalance,
   addressBalance,
+  setAddressAliases,
+  addressAliases,
   calls,
   provide
 } as const

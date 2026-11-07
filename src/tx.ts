@@ -34,7 +34,15 @@ export {
 } from "./services/Signer.ts"
 
 /** Signature verification: the Effect face of `@mysten/sui/verify`. */
-export { Verify, type VerifyOptions } from "./services/Verify.ts"
+export {
+  Verify,
+  type VerifyOptions,
+  type VerifyTransactionOptions,
+  type VerifyTransactionSignature
+} from "./services/Verify.ts"
+
+/** Sui's address aliases (0.6.0): an address's alias set read from its object, the check, and the four recipes. */
+export { AddressAlias, AddressAliases } from "./services/AddressAlias.ts"
 
 /** The lifecycle settings, with the spec's defaults in force by default. */
 export {

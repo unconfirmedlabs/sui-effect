@@ -247,8 +247,12 @@ describe("Tx.attach (sponsor#5)", () => {
         return yield* Tx.attach(built, signature).pipe(Effect.flip)
       })
     )
-    expect(error._tag).toBe("SigningError")
-    expect(String(error.cause)).toContain(stranger.address)
+    // 0.6.0: neither the sender nor an alias of it (the sender has no
+    // `AddressAliases` object), a `PolicyDenied`; it was a `SigningError`.
+    expect(error._tag).toBe("PolicyDenied")
+    if (error._tag !== "PolicyDenied") throw error
+    expect(error.rule).toBe("alias.signer")
+    expect(error.message).toContain(stranger.address)
   })
 
   test("a signature over other bytes is refused", async () => {

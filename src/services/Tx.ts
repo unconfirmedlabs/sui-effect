@@ -58,6 +58,7 @@ import {
   U32_MAX,
   Version
 } from "../domain/schemas.ts"
+import { allows as aliasAllows, readAliases, requireSigner } from "./AddressAlias.ts"
 import { Gate } from "./Gate.ts"
 import { Journal } from "./Journal.ts"
 import { defaultReadPolicy } from "./SuiCore.ts"
@@ -1389,6 +1390,11 @@ const defaultExpiration = Effect.fnUntraced(function*(
  * check is against what was actually signed. Bytes this version cannot parse
  * are let through: refusing to sign because the guard could not read them would
  * be worse than the failure it prevents.
+ *
+ * A `Signer.alias` is compared by the address it signs **as** (`address`, the
+ * account), not by the alias whose key signs: whether the alias set allows that
+ * key is a chain read, which `Tx.run` makes before building (`requireAliases`)
+ * and this offline check cannot.
  */
 const assertSignerAddress = (
   bytes: Uint8Array,
@@ -1415,6 +1421,13 @@ const assertSignerAddress = (
  * rejection at execution time. A `Signer.remote` therefore has to report the
  * address it signs as truthfully.
  *
+ * A `Signer.alias(account, key)` signs as `account`, so it signs bytes whose
+ * sender (or gas owner) is `account` with `key`'s signature. This makes no
+ * chain read: that `key` is in `account`'s alias set is checked by `Tx.run`
+ * before it builds, or by `AddressAlias.requireSigner` / `Tx.attach` /
+ * `Verify.verifyTransactionSignature(…, { checkAddressAliases: true })`
+ * when you sign step by step; a key outside the set is refused by the node.
+ *
  * Fails with: `SigningError`.
  */
 export const sign = Effect.fn("Tx.sign")(function*(
@@ -1422,6 +1435,7 @@ export const sign = Effect.fn("Tx.sign")(function*(
   signer: Signer
 ): Effect.fn.Return<Signed, SigningError> {
   yield* Effect.annotateCurrentSpan({ "sui.digest": built.digest, "sui.signer": signer.address })
+  if (signer.alias !== undefined) yield* Effect.annotateCurrentSpan({ "sui.signer_alias": signer.alias })
   yield* assertSignerAddress(built.bytes, signer)
   const signature = yield* signer.signTransaction(built.bytes)
   return {
@@ -1443,7 +1457,8 @@ export const sign = Effect.fn("Tx.sign")(function*(
  * exactly the same transaction.
  *
  * As in {@link sign}, the co-signer's address must be the sender or the gas
- * owner named in the bytes.
+ * owner named in the bytes; a `Signer.alias` is compared by the account it
+ * signs as.
  *
  * Fails with: `SigningError`.
  */
@@ -1452,6 +1467,7 @@ export const cosign = Effect.fn("Tx.cosign")(function*(
   signer: Signer
 ): Effect.fn.Return<Signed, SigningError> {
   yield* Effect.annotateCurrentSpan({ "sui.digest": signed.digest, "sui.signer": signer.address })
+  if (signer.alias !== undefined) yield* Effect.annotateCurrentSpan({ "sui.signer_alias": signer.alias })
   yield* assertSignerAddress(signed.bytes, signer)
   const signature: Signature = yield* signer.signTransaction(signed.bytes)
   return { ...signed, signatures: [...signed.signatures, signature] }
@@ -1641,9 +1657,14 @@ export const fromBytes = Effect.fn("Tx.fromBytes")(function*(
  *
  * The signature is verified against the bytes (`Verify.verifyTransactionSignature`,
  * so a zkLogin or multisig signature is checked through the node), and the
- * address it was made by must be the sender or the gas owner the bytes name.
- * A `Built` becomes a `Signed` carrying that one signature; a `Signed` gains it.
- * The same signature attached twice is attached once.
+ * address it was made by must be one the bytes accept: the sender or the gas
+ * owner they name, or — through Sui's address aliases (0.6.0) — a member of
+ * the sender's or the gas owner's alias set, read from their
+ * `AddressAliases` objects. That read is made only for a signature by neither
+ * address; a signature by the sender's own key is attached without one (an
+ * address that removed itself from its own set is refused by the node at
+ * submission). A `Built` becomes a `Signed` carrying that one signature; a
+ * `Signed` gains it. The same signature attached twice is attached once.
  *
  * ```ts
  * const built = yield* Tx.fromBytes(senderBytes)
@@ -1651,17 +1672,18 @@ export const fromBytes = Effect.fn("Tx.fromBytes")(function*(
  * const signed = yield* Tx.cosign(withSender, sponsor)
  * ```
  *
- * Fails with: `SigningError` (the signature is empty, does not parse, is not
- * valid for these bytes, or was made by an address the bytes will not accept),
- * `TransportError` (a zkLogin or multisig check could not reach a usable
- * answer).
+ * Fails with: `SigningError` (the signature is empty, does not parse or is not
+ * valid for these bytes), `PolicyDenied` (`alias.signer`, 0.6.0: it was made
+ * by an address that is neither the sender, the gas owner, nor an alias of
+ * either — before 0.6.0 this was a `SigningError`), `TransportError` (a zkLogin
+ * or multisig check, or an alias read, could not reach a usable answer).
  *
  * @since 0.4.0
  */
 export const attach = Effect.fn("Tx.attach")(function*(
   target: Built | Signed,
   signature: string
-): Effect.fn.Return<Signed, SigningError | TransportError, Sui> {
+): Effect.fn.Return<Signed, SigningError | PolicyDenied | TransportError, Sui> {
   yield* Effect.annotateCurrentSpan({ "sui.digest": target.digest })
   const decoded = decodeSignature(signature)
   if (Option.isNone(decoded)) {
@@ -1669,12 +1691,32 @@ export const attach = Effect.fn("Tx.attach")(function*(
   }
   const publicKey = yield* verifyTransactionSignature(target.bytes, decoded.value)
   const address = normalizeSuiAddress(publicKey.toSuiAddress())
-  const allowed = signersOfBytes(target.bytes)
+  const allowed = [...new Set(signersOfBytes(target.bytes))]
   if (allowed.length > 0 && !allowed.includes(address)) {
-    return yield* new SigningError({
-      cause: `the signature was made by ${address}, which is neither the transaction's sender` +
-        ` nor its gas owner (${allowed.join(", ")}); the node would reject it`
-    })
+    yield* Effect.annotateCurrentSpan({ "sui.signer_alias": address })
+    const signer = SuiAddress.normalize(address)
+    let covered = false
+    const sets: Array<string> = []
+    for (const required of allowed) {
+      const aliases = yield* readAliases(SuiAddress.normalize(required))
+      if (aliasAllows(aliases, signer)) {
+        covered = true
+        break
+      }
+      sets.push(
+        aliases._tag === "NotEnabled"
+          ? `${required} has not enabled address aliases`
+          : `${required}'s aliases are ${aliases.aliases.join(", ")}`
+      )
+    }
+    if (!covered) {
+      return yield* new PolicyDenied({
+        rule: "alias.signer",
+        message: `the signature was made by ${address}, which is neither the transaction's sender` +
+          ` nor its gas owner (${allowed.join(", ")}) nor an alias of either (${sets.join("; ")});` +
+          " the node would reject it"
+      })
+    }
   }
   const existing: ReadonlyArray<Signature> = "signatures" in target ? target.signatures : []
   const signatures = existing.includes(decoded.value) ? existing : [...existing, decoded.value]
@@ -1688,6 +1730,24 @@ export const attach = Effect.fn("Tx.attach")(function*(
     ...(target.chain === undefined ? {} : { chain: target.chain })
   }
 })
+
+/**
+ * Requires, of every `Signer.alias` among `signers`, that its key is in the
+ * alias set of the account it signs as — one `AddressAliases` read each,
+ * before anything is built, so a key the account does not (or no longer)
+ * lists costs no build and no simulate. A signer without an `alias` is not
+ * read for. What `Tx.run` and `Enoki.run` do for their signer and sponsor.
+ * Internal.
+ *
+ * Fails with: `PolicyDenied` (`alias.signer`), `TransportError`.
+ */
+export const requireAliases = (
+  signers: ReadonlyArray<Signer | undefined>
+): Effect.Effect<void, PolicyDenied | TransportError, Sui> =>
+  Effect.forEach(signers, (signer) =>
+    signer === undefined || signer.alias === undefined
+      ? Effect.void
+      : requireSigner(signer.address, signer.alias), { discard: true })
 
 const journalSigned = Effect.fnUntraced(function*(signed: Signed) {
   const journal = yield* Journal
@@ -3583,11 +3643,25 @@ export const verify = Effect.fn("Tx.verify")(function*(
  * `locked` answers `true` fails the run with `SigningError { reason:
  * "locked" }` before anything is built or simulated.
  *
- * Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`,
+ * **Sender A, signed by M** (0.6.0). `signer: Signer.alias(A, m)` runs a
+ * transaction whose sender is the account A with the signature of M, a member
+ * of A's alias set (`0x2::address_alias`) — `m` is any signer, a
+ * `Signer.multisig` included. Everything that is keyed on the sender is keyed
+ * on **A**: the build's sender, the sender lock (and the in-flight registry),
+ * `Built.sender`, the journal's `signed.sender`, `onSigned`, the intent's and
+ * `approve`'s parties; M appears only in the signature (span attribute
+ * `sui.signer_alias`). Before anything is built the run reads A's
+ * `AddressAliases` object once and refuses an M it does not list with
+ * `PolicyDenied { rule: "alias.signer" }`; a sponsor given as
+ * `Signer.alias(gasOwner, key)` is read for the same way. A plain signer
+ * costs no such read.
+ *
+ * Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied` (also
+ * `alias.signer`, 0.6.0), `SigningError`,
  * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`,
- * `TransportError` (from the build reads; once bytes are sent, transport
- * failures become `SubmissionUnknown`), and `E` — whatever `approve` fails
- * with.
+ * `TransportError` (from the build reads and an alias read; once bytes are
+ * sent, transport failures become `SubmissionUnknown`), and `E` — whatever
+ * `approve` fails with.
  */
 export const run = Effect.fn("Tx.run")(function*<E = never>(
   recipe: Recipe | Transaction,
@@ -3698,6 +3772,11 @@ export const run = Effect.fn("Tx.run")(function*<E = never>(
   }
   // Nor can a signer that is already locked: refused before any read.
   yield* requireUnlocked([opts.signer, opts.sponsor])
+  // Nor an alias key its account does not list: one `AddressAliases` read
+  // per `Signer.alias`, before the build. The run is keyed on the account —
+  // `sender` is `opts.signer.address` — never on the alias.
+  yield* requireAliases([opts.signer, payer === undefined ? undefined : opts.sponsor])
+  if (opts.signer.alias !== undefined) yield* Effect.annotateCurrentSpan({ "sui.signer_alias": opts.signer.alias })
 
   // The session bound: the earlier of the signer's and the sponsor's, so the
   // window the build sets cannot outlive either signature.

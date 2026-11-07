@@ -34,6 +34,7 @@ import {
 
 export type { FromMnemonicOptions, FromSecretKeyOptions, KeyScheme, LockableSigner, MnemonicLength }
 import { createPasskey, passkey, wallet } from "./AccountSigners.ts"
+import { alias, multisig } from "./MultiSigSigner.ts"
 import { zkLogin } from "./ZkLoginSigner.ts"
 
 /**
@@ -80,6 +81,17 @@ export interface Signer {
    * @since 0.5.0
    */
   readonly maxEpoch?: bigint
+  /**
+   * The address whose key actually signs, when this signer signs **as**
+   * `address` through Sui's address aliases (`0x2::address_alias`): `address`
+   * is the account a transaction names as its sender or gas owner, and `alias`
+   * a member of that account's alias set. Absent for a signer that signs as
+   * itself. `Signer.alias` sets it, and `Tx.run` checks it against the
+   * account's `AddressAliases` object before anything is built.
+   *
+   * @since 0.6.0
+   */
+  readonly alias?: SuiAddress
 }
 
 const decodeSignature = Schema.decodeUnknownEffect(Signature)
@@ -510,7 +522,10 @@ export const scoped = <E, R>(
  * `Signer.fromMnemonic`, `Signer.fromSecretKey`, `Signer.generateMnemonic`,
  * `Signer.derivationPath` and `Signer.scoped`; and the account signers
  * (0.5.0) `Signer.zkLogin`, `Signer.passkey`, `Signer.createPasskey`,
- * `Signer.wallet`. The type `Signer` is the interface above.
+ * `Signer.wallet`; and signers made of signers (0.6.0) `Signer.multisig`
+ * (a weighted multisig over member signers, combined in member order) and
+ * `Signer.alias` (sign as an address through its address aliases). The type
+ * `Signer` is the interface above.
  */
 export const Signer = {
   fromSdkSigner,
@@ -526,5 +541,7 @@ export const Signer = {
   zkLogin,
   passkey,
   createPasskey,
-  wallet
+  wallet,
+  multisig,
+  alias
 } as const

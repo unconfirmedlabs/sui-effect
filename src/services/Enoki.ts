@@ -33,6 +33,7 @@ import {
   lockedRun,
   prepare,
   type Prepared,
+  requireAliases,
   requireIntentOf,
   requireUnlocked,
   sign,
@@ -397,7 +398,9 @@ export const execute = Effect.fn("Enoki.execute")(function*(
  *
  * `options.signer` is the sender: an Enoki zkLogin session
  * (`Enoki.fromFlow`, `Enoki.fromWallet`, `Signer.zkLogin`) or any other
- * signer Enoki sponsors. `options.jwt`, `allowedAddresses` and
+ * signer Enoki sponsors — a `Signer.alias(account, key)` included (0.6.0),
+ * whose key is checked against the account's alias set before Enoki is
+ * asked anything (`PolicyDenied { rule: "alias.signer" }`), as in `Tx.run`. `options.jwt`, `allowedAddresses` and
  * `allowedMoveCallTargets` are {@link sponsor}'s; `refused` is
  * {@link execute}'s.
  *
@@ -405,7 +408,7 @@ export const execute = Effect.fn("Enoki.execute")(function*(
  * the execute call failed in a way `refused` recognises), `TransportError`
  * (Enoki could not be reached for the sponsor request, or the simulate),
  * `BuildError`, `PolicyDenied` (`enoki.digest`, `sponsored.*`,
- * `prepare.sender`, `intent.*`, `preflight`), `SimulationFailed`,
+ * `prepare.sender`, `intent.*`, `preflight`, `alias.signer`), `SimulationFailed`,
  * `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`,
  * `JournalError`, and `E` — whatever `approve` fails with.
  *
@@ -459,6 +462,9 @@ export const run = Effect.fn("Enoki.run")(function*<E = never>(
   yield* Effect.annotateCurrentSpan({ "sui.sender": sender })
   yield* requireIntentOf(options.intent)
   yield* requireUnlocked([options.signer])
+  // A `Signer.alias` is checked against its account's alias set before Enoki
+  // is asked anything, as `Tx.run` does (0.6.0).
+  yield* requireAliases([options.signer])
   const approve = options.approve
   return yield* lockedRun({
     sui,

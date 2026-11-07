@@ -16,6 +16,7 @@ import type { ClientWithCoreApi, SuiClientTypes } from "@mysten/sui/client"
 import { ObjectError, SimulationError, TransactionError } from "@mysten/sui/client"
 import { Inputs, TransactionDataBuilder } from "@mysten/sui/transactions"
 import { parseSerializedSignature } from "@mysten/sui/cryptography"
+import { MultiSigPublicKey } from "@mysten/sui/multisig"
 import { publicKeyFromRawBytes } from "@mysten/sui/verify"
 import type { Argument, TransactionPlugin } from "@mysten/sui/transactions"
 import {
@@ -31,6 +32,13 @@ import {
   toHex
 } from "@mysten/sui/utils"
 import { Context, Effect, Layer, Option, Result, Schema } from "effect"
+import {
+  ADDRESS_ALIAS_STATE_ID,
+  ADDRESS_ALIASES_TYPE,
+  AddressAliasesBcs,
+  aliasesId,
+  MAX_ALIASES
+} from "../domain/address-alias.ts"
 import { typeMatches } from "../domain/bcs.ts"
 import { Digest, ExecutionReason } from "../domain/schemas.ts"
 import type { SuiCoreReadOptions, SuiCoreService } from "./SuiCore.ts"
@@ -543,6 +551,18 @@ export interface FakeScript {
    * @since 0.4.0
    */
   readonly readOptions?: SuiCoreReadOptions
+  /**
+   * Address alias sets (`0x2::address_alias`), keyed by address: each becomes
+   * the address's `AddressAliases` object at its derived id (BCS content,
+   * party-owned by the address), which is what `AddressAlias.getAliases` reads
+   * and what the fake's signature check consults. An address not named here
+   * has not enabled aliases. Executions of `0x2::address_alias::enable`, `add`,
+   * `remove` and `replace_all` then edit the sets, and
+   * `SuiTest.setAddressAliases` replaces one.
+   *
+   * @since 0.6.0
+   */
+  readonly addressAliases?: Readonly<Record<string, ReadonlyArray<string>>>
 }
 
 /** One call the fake received, in order. */
@@ -606,6 +626,22 @@ export interface SuiCoreFakeState {
    * @since 0.4.0
    */
   readonly readAddressBalance: (owner: string, coinType: string) => Effect.Effect<bigint>
+  /**
+   * Replaces `address`'s alias set: its `AddressAliases` object at the derived
+   * id, at the next version. `undefined` removes the object, so the address is
+   * back to signing only for itself (which no chain allows; a test may).
+   * Never fails.
+   *
+   * @since 0.6.0
+   */
+  readonly setAddressAliases: (address: string, aliases: ReadonlyArray<string> | undefined) => Effect.Effect<void>
+  /**
+   * `address`'s alias set as the fake holds it, `None` when it has not enabled
+   * aliases. Never fails.
+   *
+   * @since 0.6.0
+   */
+  readonly readAddressAliases: (address: string) => Effect.Effect<Option.Option<ReadonlyArray<string>>>
   /** Replaces the remaining scripted outcomes of a method. */
   readonly setOutcomes: (
     method: "simulate" | "execute" | "getTransaction" | "buildSimulate" | "getObject",
@@ -726,6 +762,42 @@ const clockObject = (timestampMs: bigint): FakeObject => ({
     timestamp_ms: timestampMs.toString()
   }).toBytes()
 })
+
+/** The type of the shared object `0xa`, which every `AddressAliases` is derived from. */
+const ADDRESS_ALIAS_STATE_TYPE = "0x2::address_alias::AddressAliasState"
+
+/**
+ * The shared `AddressAliasState` (`0xa`) a node serves, so that
+ * `AddressAlias.enable()` resolves its input against the fake.
+ */
+const aliasStateObject: FakeObject = {
+  objectId: ADDRESS_ALIAS_STATE_ID,
+  type: ADDRESS_ALIAS_STATE_TYPE,
+  version: 1n,
+  digest: fakeDigest(10),
+  owner: { $kind: "Shared", Shared: { initialSharedVersion: "1" } },
+  content: bcs.struct("AddressAliasState", { id: bcs.Address, version: bcs.u64() })
+    .serialize({ id: ADDRESS_ALIAS_STATE_ID, version: "0" }).toBytes()
+}
+
+/**
+ * `address`'s `AddressAliases` object holding `aliases` (deduplicated, in the
+ * order given) at `version`, party-owned by the address as `enable` leaves it.
+ */
+const aliasesObject = (address: string, aliases: ReadonlyArray<string>, version: bigint): FakeObject => {
+  const id = aliasesId(address)
+  const contents = [...new Set(aliases.map((alias) => normalizeSuiAddress(alias)))]
+  return {
+    objectId: id,
+    type: ADDRESS_ALIASES_TYPE,
+    version,
+    owner: {
+      $kind: "ConsensusAddressOwner",
+      ConsensusAddressOwner: { startVersion: "1", owner: normalizeSuiAddress(address) }
+    },
+    content: AddressAliasesBcs.serialize({ id, aliases: { contents } }).toBytes()
+  }
+}
 
 /**
  * The SDK shape of an object, with the optional fields served only when the
@@ -1055,11 +1127,15 @@ interface InternalState extends SuiCoreFakeState {
 const makeState = (script: FakeScript): Effect.Effect<InternalState> =>
   Effect.sync(() => {
     const objects = new Map<string, FakeObject>()
-    for (const object of script.objects ?? []) {
+    const seeded = [
+      ...(script.objects ?? []),
+      ...Object.entries(script.addressAliases ?? {}).map(([address, aliases]) => aliasesObject(address, aliases, 1n))
+    ]
+    for (const object of seeded) {
       objects.set(normalizeSuiAddress(object.objectId), object)
     }
     const history = new Map<string, Map<string, string | undefined>>()
-    for (const object of script.objects ?? []) {
+    for (const object of seeded) {
       const id = normalizeSuiAddress(object.objectId)
       history.set(id, new Map([[object.version.toString(), object.previousTransaction]]))
     }
@@ -1225,6 +1301,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     if (id === normalizeSuiAddress(SUI_CLOCK_OBJECT_ID)) {
       return clockObject(state.clockTimestampMs)
     }
+    if (id === ADDRESS_ALIAS_STATE_ID && !state.objects.has(id)) return aliasStateObject
     if (state.deleted.has(id)) {
       throw new ObjectError("deleted", `object ${id} was deleted`, {
         reason: "deleted",
@@ -1854,9 +1931,15 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
    * (fewer signatures than distinct signers), and the **addresses** — every
    * signature whose public key can be read is turned back into the address it
    * signs as, and a required address nobody signed for is a refusal. A
-   * signature the SDK cannot parse (a multisig, a zkLogin proof, a fixture that
-   * is not a real signature) makes the address check stand down, so only the
-   * count applies there.
+   * signature the SDK cannot parse (a zkLogin proof, a fixture that is not a
+   * real signature) makes the address check stand down, so only the count
+   * applies there. A multisig counts as the multisig's address (0.6.0).
+   *
+   * **Address aliases** (0.6.0): a required address that has an
+   * `AddressAliases` object in the fake is covered by a signature from any
+   * member of its set and **only** by one — its own key too only while it is
+   * a member — the way a validator resolves aliases for the sender and the gas
+   * owner. An address without one is covered by its own signature, as before.
    *
    * **It rejects the way a gRPC node does**: an `RpcError` carrying
    * `INVALID_ARGUMENT`, which `mapSdkError` turns into
@@ -1876,7 +1959,13 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     for (const signature of signatures) {
       try {
         const parsed = parseSerializedSignature(signature)
-        if (parsed.signatureScheme === "MultiSig" || parsed.signatureScheme === "ZkLogin") {
+        if (parsed.signatureScheme === "MultiSig") {
+          // A multisig's address is its public key's, readable without the
+          // network (0.6.0); its members' signatures are not checked here.
+          addresses.push(normalizeSuiAddress(new MultiSigPublicKey(parsed.multisig.multisig_pk).toSuiAddress()))
+          continue
+        }
+        if (parsed.signatureScheme === "ZkLogin") {
           return undefined
         }
         addresses.push(
@@ -1924,13 +2013,126 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     }
     const signed = signerAddressesOf(signatures)
     if (signed === undefined) return
-    const missing = required.filter((address) => !signed.includes(address))
+    const covers = (address: string, signer: string): boolean => {
+      const aliases = aliasesOf(address)
+      return aliases === undefined ? signer === address : aliases.includes(signer)
+    }
+    const missing = required.filter((address) => !signed.some((signer) => covers(address, signer)))
     if (missing.length > 0) {
+      const sets = missing.map((address) => aliasesOf(address)).filter((set) => set !== undefined)
       refuse(
         `these bytes name ${missing.join(", ")} as (a) signer(s) and carry no signature` +
           ` from ${missing.length === 1 ? "that address" : "those addresses"}` +
+          (sets.length > 0 ? ` or an alias of ${missing.length === 1 ? "it" : "them"} (${sets.map((set) => set.join(", ")).join("; ")})` : "") +
           ` (the signatures are from ${signed.join(", ")})`
       )
+    }
+  }
+
+  /** `address`'s alias set as the fake holds it (its `AddressAliases` object), or `undefined`. */
+  const aliasesOf = (address: string): ReadonlyArray<string> | undefined => {
+    const object = state.objects.get(aliasesId(address))
+    if (object === undefined) return undefined
+    try {
+      return AddressAliasesBcs.parse(object.content).aliases.contents.map((alias) => normalizeSuiAddress(alias))
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Replaces `address`'s alias set at the next version (or removes it), keeping its history. */
+  const writeAliases = (address: string, aliases: ReadonlyArray<string> | undefined, digest?: string): void => {
+    const id = aliasesId(address)
+    if (aliases === undefined) {
+      state.objects.delete(id)
+      return
+    }
+    const version = (state.objects.get(id)?.version ?? 0n) + 1n
+    const object = {
+      ...aliasesObject(address, aliases, version),
+      ...(digest === undefined ? {} : { previousTransaction: digest })
+    }
+    state.objects.set(id, object)
+    state.deleted.delete(id)
+    remember(id, version, digest)
+  }
+
+  /**
+   * Edits alias sets for a transaction the fake just executed successfully,
+   * following its `0x2::address_alias` entry calls the way the Move module
+   * does — `enable` creates the sender's set `[sender]`; `add`, `remove` and
+   * `replace_all` edit the set whose object is the call's first argument. A
+   * call Move would abort (`enable` twice, adding a member, removing the last
+   * alias, more than 8) changes nothing: the fake runs no Move, so a test that
+   * wants the abort scripts it with `FakeOutcome.failWith`.
+   */
+  const applyAliasEffects = (data: TransactionDataBuilder, digest: string): void => {
+    const sender = typeof data.sender === "string" ? normalizeSuiAddress(data.sender) : undefined
+    const objectOf = (argument: Argument | undefined): string | undefined => {
+      if (argument === undefined || argument.$kind !== "Input") return undefined
+      const input = data.inputs[argument.Input]
+      const id = input?.Object?.SharedObject?.objectId ?? input?.Object?.ImmOrOwnedObject?.objectId ??
+        input?.UnresolvedObject?.objectId
+      return id === undefined ? undefined : normalizeSuiAddress(id)
+    }
+    const pureOf = (argument: Argument | undefined): Uint8Array | undefined => {
+      if (argument === undefined || argument.$kind !== "Input") return undefined
+      const bytes = data.inputs[argument.Input]?.Pure?.bytes
+      return bytes === undefined ? undefined : fromBase64(bytes)
+    }
+    const ownerOfAliases = (id: string | undefined): string | undefined => {
+      if (id === undefined) return undefined
+      const owner = state.objects.get(id)?.owner
+      return owner?.$kind === "ConsensusAddressOwner" ? normalizeSuiAddress(owner.ConsensusAddressOwner.owner) : undefined
+    }
+    for (const command of data.commands) {
+      if (command.$kind !== "MoveCall") continue
+      const call = command.MoveCall
+      let framework = false
+      try {
+        framework = normalizeSuiAddress(call.package) === SUI_FRAMEWORK
+      } catch {
+        framework = false
+      }
+      if (!framework || call.module !== "address_alias") continue
+      if (call.function === "enable") {
+        if (sender !== undefined && aliasesOf(sender) === undefined) writeAliases(sender, [sender], digest)
+        continue
+      }
+      const account = ownerOfAliases(objectOf(call.arguments[0]))
+      const current = account === undefined ? undefined : aliasesOf(account)
+      if (account === undefined || current === undefined) continue
+      try {
+        switch (call.function) {
+          case "add": {
+            const bytes = pureOf(call.arguments[1])
+            if (bytes === undefined) break
+            const alias = normalizeSuiAddress(bcs.Address.parse(bytes))
+            if (!current.includes(alias) && current.length < MAX_ALIASES) writeAliases(account, [...current, alias], digest)
+            break
+          }
+          case "remove": {
+            const bytes = pureOf(call.arguments[1])
+            if (bytes === undefined) break
+            const alias = normalizeSuiAddress(bcs.Address.parse(bytes))
+            if (current.includes(alias) && current.length > 1) {
+              writeAliases(account, current.filter((member) => member !== alias), digest)
+            }
+            break
+          }
+          case "replace_all": {
+            const bytes = pureOf(call.arguments[1])
+            if (bytes === undefined) break
+            const next = [...new Set(bcs.vector(bcs.Address).parse(bytes).map((alias) => normalizeSuiAddress(alias)))]
+            if (next.length > 0 && next.length <= MAX_ALIASES) writeAliases(account, next, digest)
+            break
+          }
+          default:
+            break
+        }
+      } catch {
+        // Bytes the fake cannot read change nothing.
+      }
     }
   }
 
@@ -2660,6 +2862,7 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         derived !== undefined
       )
       if (data !== undefined) applyBalanceEffects(data, settled, before, lastExecution)
+      if (data !== undefined && !settled.failed) applyAliasEffects(data, digest)
       state.knownTransactions.set(digest, settled)
       appendToLedger(digest)
       state.executedMeta.set(digest, metaOfBytes(options.transaction))
@@ -3020,6 +3223,11 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
         setAddressBalanceOf(owner, coinType, amount)
       }),
     readAddressBalance: (owner, coinType) => Effect.sync(() => addressBalanceOf(owner, coinType)),
+    setAddressAliases: (address, aliases) =>
+      Effect.sync(() => {
+        writeAliases(address, aliases)
+      }),
+    readAddressAliases: (address) => Effect.sync(() => Option.fromNullishOr(aliasesOf(address))),
     setOutcomes: (method, outcomes) =>
       Effect.sync(() => {
         state.scripts = { ...state.scripts, [method]: outcomes }

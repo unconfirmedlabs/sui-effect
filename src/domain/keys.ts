@@ -33,6 +33,9 @@ import { SuiAddress } from "./schemas.ts"
  *   `scheme` option that contradicts the key's own flag.
  * - `unavailable`: the platform has no `crypto.getRandomValues`, which a fresh
  *   mnemonic needs (React Native without a CSPRNG polyfill).
+ * - `invalidMultisig` (0.6.0): `Signer.multisig` was given a signer that is
+ *   not a member of the multisig, two signers for one member, or members whose
+ *   weights do not reach the threshold.
  *
  * @since 0.5.0
  */
@@ -41,7 +44,8 @@ export const KeyErrorReason = Schema.Literals([
   "invalidSecretKey",
   "invalidPath",
   "unsupportedScheme",
-  "unavailable"
+  "unavailable",
+  "invalidMultisig"
 ])
 /** @since 0.5.0 */
 export type KeyErrorReason = typeof KeyErrorReason.Type
