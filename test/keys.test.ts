@@ -6,12 +6,11 @@ import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
 import { verifyPersonalMessageSignature } from "@mysten/sui/verify"
 import { validateMnemonic } from "@scure/bip39"
 import { wordlist } from "@scure/bip39/wordlists/english.js"
-import { Effect, Exit, Fiber, Redacted, Scheduler } from "effect"
-import { SigningError, SuiError } from "../src/domain/errors.ts"
+import { Effect, Exit, Redacted } from "effect"
+import { SuiError } from "../src/domain/errors.ts"
 import { KeyError } from "../src/domain/keys.ts"
 import { SuiAddress } from "../src/domain/schemas.ts"
-import { fromRedactedSecret, Signer } from "../src/services/Signer.ts"
-import { holdKey, keypairOf, wipeHeldKey } from "../src/services/SignerKeys.ts"
+import { Signer } from "../src/services/Signer.ts"
 
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 const fail = async <A, E>(effect: Effect.Effect<A, E>): Promise<E> => {
@@ -198,118 +197,4 @@ describe("Signer.fromSecretKey", () => {
     const key = Ed25519Keypair.generate().getSecretKey()
     expect((await fail(Signer.fromSecretKey(key, { scheme: "Secp256k1" }))).reason).toBe("unsupportedScheme")
   })
-})
-
-describe("LockableSigner", () => {
-  test("lock drops the secret: signatures fail with SigningError locked", async () => {
-    const signer = await run(Signer.fromMnemonic(ED_PHRASE))
-    expect(await run(signer.locked)).toBe(false)
-    await run(signer.signTransaction(message))
-    await run(signer.lock)
-    await run(signer.lock) // idempotent
-    expect(await run(signer.locked)).toBe(true)
-    for (const sign of [signer.signTransaction, signer.signPersonalMessage]) {
-      const error = await fail(sign(message))
-      expect(error).toBeInstanceOf(SigningError)
-      expect(error.reason).toBe("locked")
-      expect(SuiError.outcome(error)).toBe("not_applied")
-    }
-    // The address stays readable: a locked account is still an account.
-    expect(signer.address).toBe(ED_ADDRESS)
-  })
-
-  for (const scheme of ["ED25519", "Secp256k1", "Secp256r1"] as const) {
-    test(`wiping a held ${scheme} key zeroes both the owned buffer and the SDK keypair's copy`, () => {
-      const seed = new Uint8Array(32).fill(7)
-      const held = holdKey(scheme, seed)
-      expect(seed.every((byte) => byte === 7)).toBe(true)
-      wipeHeldKey(held)
-      expect(held.secret.every((byte) => byte === 0)).toBe(true)
-      // The SDK's own buffer (reached the same structural way the wipe does).
-      const inner = Reflect.get(Reflect.get(held.keypair, "keypair"), "secretKey") as Uint8Array
-      expect(inner.every((byte) => byte === 0)).toBe(true)
-    })
-  }
-
-  for (const scheme of ["ED25519", "Secp256k1", "Secp256r1"] as const) {
-    test(`a ${scheme} lock racing a signature answers the real key's signature or locked, nothing else`, async () => {
-      const seed = new Uint8Array(32).fill(9)
-      const expected = holdKey(scheme, seed).keypair.toSuiAddress()
-      // Every interleaving the scheduler can produce: yield before the lock 0..n times.
-      for (const yields of [0, 1, 2, 3, 4, 5, 6, 8]) {
-        const exit = await Effect.runPromise(Effect.gen(function*() {
-          const signer = yield* Signer.fromSecretKey(Uint8Array.from(seed), { scheme })
-          const fiber = yield* Effect.forkChild(Effect.exit(signer.signPersonalMessage(message)))
-          for (let i = 0; i < yields; i++) yield* Effect.yieldNow
-          yield* signer.lock
-          return yield* Fiber.join(fiber)
-        }).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 5)))
-        if (Exit.isSuccess(exit)) {
-          const publicKey = await verifyPersonalMessageSignature(message, exit.value)
-          expect(publicKey.toSuiAddress()).toBe(expected)
-        } else {
-          const reason = exit.cause.reasons[0]
-          expect(reason?._tag).toBe("Fail")
-          if (reason?._tag === "Fail") {
-            expect(reason.error).toBeInstanceOf(SigningError)
-            expect(reason.error.reason).toBe("locked")
-          }
-        }
-      }
-    })
-  }
-
-  test("Signer.scoped locks when the scope closes, on success and failure", async () => {
-    const kept = await run(Effect.scoped(Signer.scoped(Signer.fromMnemonic(ED_PHRASE))))
-    expect(await run(kept.locked)).toBe(true)
-    let held: { readonly locked: Effect.Effect<boolean> } | undefined
-    const exit = await Effect.runPromise(Effect.exit(Effect.scoped(Effect.gen(function*() {
-      held = yield* Signer.scoped(Signer.fromMnemonic(ED_PHRASE))
-      return yield* Effect.fail("boom")
-    }))))
-    expect(Exit.isFailure(exit)).toBe(true)
-    expect(held === undefined ? false : await run(held.locked)).toBe(true)
-  })
-
-  test("carries no secret material on the value", async () => {
-    const signer = await run(Signer.fromMnemonic(ED_PHRASE))
-    expect(Object.keys(signer).sort()).toEqual([
-      "address",
-      "lock",
-      "locked",
-      "scheme",
-      "signPersonalMessage",
-      "signTransaction"
-    ])
-    expect(JSON.stringify(signer)).not.toContain("suiprivkey")
-  })
-})
-
-describe("Signer.fromConfig copies before it builds", () => {
-  test("a Secp256k1 key read from config is not aliased to the decoded buffer", async () => {
-    const keypair = Secp256k1Keypair.generate()
-    const signer = await run(fromRedactedSecret(Redacted.make(keypair.getSecretKey()), "KEY"))
-    const signature = await run(signer.signPersonalMessage(message))
-    const publicKey = await verifyPersonalMessageSignature(message, signature)
-    expect(publicKey.toSuiAddress()).toBe(keypair.toSuiAddress())
-  })
-})
-
-describe("keypairOf keeps no orphaned copy of the secret (0.5.0)", () => {
-  for (const scheme of ["ED25519", "Secp256k1", "Secp256r1"] as const) {
-    test(`${scheme}: the held buffer is zeroed unless the keypair signs with it`, async () => {
-      const held = holdKey(scheme, new Uint8Array(32).fill(9))
-      const keypair = keypairOf(held)
-      const sdkOwn = Reflect.get(Reflect.get(keypair, "keypair"), "secretKey")
-      if (sdkOwn === held.secret) {
-        expect(held.secret.some((byte) => byte !== 0)).toBe(true)
-      } else {
-        expect(held.secret.every((byte) => byte === 0)).toBe(true)
-      }
-      // Ed25519 copies, so its held buffer is the orphan this zeroes.
-      if (scheme === "ED25519") expect(sdkOwn).not.toBe(held.secret)
-      const { signature } = await keypair.signPersonalMessage(message)
-      expect((await verifyPersonalMessageSignature(message, signature)).toSuiAddress()).toBe(keypair.toSuiAddress())
-    })
-  }
 })

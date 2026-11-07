@@ -21,40 +21,11 @@ const SUBPATHS: ReadonlyArray<{ readonly name: string; readonly file: string }> 
   { name: "@unconfirmed/sui-effect", file: "dist/index.d.ts" },
   { name: "@unconfirmed/sui-effect/tx", file: "dist/tx.d.ts" },
   { name: "@unconfirmed/sui-effect/journal", file: "dist/journal.d.ts" },
-  { name: "@unconfirmed/sui-effect/gate", file: "dist/gate.d.ts" },
-  { name: "@unconfirmed/sui-effect/keystore", file: "dist/keystore.d.ts" },
-  { name: "@unconfirmed/sui-effect/storage", file: "dist/storage.d.ts" },
-  { name: "@unconfirmed/sui-effect/enoki", file: "dist/enoki.d.ts" },
-  { name: "@unconfirmed/sui-effect/extension", file: "dist/extension.d.ts" },
-  { name: "@unconfirmed/sui-effect/script", file: "dist/script.d.ts" },
   { name: "@unconfirmed/sui-effect/testing", file: "dist/testing.d.ts" }
 ]
 
 /** Files appended verbatim, after the API. */
 const EXAMPLE_DIRS = ["examples"]
-const WORKED_EXAMPLE = "examples/extension-template"
-const WORKED_EXAMPLE_FILES = [
-  "src/index.ts",
-  "src/schema.ts",
-  "src/errors.ts",
-  "src/Escrow.ts",
-  "src/upstream.ts",
-  "src/extension.ts"
-]
-
-/**
- * Template files named by path rather than printed: the test suite alone is a
- * sixth of this document, and the template ships inside the package, so an
- * agent can open them from `node_modules` without a checkout.
- */
-const WORKED_EXAMPLE_REFERENCED = [
-  "test/escrow.test.ts",
-  "test/durable-object.test.ts",
-  "recipes/durable-object.ts",
-  "package.json",
-  "scripts/check-package.ts"
-]
-
 /** The hand-written head, with `<!-- recipe: path -->` and `<!-- index -->` filled in. */
 const HEAD = "docs/llms-head.md"
 
@@ -68,12 +39,6 @@ const SUBPATH_OF_SOURCE: ReadonlyArray<readonly [string, string]> = [
   ["src/index.ts", "@unconfirmed/sui-effect"],
   ["src/tx.ts", "@unconfirmed/sui-effect/tx"],
   ["src/journal.ts", "@unconfirmed/sui-effect/journal"],
-  ["src/gate.ts", "@unconfirmed/sui-effect/gate"],
-  ["src/keystore.ts", "@unconfirmed/sui-effect/keystore"],
-  ["src/storage.ts", "@unconfirmed/sui-effect/storage"],
-  ["src/enoki.ts", "@unconfirmed/sui-effect/enoki"],
-  ["src/extension.ts", "@unconfirmed/sui-effect/extension"],
-  ["src/script.ts", "@unconfirmed/sui-effect/script"],
   ["src/testing.ts", "@unconfirmed/sui-effect/testing"]
 ]
 
@@ -833,7 +798,6 @@ const renderFiles = (paths: ReadonlyArray<string>): string =>
 export const render = (): string => {
   const { api, index } = renderApi()
   const examples = EXAMPLE_DIRS.flatMap(listFiles)
-  const worked = WORKED_EXAMPLE_FILES.map((file) => `${WORKED_EXAMPLE}/${file}`)
   return [
     renderHead(index),
     "",
@@ -845,16 +809,7 @@ export const render = (): string => {
     "Every file below is typechecked, and each one is exercised by a test against",
     "the in-memory fake.",
     "",
-    renderFiles(examples),
-    "# The extension worked example",
-    "",
-    "`examples/extension-template/` is a complete, copyable extension package, and",
-    "the source of every code block in `docs/extensions.md`. It ships inside this",
-    "package (`node_modules/@unconfirmed/sui-effect/examples/extension-template/`).",
-    "Its source files are below; these are in the template too and are not",
-    `reprinted here: ${WORKED_EXAMPLE_REFERENCED.map((file) => `\`${file}\``).join(", ")}.`,
-    "",
-    renderFiles(worked)
+    renderFiles(examples)
   ].join("\n")
 }
 

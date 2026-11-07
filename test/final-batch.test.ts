@@ -12,18 +12,16 @@ import { SuiGrpcClient } from "@mysten/sui/grpc"
 import type { SuiClientTypes } from "@mysten/sui/client"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Transaction } from "@mysten/sui/transactions"
-import { ConfigProvider, Context, Duration, Effect, Layer, Schema } from "effect"
-import { ExtensionNotReady, GraphQLUnavailable, SuiError, TransportError } from "../src/domain/errors.ts"
+import { Duration, Effect, Layer, Schema } from "effect"
+import { SuiError, TransportError } from "../src/domain/errors.ts"
 import { ObjectId, SuiAddress } from "../src/domain/schemas.ts"
 import { SuiSchema } from "../src/index.ts"
-import { Script } from "../src/services/Script.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
 import { SubmitConfig } from "../src/services/SubmitConfig.ts"
 import { Sui } from "../src/services/Sui.ts"
 import type { SuiCoreService } from "../src/services/SuiCore.ts"
 import { makeFromClient, SuiCore } from "../src/services/SuiCore.ts"
 import { FakeOutcome, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
-import { SuiExtension } from "../src/services/SuiExtension.ts"
 import { SuiGraphQL } from "../src/services/SuiGraphQL.ts"
 import { Tx } from "../src/services/Tx.ts"
 import { layerTest, SuiTest } from "../src/testing.ts"
@@ -93,11 +91,6 @@ describe("A1. the effect peer is the stable 4.1.x line, and everything says so",
     expect(readme).not.toContain("4.0.0-rc.112`, in CI")
   })
 
-  test("the template admits the same range", () => {
-    const template = JSON.parse(readFileSync("examples/extension-template/package.json", "utf8"))
-    expect(template.peerDependencies.effect).toBe(">=4.1.1 <4.2")
-    expect(template.devDependencies.effect).toBe("4.1.1")
-  })
 })
 
 describe("A2. every CI job can pass as written", () => {
@@ -140,154 +133,6 @@ describe("A2. every CI job can pass as written", () => {
     // It used to `process.exit(1)` when `dist/` was absent, which took the
     // whole `bun test` down with it. `test/llms.test.ts` skips instead.
     expect(readFileSync("scripts/llms.ts", "utf8")).not.toContain("process.exit(")
-  })
-})
-
-describe("A3. one base per client per chain id: warm and lazy share", () => {
-  class Locking extends Context.Service<Locking, { readonly hold: Effect.Effect<void> }>()(
-    "final-batch/Locking"
-  ) {
-    static readonly make = (
-      onEnter: () => void,
-      onLeave: () => void
-    ): Layer.Layer<Locking, never, Sui> =>
-      Layer.effect(
-        Locking,
-        Effect.gen(function*() {
-          const sui = yield* Sui
-          return {
-            hold: sui.withSenderLock(SuiAddress.make(SENDER))(
-              Effect.gen(function*() {
-                onEnter()
-                yield* Effect.sleep("25 millis")
-                onLeave()
-              })
-            )
-          }
-        })
-      )
-  }
-
-  const probe = async (
-    register: (
-      layer: Layer.Layer<Locking, never, Sui>,
-      client: ReturnType<typeof clientOf>
-    ) => ReadonlyArray<{ readonly hold: () => Promise<void>; readonly $dispose: () => Promise<void> }>
-  ): Promise<number> => {
-    let active = 0
-    let peak = 0
-    const layer = Locking.make(
-      () => {
-        active += 1
-        peak = Math.max(peak, active)
-      },
-      () => {
-        active -= 1
-      }
-    )
-    const registered = register(layer, clientOf())
-    await Promise.all(registered.map((one) => one.hold()))
-    for (const one of registered) await one.$dispose()
-    return peak
-  }
-
-  const clientOf = () =>
-    Effect.runSync(
-      Effect.provide(
-        Effect.map(SuiCoreFake, (fake) => fake.client),
-        SuiCoreFake.layer({ chainId: CHAIN_ID, network: "mainnet" }),
-        { local: true }
-      )
-    )
-
-  test("a warm registration and a lazy one hold one lock, not two", async () => {
-    // The verifier's probe: the extension template's own pair is exactly this
-    // combination (`Platform.ts` warm, `extension.ts` lazy), and it used to
-    // reach peak concurrency 2 because the base was keyed `read:` versus
-    // `pinned:` rather than by the chain the two agree on.
-    const peak = await probe((layer, client) => [
-      SuiExtension.fromService(Locking, { name: "warm", layer, warm: { chainId: CHAIN_ID } })
-        .register(client) as never,
-      SuiExtension.fromService(Locking, { name: "lazy", layer }).register(client) as never
-    ])
-    expect(peak).toBe(1)
-  })
-
-  test("a lazy registration with sui.chainId and one without hold one lock", async () => {
-    const peak = await probe((layer, client) => [
-      SuiExtension.fromService(Locking, { name: "pinned", layer, sui: { chainId: CHAIN_ID } })
-        .register(client) as never,
-      SuiExtension.fromService(Locking, { name: "plain", layer }).register(client) as never
-    ])
-    expect(peak).toBe(1)
-  })
-
-  test("chained $extend still shares, because the key is the client's core", async () => {
-    const peak = await probe((layer, client) => {
-      const extended = (client as unknown as {
-        $extend: (registration: unknown) => Record<string, never>
-      })
-        .$extend(
-          SuiExtension.fromService(Locking, { name: "one", layer, warm: { chainId: CHAIN_ID } })
-        )
-      const twice = (extended as unknown as {
-        $extend: (registration: unknown) => Record<string, never>
-      })
-        .$extend(SuiExtension.fromService(Locking, { name: "two", layer }))
-      return [twice["one"] as never, twice["two"] as never]
-    })
-    expect(peak).toBe(1)
-  })
-
-  test("two registrations that pin different chain ids are not handed one Sui", async () => {
-    // Sharing is per chain id on purpose: an extension that pins a different
-    // identifier is not asking for the same `Sui`.
-    const client = clientOf()
-    const layer = Locking.make(() => undefined, () => undefined)
-    const first = SuiExtension.fromService(Locking, {
-      name: "one",
-      layer,
-      warm: { chainId: CHAIN_ID }
-    }).register(client)
-    const second = SuiExtension.fromService(Locking, {
-      name: "two",
-      layer,
-      warm: { chainId: "69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD" }
-    }).register(client)
-    await Promise.all([first.hold(), second.hold()])
-    await first.$dispose()
-    await second.$dispose()
-  })
-
-  test("a lazy registration joining a pinned base still asserts the chain id", async () => {
-    // The pinned base asks the node nothing, so the lazy registration owes the
-    // `getChainIdentifier` check — and a node on another chain must still fail
-    // its build.
-    const client = Effect.runSync(
-      Effect.provide(
-        Effect.map(SuiCoreFake, (fake) => fake.client),
-        SuiCoreFake.layer({ chainId: "69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD" }),
-        { local: true }
-      )
-    )
-    const layer = Locking.make(() => undefined, () => undefined)
-    // Warm takes the wrong id without complaint...
-    const warm = SuiExtension.fromService(Locking, {
-      name: "warm",
-      layer,
-      warm: { chainId: CHAIN_ID }
-    }).register(client)
-    await warm.hold()
-    // ...and the lazy registration joining it is the one that finds out.
-    const lazy = SuiExtension.fromService(Locking, {
-      name: "lazy",
-      layer,
-      sui: { chainId: CHAIN_ID }
-    }).register(client)
-    const failure = await lazy.hold().then(() => undefined, (error: unknown) => error)
-    expect((failure as { readonly _tag?: string })?._tag).toBe("NetworkMismatch")
-    await warm.$dispose()
-    await lazy.$dispose()
   })
 })
 
@@ -342,8 +187,18 @@ describe("B1. an interrupted build cancels the gRPC resolver's simulate", () => 
         Effect.timeout("200 millis"),
         Effect.provideService(SubmitConfig, { ...SubmitConfig.defaults, expiration: "none" }),
         Effect.provide(
-          Sui.layerNoDepsPinned(CHAIN_ID).pipe(
-            Layer.provideMerge(SuiCore.layerFromClient(client))
+          Sui.layerNoDeps.pipe(
+            // The transport never answers, so the chain identifier is given.
+            Layer.provideMerge(Layer.effect(
+              SuiCore,
+              Effect.gen(function*() {
+                const core = yield* SuiCore
+                return {
+                ...core,
+                getChainIdentifier: () => Effect.succeed({ chainIdentifier: CHAIN_ID })
+                }
+              })
+            ).pipe(Layer.provide(SuiCore.layerFromClient(client))))
           ),
           { local: true }
         )
@@ -456,25 +311,6 @@ describe("B2. inputConsumed is the consuming transaction's own inputVersion", ()
 })
 
 describe("B3 to B6 and the guide's own rules", () => {
-  test("B3: the packed-package check does not assume it lives in this repository", () => {
-    const source = readFileSync("examples/extension-template/scripts/check-package.ts", "utf8")
-    // It prefers the template's own node_modules...
-    expect(source).toContain("join(templateModules, name)")
-    // ...and only trusts `../..` when that really is sui-effect.
-    expect(source).toContain('=== "@unconfirmed/sui-effect"')
-  })
-
-  test("B4: nothing hand-builds a TransportError outside the constructor's own module", () => {
-    for (
-      const file of [
-        "examples/extension-template/src/Escrow.ts",
-        "examples/extension-consumer.ts"
-      ]
-    ) {
-      expect(readFileSync(file, "utf8")).not.toContain("new TransportError(")
-    }
-  })
-
   test("B5: Tx.build's JSDoc no longer promises a wall-clock default", () => {
     const source = readFileSync("src/services/Tx.ts", "utf8")
     const doc = source
@@ -503,42 +339,6 @@ describe("B3 to B6 and the guide's own rules", () => {
 })
 
 describe("C. the minor findings", () => {
-  test("npm pack does not ship the template's build output", () => {
-    const manifest = JSON.parse(readFileSync("package.json", "utf8"))
-    expect(manifest.files).toContain("!examples/extension-template/dist")
-  })
-
-  test("Script.run describes every tag in the taxonomy", async () => {
-    for (
-      const error of [
-        new GraphQLUnavailable({ method: "query", reason: "no endpoint" }),
-        new ExtensionNotReady({ extension: "escrow", member: "packageId" })
-      ]
-    ) {
-      const lines: Array<string> = []
-      await Script.run(Effect.fail(error), {
-        layer: Script.layerNoDeps.pipe(
-          Layer.provideMerge(layerTest(baseScript)),
-          Layer.provide(
-            ConfigProvider.layer(
-              ConfigProvider.fromEnvRecord({
-                SUI_NETWORK: "localnet",
-                SUI_PRIVATE_KEY: Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(3))
-                  .getSecretKey()
-              })
-            )
-          )
-        ),
-        exit: () => undefined,
-        stderr: (line) => lines.push(line),
-        signals: { on: () => undefined }
-      })
-      // Before the fix `SUI_ERROR_TAGS` omitted both tags, so `Script.run`
-      // printed the bare `_tag` line for a foreign error instead of `describe`.
-      expect(lines.join("\n")).toContain(SuiError.describe(error))
-    }
-  })
-
   test("reconcileAll has no unreachable TransportError case", () => {
     const source = readFileSync("src/services/Tx.ts", "utf8")
     const body = source.slice(source.indexOf("export const reconcileAll"))
@@ -734,8 +534,4 @@ describe("conversion feedback: the new public surface", () => {
     expect(simulation.commandResults[0]?.mutatedReferences).toEqual([])
   })
 
-  test("12. Stream.runCollect returns a plain Array in Effect v4", () => {
-    // The one-line callout the testing docs now carry, pinned so it stays true.
-    expect(readFileSync("docs/extensions.tpl.md", "utf8")).toContain("`Stream.runCollect`")
-  })
 })

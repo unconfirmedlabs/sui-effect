@@ -337,14 +337,13 @@ describe("2.10 coverage that was missing", () => {
     expect(short).toBe(padded)
     const { sameBlocked, otherRan } = await run(
       Effect.gen(function*() {
-        const sui = yield* Sui
         const release = yield* Deferred.make<void>()
-        const holder = yield* Effect.forkChild(sui.withSenderLock(short)(Deferred.await(release)))
+        const holder = yield* Effect.forkChild((yield* Sui).withSenderLock(short)(Deferred.await(release)))
         yield* Effect.yieldNow
         // A different address is not serialized behind the holder...
-        const otherRan = yield* sui.withSenderLock(sponsor.address)(Effect.succeed(true))
+        const otherRan = yield* (yield* Sui).withSenderLock(sponsor.address)(Effect.succeed(true))
         // ...the same address, spelled either way, is.
-        const same = yield* Effect.forkChild(sui.withSenderLock(padded)(Effect.succeed(true)))
+        const same = yield* Effect.forkChild((yield* Sui).withSenderLock(padded)(Effect.succeed(true)))
         for (let i = 0; i < 50; i++) yield* Effect.yieldNow
         const sameBlocked = same.pollUnsafe() === undefined
         yield* Deferred.succeed(release, undefined)

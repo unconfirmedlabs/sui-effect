@@ -59,7 +59,7 @@ const overFake = (
   script: FakeScript,
   override: (core: SuiCoreService) => Partial<SuiCoreService>
 ) =>
-  Sui.layerNoDepsPinned(CHAIN_ID).pipe(
+  Sui.layerNoDeps.pipe(
     Layer.provideMerge(
       Layer.effect(
         SuiCore,
@@ -343,20 +343,18 @@ const ledger = (from: number, to: number): NonNullable<FakeScript["transactions"
 }
 
 describe("indexer#4: resumable and tailing streams", () => {
-  test("pages carry the cursor to resume from, and `after` resumes there", async () => {
-    const [pages, resumed] = await run(
+  test("`after` resumes a stream at a cursor from sui.core.listEvents", async () => {
+    const resumed = await run(
       Effect.gen(function*() {
         const sui = yield* Sui
-        const pages = yield* collect(sui.streamEventPages(undefined))
-        const third = pages[2]
-        const resumed = yield* collect(sui.streamEvents(undefined, { after: third?.endCursor ?? null }))
-        return [pages, resumed] as const
+        let cursor: string | null = null
+        for (let page = 0; page < 3; page++) {
+          cursor = (yield* sui.core.listEvents({ limit: 1, after: cursor })).endCursor ?? null
+        }
+        return yield* collect(sui.streamEvents(undefined, { after: cursor }))
       }),
       { transactions: ledger(1, 5), pageSize: 1 }
     )
-    expect(pages).toHaveLength(5)
-    expect(pages.every((page) => page.endCursor !== null)).toBe(true)
-    expect(pages.slice(0, 4).every((page) => page.hasNextPage)).toBe(true)
     expect(resumed.map((entry) => entry.transactionDigest)).toEqual([fakeDigest(4), fakeDigest(5)] as never)
   })
 
@@ -379,8 +377,9 @@ describe("indexer#4: resumable and tailing streams", () => {
     const entries = await run(
       Effect.gen(function*() {
         const sui = yield* Sui
-        const pages = yield* collect(sui.streamEventPages(undefined, { order: "descending" }))
-        return yield* collect(sui.streamEvents(undefined, { before: pages[1]?.endCursor ?? "" }))
+        const first = yield* sui.core.listEvents({ limit: 1, order: "descending" })
+        const second = yield* sui.core.listEvents({ limit: 1, order: "descending", before: first.endCursor ?? null })
+        return yield* collect(sui.streamEvents(undefined, { before: second.endCursor ?? "" }))
       }),
       { transactions: ledger(1, 5), pageSize: 1 }
     )
@@ -414,16 +413,15 @@ describe("indexer#4: resumable and tailing streams", () => {
   })
 
   test("a caught-up filtered tail moves its cursor to the ledger head, read before the page", async () => {
+    // The cursor each filtered request resumed from.
+    const afters: Array<string | null | undefined> = []
     const program = Effect.gen(function*() {
       const sui = yield* Sui
-      const fiber = yield* Effect.forkChild(
-        collect(
-          sui.tailEventPages({ eventType: Ping }, { poll: "1 second" }).pipe(Stream.take(2))
-        )
-      )
+      const fiber = yield* Effect.forkChild(collect(sui.tailEvents({ eventType: Ping }, { poll: "1 second" })))
       yield* TestClock.adjust("1 second")
       yield* TestClock.adjust("1 second")
-      return yield* Fiber.join(fiber)
+      yield* TestClock.adjust("1 second")
+      yield* Fiber.interrupt(fiber)
     })
     // Only one Ping, at the start; three Pongs after it. The override answers a
     // filtered page the way gRPC does: `endCursor` at the last *match*, and
@@ -434,20 +432,18 @@ describe("indexer#4: resumable and tailing streams", () => {
         listEvents: (options) =>
           options.filter === undefined
             ? core.listEvents(options)
-            : Effect.map(core.listEvents(options), (page) => ({
+            : Effect.map(Effect.andThen(Effect.sync(() => afters.push(options.after)), core.listEvents(options)), (page) => ({
               ...page,
               endCursor: page.events.length === 0 ? null : page.startCursor
             }))
       })
     )
-    const pages = await Effect.runPromise(
+    await Effect.runPromise(
       Effect.provide(program, Layer.merge(layer, TestClock.layer()), { local: true })
     )
-    expect(pages[0]?.items.map((entry) => entry.eventType)).toEqual([Ping] as never)
-    // The second page is empty and exists only to move the cursor to the head:
-    // the newest event's position, so a pruning node cannot prune past it.
-    expect(pages[1]?.items).toHaveLength(0)
-    expect(pages[1]?.endCursor).toBe("3")
+    // After the empty page the tail resumes from the head — the newest
+    // event's position — so a pruning node cannot prune past its cursor.
+    expect(afters.at(-1)).toBe("3")
   })
 
   test("a tail retries a retryable failure from its last cursor instead of ending", async () => {

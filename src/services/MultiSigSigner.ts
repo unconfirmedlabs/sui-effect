@@ -21,12 +21,6 @@ import type { Signer } from "./Signer.ts"
 
 const decodeSignature = Schema.decodeUnknownEffect(Signature)
 
-/** The structural `locked` member a `LockableSigner` carries, when this signer has one. */
-const lockedOf = (signer: Signer): Effect.Effect<boolean> | undefined => {
-  const locked: unknown = Reflect.get(signer, "locked")
-  return Effect.isEffect(locked) ? locked as Effect.Effect<boolean> : undefined
-}
-
 /** The earliest of the bounds that exist, or `undefined` when none does. */
 const earliest = (bounds: ReadonlyArray<bigint | undefined>): bigint | undefined =>
   bounds.reduce<bigint | undefined>(
@@ -51,19 +45,18 @@ const invalid = (message: string): KeyError => new KeyError({ reason: "invalidMu
  * time, never two at once).
  *
  * Members may be of any scheme the SDK combines: Ed25519, Secp256k1,
- * Secp256r1, a passkey (`Signer.passkey`), a zkLogin session (`Signer.zkLogin`;
- * its member key is the session's `ZkLoginPublicIdentifier`), a wallet account
- * or a `Signer.remote`. A member is matched by its `address`, the address the
+ * Secp256r1, a passkey (the SDK's `PasskeyKeypair` through
+ * `Signer.fromSdkSigner`), a zkLogin signer (`Signer.zkLogin`; its member key
+ * is the `ZkLoginPublicIdentifier`) or a `Signer.remote`. A member is matched by its `address`, the address the
  * member's public key derives — the rule the SDK's `MultiSigSigner` uses — so a
  * zkLogin member must sign as the current (non-legacy) derivation of its
  * identifier. A member's partial signature that the multisig key does not know
  * is a `SigningError` when signing.
  *
  * The signer's `address` is the multisig's address, its scheme `"MultiSig"`,
- * its `maxEpoch` the earliest of its members' (a zkLogin member's session
- * bounds the whole signature), and it carries a structural `locked` that is
- * `true` when any member's is, so `Tx.run` refuses it before building. To sign
- * as an account whose alias the multisig is, wrap it in {@link alias}.
+ * its `maxEpoch` the earliest of its members' (a zkLogin member's proof
+ * bounds the whole signature). To sign as an account whose alias the multisig
+ * is, wrap it in {@link alias}.
  *
  * ```ts
  * const m = yield* Signer.multisig(publicKey, [passkey, phrase])
@@ -127,9 +120,8 @@ export const multisig: (
       )
     )
 
-  const lockedMembers = ordered.map(lockedOf).filter((locked): locked is Effect.Effect<boolean> => locked !== undefined)
   const maxEpoch = earliest(ordered.map((signer) => signer.maxEpoch))
-  const signer: Signer = {
+  return {
     address,
     scheme: "MultiSig",
     ...(maxEpoch === undefined ? {} : { maxEpoch }),
@@ -144,10 +136,6 @@ export const multisig: (
       return yield* combine(partial)
     })
   }
-  if (lockedMembers.length === 0) return signer
-  return Object.assign(signer, {
-    locked: Effect.map(Effect.all(lockedMembers), (states) => states.some((locked) => locked))
-  })
 })
 
 /**
@@ -159,7 +147,7 @@ export const multisig: (
  * the journal's `sender` and every check against the bytes are the account's —
  * and its `alias` is the address whose key actually signs (`signer.alias` when
  * `signer` is itself an alias signer, else `signer.address`). The scheme and
- * `maxEpoch` are `signer`'s, and a structural `locked` is carried over.
+ * `maxEpoch` are `signer`'s.
  *
  * **That the alias may sign is checked against the chain, not here**: this
  * constructor makes no read. `Tx.run` reads `address`'s `AddressAliases`
@@ -190,7 +178,7 @@ export const alias = (address: SuiAddress, signer: Signer): Signer => {
   const account = SuiAddress.make(normalizeSuiAddress(address))
   if (normalizeSuiAddress(signer.address) === account && signer.alias === undefined) return signer
   const key = SuiAddress.make(normalizeSuiAddress(signer.alias ?? signer.address))
-  const aliased: Signer = {
+  return {
     address: account,
     alias: key,
     scheme: signer.scheme,
@@ -205,6 +193,4 @@ export const alias = (address: SuiAddress, signer: Signer): Signer => {
         })
       )
   }
-  const locked = lockedOf(signer)
-  return locked === undefined ? aliased : Object.assign(aliased, { locked })
 }

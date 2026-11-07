@@ -8,13 +8,12 @@ import type { SuiClientTypes } from "@mysten/sui/client"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Transaction } from "@mysten/sui/transactions"
 import { toBase64 } from "@mysten/sui/utils"
-import { ConfigProvider, DateTime, Effect, Exit, Layer, Option } from "effect"
+import { DateTime, Effect, Layer, Option } from "effect"
 import { TestClock } from "effect/testing"
 import {
   BuildError,
   DecodeError,
   ExecutionFailed,
-  ExtensionNotReady,
   GraphQLUnavailable,
   JournalError,
   NetworkMismatch,
@@ -34,8 +33,7 @@ import {
 import { Executed } from "../src/domain/executed.ts"
 import { Digest, ExecutionReason, Mist, ObjectId, SuiAddress, Version } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
-import { Script } from "../src/services/Script.ts"
-import { fromConfig, fromKeypair, fromSdkSigner } from "../src/services/Signer.ts"
+import { fromKeypair, fromSdkSigner } from "../src/services/Signer.ts"
 import { Sui } from "../src/services/Sui.ts"
 import { FakeOutcome, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
 import { Tx } from "../src/services/Tx.ts"
@@ -82,8 +80,7 @@ const TAXONOMY = [
   "PolicyDenied",
   "JournalError",
   "UnexpectedEffects",
-  "GraphQLUnavailable",
-  "ExtensionNotReady"
+  "GraphQLUnavailable"
 ] as const
 const PADDED = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
 const ESCROW_ID = PADDED("e1")
@@ -337,26 +334,26 @@ describe("Reconciled carries one discriminator (item 12)", () => {
   })
 })
 
-describe("Tx.recorded (item 18)", () => {
+describe("Journal.get after reconcileAll (item 18)", () => {
   test("answers the terminal entry reconcileAll no longer returns", async () => {
     const { after, settled } = await run(
       Effect.gen(function*() {
         const executedResult = yield* Tx.run(claim, { signer })
         const settled = yield* Tx.reconcileAll()
-        const after = yield* Tx.recorded(executedResult.digest)
+        const after = yield* (yield* Journal).get(executedResult.digest)
         return { settled, after }
       }),
       { ...baseScript, execute: [executed] }
     )
     // The run settled, so `reconcileAll` has nothing to say about it...
     expect(settled).toHaveLength(0)
-    // ...and `Tx.recorded` has the terminal entry.
+    // ...and the journal has the terminal entry.
     expect(Option.isSome(after)).toBe(true)
     if (Option.isSome(after)) expect(after.value._tag).toBe("Executed")
   })
 
   test("None for a digest the journal never saw", async () => {
-    const found = await run(Tx.recorded("11111111111111111111111111111111" as never))
+    const found = await run(Effect.flatMap(Effect.service(Journal), (journal) => journal.get("11111111111111111111111111111111" as never)))
     expect(Option.isNone(found)).toBe(true)
   })
 })
@@ -438,41 +435,6 @@ describe("Signer (items 8 and 22)", () => {
     expect(wrapped.scheme).toBe("ED25519")
   })
 
-  test("fromConfig reads a 32-byte hex seed as Ed25519", async () => {
-    const seed = "0x" + "07".repeat(32)
-    const built = await Effect.runPromise(
-      fromConfig("SUI_KEY").pipe(
-        Effect.provideService(
-          ConfigProvider.ConfigProvider,
-          ConfigProvider.fromEnv({ env: { SUI_KEY: seed } })
-        )
-      )
-    )
-    expect(built.address).toBe(SENDER)
-    expect(built.scheme).toBe("ED25519")
-  })
-
-  test("fromConfig still reads Bech32, and refuses anything else", async () => {
-    const bech32 = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(7)).getSecretKey()
-    const built = await Effect.runPromise(
-      fromConfig("SUI_KEY").pipe(
-        Effect.provideService(
-          ConfigProvider.ConfigProvider,
-          ConfigProvider.fromEnv({ env: { SUI_KEY: bech32 } })
-        )
-      )
-    )
-    expect(built.address).toBe(SENDER)
-    const exit = await Effect.runPromiseExit(
-      fromConfig("SUI_KEY").pipe(
-        Effect.provideService(
-          ConfigProvider.ConfigProvider,
-          ConfigProvider.fromEnv({ env: { SUI_KEY: "not a key" } })
-        )
-      )
-    )
-    expect(exit._tag).toBe("Failure")
-  })
 })
 
 describe("the fake's reads (items 13 and 17)", () => {
@@ -635,8 +597,7 @@ describe("every error carries a readable message (app verification a, b)", () =>
       _tag: "UnexpectedEffects",
       error: new UnexpectedEffects({ digest: DIGEST, expected: "Receipt", found: [] })
     },
-    { _tag: "GraphQLUnavailable", error: new GraphQLUnavailable({ method: "q", reason: "none" }) },
-    { _tag: "ExtensionNotReady", error: new ExtensionNotReady({ extension: "escrow", member: "id" }) }
+    { _tag: "GraphQLUnavailable", error: new GraphQLUnavailable({ method: "q", reason: "none" }) }
   ]
 
   test("no taxonomy error has an empty message", () => {
@@ -866,49 +827,5 @@ describe("Tx.submitVia (cli verification b)", () => {
     expect((result.failure as { _tag: string })._tag).toBe("RelayRefused")
     // No reconcile was spent: the service said it never sent them.
     expect(calls).toHaveLength(0)
-  })
-})
-
-describe("Script.report (cli feedback)", () => {
-  test("prints the failure and the unresolved entries, and answers the code", async () => {
-    const lines: Array<string> = []
-    const journal = Journal.makeMemoryUnsafe()
-    const signed = await run(
-      Effect.gen(function*() {
-        const built = yield* Tx.build(claim, { sender: SENDER })
-        return yield* Tx.sign(built, signer)
-      })
-    )
-    await Effect.runPromise(
-      journal.put(
-        JournalEntry.cases.Signed.make({
-          _tag: "Signed",
-          digest: signed.digest,
-          signed,
-          signedAt: DateTime.makeUnsafe(0)
-        })
-      ).pipe(Effect.orDie)
-    )
-    const code = await Script.report(
-      Exit.fail(new SubmissionUnknown({ digest: signed.digest, signed, cause: "gone" })),
-      { stderr: (line) => lines.push(line), journal }
-    )
-    expect(code).toBe(3)
-    const printed = lines.join("\n")
-    expect(printed).toContain("SubmissionUnknown")
-    expect(printed).toContain("unresolved")
-    // The whole entry, through the JournalEntry schema, with base64 bytes.
-    const entryLine = lines.find((line) => line.startsWith("entry: "))!
-    expect(entryLine).toBeDefined()
-    const parsed = JSON.parse(entryLine.slice("entry: ".length))
-    expect(parsed._tag).toBe("Signed")
-    expect(typeof parsed.signed.bytes).toBe("string")
-  })
-
-  test("a success reports 0 and prints nothing", async () => {
-    const lines: Array<string> = []
-    const code = await Script.report(Exit.succeed(1), { stderr: (line) => lines.push(line) })
-    expect(code).toBe(0)
-    expect(lines).toEqual([])
   })
 })

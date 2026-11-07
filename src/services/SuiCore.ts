@@ -982,8 +982,8 @@ class ServiceInfoUnimplemented extends Error {
 }
 
 /**
- * Wraps a client object into the service. Exported so `SuiExtension.fromService`
- * and tests can build the same implementation over any `ClientWithCoreApi`.
+ * Wraps a client object into the service. Exported so `layerFromClient` and
+ * tests can build the same implementation over any `ClientWithCoreApi`.
  */
 export const makeFromClient = (
   client: ClientWithCoreApi,

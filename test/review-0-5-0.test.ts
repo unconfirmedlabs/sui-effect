@@ -8,9 +8,8 @@ import type { Transaction } from "@mysten/sui/transactions"
 import { Effect, Layer } from "effect"
 import { TestClock } from "effect/testing"
 import { PolicyDenied } from "../src/domain/errors.ts"
-import { CoinType, Mist, SuiAddress } from "../src/domain/schemas.ts"
+import { SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
-import { SubmitConfig } from "../src/services/SubmitConfig.ts"
 import { verifySponsored } from "../src/tx.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
 import type { Sui } from "../src/services/Sui.ts"
@@ -45,13 +44,6 @@ const send = (amount: bigint) => (tx: Transaction) => {
   tx.setGasBudget(5_000_000n)
 }
 
-const theft = {
-  balanceChanges: [
-    { address: SENDER, coinType: SUI, amount: "-500000000" },
-    { address: THIEF, coinType: SUI, amount: "500000000" }
-  ]
-}
-
 const run = <A, E>(
   effect: Effect.Effect<A, E, Sui | SuiCoreFake | TestClock.TestClock>,
   script: FakeScript
@@ -59,65 +51,6 @@ const run = <A, E>(
   Effect.runPromise(
     Effect.provide(effect, Layer.mergeAll(layerTest(script), TestClock.layer(), Journal.layerMemory), { local: true })
   )
-
-describe("Tx.verify reads the bytes, never a forged Built's fields", () => {
-  const script: FakeScript = {
-    chainId: CHAIN_ID,
-    objects: [],
-    coins: [],
-    balances: [funded(SENDER), funded(other.address)],
-    // The first build's simulate shows nothing; every later simulate shows the theft.
-    simulate: [FakeOutcome.succeed(), FakeOutcome.succeed(theft)],
-    execute: [FakeOutcome.succeed()]
-  }
-
-  test("a value spread from a real build with other bytes is simulated again", async () => {
-    const result = await run(
-      Effect.gen(function*() {
-        const benign = yield* Tx.build(send(1n), { sender: SENDER })
-        const evil = yield* Tx.fromBytes((yield* Tx.build(send(500_000_000n), { sender: SENDER })).bytes)
-        return yield* Effect.flip(Tx.verify({ ...benign, bytes: evil.bytes }, {
-          summary: "Do nothing.",
-          author: "user",
-          claims: { outflows: [], recipients: [], objects: [] }
-        }))
-      }),
-      script
-    )
-    expect(result).toBeInstanceOf(PolicyDenied)
-  })
-
-  test("a sender field that is not the bytes' sender is refused, not checked", async () => {
-    const result = await run(
-      Effect.gen(function*() {
-        const evil = yield* Tx.fromBytes((yield* Tx.build(send(500_000_000n), { sender: SENDER })).bytes)
-        return yield* Effect.flip(Tx.verify({ ...evil, sender: other.address }, {
-          summary: "Send one MIST to the thief.",
-          author: "user",
-          claims: { outflows: [{ coinType: CoinType.SUI, max: 1n }], recipients: [THIEF], objects: [] }
-        }))
-      }),
-      script
-    )
-    expect(result).toBeInstanceOf(PolicyDenied)
-    expect((result as PolicyDenied).rule).toBe("intent.invalid")
-  })
-
-  test("a gas owner field the bytes do not name is refused", async () => {
-    const result = await run(
-      Effect.gen(function*() {
-        const evil = yield* Tx.fromBytes((yield* Tx.build(send(500_000_000n), { sender: SENDER })).bytes)
-        return yield* Effect.flip(Tx.verify({ ...evil, gasOwner: other.address }, {
-          summary: "Send 0.5 SUI to the thief.",
-          author: "user",
-          claims: { outflows: [{ coinType: CoinType.SUI, max: 500_000_000n }], recipients: [THIEF], objects: [] }
-        }))
-      }),
-      script
-    )
-    expect((result as PolicyDenied).rule).toBe("intent.invalid")
-  })
-})
 
 describe("Tx.foldCoins refuses a plan whose batch names another owner", () => {
   const coin = fakeCoin({ objectId: PADDED("c001"), owner: SENDER, balance: 5_000_000_000n })
@@ -159,29 +92,6 @@ describe("handed-over bytes: the gas ceiling and the sponsorship check read the 
     Tx.build(send(1n), { sender: SENDER }),
     (built) => Tx.fromBytes(built.bytes)
   )
-  const ceiling = SubmitConfig.with({ maxGasBudget: Mist.make(1_000_000n) })
-
-  test("Tx.prepare of a Built over SubmitConfig.maxGasBudget is refused before it is simulated", async () => {
-    const error = await run(
-      Effect.flatMap(handedOver, (built) => Effect.flip(ceiling(Tx.prepare(built, { sender: SENDER })))),
-      script
-    )
-    expect(error).toBeInstanceOf(PolicyDenied)
-    expect((error as PolicyDenied).rule).toBe("maxGasBudget")
-  })
-
-  test("Tx.verify of a Built over SubmitConfig.maxGasBudget is refused", async () => {
-    const error = await run(
-      Effect.flatMap(handedOver, (built) =>
-        Effect.flip(ceiling(Tx.verify(built, {
-          summary: "Send one MIST.",
-          author: "dapp",
-          claims: { outflows: [{ coinType: CoinType.SUI, max: 1n }], recipients: [THIEF], objects: [] }
-        })))),
-      script
-    )
-    expect((error as PolicyDenied).rule).toBe("maxGasBudget")
-  })
 
   test("verifySponsored refuses bytes the sender pays for, whatever the Built's gasOwner field says", async () => {
     const error = await run(

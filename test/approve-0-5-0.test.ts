@@ -1,11 +1,11 @@
 /**
- * 0.5.0's prepare → verify → approve primitive and what `Built` learned
- * (DESIGN §4, §6, §17): `Tx.prepare`, `Tx.run`'s `approve`, `Built.gas` and
- * `Built.simulation`, the session bound (`Signer.maxEpoch` / `maxEpoch`),
+ * 0.5.0's approve step and what `Built` learned (DESIGN §4, §6): `Tx.run`'s
+ * `approve` and its `Prepared`, `Built.gas` and `Built.simulation`, the
+ * `maxEpoch` bound (`Signer.maxEpoch` / `Tx.build`'s `maxEpoch`),
  * `Simulation`'s accessors shared with `Executed`, `transferred()`,
- * `Executed.sender`, `Tx.foldCoins({ plan, approve })` with
- * `Tx.foldMovement`, and the fake serving `json`/`display`. All on
- * `layerTest`; `test/live.localnet.test.ts` holds the same claims to a chain.
+ * `Executed.sender`, `Tx.foldCoins({ plan, approve })`, and the fake serving
+ * `json`/`display`. All on `layerTest`; `test/live.localnet.test.ts` holds the
+ * same claims to a chain.
  */
 import { describe, expect, test } from "bun:test"
 import type { SuiClientTypes } from "@mysten/sui/client"
@@ -14,14 +14,12 @@ import type { Transaction } from "@mysten/sui/transactions"
 import { Deferred, Effect, Fiber, Layer, Option, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { Built } from "../src/domain/built.ts"
-import { PolicyDenied, SigningError } from "../src/domain/errors.ts"
+import { SigningError } from "../src/domain/errors.ts"
 import { Executed, Simulation } from "../src/domain/executed.ts"
 import { SuiAddress } from "../src/domain/schemas.ts"
-import { Gate } from "../src/services/Gate.ts"
 import { Journal } from "../src/services/Journal.ts"
 import type { Signer } from "../src/services/Signer.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
-import { SubmitConfig } from "../src/services/SubmitConfig.ts"
 import { Sui as SuiNs } from "../src/services/Sui.ts"
 import type { Sui } from "../src/services/Sui.ts"
 import { DEFAULT_EPOCH, type FakeChange, FakeOutcome, type FakeScript, type SuiCoreFake } from "../src/services/SuiCoreFake.ts"
@@ -95,6 +93,13 @@ const run = <A, E>(
       local: true
     })
   )
+
+/** `claim` built, and the simulation of exactly those bytes, signed by nobody. */
+const preview = Effect.gen(function*() {
+  const built = yield* Tx.build(claim, { sender: SENDER })
+  const sui = yield* SuiNs
+  return { built, simulation: yield* sui.simulate(built.bytes) }
+})
 
 /** The simulates that were not the resolver's own: what the front half costs. */
 const explicitSimulates = Effect.map(SuiTest.calls("simulateTransaction"), (calls) =>
@@ -185,11 +190,10 @@ describe("Built.simulation: only a simulation of exactly the built bytes", () =>
     expect(resolved.simulation).toBeUndefined()
   })
 
-  test("Tx.run with an intent and approve reuses it: no second simulate", async () => {
+  test("Tx.run with approve reuses it: no second simulate", async () => {
     const simulates = await run(Effect.gen(function*() {
       yield* Tx.run(preset, {
         signer,
-        intent: { summary: "Send nothing to Alice.", author: "user", claims: { outflows: [], recipients: [RECIPIENT], objects: [] } },
         approve: () => Effect.void
       })
       return yield* explicitSimulates
@@ -198,103 +202,6 @@ describe("Built.simulation: only a simulation of exactly the built bytes", () =>
     expect(simulates).toBe(1)
   })
 
-  test("a Built that went through JSON is simulated again: a decoded simulation is not trusted", async () => {
-    const simulates = await run(Effect.gen(function*() {
-      const built = yield* Tx.build(preset, { sender: SENDER })
-      const decoded = Schema.decodeUnknownSync(Built)(Schema.encodeSync(Built)(built))
-      expect(decoded.simulation).toBeInstanceOf(Simulation)
-      yield* Tx.prepare(decoded, { sender: SENDER })
-      return yield* explicitSimulates
-    }))
-    expect(simulates).toBe(2)
-  })
-})
-
-describe("Tx.prepare", () => {
-  test("a recipe: built, simulated, nothing signed or sent", async () => {
-    const { prepared, executes } = await run(Effect.gen(function*() {
-      const prepared = yield* Tx.prepare(pinsNothing, { sender: SENDER })
-      return { prepared, executes: (yield* SuiTest.calls("executeTransaction")).length }
-    }))
-    expect(prepared.simulation).toBeInstanceOf(Simulation)
-    expect(prepared.simulation.digest).toBe(prepared.built.digest)
-    expect(prepared.verified).toBeUndefined()
-    expect(executes).toBe(0)
-  })
-
-  test("bytes from Tx.fromBytes are not rebuilt, and are what Tx.sign signs", async () => {
-    const { built, prepared, signed, resolves } = await run(Effect.gen(function*() {
-      const built = yield* Tx.build(pinsNothing, { sender: SENDER })
-      const before = (yield* SuiTest.calls("simulateTransaction")).filter((call) =>
-        (call.options as { readonly resolver?: boolean }).resolver === true).length
-      const prepared = yield* Tx.prepare(yield* Tx.fromBytes(built.bytes), { sender: SENDER })
-      const after = (yield* SuiTest.calls("simulateTransaction")).filter((call) =>
-        (call.options as { readonly resolver?: boolean }).resolver === true).length
-      const signed = yield* Tx.sign(prepared.built, signer)
-      return { built, prepared, signed, resolves: after - before }
-    }))
-    expect(prepared.built.bytes).toEqual(built.bytes)
-    expect(signed.digest).toBe(built.digest)
-    expect(resolves).toBe(0)
-  })
-
-  test("someone else's bytes are refused: prepare.sender", async () => {
-    const error = await run(Effect.gen(function*() {
-      const built = yield* Tx.build(pinsNothing, { sender: SENDER })
-      return yield* Effect.flip(Tx.prepare(built, { sender: RECIPIENT }))
-    }))
-    expect(error._tag).toBe("PolicyDenied")
-    if (error._tag === "PolicyDenied") expect(error.rule).toBe("prepare.sender")
-  })
-
-  test("bytes paid for by someone else than claimed are refused: prepare.gasOwner", async () => {
-    const error = await run(Effect.gen(function*() {
-      const built = yield* Tx.build(pinsNothing, { sender: SENDER })
-      return yield* Effect.flip(Tx.prepare(built, { sender: SENDER, gasOwner: SPONSOR }))
-    }))
-    expect(error._tag).toBe("PolicyDenied")
-    if (error._tag === "PolicyDenied") expect(error.rule).toBe("prepare.gasOwner")
-  })
-
-  test("a sponsored prepare shows the sponsor as gas owner, and the sponsor co-signs later", async () => {
-    const executed = await run(Effect.gen(function*() {
-      const prepared = yield* Tx.prepare(Tx.sponsored({ sender: SENDER, gasOwner: SPONSOR })(pinsNothing), {
-        sender: SENDER,
-        gasOwner: SPONSOR
-      })
-      expect(prepared.built.gasOwner).toBe(SPONSOR)
-      expect(prepared.built.gas.owner).toBe(SPONSOR)
-      // The two parties sign separately: the sponsor's signature is attached.
-      const withSender = yield* Tx.sign(prepared.built, signer)
-      const sponsorSignature = yield* sponsor.signTransaction(prepared.built.bytes)
-      return yield* Tx.submit(yield* Tx.attach(withSender, sponsorSignature))
-    }))
-    expect(executed.sender).toBe(SENDER)
-  })
-
-  test("an intent is verified; requireIntent does not bind a prepare", async () => {
-    const { plain, declared } = await run(Effect.gen(function*() {
-      const plain = yield* Tx.prepare(pinsNothing, { sender: SENDER })
-      const declared = yield* Tx.prepare(pinsNothing, {
-        sender: SENDER,
-        intent: { summary: "Send nothing to Alice.", author: "user", claims: { outflows: [], recipients: [RECIPIENT], objects: [] } }
-      })
-      return { plain, declared }
-    }).pipe(Gate.with({ requireIntent: true })))
-    expect(plain.verified).toBeUndefined()
-    expect(declared.verified?.verdict._tag).toBe("Unscreened")
-    expect(declared.verified?.digest).toBe(declared.built.digest)
-  })
-
-  test("preflight runs on the prepared simulation", async () => {
-    const error = await run(
-      Tx.prepare(pinsNothing, { sender: SENDER }).pipe(
-        Effect.flip,
-        SubmitConfig.with({ preflight: () => Effect.fail(new PolicyDenied({ rule: "spend", message: "no" })) })
-      )
-    )
-    expect(error._tag).toBe("PolicyDenied")
-  })
 })
 
 describe("Tx.run({ approve })", () => {
@@ -317,7 +224,7 @@ describe("Tx.run({ approve })", () => {
         }
       }))
       const executes = (yield* SuiTest.calls("executeTransaction")).length
-      const recorded = seen === undefined ? Option.none() : yield* Tx.recorded(seen as never)
+      const recorded = seen === undefined ? Option.none() : yield* (yield* Journal).get(seen as never)
       return { error, executes, recorded }
     }))
     expect(error).toBeInstanceOf(UserRejected)
@@ -341,7 +248,6 @@ describe("Tx.run({ approve })", () => {
   /** Whether another fiber can take the sender lock while `approve` is waiting. */
   const lockFreeDuringApprove = (recipe: (tx: Transaction) => void, script: FakeScript) =>
     run(Effect.gen(function*() {
-      const sui = yield* SuiNs
       const inside = yield* Deferred.make<void>()
       const gate = yield* Deferred.make<void>()
       const taken = yield* Deferred.make<void>()
@@ -350,7 +256,7 @@ describe("Tx.run({ approve })", () => {
         approve: () => Effect.andThen(Deferred.succeed(inside, undefined), Deferred.await(gate))
       }))
       yield* Deferred.await(inside)
-      const other = yield* Effect.forkChild(sui.withSenderLock(SENDER)(Deferred.succeed(taken, undefined)))
+      const other = yield* Effect.forkChild((yield* SuiNs).withSenderLock(SENDER)(Deferred.succeed(taken, undefined)))
       const free = yield* settleUntil(Deferred.isDone(taken))
       yield* Deferred.succeed(gate, undefined)
       yield* Fiber.join(running)
@@ -378,7 +284,7 @@ describe("Tx.run({ approve })", () => {
   })
 })
 
-describe("the session bound: Signer.maxEpoch and Tx.build's maxEpoch", () => {
+describe("the maxEpoch bound: Signer.maxEpoch and Tx.build's maxEpoch", () => {
   const session = (maxEpoch: bigint): Signer => ({ ...signer, maxEpoch })
   const maxEpochOfBuilt = (built: Built) =>
     built.expiration?.$kind === "ValidDuring" ? built.expiration.ValidDuring.maxEpoch : undefined
@@ -423,19 +329,12 @@ describe("the session bound: Signer.maxEpoch and Tx.build's maxEpoch", () => {
     expect(window).toBe(DEFAULT_EPOCH)
   })
 
-  test("Tx.build and Tx.prepare refuse an ended bound as BuildError carrying the SigningError", async () => {
-    const { built, prepared } = await run(Effect.gen(function*() {
-      return {
-        built: yield* Effect.flip(Tx.build(pinsNothing, { sender: SENDER, maxEpoch: DEFAULT_EPOCH - 1n })),
-        prepared: yield* Effect.flip(Tx.prepare(pinsNothing, { sender: SENDER, maxEpoch: DEFAULT_EPOCH - 1n }))
-      }
-    }))
-    for (const error of [built, prepared]) {
-      expect(error._tag).toBe("BuildError")
-      if (error._tag === "BuildError") {
-        expect(error.cause).toBeInstanceOf(SigningError)
-        expect((error.cause as SigningError).reason).toBe("expired")
-      }
+  test("Tx.build refuses an ended bound as BuildError carrying the SigningError", async () => {
+    const error = await run(Effect.flip(Tx.build(pinsNothing, { sender: SENDER, maxEpoch: DEFAULT_EPOCH - 1n })))
+    expect(error._tag).toBe("BuildError")
+    if (error._tag === "BuildError") {
+      expect(error.cause).toBeInstanceOf(SigningError)
+      expect((error.cause as SigningError).reason).toBe("expired")
     }
   })
 
@@ -487,9 +386,9 @@ describe("Simulation and Executed share one accessor implementation", () => {
 
   test("the same answers from a simulation and from the execution it predicted", async () => {
     const { simulation, executed } = await run(Effect.gen(function*() {
-      const prepared = yield* Tx.prepare(claim, { sender: SENDER })
-      const executed = yield* Tx.submit(yield* Tx.sign(prepared.built, signer))
-      return { simulation: prepared.simulation, executed }
+      const { built, simulation } = yield* preview
+      const executed = yield* Tx.submit(yield* Tx.sign(built, signer))
+      return { simulation, executed }
     }), script)
     expect(view(simulation)).toEqual(view(executed))
     const seen = view(simulation)
@@ -509,7 +408,7 @@ describe("Simulation and Executed share one accessor implementation", () => {
   })
 
   test("transferred(type) filters by type, and names the owners on both sides", async () => {
-    const simulation = await run(Effect.map(Tx.prepare(claim, { sender: SENDER }), (p) => p.simulation), script)
+    const simulation = await run(Effect.map(preview, (p) => p.simulation), script)
     const swords = simulation.transferred(`${PADDED("b0b")}::hero::Sword`)
     expect(swords).toHaveLength(1)
     expect(swords[0]?.inputOwner).toEqual({ $kind: "AddressOwner", AddressOwner: SENDER })
@@ -541,8 +440,8 @@ describe("Simulation and Executed share one accessor implementation", () => {
     expect(executedWith([change(ownedBy(SENDER), consensus("2"))]).transferred()).toHaveLength(1)
   })
 
-  test("a Simulation can be assembled by hand with new, and the pure checks take its fields", async () => {
-    const simulation = await run(Effect.map(Tx.prepare(claim, { sender: SENDER }), (p) => p.simulation), script)
+  test("a Simulation can be assembled by hand with new", async () => {
+    const simulation = await run(Effect.map(preview, (p) => p.simulation), script)
     const copy = new Simulation({ ...simulation })
     expect<unknown>(copy.created().map((ref) => ref.id)).toEqual([HERO])
   })
@@ -570,7 +469,7 @@ describe("Executed.sender", () => {
   })
 })
 
-describe("Tx.foldCoins({ plan, approve }) and Tx.foldMovement", () => {
+describe("Tx.foldCoins({ plan, approve })", () => {
   const coins = [suiCoin(1, 600_000_000_000n), suiCoin(2, 400_000_000_000n)]
   const deposit: FakeChange[] = coins.map((coin) => ({ objectId: coin.objectId, type: `0x2::coin::Coin<${SUI}>`, version: 2n, owner: ownedBy(SENDER) }))
   const foldEffects = {
@@ -587,30 +486,34 @@ describe("Tx.foldCoins({ plan, approve }) and Tx.foldMovement", () => {
     execute: [FakeOutcome.succeed(foldEffects)]
   }
 
-  test("the previewed plan runs as given, approve sees every batch, and the movement is the coins", async () => {
-    const { result, movements, balanceListings } = await run(Effect.gen(function*() {
+  test("the previewed plan runs as given, and approve sees every batch beside its simulation", async () => {
+    const { result, seen, balanceListings } = await run(Effect.gen(function*() {
       const plan = yield* Tx.planFold({ owner: SENDER })
       const before = (yield* SuiTest.calls("listBalances")).length
-      const movements: Array<ReturnType<typeof Tx.foldMovement>> = []
+      const seen: Array<{ readonly amount: bigint; readonly coins: ReadonlyArray<string>; readonly net: bigint }> = []
       const result = yield* Tx.foldCoins({
         signer,
         plan,
-        approve: (prepared, batch) => Effect.sync(() => movements.push(Tx.foldMovement(batch, prepared.simulation)))
+        approve: (prepared, batch) =>
+          Effect.sync(() =>
+            seen.push({
+              amount: batch.amount,
+              coins: batch.coins.map((coin) => coin.objectId),
+              net: prepared.simulation.balanceChange(SENDER, SUI)
+            })
+          )
       })
       const after = (yield* SuiTest.calls("listBalances")).length
-      return { result, movements, balanceListings: after - before }
+      return { result, seen, balanceListings: after - before }
     }), script)
     // Not re-planned.
     expect(balanceListings).toBe(0)
     expect(result.executed).toHaveLength(1)
-    expect(movements).toHaveLength(1)
-    const moved = movements[0]!
-    expect<unknown>(moved.consumed.map((coin) => coin.objectId)).toEqual(coins.map((coin) => coin.objectId))
-    expect(moved.fromCoins).toBe(1_000_000_000_000n)
-    expect(moved.netChange).toBe(3_939_506n)
-    expect(moved.toAddressBalance).toBe(1_000_003_939_506n)
-    expect(moved.exact).toBe(true)
-    expect(Tx.foldMovement(result.plan.batches[0]!, result.executed[0]!)).toEqual(moved)
+    expect(seen).toHaveLength(1)
+    // The batch says what moves into the balance; the balance changes net to the gas.
+    expect(seen[0]!.amount).toBe(1_000_000_000_000n)
+    expect<unknown>(seen[0]!.coins).toEqual(coins.map((coin) => coin.objectId))
+    expect(seen[0]!.net).toBe(3_939_506n)
   })
 
   test("approve refusing a batch stops the fold with the caller's error", async () => {
@@ -626,47 +529,7 @@ describe("Tx.foldCoins({ plan, approve }) and Tx.foldMovement", () => {
     expect(error._tag).toBe("BuildError")
   })
 
-  test("a coin the effects do not consume makes the movement inexact", async () => {
-    const simulation = await run(Effect.gen(function*() {
-      const plan = yield* Tx.planFold({ owner: SENDER })
-      return { plan, prepared: yield* Tx.prepare(Tx.fold(plan.batches[0]!), { sender: SENDER }) }
-    }), { ...script, simulate: [FakeOutcome.succeed({ ...foldEffects, deleted: deposit.slice(0, 1) })] })
-    const moved = Tx.foldMovement(simulation.plan.batches[0]!, simulation.prepared.simulation)
-    expect(moved.missing).toHaveLength(1)
-    expect(moved.fromCoins).toBe(600_000_000_000n)
-    expect(moved.exact).toBe(false)
-  })
-
-  test("under Gate.requireIntent a fold declares its own claim-free intent and runs", async () => {
-    const { result, verdicts } = await run(Gate.with({ requireIntent: true })(Effect.gen(function*() {
-      const verdicts: Array<string | undefined> = []
-      const result = yield* Tx.foldCoins({
-        signer,
-        approve: (prepared) => Effect.sync(() => verdicts.push(prepared.verified?.verdict._tag))
-      })
-      return { result, verdicts }
-    })), script)
-    expect(result.executed).toHaveLength(1)
-    expect(verdicts).toEqual(["Unscreened"])
-  })
-
-  test("the fold's own intent refuses a batch whose simulation pays someone else", async () => {
-    const leaking = {
-      ...foldEffects,
-      balanceChanges: [
-        { coinType: SUI, address: SENDER, amount: "-5000000" },
-        { coinType: SUI, address: RECIPIENT, amount: "5000000" }
-      ]
-    }
-    const error = await run(
-      Gate.with({ requireIntent: true })(Effect.flip(Tx.foldCoins({ signer }))),
-      { ...script, simulate: [FakeOutcome.succeed(leaking)], execute: [FakeOutcome.succeed(leaking)] }
-    )
-    expect(error._tag).toBe("PolicyDenied")
-    expect(error._tag === "PolicyDenied" ? error.rule : "").toMatch(/^intent\.(outflow|recipient)$/)
-  })
-
-  test("without a gate a fold checks no intent and runs no extra simulate", async () => {
+  test("without approve a fold runs no extra simulate", async () => {
     const simulates = await run(Effect.gen(function*() {
       yield* Tx.foldCoins({ signer })
       return (yield* SuiTest.calls("simulateTransaction")).filter((call) => !JSON.stringify(call).includes("resolver")).length

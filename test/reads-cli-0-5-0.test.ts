@@ -3,8 +3,6 @@
  *
  * - `Sui.streamTransactions({ affectedAddress })` over the gRPC ledger's
  *   `affectedAddress` predicate (finding 5), on the fake's ledger service.
- * - `Script.layerStderrLogger`, effect/cli's `CliError` in `Script.exitCode`,
- *   and `Script.report({ applied })` (findings 6, 16).
  * - `CoinType.Strict` and the coin-agnostic `CoinAmount` (findings 7, 20).
  * - The fake's simulate fallback, a shared memory `KeyValueStore`, and
  *   `TestServices` (finding 18).
@@ -13,13 +11,11 @@ import { describe, expect, test } from "bun:test"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Transaction } from "@mysten/sui/transactions"
 import { Cause, DateTime, Effect, Exit, Layer, Result, Schema, Stream } from "effect"
-import { CliError } from "effect/cli"
 import { KeyValueStore } from "effect/persistence"
 import { TransportError } from "../src/domain/errors.ts"
 import { Balance, CoinAmount, CoinType, Digest, Signature } from "../src/domain/schemas.ts"
 import { layerKeyValueStore } from "../src/journal.ts"
 import { Journal } from "../src/services/Journal.ts"
-import { Script } from "../src/services/Script.ts"
 import { Sui } from "../src/services/Sui.ts"
 import { FakeOutcome, type FakeScript, fakeDigest } from "../src/services/SuiCoreFake.ts"
 import { layerTest, SuiTest, type TestServices } from "../src/testing.ts"
@@ -100,30 +96,22 @@ describe("Sui.streamTransactions({ affectedAddress })", () => {
     expect(digestsOf(bobSent)).toEqual([fakeDigest(2)])
   })
 
-  test("descending, paged, resumable from a committed cursor", async () => {
-    const [descending, pages, resumed] = await run(
+  test("descending, and ascending through short pages", async () => {
+    const [descending, ascending] = await run(
       Effect.gen(function*() {
         const sui = yield* Sui
         const descending = yield* collect(
           sui.streamTransactions({ affectedAddress: CAROL }, { order: "descending" })
         )
-        const pages = yield* collect(sui.streamTransactionPages({ affectedAddress: CAROL }))
-        const first = pages[0]!
-        const resumed = yield* collect(
-          sui.streamTransactions({ affectedAddress: CAROL }, { after: first.endCursor })
-        )
-        return [descending, pages, resumed] as const
+        const ascending = yield* collect(sui.streamTransactions({ affectedAddress: CAROL }))
+        return [descending, ascending] as const
       }),
       // One transaction examined per request: every page is short, the cursor
       // still makes progress.
       { transactions: history, ledger: {}, scanLimit: 1 }
     )
     expect(digestsOf(descending)).toEqual([fakeDigest(4), fakeDigest(3), fakeDigest(2)])
-    expect(pages.flatMap((page) => digestsOf(page.items))).toEqual([fakeDigest(2), fakeDigest(3), fakeDigest(4)])
-    expect(pages.every((page) => page.items.length <= 1)).toBe(true)
-    expect(digestsOf(resumed)).toEqual(
-      pages.slice(1).flatMap((page) => digestsOf(page.items))
-    )
+    expect(digestsOf(ascending)).toEqual([fakeDigest(2), fakeDigest(3), fakeDigest(4)])
   })
 
   test("reads each listed digest with the read include set (execute's plus bcs)", async () => {
@@ -233,66 +221,6 @@ describe("SuiCoreFake: the simulate after a build", () => {
     )
     expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
     if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("SuiTest.scriptSimulate")
-  })
-})
-
-describe("Script at a CLI edge", () => {
-  const failed = <E>(error: E) => Exit.fail(error)
-
-  test("effect/cli: --help exits 0, a bad command line 2, a UserError as its cause", () => {
-    expect(Script.exitCode(failed(new CliError.ShowHelp({ commandPath: ["wallet"], errors: [] })))).toBe(0)
-    expect(
-      Script.exitCode(
-        failed(new CliError.ShowHelp({ commandPath: ["wallet"], errors: [new CliError.MissingOption({ option: "to" })] }))
-      )
-    ).toBe(2)
-    expect(Script.exitCode(failed(new CliError.MissingOption({ option: "to" })))).toBe(2)
-    const transport = TransportError.fromUnknown("getObject", new Error("down"), false)
-    expect(Script.exitCode(failed(new CliError.UserError({ cause: transport })))).toBe(4)
-    // The same applied/unresolved rules as for any other would-be 2.
-    expect(Script.exitCode(failed(new CliError.MissingOption({ option: "to" })), { applied: 1 })).toBe(5)
-  })
-
-  test("Script.report: `applied` turns a later failure into 5, and a CliError prints nothing", async () => {
-    const lines: Array<string> = []
-    const journal = Journal.makeMemoryUnsafe()
-    const transport = TransportError.fromUnknown("getObject", new Error("down"), false)
-    const code = await Script.report(failed(transport), {
-      stderr: (line) => lines.push(line),
-      applied: 2,
-      journal
-    })
-    expect(code).toBe(5)
-    expect(lines.length).toBeGreaterThan(0)
-    lines.length = 0
-    const help = await Script.report(failed(new CliError.MissingOption({ option: "to" })), {
-      stderr: (line) => lines.push(line),
-      journal
-    })
-    expect(help).toBe(2)
-    expect(lines).toEqual([])
-  })
-
-  test("layerStderrLogger: library log lines go to the writer, never to stdout", async () => {
-    const lines: Array<string> = []
-    const stdout: Array<unknown> = []
-    const original = console.log
-    console.log = (...args: Array<unknown>) => {
-      stdout.push(args)
-    }
-    try {
-      await Effect.runPromise(
-        Effect.logWarning("the transaction executed but did not become visible").pipe(
-          Effect.provide(Script.layerStderrLogger({ stderr: (line) => lines.push(line) }))
-        )
-      )
-    } finally {
-      console.log = original
-    }
-    expect(stdout).toEqual([])
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain("level=WARN")
-    expect(lines[0]).toContain("did not become visible")
   })
 })
 

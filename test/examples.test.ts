@@ -1,9 +1,6 @@
 /**
- * Every example runs against the fake.
- *
- * `examples/script-claim.ts` has its own file. This one covers the read example
- * and both faces of the extension example, so no snippet that reaches `LLMS.md`
- * or the README is untested.
+ * Every example runs against the fake, so no snippet that reaches `LLMS.md` or
+ * the README is untested.
  */
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
@@ -16,9 +13,7 @@ import { readEscrow } from "../examples/compare-read.sdk.ts"
 import { program as compareReadProgram } from "../examples/compare-read.effect.ts"
 import { claimEscrow } from "../examples/compare-write.sdk.ts"
 import { program as compareWriteProgram } from "../examples/compare-write.effect.ts"
-import { Escrow, program as consumerProgram, readWithPromises } from "../examples/extension-consumer.ts"
 import { program as readProgram } from "../examples/read-escrow.ts"
-import { Script } from "../src/script.ts"
 import { Journal } from "../src/services/Journal.ts"
 import { FakeOutcome, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
 import { layerTest } from "../src/testing.ts"
@@ -34,12 +29,6 @@ const owner: SuiClientTypes.ObjectOwner = { $kind: "AddressOwner", AddressOwner:
 
 /** The layout `examples/read-escrow.ts` reads: two fields. */
 const ReadEscrowBcs = suiBcs.struct("Escrow", { id: suiBcs.Address, amount: suiBcs.u64() })
-/** The layout `examples/extension-consumer.ts` reads: three fields. */
-const ConsumerEscrowBcs = suiBcs.struct("Escrow", {
-  id: suiBcs.Address,
-  owner: suiBcs.Address,
-  amount: suiBcs.u64()
-})
 
 const coin = {
   objectId: PADDED("c01"),
@@ -83,54 +72,6 @@ describe("examples/read-escrow.ts", () => {
     )
     expect(lines).toHaveLength(1)
     expect(String(lines[0])).toContain("holds 42")
-  })
-})
-
-describe("examples/extension-consumer.ts", () => {
-  const script = {
-    objects: [
-      {
-        objectId: ESCROW_ID,
-        type: `${PKG}::escrow::Escrow`,
-        version: 3n,
-        owner,
-        content: ConsumerEscrowBcs.serialize({ id: ESCROW_ID, owner: SENDER, amount: "7" }).toBytes()
-      }
-    ],
-    coins: [coin],
-    execute: [
-      FakeOutcome.succeed({
-        created: [{ objectId: RECEIPT_ID, type: `${PKG}::escrow::Receipt`, version: 4n, owner }],
-        mutated: [{ objectId: ESCROW_ID, type: `${PKG}::escrow::Escrow`, version: 4n, owner }]
-      })
-    ]
-  }
-
-  test("the Effect consumer claims through the extension inside a script", async () => {
-    const lines: Array<string> = []
-    const code = await Script.run(
-      // The default journal is process-wide, so a test that submits provides
-      // its own and its entries cannot be seen by the next one.
-      consumerProgram.pipe(Effect.provide(Layer.mergeAll(Escrow.layer, env, Journal.layerMemory))),
-      {
-        layer: Script.layerNoDeps.pipe(
-          Layer.provideMerge(layerTest(script)),
-          Layer.provide(env)
-        ),
-        exit: () => {},
-        stderr: (line) => lines.push(line),
-        signals: { on: () => {} }
-      }
-    )
-    expect(lines).toEqual([])
-    expect(code).toBe(0)
-  })
-
-  test("the Promise consumer reads through $extend with no Effect in sight", async () => {
-    const fake = Effect.runSync(
-      Effect.provide(SuiCoreFake, SuiCoreFake.layer(script), { local: true })
-    )
-    expect(await readWithPromises(fake.client, ESCROW_ID)).toBe(7n)
   })
 })
 
@@ -228,21 +169,16 @@ describe("examples/compare-write.sdk.ts and examples/compare-write.effect.ts", (
     expect(await claimEscrow(fake.client, ESCROW_ID, keypair)).toBe(RECEIPT_ID)
   })
 
-  test("the sui-effect version claims the escrow inside a script", async () => {
-    const lines: Array<string> = []
-    const code = await Script.run(
-      // The default journal is process-wide, so a test that submits provides
-      // its own and its entries cannot be seen by the next one.
-      compareWriteProgram.pipe(Effect.provide(Layer.merge(env, Journal.layerMemory))),
-      {
-        layer: Script.layerNoDeps.pipe(Layer.provideMerge(layerTest(script)), Layer.provide(env)),
-        exit: () => {},
-        stderr: (line) => lines.push(line),
-        signals: { on: () => {} }
-      }
+  test("the sui-effect version claims the escrow and prints the receipt", async () => {
+    const lines = await Effect.runPromise(
+      compareWriteProgram.pipe(
+        Effect.andThen(TestConsole.logLines),
+        // The default journal is process-wide, so a test that submits provides
+        // its own and its entries cannot be seen by the next one.
+        Effect.provide(Layer.mergeAll(layerTest(script), TestConsole.layer, env, Journal.layerMemory))
+      )
     )
-    expect(lines).toEqual([])
-    expect(code).toBe(0)
+    expect(lines.map(String)).toEqual([RECEIPT_ID])
   })
 })
 
@@ -258,13 +194,11 @@ describe("README.md", () => {
   }
 
   const readme = readFileSync("README.md", "utf8")
-  const example = readFileSync("examples/script-claim.ts", "utf8")
+  const example = readFileSync("examples/compare-write.effect.ts", "utf8")
 
-  test("the script example is the one in examples/script-claim.ts", () => {
+  test("the opening example is the program in examples/compare-write.effect.ts", () => {
     const program = slice(example, "export const program = Effect.gen(function*() {", "})")
     expect(readme).toContain(program)
-    const schema = slice(example, "const Escrow = SuiSchema.bcs(", ")")
-    expect(readme).toContain(schema)
   })
 
   const compareFiles = [

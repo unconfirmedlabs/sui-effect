@@ -523,7 +523,7 @@ export class Executed extends Schema.Class<Executed>("sui-effect/Executed")({
    * `CoinType.SUI` — compared under the one Move type rule. It covers coin
    * objects and the address balance alike, netted per address: a fold that
    * moves 1,000 SUI of coins into its owner's address balance reports only
-   * the gas it cost (`Tx.foldMovement` reports the movement). Never fails.
+   * the gas it cost (the fold's `FoldBatch.amount` is the movement). Never fails.
    */
   balanceChange(address: SuiAddress, coinType: CoinType | string): bigint {
     return balanceChangeOf(this, address, coinType)

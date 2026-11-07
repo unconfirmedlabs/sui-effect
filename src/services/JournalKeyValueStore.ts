@@ -1,10 +1,9 @@
 /**
  * The durable `Journal`, over `KeyValueStore` from `effect/persistence`.
  *
- * It imports `effect/persistence` (`@stability unstable` upstream), as do
- * `Keystore.ts` and the storage adapters, each reachable only through its own
- * subpath (`sui-effect/journal`, `sui-effect/keystore`, `sui-effect/storage`),
- * so the core modules never load it.
+ * It imports `effect/persistence` (`@stability unstable` upstream) and is
+ * reachable only through its own subpath (`sui-effect/journal`), so the core
+ * modules never load it.
  *
  * Building the layer does no network work: it lists the store's unresolved
  * entries and, when asked to, refuses to start while any are unresolved. What
@@ -219,7 +218,7 @@ const readUnmarked = (kv: KeyValueStore.KeyValueStore) =>
  * safe as is.** 0.3 lists unresolved entries only through that index, so a
  * `Signed` or `Unknown` entry this journal wrote is invisible to a 0.3
  * `listUnresolved`, `Tx.reconcileAll` and `onUnresolved: "fail"` (only
- * `Tx.recorded(digest)` finds it), and a 0.3 reader cannot decode a
+ * `Journal.get(digest)` finds it), and a 0.3 reader cannot decode a
  * `NotApplied { evidence: "refused" }` entry at all. Before rolling back, or
  * while 0.3 and later processes share a store, drain it with
  * `Tx.reconcileAll()` (or settle the entries by hand) and delete the
@@ -270,7 +269,7 @@ export const make = (
  * store short in a service that runs for months. It reads every entry itself
  * (it deletes nothing on the strength of a marker alone), removes each pruned
  * entry's marker before the entry, and removes markers whose entry is gone.
- * After it, `Journal.get` and `Tx.recorded` answer `None` for a pruned
+ * After it, `Journal.get` answers `None` for a pruned
  * digest, so choose `before` older than anything you still look up by digest —
  * and older than any bytes you might still hand to `Tx.submit` again, because a
  * resubmission puts a fresh `Signed` entry that a concurrent prune of the same

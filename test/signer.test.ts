@@ -2,12 +2,10 @@ import { describe, expect, test } from "bun:test"
 import type { Keypair, PublicKey, SignatureScheme } from "@mysten/sui/cryptography"
 import { decodeSuiPrivateKey, Signer as SdkSigner } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
-import { Secp256k1Keypair } from "@mysten/sui/keypairs/secp256k1"
-import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
-import { ConfigProvider, Effect, Redacted } from "effect"
+import { Config, ConfigProvider, Effect } from "effect"
 import { SigningError } from "../src/domain/errors.ts"
 import { Signature, SuiAddress } from "../src/domain/schemas.ts"
-import { fromRedactedSecret, Signer } from "../src/services/Signer.ts"
+import { Signer } from "../src/services/Signer.ts"
 
 const bytes = new Uint8Array([1, 2, 3, 4])
 
@@ -45,28 +43,10 @@ describe("Signer.fromKeypair", () => {
   })
 })
 
-describe("Signer.fromConfig", () => {
-  const cases = [
-    ["ED25519", new Ed25519Keypair()],
-    ["Secp256k1", new Secp256k1Keypair()],
-    ["Secp256r1", new Secp256r1Keypair()]
-  ] as const
-
-  for (const [scheme, keypair] of cases) {
-    test(`decodes a Bech32 ${scheme} key`, async () => {
-      const secret = keypair.getSecretKey()
-      expect(decodeSuiPrivateKey(secret).scheme).toBe(scheme)
-      const signer = await run(
-        Effect.provide(Signer.fromConfig(), withEnv({ SUI_PRIVATE_KEY: secret }))
-      )
-      expect(signer.scheme).toBe(scheme)
-      expect(signer.address).toBe(SuiAddress.make(keypair.toSuiAddress()))
-    })
-  }
-
+describe("Signer.fromSecretKey over a configured key", () => {
   // ML-DSA-65 shipped in @mysten/sui 2.36; the peer range still admits 2.28 and
   // the SDK matrix runs 2.30, so the keypair class is imported on demand here
-  // exactly as `Signer.fromConfig` does.
+  // exactly as `Signer.fromSecretKey` does.
   test("decodes a Bech32 MLDSA65 key", async () => {
     const specifier = "@mysten/sui/keypairs/mldsa65"
     const mod: { MLDSA65Keypair: { generate: () => Keypair } } | undefined = await import(specifier)
@@ -77,67 +57,41 @@ describe("Signer.fromConfig", () => {
     // Widened to `string`: on an SDK before 2.36 `SignatureScheme` has no
     // `"MLDSA65"`, and the SDK matrix typechecks this file against 2.30.
     expect<string>(decodeSuiPrivateKey(secret).scheme).toBe("MLDSA65")
-    const signer = await run(
-      Effect.provide(Signer.fromConfig(), withEnv({ SUI_PRIVATE_KEY: secret }))
-    )
+    const signer = await run(Signer.fromSecretKey(secret))
     expect<string>(signer.scheme).toBe("MLDSA65")
     expect(signer.address).toBe(SuiAddress.make(keypair.toSuiAddress()))
   })
 
-  test("reads the name it is given", async () => {
+  test("reads SUI_PRIVATE_KEY through Config.Redacted", async () => {
     const keypair = new Ed25519Keypair()
     const signer = await run(
       Effect.provide(
-        Signer.fromConfig("SPONSOR_KEY"),
-        withEnv({ SPONSOR_KEY: keypair.getSecretKey() })
+        Config.Redacted("SUI_PRIVATE_KEY").pipe(Effect.flatMap(Signer.fromSecretKey)),
+        withEnv({ SUI_PRIVATE_KEY: keypair.getSecretKey() })
       )
     )
     expect(signer.address).toBe(SuiAddress.make(keypair.toSuiAddress()))
   })
 
-  test("a missing variable is a ConfigError", async () => {
-    const error = await run(
-      Effect.provide(Signer.fromConfig().pipe(Effect.flip), withEnv({}))
-    )
-    expect(error._tag).toBe("ConfigError")
-  })
-
-  test("a key that is not Bech32 is a ConfigError", async () => {
-    const error = await run(
-      Effect.provide(
-        Signer.fromConfig().pipe(Effect.flip),
-        withEnv({ SUI_PRIVATE_KEY: "not-a-key" })
-      )
-    )
-    expect(error._tag).toBe("ConfigError")
-    expect(error.message).toContain("SUI_PRIVATE_KEY")
-  })
-
   test("a corrupted key leaks nothing: no run of it reaches the message or the JSON", async () => {
     // One character wrong in a real key. The Bech32 decoder's own message is
-    // `Invalid checksum in suiprivkey1…` with the whole input in it, and
-    // `Script.run` prints the ConfigError's message on stderr, so a typo in a
-    // live key would otherwise put a recoverable secret in a log.
+    // `Invalid checksum in suiprivkey1…` with the whole input in it, so a typo
+    // in a live key would otherwise put a recoverable secret in a log.
     const secret = new Ed25519Keypair().getSecretKey()
     const corrupted = `${secret.slice(0, -1)}${secret.endsWith("q") ? "p" : "q"}`
     expect(corrupted).not.toBe(secret)
 
-    const error = await run(
-      Effect.provide(
-        Signer.fromConfig().pipe(Effect.flip),
-        withEnv({ SUI_PRIVATE_KEY: corrupted })
-      )
-    )
-    expect(error._tag).toBe("ConfigError")
+    const error = await run(Signer.fromSecretKey(corrupted).pipe(Effect.flip))
+    expect(error._tag).toBe("KeyError")
 
     const printed = `${error.message}\n${JSON.stringify(error)}\n${String(error)}`
     // Nothing longer than eight characters of the input may appear anywhere in
-    // what a failure can print. Eight characters of base32 is 40 bits: far too
-    // little to reconstruct a key, and short enough that the shared
-    // `suiprivkey1` prefix does not trip the check on its own.
+    // what a failure can print, past the shared `suiprivkey1` prefix (which the
+    // fixed message names). Eight characters of base32 is 40 bits: far too
+    // little to reconstruct a key.
     const WINDOW = 9
     const leaked: Array<string> = []
-    for (let start = 0; start + WINDOW <= corrupted.length; start += 1) {
+    for (let start = "suiprivkey1".length; start + WINDOW <= corrupted.length; start += 1) {
       const run = corrupted.slice(start, start + WINDOW)
       if (printed.includes(run)) leaked.push(run)
     }
@@ -223,21 +177,5 @@ describe("Signer.fromSdkSigner", () => {
   test("fromKeypair is the same function under its old name", () => {
     const keypair = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(4))
     expect(Signer.fromKeypair(keypair).address).toBe(Signer.fromSdkSigner(keypair).address)
-  })
-})
-
-describe("Signer.fromConfig wipes the secret it decoded", () => {
-  test("after a successful decode the Redacted can no longer be read", async () => {
-    const secret = Redacted.make(Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(4)).getSecretKey())
-    const signer = await Effect.runPromise(fromRedactedSecret(secret, "SUI_PRIVATE_KEY"))
-    expect(signer.scheme).toBe("ED25519")
-    expect(() => Redacted.value(secret)).toThrow()
-  })
-
-  test("after a failed decode too", async () => {
-    const secret = Redacted.make("suiprivkey1notakey")
-    const exit = await Effect.runPromiseExit(fromRedactedSecret(secret, "SUI_PRIVATE_KEY"))
-    expect(exit._tag).toBe("Failure")
-    expect(() => Redacted.value(secret)).toThrow()
   })
 })

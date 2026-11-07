@@ -12,15 +12,12 @@ import { SimulationError } from "@mysten/sui/client"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
 import {
-  ConfigProvider,
-  Context,
   DateTime,
   Duration,
   Effect,
   Fiber,
   Layer,
-  Schema,
-  Stream
+  Schema
 } from "effect"
 import { TestClock } from "effect/testing"
 import { KeyValueStore } from "effect/persistence"
@@ -30,14 +27,12 @@ import { JournalEntry } from "../src/domain/journal-entry.ts"
 import { ObjectId, SuiAddress, TransactionExpiration } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
 import { make as makeKeyValueJournal } from "../src/services/JournalKeyValueStore.ts"
-import { Script } from "../src/services/Script.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
 import type { SubmitConfigService } from "../src/services/SubmitConfig.ts"
 import { SubmitConfig } from "../src/services/SubmitConfig.ts"
 import { Sui } from "../src/services/Sui.ts"
 import { mapSdkError } from "../src/services/SuiCore.ts"
 import { FakeOutcome, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
-import { SuiExtension } from "../src/services/SuiExtension.ts"
 import { Tx } from "../src/services/Tx.ts"
 import { layerTest, SuiTest } from "../src/testing.ts"
 
@@ -345,47 +340,6 @@ describe("4. public reconcile never leaks a read failure as not-applied", () => 
   })
 })
 
-describe("5. an outer timeout after the bytes were sent", () => {
-  const env = () =>
-    ConfigProvider.layer(
-      ConfigProvider.fromEnvRecord({ SUI_NETWORK: "localnet" })
-    )
-
-  test("exits 3, not 4, when the journal still holds the submission", async () => {
-    const lines: Array<string> = []
-    const codes: Array<number> = []
-    const layer = Layer.mergeAll(
-      Script.layerWithSigner(signer).pipe(
-        Layer.provideMerge(
-          layerTest({
-            ...baseScript,
-            // The execute never answers; the outer timeout interrupts it.
-            execute: [FakeOutcome.timeoutThen(false)]
-          })
-        )
-      ),
-      Journal.layerMemory
-    ).pipe(Layer.provide(env()))
-    const code = await Script.run(
-      Effect.gen(function*() {
-        const built = yield* Tx.build(claim, { sender: SENDER })
-        const signed = yield* Tx.sign(built, signer)
-        return yield* Tx.submit(signed).pipe(Effect.timeout("30 millis"))
-      }),
-      {
-        layer,
-        exit: (value) => codes.push(value),
-        stderr: (line) => lines.push(line),
-        signals: { on: () => undefined, off: () => undefined }
-      }
-    )
-    expect(code).toBe(3)
-    expect(codes).toEqual([3])
-    // And the unresolved dump runs on a typed failure exit too.
-    expect(lines.join("\n")).toContain("unresolved")
-  })
-})
-
 describe("6. reconciliation refuses evidence from another chain", () => {
   test("bytes built on chain A are SubmissionUnknown against chain B", async () => {
     const built = await run(
@@ -528,79 +482,6 @@ describe("7. the durable journal: one write per entry, no index to fall out of s
   })
 })
 
-describe("8. extensions on one client share the sender lock", () => {
-  class Locking extends Context.Service<Locking, {
-    readonly hold: Effect.Effect<void>
-  }>()("codex/Locking") {
-    static readonly make = (
-      onEnter: () => void,
-      onLeave: () => void
-    ): Layer.Layer<Locking, never, Sui> =>
-      Layer.effect(
-        Locking,
-        Effect.gen(function*() {
-          const sui = yield* Sui
-          return {
-            hold: sui.withSenderLock(SuiAddress.make(SENDER))(
-              Effect.gen(function*() {
-                onEnter()
-                yield* Effect.sleep("25 millis")
-                onLeave()
-              })
-            )
-          }
-        })
-      )
-  }
-
-  test("two registrations on one client never hold the same sender lock at once", async () => {
-    // The audit's reproduction: two registrations entered the same-sender
-    // critical section simultaneously, because each built its own `Sui` and
-    // therefore its own lock map.
-    let active = 0
-    let peak = 0
-    const layer = Locking.make(
-      () => {
-        active += 1
-        peak = Math.max(peak, active)
-      },
-      () => {
-        active -= 1
-      }
-    )
-    const fake = Effect.runSync(
-      Effect.provide(SuiCoreFake, SuiCoreFake.layer({ chainId: CHAIN_ID }), { local: true })
-    )
-    const registration = (name: string) =>
-      SuiExtension.fromService(Locking, { name, layer }).register(fake.client)
-    const first = registration("one")
-    const second = registration("two")
-    await Promise.all([first.hold(), second.hold()])
-    expect(peak).toBe(1)
-    await first.$dispose()
-    await second.$dispose()
-  })
-
-  test("disposing one registration leaves the other working", async () => {
-    // The shared base is reference counted, so `$dispose()` on one extension
-    // must not tear the transport out from under another on the same client.
-    const layer = Locking.make(() => undefined, () => undefined)
-    const fake = Effect.runSync(
-      Effect.provide(SuiCoreFake, SuiCoreFake.layer({ chainId: CHAIN_ID }), { local: true })
-    )
-    const first = SuiExtension.fromService(Locking, { name: "one", layer }).register(fake.client)
-    const second = SuiExtension.fromService(Locking, { name: "two", layer }).register(fake.client)
-    await first.hold()
-    await second.hold()
-    await first.$dispose()
-    await second.hold()
-    await second.$dispose()
-    // And it is not final: a fresh base is built on the next call.
-    await second.hold()
-    await second.$dispose()
-  })
-})
-
 describe("9. Tx.run completes a sponsorship or refuses it", () => {
   const sponsoredScript = {
     ...baseScript,
@@ -706,75 +587,6 @@ describe("10. visibility before the lock is released", () => {
       { ...baseScript, execute: [executed] }
     )
     expect(result.length).toBeGreaterThan(0)
-  })
-})
-
-describe("11. the cold Promise face tells the truth about its member kinds", () => {
-  class Faces extends Context.Service<Faces, {
-    readonly value: string
-    readonly status: Effect.Effect<string>
-    readonly listing: (n: number) => Stream.Stream<number>
-  }>()("codex/Faces") {
-    static readonly layer: Layer.Layer<Faces, never, Sui> = Layer.succeed(Faces, {
-      value: "cold",
-      status: Effect.succeed("ok"),
-      listing: (n: number) => Stream.fromIterable([n, n + 1])
-    })
-  }
-
-  const registration = () => {
-    const fake = Effect.runSync(
-      Effect.provide(SuiCoreFake, SuiCoreFake.layer({ chainId: CHAIN_ID }), { local: true })
-    )
-    return SuiExtension.fromService(Faces, { name: "faces", layer: Faces.layer })
-      .register(fake.client)
-  }
-
-  test("a cold Stream method is an AsyncIterable, not a Promise of one", async () => {
-    const client = registration()
-    const seen: Array<number> = []
-    for await (const value of client.listing(1)) seen.push(value)
-    expect(seen).toEqual([1, 2])
-    await client.$dispose()
-  })
-
-  test("a cold Effect method is a Promise", async () => {
-    const client = registration()
-    expect(await client.status()).toBe("ok")
-    await client.$dispose()
-  })
-
-  test("the declared types hold cold and warm, for all three member kinds", async () => {
-    const client = registration()
-    // Compile-time: the face types a Stream method as `AsyncIterable`, an
-    // Effect method as Promise-returning, and a plain value as itself. These
-    // annotations fail to typecheck if any of the three drifts.
-    const cold: AsyncIterable<number> = client.listing(1)
-    const coldStatus: Promise<string> = client.status()
-    expect(await coldStatus).toBe("ok")
-    const seenCold: Array<number> = []
-    for await (const value of cold) seenCold.push(value)
-    await client.$ready()
-    const warm: AsyncIterable<number> = client.listing(3)
-    const warmStatus: Promise<string> = client.status()
-    const warmValue: string = client.value
-    const seenWarm: Array<number> = []
-    for await (const value of warm) seenWarm.push(value)
-    expect({ seenCold, seenWarm, warmValue, warmStatus: await warmStatus }).toEqual({
-      seenCold: [1, 2],
-      seenWarm: [3, 4],
-      warmValue: "cold",
-      warmStatus: "ok"
-    })
-    await client.$dispose()
-  })
-
-  test("a cold synchronous member fails with ExtensionNotReady, and $ready fixes it", async () => {
-    const client = registration()
-    expect(() => JSON.stringify(client.value)).toThrow()
-    await client.$ready()
-    expect(client.value).toBe("cold")
-    await client.$dispose()
   })
 })
 

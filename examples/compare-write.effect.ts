@@ -18,9 +18,8 @@
  */
 import { bcs } from "@mysten/sui/bcs"
 import { Config, Console, Effect } from "effect"
-import { ObjectId, SuiSchema } from "../src/index.ts"
-import { Script } from "../src/script.ts"
-import { Tx } from "../src/tx.ts"
+import { ObjectId, Sui, SuiSchema } from "../src/index.ts"
+import { Signer, Tx } from "../src/tx.ts"
 
 const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
 
@@ -36,10 +35,11 @@ const Escrow = SuiSchema.bcs(
  * `ObjectUnavailable`, `DecodeError`, `TransportError`, `BuildError`,
  * `SimulationFailed`, `SigningError`, `PolicyDenied`, `NotApplied`,
  * `JournalError`, `UnexpectedEffects`, `ExecutionFailed`, `SubmissionUnknown`,
- * plus `ConfigError` and `NetworkMismatch` from the layer.
+ * `KeyError` and `ConfigError`, plus `NetworkMismatch` from the layer.
  */
 export const program = Effect.gen(function*() {
-  const { signer, sui } = yield* Script
+  const sui = yield* Sui
+  const signer = yield* Effect.flatMap(Config.Redacted("SUI_PRIVATE_KEY"), Signer.fromSecretKey)
   const id = yield* Config.schema(ObjectId, "ESCROW_ID")
   const escrow = yield* sui.getObject(id, { schema: Escrow })
   const executed = yield* Tx.run((tx) => {
@@ -53,5 +53,6 @@ export const program = Effect.gen(function*() {
 })
 
 if (import.meta.main) {
-  await Script.run(program)
+  const { BunRuntime } = await import("@effect/platform-bun")
+  BunRuntime.runMain(program.pipe(Effect.provide(Sui.layerConfig)))
 }

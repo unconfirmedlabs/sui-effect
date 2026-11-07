@@ -1,6 +1,6 @@
 /**
- * `sui-effect/testing`: the in-memory fake, the test layers built on it, and
- * the harness an extension's own tests need.
+ * `sui-effect/testing`: the in-memory fake, the test layer built on it, and
+ * the harness that drives it.
  *
  * Nothing here touches the network. `layerTest` is the real `Sui` over the
  * fake `SuiCore`, so a test exercises the production high tier.
@@ -13,7 +13,6 @@ import type { NetworkMismatch, TransportError } from "./domain/errors.ts"
 import { Journal } from "./services/Journal.ts"
 import { SubmitConfig } from "./services/SubmitConfig.ts"
 import { Sui } from "./services/Sui.ts"
-import { SuiGraphQL } from "./services/SuiGraphQL.ts"
 import type { SuiCore } from "./services/SuiCore.ts"
 import type { FakeObject, FakeOutcome, FakeScript, RecordedCall } from "./services/SuiCoreFake.ts"
 import { SuiCoreFake } from "./services/SuiCoreFake.ts"
@@ -42,7 +41,8 @@ export const testSubmitConfig: Partial<typeof SubmitConfig.defaults> = {
  * What {@link layerTest} provides, under one name: `Sui`, `SuiCore` and the
  * fake's handle, `SuiCoreFake`. A test helper that runs programs against the
  * fake takes `Effect.Effect<A, E, TestServices>` instead of spelling the union
- * out (an extension test adds its own service: `TestServices | Escrow`).
+ * out (a test of a service built on `Sui` adds it: `TestServices | Escrow`,
+ * over `Escrow.layer.pipe(Layer.provideMerge(layerTest(script)))`).
  *
  * @since 0.5.0
  */
@@ -78,68 +78,6 @@ export const layerTest = (
     Layer.provideMerge(SuiCoreFake.layer(script)),
     Layer.provideMerge(SubmitConfig.layer(testSubmitConfig))
   )
-
-/**
- * An extension's own layer over {@link layerTest}, which is the whole wiring an
- * extension test needs.
- *
- * `layerTest` provides `Sui`, `SuiCore` and `SuiCoreFake`, and an extension's
- * `layerTest` (or `layer`, for an extension with no fake of its own) may
- * require `Sui | SuiCore` and nothing else — the same requirement
- * `SuiExtension.fromService` satisfies in production. So composing the two is
- * the recipe, and everything the extension's layer provides plus the fake's
- * handle comes out the other side.
- *
- * **`SuiGraphQL` is provided too**, as `SuiGraphQL.layerUnavailable`: an
- * extension that reads GraphQL requires the tag, its layer would otherwise not
- * build in a test, and "there is no endpoint" is the answer a test wants by
- * default — every GraphQL call fails with `GraphQLUnavailable`, which is a
- * failure the extension already handles. Pass `extra` to override it with a
- * real or scripted client, or to provide anything else the extension's layer
- * requires that the client could not have given it (an `HttpClient`, an
- * operator service, a sibling extension's test layer).
- *
- * Fails with: whatever the extension's layer fails with, whatever `extra` fails
- * with, plus `NetworkMismatch` and `TransportError` when the script asks for
- * them.
- *
- * @example
- * ```ts
- * import { layerExtensionTest } from "@unconfirmed/sui-effect/testing"
- *
- * const layer = layerExtensionTest(Escrow.layerTest(), { objects: [escrow] })
- *
- * // with a dependency of the extension's own:
- * const withGraphQL = layerExtensionTest(Escrow.layerTest(), {}, {
- *   extra: SuiGraphQL.layer(fakeGraphQLClient)
- * })
- * ```
- */
-export const layerExtensionTest = <Self, E, RExtra = never, EExtra = never>(
-  layer: Layer.Layer<Self, E, Sui | SuiCore | SuiGraphQL | RExtra>,
-  script: FakeScript = {},
-  options: { readonly extra?: Layer.Layer<RExtra, EExtra> } = {}
-): Layer.Layer<
-  Self | Sui | SuiCore | SuiCoreFake,
-  E | EExtra | NetworkMismatch | TransportError
-> => {
-  // `extra` last, so a caller that provides its own `SuiGraphQL` wins over the
-  // unavailable default rather than racing it.
-  const deps = options.extra === undefined
-    ? SuiGraphQL.layerUnavailable
-    : Layer.merge(SuiGraphQL.layerUnavailable, options.extra)
-  // The cast is the one thing the checker cannot do for itself: `deps` provides
-  // exactly `RExtra` (plus `SuiGraphQL`), but `Exclude<RExtra, …>` does not
-  // reduce to `never` for an unresolved type parameter. Everything the layer
-  // requires is provided here or by `layerTest`.
-  return layer.pipe(
-    Layer.provide(deps),
-    Layer.provideMerge(layerTest(script))
-  ) as unknown as Layer.Layer<
-    Self | Sui | SuiCore | SuiCoreFake,
-    E | EExtra | NetworkMismatch | TransportError
-  >
-}
 
 const withFake = <A>(f: (fake: SuiCoreFake["Service"]) => Effect.Effect<A>) =>
   Effect.flatMap(SuiCoreFake, f)
@@ -264,9 +202,9 @@ const scriptGetTransaction = (
  * Every call the fake has received, oldest first, optionally only those of one
  * method.
  *
- * This is how a test asserts what the extension sent rather than only what it
+ * This is how a test asserts what the program sent rather than only what it
  * got back: the include set on a read, the fact that a recipe fragment reached
- * exactly one `executeTransaction`, the absence of a call the extension should
+ * exactly one `executeTransaction`, the absence of a call the program should
  * have cached. Never fails.
  */
 const calls = (
@@ -396,7 +334,7 @@ const provide =
     )
 
 /**
- * The harness: everything an extension's tests need to drive the fake from
+ * The harness: everything a test needs to drive the fake from
  * inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
  *
  * Every member requires `SuiCoreFake`, which {@link layerTest} and

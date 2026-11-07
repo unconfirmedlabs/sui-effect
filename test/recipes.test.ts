@@ -17,21 +17,18 @@ import { KeyValueStore } from "effect/persistence"
 import { TestClock } from "effect/testing"
 import { handOver, payAs } from "../examples/recipes/account-alias.ts"
 import { pay } from "../examples/recipes/build-and-submit.ts"
-import { durableJournal, payOnce } from "../examples/recipes/durable-journal-script.ts"
+import { durableJournal, payOnce } from "../examples/recipes/durable-journal.ts"
 import { foldAll, previewFold } from "../examples/recipes/fold-coins.ts"
 import { postedIndices, thePost } from "../examples/recipes/events.ts"
-import { Versions, versions } from "../examples/recipes/extension.ts"
 import { indexPosts } from "../examples/recipes/indexer.ts"
 import { AlreadyClaimed, claim } from "../examples/recipes/move-abort.ts"
-import { counters, incrementCommand } from "../examples/recipes/promise-face.ts"
 import { publish, upgrade } from "../examples/recipes/publish-and-upgrade.ts"
 import { readCounter } from "../examples/recipes/read-object.ts"
 import { payOrResend, startup } from "../examples/recipes/resubmit.ts"
 import { sponsorBytes } from "../examples/recipes/sponsored-stateless.ts"
 import { coinPaidIncrement, sponsoredIncrement } from "../examples/recipes/sponsored.ts"
-import { type EventEntry, ObjectId, Sui, SuiAddress } from "../src/index.ts"
+import { ObjectId, Sui, SuiAddress } from "../src/index.ts"
 import { makeKeyValueStore } from "../src/journal.ts"
-import { Script } from "../src/services/Script.ts"
 import { fromKeypair } from "../src/services/Signer.ts"
 import { SubmitConfig } from "../src/services/SubmitConfig.ts"
 import { Tx } from "../src/services/Tx.ts"
@@ -40,9 +37,7 @@ import {
   fakeDigest,
   FakeOutcome,
   type FakeScript,
-  layerExtensionTest,
   layerTest,
-  SuiCoreFake,
   SuiTest
 } from "../src/testing.ts"
 
@@ -80,6 +75,18 @@ const script: FakeScript = {
   execute: [FakeOutcome.succeed({ mutated: [{ ...counter, version: 4n }] })]
 }
 
+/** `script` with the signer's SUI in its address balance, which `Tx.sendFunds` draws from. */
+const withBalance: FakeScript = {
+  ...script,
+  balances: [...(script.balances ?? []), {
+    owner: signer.address,
+    coinType: "0x2::sui::SUI",
+    balance: "1000000000",
+    coinBalance: "0",
+    addressBalance: "1000000000"
+  }]
+}
+
 const run = <A, E>(effect: Effect.Effect<A, E, never>) => Effect.runPromise(effect)
 
 const increment = (tx: Transaction) => {
@@ -95,7 +102,7 @@ describe("docs/llms-head.md recipes", () => {
 
   test("build-and-submit: Tx.run pays and answers the digest", async () => {
     const digest = await run(
-      pay(signer, SuiAddress.normalize("0xa11ce"), 1_000n).pipe(SuiTest.provide(layerTest(script)))
+      pay(signer, SuiAddress.normalize("0xa11ce"), 1_000n).pipe(SuiTest.provide(layerTest(withBalance)))
     )
     expect(digest.length).toBeGreaterThan(0)
   })
@@ -217,32 +224,6 @@ describe("docs/llms-head.md recipes", () => {
     expect(refused._tag).toBe("TransportError")
   })
 
-  test("extension: the Effect service and its derived Promise face agree", async () => {
-    const viaEffect = await run(
-      Effect.flatMap(Versions, (service) => service.of(COUNTER)).pipe(
-        Effect.provide(layerExtensionTest(Versions.layer, script))
-      )
-    )
-    expect(viaEffect).toBe(3n)
-
-    const fake = Effect.runSync(Effect.provide(SuiCoreFake, SuiCoreFake.layer(script), { local: true }))
-    const client = fake.client.$extend(versions)
-    expect(await client.versions.of(COUNTER)).toBe(3n)
-    await client.versions.$dispose()
-  })
-
-  test("promise-face: a typed id and a Signer in, a digest or one readable line out", async () => {
-    const fake = Effect.runSync(Effect.provide(SuiCoreFake, SuiCoreFake.layer(script), { local: true }))
-    const command = incrementCommand(fake.client, sponsorKeypair)
-    expect(await command(COUNTER)).toMatch(/^incremented in \S+$/)
-    // A shorthand is not what a person may type: Strict refuses it, and
-    // describe turns the refusal into one line.
-    const refused = await command("0xc0")
-    expect(refused).not.toContain("incremented")
-    expect(refused).not.toContain("\n")
-    await fake.client.$extend(counters).counters.$dispose()
-  })
-
   test("publish-and-upgrade: expectPublished answers the package and the cap", async () => {
     const PACKAGE = ObjectId.normalize("0xbeef")
     const UPGRADED = ObjectId.normalize("0xbeef2")
@@ -340,22 +321,26 @@ describe("docs/llms-head.md recipes", () => {
         rows: [],
         cursor: null
       })
-      const commit = (items: ReadonlyArray<EventEntry>, cursor: string | null) =>
+      const commit = (items: ReadonlyArray<SuiClientTypes.EventEntry>, cursor: string | null) =>
         Ref.update(db, (state) => ({
           rows: [...state.rows, ...items.map((item) => item.transactionDigest)],
           cursor
         }))
-      // The first run commits one page, then stops (a crash, a deploy).
-      yield* Stream.runDrain(indexPosts(null, commit).pipe(Stream.take(1)))
+      // The first run commits one page, then crashes on its second commit.
+      const commits = yield* Ref.make(0)
+      const crashing = (items: ReadonlyArray<SuiClientTypes.EventEntry>, cursor: string | null) =>
+        Effect.flatMap(
+          Ref.getAndUpdate(commits, (n) => n + 1),
+          (n) => (n === 0 ? commit(items, cursor) : Effect.fail("crash" as const))
+        )
+      yield* Effect.flip(indexPosts(null, crashing))
       const afterCrash = yield* Ref.get(db)
       // The next run starts from the committed cursor and keeps following.
-      const fiber = yield* Effect.forkChild(
-        Stream.runDrain(indexPosts(afterCrash.cursor, commit).pipe(Stream.take(2)))
-      )
+      const fiber = yield* Effect.forkChild(indexPosts(afterCrash.cursor, commit))
       yield* TestClock.adjust("1 second")
       yield* SuiTest.recordTransaction(fakeDigest(4), FakeOutcome.succeed(posted(4)))
       yield* TestClock.adjust("1 second")
-      yield* Fiber.join(fiber)
+      yield* Fiber.interrupt(fiber)
       return [afterCrash, yield* Ref.get(db)] as const
     })
     const [afterCrash, final] = await run(
@@ -365,26 +350,18 @@ describe("docs/llms-head.md recipes", () => {
     expect(final.rows).toEqual([fakeDigest(1), fakeDigest(2), fakeDigest(3), fakeDigest(4)])
   })
 
-  test("durable-journal-script: entries land in the durable store, in a program and through Script.run", async () => {
+  test("durable-journal: entries land in the durable store, and the next run sweeps first", async () => {
     const kv = Effect.runSync(Effect.provide(KeyValueStore.KeyValueStore, KeyValueStore.layerMemory))
     const store = Layer.succeed(KeyValueStore.KeyValueStore, kv)
-    const scriptLayer = Script.layerWithSigner(signer).pipe(Layer.provideMerge(layerTest(script)))
+    const layer = Layer.merge(layerTest(withBalance), durableJournal(store))
     const entry = await run(
-      payOnce(SuiAddress.normalize("0xa11ce"), 1_000n).pipe(
+      payOnce(signer, SuiAddress.normalize("0xa11ce"), 1_000n).pipe(
         Effect.flatMap((digest) => makeKeyValueStore(kv).get(digest)),
-        Effect.provide(Layer.merge(scriptLayer, durableJournal(store)))
+        Effect.provide(layer)
       )
     )
     expect(Option.map(entry, (found) => found._tag)).toEqual(Option.some("Executed"))
-
-    const lines: Array<string> = []
-    const code = await Script.run(payOnce(SuiAddress.normalize("0xa11ce"), 2_000n), {
-      layer: Layer.merge(scriptLayer, durableJournal(store)),
-      exit: () => undefined,
-      stderr: (line) => lines.push(line),
-      signals: { on: () => undefined }
-    })
-    expect(code).toBe(0)
+    await run(payOnce(signer, SuiAddress.normalize("0xa11ce"), 2_000n).pipe(Effect.provide(layer)))
     // Two entries; settled ones also carry a `settled:` marker (0.5.0).
     expect(
       await run(Effect.map(kv.keys, (keys) => keys.filter((key) => key.startsWith("entry:")).length).pipe(Effect.orDie))
@@ -412,7 +389,7 @@ describe("docs/llms-head.md recipes", () => {
         )
         expect(unknown._tag).toBe("SubmissionUnknown")
         return [executed, yield* startup.pipe(lost)] as const
-      }).pipe(SuiTest.provide(layerTest(script)))
+      }).pipe(SuiTest.provide(layerTest(withBalance)))
     )
     expect(executed.digest.length).toBeGreaterThan(0)
     expect(swept.map((entry) => entry._tag)).toEqual(["Executed"])

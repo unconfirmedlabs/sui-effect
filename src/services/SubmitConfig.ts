@@ -319,7 +319,7 @@ const layer = (overrides: SubmitConfigOverrides): Layer.Layer<never> =>
  * single submission rather than for a whole application.
  *
  * It merges over whatever is in force where the effect runs, not over
- * {@link defaults}, the way `Gate.with` does: a `SubmitConfig.layer` (or the
+ * {@link defaults}: a `SubmitConfig.layer` (or the
  * fast config `layerTest` installs) stays in force for every field the
  * overrides leave out, and two nested `with`s compose. Before 0.4.0 it reset
  * to the defaults.

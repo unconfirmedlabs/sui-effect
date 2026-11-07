@@ -13,9 +13,8 @@
  * generator here.
  */
 import { describe, expect, test } from "bun:test"
-import { Arbitrary, Cause, Effect, Exit, Schema } from "effect"
+import { Arbitrary, Effect, Schema } from "effect"
 import { SuiError, SuiErrorSchema } from "../src/domain/errors.ts"
-import { exitCode } from "../src/services/Script.ts"
 
 const decodeError = Schema.decodeUnknownEffect(SuiErrorSchema)
 
@@ -42,8 +41,7 @@ describe("SuiError.toJson", () => {
         "BuildError",
         "PolicyDenied",
         "JournalError",
-        "GraphQLUnavailable",
-        "ExtensionNotReady"
+        "GraphQLUnavailable"
       ]
     ) {
       expect([tag, tags.has(tag)]).toEqual([tag, true])
@@ -66,62 +64,6 @@ describe("SuiError.toJson", () => {
             return JSON.stringify(SuiError.toJson(decoded)) === JSON.stringify(json)
           }),
         { runs: 300, seed: 11 }
-      )
-    )
-    passes(result)
-  })
-})
-
-describe("Script.exitCode is total", () => {
-  /** One reason a cause can carry: a taxonomy failure, any failure value, a defect, an interrupt. */
-  const reason = Arbitrary.flatMap(
-    Arbitrary.schema(Schema.Literals(["taxonomy", "foreign", "die", "interrupt"])),
-    (kind): Arbitrary.Arbitrary<Cause.Cause<unknown>> => {
-      switch (kind) {
-        case "taxonomy":
-          return Arbitrary.map(errors, (error) => Cause.fail(error))
-        case "foreign":
-          return Arbitrary.map(Arbitrary.schema(Schema.Unknown), (value) => Cause.fail(value))
-        case "die":
-          return Arbitrary.map(Arbitrary.schema(Schema.Unknown), (value) => Cause.die(value))
-        case "interrupt":
-          return Arbitrary.Constant(Cause.interrupt())
-      }
-    }
-  )
-  const input = Arbitrary.all({
-    reasons: Arbitrary.array(reason, { minLength: 1, maxLength: 3 }),
-    unresolved: Arbitrary.schema(Schema.Literals([0, 1])),
-    applied: Arbitrary.schema(Schema.Literals([0, 1]))
-  })
-
-  test("every failing cause exits with an integer from 1 to 255, and never 0", async () => {
-    const result = await Effect.runPromise(
-      Arbitrary.checkEffect(
-        input,
-        ({ applied, reasons, unresolved }) => {
-          const cause = reasons.reduce((all, one) => Cause.combine(all, one))
-          const code = exitCode(Exit.failCause(cause), { unresolved, applied })
-          return Number.isInteger(code) && code >= 1 && code <= 255
-        },
-        { runs: 500, seed: 13 }
-      )
-    )
-    passes(result)
-  })
-
-  test("a lone taxonomy failure exits on its outcome axis", async () => {
-    const expected = { applied: 5, unknown: 3, not_applied: 4 } as const
-    const result = await Effect.runPromise(
-      Arbitrary.checkEffect(
-        errors,
-        (error) => {
-          const code = exitCode(Exit.fail(error))
-          // Configuration is not on the outcome axis.
-          if (error._tag === "NetworkMismatch") return code === 2
-          return code === expected[SuiError.outcome(error)]
-        },
-        { runs: 300, seed: 17 }
       )
     )
     passes(result)

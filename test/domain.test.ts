@@ -6,7 +6,6 @@ import {
   DecodeError,
   ExecutionFailed,
   ExecutionReason,
-  ExtensionNotReady,
   GraphQLUnavailable,
   JournalError,
   NetworkMismatch,
@@ -260,10 +259,9 @@ describe("error classes", () => {
         expected: StructTag.make("0x2::coin::Coin<0x2::sui::SUI>"),
         found: []
       }),
-      new GraphQLUnavailable({ method: "query", reason: "no endpoint" }),
-      new ExtensionNotReady({ extension: "miso", member: "tx.purchaseRecord" })
+      new GraphQLUnavailable({ method: "query", reason: "no endpoint" })
     ]
-    expect(instances).toHaveLength(18)
+    expect(instances).toHaveLength(17)
     for (const instance of instances) {
       const json = SuiError.toJson(instance)
       expect(json._tag).toBe(instance._tag)
@@ -327,13 +325,9 @@ describe("error classes", () => {
           found: [f.objectId]
         })
       ],
-      [GraphQLUnavailable, new GraphQLUnavailable({ method: "query", reason: "no endpoint" })],
-      [
-        ExtensionNotReady,
-        new ExtensionNotReady({ extension: "miso", member: "tx.purchaseRecord" })
-      ]
+      [GraphQLUnavailable, new GraphQLUnavailable({ method: "query", reason: "no endpoint" })]
     ]
-    expect(cases).toHaveLength(18)
+    expect(cases).toHaveLength(17)
     for (const [schema, instance] of cases) {
       const asserts = new TestSchema.Asserts(schema)
       const encoded = Schema.encodeUnknownSync(schema)(instance)
@@ -417,8 +411,7 @@ describe("error classes", () => {
     // "not_applied" would be a claim: it tells the documented retry idiom that
     // nothing happened and the intent is safe to send again. Nothing about an
     // unrecognised tag supports that claim, so the answer is that we do not
-    // know. `Script.exitCode` disagrees on purpose and exits 1, because exit 3
-    // would claim the opposite — that there is a digest to reconcile.
+    // know.
     class Foreign extends Schema.TaggedError<Foreign>()("some-sdk/Foreign", {}) {}
     expect(SuiError.outcome(new Foreign() as never)).toBe("unknown")
     expect(SuiError.outcome({ _tag: "WhoKnows" } as never)).toBe("unknown")
@@ -646,8 +639,7 @@ describe("SuiError.toJson message (NB8)", () => {
     new PolicyDenied({ rule: "spend", message: "too much" }),
     new JournalError({ cause: "disk full" }),
     new UnexpectedEffects({ digest: DIGEST_VALUE, expected: "0x2::a::B", found: [] }),
-    new GraphQLUnavailable({ method: "query", reason: "no endpoint" }),
-    new ExtensionNotReady({ extension: "escrow", member: "status" })
+    new GraphQLUnavailable({ method: "query", reason: "no endpoint" })
   ] as const
 
   test("every taxonomy class gets the same sentence in the same key", () => {

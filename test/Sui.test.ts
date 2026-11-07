@@ -966,13 +966,12 @@ describe("getTransaction", () => {
   })
 })
 
-describe("withSenderLock", () => {
+describe("Sui.withSenderLock", () => {
   test("serializes two fibers on the same sender", async () => {
     const program = Effect.gen(function*() {
-      const sui = yield* Sui
       const gate = yield* Deferred.make<void>()
       const order: Array<string> = []
-      const lock = sui.withSenderLock(SuiAddress.make(ALICE))
+      const lock = (yield* Sui).withSenderLock(SuiAddress.make(ALICE))
       const first = yield* Effect.forkChild(
         lock(
           Effect.gen(function*() {
@@ -1008,11 +1007,10 @@ describe("withSenderLock", () => {
 
   test("does not serialize two different senders", async () => {
     const program = Effect.gen(function*() {
-      const sui = yield* Sui
       const gate = yield* Deferred.make<void>()
       const order: Array<string> = []
       const first = yield* Effect.forkChild(
-        sui.withSenderLock(SuiAddress.make(ALICE))(
+        (yield* Sui).withSenderLock(SuiAddress.make(ALICE))(
           Effect.gen(function*() {
             yield* Deferred.await(gate)
             order.push("alice")
@@ -1021,7 +1019,7 @@ describe("withSenderLock", () => {
       )
       yield* TestClock.adjust("1 milli")
       const second = yield* Effect.forkChild(
-        sui.withSenderLock(SuiAddress.make(PADDED("b0b")))(
+        (yield* Sui).withSenderLock(SuiAddress.make(PADDED("b0b")))(
           Effect.sync(() => {
             order.push("bob")
           })

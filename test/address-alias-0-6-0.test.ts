@@ -11,16 +11,14 @@ import { describe, expect, test } from "bun:test"
 import type { PublicKey } from "@mysten/sui/cryptography"
 import { parseSerializedSignature } from "@mysten/sui/cryptography"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
-import { PasskeyPublicKey } from "@mysten/sui/keypairs/passkey"
+import { PasskeyKeypair, type PasskeyProvider, PasskeyPublicKey } from "@mysten/sui/keypairs/passkey"
 import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
 import { MultiSigPublicKey } from "@mysten/sui/multisig"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
 import { deriveObjectID, normalizeSuiAddress, toBase64 } from "@mysten/sui/utils"
 import { computeZkLoginAddressFromSeed, genAddressSeed, toZkLoginPublicIdentifier } from "@mysten/sui/zklogin"
 import { Deferred, Effect, Fiber, Option } from "effect"
-import { TestClock } from "effect/testing"
 import { SuiAddress } from "../src/domain/schemas.ts"
-import type { PasskeyProvider } from "../src/services/AccountSigners.ts"
 import { AddressAlias } from "../src/services/AddressAlias.ts"
 import type { JournalEntry } from "../src/domain/journal-entry.ts"
 import { Journal, type JournalService } from "../src/services/Journal.ts"
@@ -36,7 +34,6 @@ const CHAIN_ID = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
 const PADDED = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
 const SUI = "0x2::sui::SUI"
 const ONE_SUI = 1_000_000_000n
-const NOW = 1_700_000_000_000
 
 const key = (fill: number) => Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(fill))
 
@@ -219,10 +216,10 @@ describe("Signer.multisig", () => {
     expect(addressOf(publicKey)).toBe(M)
   })
 
-  test("a passkey member: the WebAuthn partial signature lands on its bit and verifies", async () => {
+  test("a passkey member (the SDK's PasskeyKeypair): the WebAuthn partial signature lands on its bit and verifies", async () => {
     const bytes = await bytesFor(PADDED("1"))
     const result = await run(Effect.gen(function*() {
-      const passkey = yield* Signer.passkey({ publicKey: PASSKEY_PUBLIC_KEY, provider: stubProvider() })
+      const passkey = Signer.fromSdkSigner(new PasskeyKeypair(PASSKEY_PUBLIC_KEY, stubProvider()))
       const publicKey = MultiSigPublicKey.fromPublicKeys({
         threshold: 2,
         publicKeys: [
@@ -242,7 +239,7 @@ describe("Signer.multisig", () => {
     expect(parsed.multisig.sigs.map((sig) => Object.keys(sig).filter((name) => name !== "$kind")[0])).toEqual(["ED25519", "Passkey"])
   })
 
-  test("a zkLogin member: its signature goes on its bit, and its session bounds the multisig's maxEpoch", async () => {
+  test("a zkLogin member: its signature goes on its bit, and its maxEpoch bounds the multisig's", async () => {
     const zkPublicKey = toZkLoginPublicIdentifier(BigInt(ADDRESS_SEED), ISS, { legacyAddress: false })
     const publicKey = MultiSigPublicKey.fromPublicKeys({
       threshold: 2,
@@ -253,16 +250,14 @@ describe("Signer.multisig", () => {
     })
     expect(normalizeSuiAddress(zkPublicKey.toSuiAddress())).toBe(ZK_ADDRESS)
     const bytes = await bytesFor(publicKey.toSuiAddress())
-    const { signature, maxEpoch } = await Effect.runPromise(Effect.provide(
+    const { signature, maxEpoch } = await Effect.runPromise(
       Effect.gen(function*() {
-        yield* TestClock.setTime(NOW)
-        const zk = yield* Signer.zkLogin({ session, ephemeral })
+        const zk = yield* Signer.zkLogin({ address: ZK_ADDRESS, inputs: proof, maxEpoch: MAX_EPOCH, ephemeralSigner: ephemeral })
         // Given the phrase first; the zkLogin identifier is member 0.
         const signer = yield* Signer.multisig(publicKey, [fromKeypair(phrase), zk])
         return { signature: yield* signer.signTransaction(bytes), maxEpoch: signer.maxEpoch }
-      }),
-      TestClock.layer()
-    ))
+      })
+    )
     expect(maxEpoch).toBe(MAX_EPOCH)
     const parsed = parseSerializedSignature(signature)
     if (parsed.signatureScheme !== "MultiSig") throw new Error("not a multisig")
@@ -270,18 +265,6 @@ describe("Signer.multisig", () => {
     expect(parsed.multisig.sigs.map((sig) => Object.keys(sig).filter((name) => name !== "$kind")[0])).toEqual(["ZkLogin", "ED25519"])
   })
 
-  test("a locked member locks the multisig: Tx.run refuses it before building", async () => {
-    const [error, simulates] = await run(Effect.gen(function*() {
-      const held = yield* Signer.fromSecretKey(phrase.getSecretKey())
-      const signer = yield* Signer.multisig(M_KEY, [fromKeypair(passkeyLike), held])
-      yield* held.lock
-      const error = yield* Effect.flip(Tx.run(ping, { signer: Signer.alias(A, signer) }))
-      return [error, (yield* SuiTest.calls("simulateTransaction")).length] as const
-    }))
-    expect(error._tag).toBe("SigningError")
-    if (error._tag === "SigningError") expect(error.reason).toBe("locked")
-    expect(simulates).toBe(0)
-  })
 })
 
 describe("Signer.alias", () => {
@@ -326,7 +309,7 @@ describe("Tx.run: sender A, signed by M", () => {
         signer,
         onSigned: (signed) => Effect.sync(() => void (signedSender = signed.sender))
       })
-      const entry = yield* Tx.recorded(executed.digest)
+      const entry = yield* (yield* Journal).get(executed.digest)
       const sent = yield* SuiTest.calls("executeTransaction")
       return { executed, entry, sent, signedSender }
     }), aliased)
@@ -353,7 +336,6 @@ describe("Tx.run: sender A, signed by M", () => {
 
   test("the sender lock is A's, not M's", async () => {
     const order = await run(Effect.gen(function*() {
-      const sui = yield* Sui
       const inApprove = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       const events: Array<string> = []
@@ -366,8 +348,8 @@ describe("Tx.run: sender A, signed by M", () => {
       )
       yield* Deferred.await(inApprove)
       // M's lock is free while A's run is approving under A's lock.
-      yield* sui.withSenderLock(M)(Effect.sync(() => events.push("M")))
-      const waiting = yield* Effect.forkChild(sui.withSenderLock(A)(Effect.sync(() => events.push("A"))))
+      yield* (yield* Sui).withSenderLock(M)(Effect.sync(() => events.push("M")))
+      const waiting = yield* Effect.forkChild((yield* Sui).withSenderLock(A)(Effect.sync(() => events.push("A"))))
       yield* Effect.yieldNow
       events.push("release")
       yield* Deferred.succeed(release, undefined)
@@ -420,7 +402,7 @@ describe("Tx.run: sender A, signed by M", () => {
       const old = yield* Effect.flip(Tx.run(ping, { signer: account }))
       const oldEntry = yield* Effect.flatMap(SuiTest.calls("executeTransaction"), (calls) => {
         const last = calls[calls.length - 1]!.options as { transaction: Uint8Array }
-        return Tx.recorded(TransactionDataBuilder.getDigestFromBytes(last.transaction) as never)
+        return Effect.flatMap(Effect.service(Journal), (journal) => journal.get(TransactionDataBuilder.getDigestFromBytes(last.transaction) as never))
       })
       return { enabled, aliases, executed, old, oldEntry }
     }))
@@ -507,7 +489,7 @@ describe("Tx.attach and Verify against the alias set", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Fixtures for the passkey and zkLogin members (as in account-signers.test.ts).
+// Fixtures for the passkey and zkLogin members.
 // ---------------------------------------------------------------------------
 
 const ISS = "https://accounts.google.com"
@@ -523,7 +505,6 @@ const proof = {
 const ZK_ADDRESS = SuiAddress.make(computeZkLoginAddressFromSeed(BigInt(ADDRESS_SEED), ISS, false))
 const ephemeral = Ed25519Keypair.fromSecretKey(new Uint8Array(32).fill(3))
 const MAX_EPOCH = 101n
-const session = { address: ZK_ADDRESS, maxEpoch: MAX_EPOCH, proof, expiresAt: NOW + 60_000 }
 
 const sha256 = async (bytes: Uint8Array) =>
   new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>))
@@ -546,7 +527,7 @@ const PASSKEY_PUBLIC_KEY = authenticator.getPublicKey().toRawBytes()
 
 const stubProvider = (): PasskeyProvider => ({
   create: () => Promise.reject(new Error("not used")),
-  get: async (challenge) => {
+  get: async (challenge: Uint8Array) => {
     const clientDataJSON = new TextEncoder().encode(JSON.stringify({
       type: "webauthn.get",
       challenge: toBase64(challenge).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
@@ -560,6 +541,6 @@ const stubProvider = (): PasskeyProvider => ({
         clientDataJSON: buffer(clientDataJSON),
         signature: buffer(derOf(await authenticator.sign(payload)))
       }
-    }
+    } as unknown as Awaited<ReturnType<PasskeyProvider["get"]>>
   }
 })

@@ -1,52 +1,47 @@
 /**
- * The 0.5.0 wallet core against a **localnet**: every signer kind a wallet
- * holds (DESIGN §18, §19), the sponsored and dapp flows through `Tx.prepare`
- * and the intent (§6, §17), and the durable journal over a portable store
- * (§20). The unit tests prove each signer produces a signature the SDK
- * verifies; only a validator says it accepts one, and only a node says what a
- * sponsored or dapp transaction's effects are.
+ * Signers, sponsorship and the durable journal against a **localnet**: the
+ * mnemonic signer, the SDK's `PasskeyKeypair` through `Signer.fromSdkSigner`,
+ * the sponsored flows (`verifySponsored`, `Tx.attach`, `Tx.run` with a
+ * `Signer.remote` sponsor and `approve`), the durable journal over a
+ * `KeyValueStore`, and the zkLogin `maxEpoch` bound. The unit tests prove each
+ * signer produces a signature the SDK verifies; only a validator says it
+ * accepts one, and only a node says what a sponsored transaction's effects are.
  *
  * Gated behind `SUI_LOCALNET=1`, like `test/live.localnet.test.ts`:
  *
  * ```bash
  * sui start --with-faucet --force-regenesis &
- * SUI_LOCALNET=1 bun test test/live.localnet-wallet.test.ts
+ * SUI_LOCALNET=1 bun test test/live.localnet-signers.test.ts
  * ```
  *
  * Every test uses fresh accounts. What is **not** proven here: a zkLogin
- * signature a validator accepts (that needs a prover and the issuer's JWK), a
- * real WebAuthn authenticator or browser, a real Wallet Standard extension, and
- * a real IndexedDB — those are stand-ins (`test/account-signers.test.ts`,
- * `test/storage-fakes.ts`).
+ * signature a validator accepts (that needs a prover and the issuer's JWK) and
+ * a real WebAuthn authenticator or browser.
  */
 import { describe, expect, test } from "bun:test"
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519"
+import { PasskeyKeypair, type PasskeyProvider } from "@mysten/sui/keypairs/passkey"
 import { Secp256r1Keypair } from "@mysten/sui/keypairs/secp256r1"
 import { requestSuiFromFaucetV2 } from "@mysten/sui/faucet"
 import { SuiGrpcClient } from "@mysten/sui/grpc"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
-import { normalizeSuiAddress, toBase64 } from "@mysten/sui/utils"
+import { toBase64 } from "@mysten/sui/utils"
 import { computeZkLoginAddressFromSeed, genAddressSeed } from "@mysten/sui/zklogin"
 import { validateMnemonic } from "@scure/bip39"
 import { wordlist } from "@scure/bip39/wordlists/english.js"
 import { DateTime, Effect, Layer, Option, Redacted, Schedule } from "effect"
 import { KeyValueStore } from "effect/persistence"
-import { JournalError, type PolicyDenied, SigningError } from "../src/domain/errors.ts"
-import { Intent } from "../src/domain/intent.ts"
+import { JournalError, type PolicyDenied } from "../src/domain/errors.ts"
 import { JournalEntry } from "../src/domain/journal-entry.ts"
 import { KeyError } from "../src/domain/keys.ts"
-import { CoinType, SuiAddress } from "../src/domain/schemas.ts"
+import { SuiAddress } from "../src/domain/schemas.ts"
 import { layerKeyValueStore } from "../src/journal.ts"
-import { DEFAULT_ITERATIONS, DEFAULT_PREFIX, Keystore } from "../src/keystore.ts"
-import type { PasskeyProvider } from "../src/services/AccountSigners.ts"
 import { Journal } from "../src/services/Journal.ts"
 import { fromKeypair, Signer } from "../src/services/Signer.ts"
 import { Sui } from "../src/services/Sui.ts"
 import { SuiCore } from "../src/services/SuiCore.ts"
 import { type Prepared, type Signed, Tx } from "../src/services/Tx.ts"
-import { layerIndexedDb } from "../src/storage.ts"
 import { verifySponsored } from "../src/tx.ts"
-import { makeFakeIndexedDb } from "./storage-fakes.ts"
 
 const LOCALNET = process.env["SUI_LOCALNET"] === "1"
 const BASE_URL = process.env["SUI_LOCALNET_URL"] ?? "http://127.0.0.1:9000"
@@ -155,7 +150,7 @@ const oneWordOff = (phrase: string): string => {
 }
 
 // ---------------------------------------------------------------------------
-// A software P-256 authenticator (as in test/account-signers.test.ts).
+// A software P-256 authenticator for the SDK's PasskeyKeypair.
 // ---------------------------------------------------------------------------
 
 const sha256 = async (bytes: Uint8Array) =>
@@ -177,7 +172,7 @@ const arrayBuffer = (bytes: Uint8Array) => bytes.slice().buffer as ArrayBuffer
 
 const softwareAuthenticator = (key: Secp256r1Keypair, prompts: { count: number }): PasskeyProvider => ({
   create: () => Promise.reject(new Error("not used")),
-  get: async (challenge) => {
+  get: async (challenge: Uint8Array) => {
     prompts.count += 1
     const clientDataJSON = new TextEncoder().encode(JSON.stringify({
       type: "webauthn.get",
@@ -192,39 +187,8 @@ const softwareAuthenticator = (key: Secp256r1Keypair, prompts: { count: number }
         clientDataJSON: arrayBuffer(clientDataJSON),
         signature: arrayBuffer(derOf(await key.sign(payload)))
       }
-    }
+    } as unknown as Awaited<ReturnType<PasskeyProvider["get"]>>
   }
-})
-
-// ---------------------------------------------------------------------------
-// A Wallet Standard wallet backed by a keypair.
-// ---------------------------------------------------------------------------
-
-const keypairWallet = (key: Ed25519Keypair, mode: "honest" | "rebuild-differently") => ({
-  name: "Keypair Wallet",
-  features: {
-    "sui:signTransaction": {
-      version: "2.0.0",
-      signTransaction: async (input: { transaction: { toJSON(): Promise<string> } }) => {
-        // What a wallet does with a dapp's request: rebuild it from its JSON.
-        const tx = Transaction.from(await input.transaction.toJSON())
-        if (mode === "rebuild-differently") tx.setGasBudget(BigInt(tx.getData().gasData.budget ?? 0) + 1n)
-        const bytes = await tx.build()
-        return { bytes: toBase64(bytes), signature: (await key.signTransaction(bytes)).signature }
-      }
-    },
-    "sui:signPersonalMessage": {
-      version: "1.1.0",
-      signPersonalMessage: (input: { message: Uint8Array }) => key.signPersonalMessage(input.message)
-    }
-  }
-})
-
-const walletAccount = (key: Ed25519Keypair) => ({
-  address: key.toSuiAddress(),
-  publicKey: key.getPublicKey().toRawBytes(),
-  chains: ["sui:localnet"],
-  features: ["sui:signTransaction", "sui:signPersonalMessage"]
 })
 
 // ---------------------------------------------------------------------------
@@ -287,26 +251,20 @@ const countingSigns = (signer: Signer, counter: { count: number }): Signer => ({
     })
 })
 
-const noClaims = (summary: string): Intent => ({
-  summary,
-  author: "user",
-  claims: { outflows: [], recipients: [], objects: [] }
-})
-
 // ---------------------------------------------------------------------------
-// zkLogin: a session with placeholder proof points but a real address seed.
+// zkLogin: placeholder proof points but a real address seed.
 // ---------------------------------------------------------------------------
 
 const ISS = "https://accounts.google.com"
 const base64Url = (text: string) =>
   toBase64(new TextEncoder().encode(text)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
-const zkSession = (maxEpoch: bigint, salt: bigint) => {
+const zkLoginOptions = (maxEpoch: bigint, salt: bigint) => {
   const addressSeed = genAddressSeed(salt, "sub", `user-${salt}`, "client-1").toString()
   return {
     address: SuiAddress.make(computeZkLoginAddressFromSeed(BigInt(addressSeed), ISS, false)),
     maxEpoch,
-    expiresAt: Date.now() + 30 * MINUTE,
-    proof: {
+    ephemeralSigner: new Ed25519Keypair(),
+    inputs: {
       proofPoints: { a: ["1", "2", "1"], b: [["1", "0"], ["1", "0"], ["1", "0"]], c: ["1", "2", "1"] },
       issBase64Details: { value: base64Url(`"iss":"${ISS}",`), indexMod4: 0 },
       headerBase64: base64Url("{\"alg\":\"RS256\"}"),
@@ -320,7 +278,7 @@ const currentEpoch = Effect.map(
   (state) => BigInt(state.systemState.epoch)
 )
 
-describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", () => {
+describe.skipIf(!LOCALNET)("signers and sponsorship on localnet, with SUI_LOCALNET=1", () => {
   for (const scheme of ["ED25519", "Secp256k1", "Secp256r1"] as const) {
     test(
       `1. Signer.fromMnemonic (${scheme}): a generated phrase executes; one word off is refused before anything is built`,
@@ -357,67 +315,14 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
   }
 
   test(
-    "2. /keystore: importMnemonic → unlock → Tx.run executes → lock → Tx.run fails locked with nothing sent",
-    async () => {
-      const counts: Counts = { simulates: 0, executes: 0 }
-      const phrase = await Effect.runPromise(Signer.generateMnemonic(24))
-      const password = Redacted.make(`pw-${Math.random()}`)
-      const timings: Record<string, number> = {}
-      const result = await node(
-        Effect.gen(function*() {
-          const keystore = yield* Keystore
-          let start = performance.now()
-          const account = yield* keystore.importMnemonic(phrase, password)
-          timings["import"] = Math.round(performance.now() - start)
-          start = performance.now()
-          const signer = yield* keystore.unlock(account.address, password)
-          timings["unlock"] = Math.round(performance.now() - start)
-          yield* fundAndFold(signer)
-          const friend = stranger()
-          const executed = yield* Tx.run(Tx.sendFunds({ amount: ONE_SUI, recipient: friend }), { signer })
-          yield* signer.lock
-          const executesBefore = counts.executes
-          const locked = yield* Effect.flip(Tx.run(Tx.sendFunds({ amount: ONE_SUI, recipient: friend }), { signer }))
-          const journal = yield* Journal
-          const stored = yield* Effect.flatMap(KeyValueStore.KeyValueStore, (store) =>
-            store.get(`${DEFAULT_PREFIX}${account.address}`))
-          return {
-            iterations: JSON.parse(stored ?? "{}").kdf?.iterations,
-            account,
-            executed,
-            locked,
-            sentAfterLock: counts.executes - executesBefore,
-            unresolved: yield* journal.listUnresolved,
-            received: yield* balanceOf(friend)
-          }
-        }),
-        { counts, extra: Keystore.layer().pipe(Layer.provideMerge(KeyValueStore.layerMemory)) }
-      )
-      console.log(`keystore (600 000 PBKDF2 iterations): import ${timings["import"]} ms, unlock ${timings["unlock"]} ms`)
-      expect(result.iterations).toBe(DEFAULT_ITERATIONS)
-      expect(result.executed.effects.status.success).toBe(true)
-      expect(result.received.addressBalance).toBe(ONE_SUI)
-      expect(result.locked).toBeInstanceOf(SigningError)
-      expect(result.locked._tag).toBe("SigningError")
-      if (result.locked._tag === "SigningError") expect(result.locked.reason).toBe("locked")
-      expect(result.sentAfterLock).toBe(0)
-      expect(result.unresolved).toEqual([])
-      // Real default iterations: unlocking is deliberately slow, but not unusable.
-      expect(timings["unlock"]!).toBeGreaterThan(20)
-    },
-    5 * MINUTE
-  )
-
-  test(
-    "3. Signer.passkey over a software P-256 authenticator: a validator accepts the passkey signature",
+    "2. the SDK's PasskeyKeypair through Signer.fromSdkSigner, over a software P-256 authenticator: a validator accepts the passkey signature",
     async () => {
       const prompts = { count: 0 }
       const key = Secp256r1Keypair.generate()
       const { signer, executed, received } = await node(Effect.gen(function*() {
-        const signer = yield* Signer.passkey({
-          publicKey: key.getPublicKey().toRawBytes(),
-          provider: softwareAuthenticator(key, prompts)
-        })
+        const signer = Signer.fromSdkSigner(
+          new PasskeyKeypair(key.getPublicKey().toRawBytes(), softwareAuthenticator(key, prompts))
+        )
         yield* fundAndFold(signer)
         const friend = stranger()
         const executed = yield* Tx.run(Tx.sendFunds({ amount: ONE_SUI, recipient: friend }), { signer })
@@ -434,53 +339,11 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
   )
 
   test(
-    "4. Signer.wallet over a keypair-backed Wallet Standard wallet: executes; a wallet that rebuilds different bytes is refused before any send",
-    async () => {
-      const counts: Counts = { simulates: 0, executes: 0 }
-      const key = new Ed25519Keypair()
-      const result = await node(Effect.gen(function*() {
-        const honest = yield* Signer.wallet({
-          wallet: keypairWallet(key, "honest"),
-          account: walletAccount(key),
-          chain: "sui:localnet"
-        })
-        yield* fundAndFold(honest)
-        const friend = stranger()
-        const executed = yield* Tx.run(Tx.sendFunds({ amount: ONE_SUI, recipient: friend }), { signer: honest })
-        const executesBefore = counts.executes
-        const dishonest = yield* Signer.wallet({
-          wallet: keypairWallet(key, "rebuild-differently"),
-          account: walletAccount(key),
-          chain: "sui:localnet"
-        })
-        const refused = yield* Effect.flip(
-          Tx.run(Tx.sendFunds({ amount: ONE_SUI, recipient: friend }), { signer: dishonest })
-        )
-        return {
-          honest,
-          executed,
-          refused,
-          sentByDishonest: counts.executes - executesBefore,
-          received: yield* balanceOf(friend)
-        }
-      }), { counts })
-      expect(result.honest.address).toBe(SuiAddress.make(normalizeSuiAddress(key.toSuiAddress())))
-      expect(result.executed.effects.status.success).toBe(true)
-      expect(result.received.addressBalance).toBe(ONE_SUI)
-      expect(result.refused._tag).toBe("SigningError")
-      expect(String((result.refused as SigningError).cause)).toContain("different bytes")
-      expect(result.sentByDishonest).toBe(0)
-    },
-    5 * MINUTE
-  )
-
-  test(
-    "5a. sponsored, miso-style: a sender with no SUI, a sponsor backend's bytes → verifySponsored → prepare → approve → sign → attach → submit",
+    "3a. sponsored, miso-style: a sender with no SUI, a sponsor backend's bytes → verifySponsored → simulate → sign → attach → submit",
     async () => {
       const sponsorKey = new Ed25519Keypair()
       const sponsor = fromKeypair(sponsorKey)
       const phrase = await Effect.runPromise(Signer.generateMnemonic())
-      const approvals: Array<Prepared> = []
       const result = await node(Effect.gen(function*() {
         yield* fundAndFold(sponsor)
         const sender = yield* Signer.fromMnemonic(phrase)
@@ -493,19 +356,17 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
           gasOwner: sponsor.address,
           transactionKind: kind
         })
-        const prepared = yield* Tx.prepare(built, {
-          sender: sender.address,
-          intent: noClaims("Record my account's object id; the sponsor pays the gas.")
-        })
-        yield* Effect.sync(() => approvals.push(prepared))
-        const signed = yield* Tx.sign(prepared.verified ?? prepared.built, sender)
+        // What the sender is shown before signing: exactly these bytes, simulated.
+        const simulation = yield* (yield* Sui).simulate(built.bytes)
+        const signed = yield* Tx.sign(built, sender)
         const both = yield* Tx.attach(signed, reply.signature)
         const executed = yield* Tx.submit(both)
         return {
-          prepared,
+          built,
+          simulation,
           both,
           executed,
-          entry: yield* Tx.recorded(both.digest),
+          entry: yield* (yield* Journal).get(both.digest),
           senderBefore,
           senderAfter: yield* balanceOf(sender.address),
           sponsorBefore,
@@ -513,23 +374,22 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
         }
       }))
       expect(result.senderBefore).toEqual({ coinBalance: 0n, addressBalance: 0n })
-      expect(result.prepared.built.gasOwner).toBe(sponsor.address)
-      expect(result.prepared.built.gas.owner).toBe(sponsor.address)
-      expect(result.prepared.verified).toBeDefined()
-      expect(approvals).toHaveLength(1)
+      expect(result.built.gasOwner).toBe(sponsor.address)
+      expect(result.built.gas.owner).toBe(sponsor.address)
+      expect(result.simulation.effects.status.success).toBe(true)
       expect(result.both.signatures).toHaveLength(2)
       expect(result.executed.effects.status.success).toBe(true)
       expect(Option.isSome(result.entry) && result.entry.value._tag).toBe("Executed")
       expect(result.senderAfter).toEqual({ coinBalance: 0n, addressBalance: 0n })
       const gasPaid = result.sponsorBefore.addressBalance - result.sponsorAfter.addressBalance
       expect(gasPaid).toBeGreaterThan(0n)
-      console.log(`5a: sponsor paid ${gasPaid} MIST from its address balance; sender stayed at 0`)
+      console.log(`3a: sponsor paid ${gasPaid} MIST from its address balance; sender stayed at 0`)
     },
     5 * MINUTE
   )
 
   test(
-    "5b. sponsored through Tx.run: gasOwner + Signer.remote sponsor + approve",
+    "3b. sponsored through Tx.run: gasOwner + Signer.remote sponsor + approve",
     async () => {
       const sponsorKey = new Ed25519Keypair()
       const sponsor = fromKeypair(sponsorKey)
@@ -573,7 +433,7 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
   )
 
   test(
-    "5c. tampered sponsor bytes (sender changed, kind changed) are refused with PolicyDenied before signing",
+    "3c. tampered sponsor bytes (sender changed, kind changed) are refused with PolicyDenied before signing",
     async () => {
       const sponsorKey = new Ed25519Keypair()
       const phrase = await Effect.runPromise(Signer.generateMnemonic())
@@ -610,53 +470,15 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
   )
 
   test(
-    "6. a dapp's transaction: fromBytes → prepare → Intent.fromSimulation → verify passes; an extra unclaimed recipient is intent.recipient",
+    "4. the durable journal over one KeyValueStore: settled across a fresh layer, and a crashed Signed entry reconciles to Executed",
     async () => {
-      const key = new Ed25519Keypair()
-      const user = fromKeypair(key)
-      const friend = stranger()
-      const other = stranger()
-      const result = await node(Effect.gen(function*() {
-        yield* fundAndFold(user)
-        // The dapp builds against its own client and hands over bytes.
-        const dappBytes = (sends: ReadonlyArray<readonly [SuiAddress, bigint]>) =>
-          Effect.promise(async () => {
-            const tx = new Transaction()
-            tx.setSender(user.address)
-            for (const [recipient, amount] of sends) Tx.sendFunds({ amount, recipient })(tx)
-            return Transaction.from(await tx.toJSON({ client: grpc })).build({ client: grpc })
-          })
-        const bytes = yield* dappBytes([[friend, ONE_SUI]])
-        const prepared = yield* Tx.prepare(yield* Tx.fromBytes(bytes), { sender: user.address })
-        const intent = Intent.fromSimulation(prepared.simulation, prepared.built, {
-          summary: "Send 1 SUI to a friend.",
-          author: "dapp"
-        })
-        const verified = yield* Tx.verify(prepared.built, intent)
-        // Same total, half of it to an address the intent never named.
-        const variant = yield* Tx.fromBytes(yield* dappBytes([[friend, ONE_SUI / 2n], [other, ONE_SUI / 2n]]))
-        const refused = yield* Effect.flip(Tx.verify(variant, intent))
-        const executed = yield* Tx.submit(yield* Tx.sign(verified, user))
-        return { bytes, intent, verified, refused, executed, received: yield* balanceOf(friend) }
-      }))
-      expect(gasPaymentOf(result.bytes)).toBe(0)
-      expect(result.intent.claims.recipients).toEqual([friend])
-      expect(result.intent.claims.outflows).toEqual([{ coinType: CoinType.SUI, max: ONE_SUI }])
-      expect(result.verified.verdict._tag).toBe("Unscreened")
-      expect(result.refused._tag).toBe("PolicyDenied")
-      expect((result.refused as PolicyDenied).rule).toBe("intent.recipient")
-      expect(result.executed.effects.status.success).toBe(true)
-      expect(result.received.addressBalance).toBe(ONE_SUI)
-    },
-    5 * MINUTE
-  )
-
-  test(
-    "7. the durable journal over the IndexedDB stand-in: settled across a fresh layer, and a crashed Signed entry reconciles to Executed",
-    async () => {
-      const idb = makeFakeIndexedDb()
+      // One store for every "process" below, as a file or database would be.
+      const store = Layer.succeed(
+        KeyValueStore.KeyValueStore,
+        Effect.runSync(Effect.provide(KeyValueStore.KeyValueStore, KeyValueStore.layerMemory))
+      )
       const journalOver = (onUnresolved: "fail" | "ignore" = "ignore") =>
-        layerKeyValueStore({ onUnresolved }).pipe(Layer.provide(layerIndexedDb({ indexedDB: idb.factory })))
+        layerKeyValueStore({ onUnresolved }).pipe(Layer.provide(store))
       const signer = fromKeypair(new Ed25519Keypair())
       const friend = stranger()
 
@@ -669,7 +491,7 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
 
       // Run 2: a fresh journal over the same store sees it settled; nothing is unresolved.
       const reopened = await node(Effect.gen(function*() {
-        return { entry: yield* Tx.recorded(first.digest), reconciled: yield* Tx.reconcileAll() }
+        return { entry: yield* (yield* Journal).get(first.digest), reconciled: yield* Tx.reconcileAll() }
       }), { journal: journalOver("fail") })
       expect(Option.isSome(reopened.entry) && reopened.entry.value._tag).toBe("Executed")
       expect(reopened.reconciled).toEqual([])
@@ -693,15 +515,16 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
       }), { journal: journalOver() })
 
       // A strict startup refuses the store while the entry is unresolved.
-      const strict = await node(Effect.flip(Tx.recorded(crashed.digest)), { journal: journalOver("fail") })
+      const strict = await node(Effect.flip(Effect.flatMap(Effect.service(Journal), (journal) => journal.get(crashed.digest))), { journal: journalOver("fail") })
         .then(() => "built", (error: unknown) => (error as { _tag?: string })._tag)
       expect(strict).toBe("JournalError")
 
       // Run 4: a fresh process reconciles it from the chain.
       const recovered = await node(Effect.gen(function*() {
-        const before = yield* Tx.recorded(crashed.digest)
+        const journal = yield* Journal
+        const before = yield* journal.get(crashed.digest)
         const reconciled = yield* Tx.reconcileAll()
-        return { before, reconciled, after: yield* Tx.recorded(crashed.digest) }
+        return { before, reconciled, after: yield* journal.get(crashed.digest) }
       }), { journal: journalOver() })
       expect(Option.isSome(recovered.before) && recovered.before.value._tag).toBe("Signed")
       expect(recovered.reconciled.map((each) => each._tag)).toEqual(["Executed"])
@@ -712,13 +535,12 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
       // And a strict startup now builds.
       const finally_ = await node(Tx.reconcileAll(), { journal: journalOver("fail") })
       expect(finally_).toEqual([])
-      console.log(`7: IndexedDB stand-in served ${JSON.stringify(idb.calls)}`)
     },
     5 * MINUTE
   )
 
   test(
-    "8. zkLogin session bound: maxEpoch = current epoch builds bytes the node simulates (window capped); below it is expired before building",
+    "5. zkLogin maxEpoch bound: maxEpoch = current epoch builds bytes the node simulates (window capped); below it is expired before building",
     async () => {
       const funder = fromKeypair(new Ed25519Keypair())
       const counts: Counts = { simulates: 0, executes: 0 }
@@ -729,8 +551,7 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
         const attempt = Effect.gen(function*() {
           attempts += 1
           const epoch = yield* currentEpoch
-          const session = zkSession(epoch, BigInt(Math.floor(Math.random() * 1e9)))
-          const signer = yield* Signer.zkLogin({ session, ephemeral: new Ed25519Keypair() })
+          const signer = yield* Signer.zkLogin(zkLoginOptions(epoch, BigInt(Math.floor(Math.random() * 1e9))))
           // The zkLogin address pays from an address balance it is sent.
           yield* Tx.run(Tx.sendFunds({ amount: ONE_SUI, recipient: signer.address }), { signer: funder })
           let captured: Signed | undefined
@@ -750,11 +571,8 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
         )
         const executesBefore = counts.executes
         const simulation = yield* (yield* Sui).simulate(capped.captured!.bytes)
-        // A session that ended before the current epoch.
-        const expiredSigner = yield* Signer.zkLogin({
-          session: zkSession(capped.epoch - 1n, 7n),
-          ephemeral: new Ed25519Keypair()
-        })
+        // A proof whose maxEpoch ended before the current epoch.
+        const expiredSigner = yield* Signer.zkLogin(zkLoginOptions(capped.epoch - 1n, 7n))
         const simulatesBefore = counts.simulates
         const expired = yield* Effect.flip(
           Tx.run(Tx.sendFunds({ amount: 1n, recipient: stranger() }), { signer: expiredSigner })
@@ -767,7 +585,7 @@ describe.skipIf(!LOCALNET)("the wallet core on localnet, with SUI_LOCALNET=1", (
           sent: counts.executes - executesBefore
         }
       }), { counts })
-      console.log(`8: capped at epoch ${result.epoch} after ${attempts} attempt(s)`)
+      console.log(`5: capped at epoch ${result.epoch} after ${attempts} attempt(s)`)
       expect(result.signer.scheme).toBe("ZkLogin")
       expect(result.stopped._tag).toBe("JournalError")
       const expiration = result.captured!.expiration

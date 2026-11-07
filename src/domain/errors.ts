@@ -388,21 +388,21 @@ export class NotApplied extends Schema.TaggedError<NotApplied>()("NotApplied", {
   }
 }
 
-/** A signer refused or failed to produce a signature. */
 /**
- * Why a signer refused, when it knows: `"expired"` (a session-bound credential —
- * a zkLogin proof — whose `maxEpoch` has passed or would pass before the bytes
- * could land), `"locked"` (the secret was dropped by `lock` / `dispose` and must
- * be unlocked again), `"rejected"` (the person, or the wallet acting for them,
- * declined), `"unavailable"` (the device, wallet or remote signer could not be
- * reached). Absent for every other failure. A program branches on this, never
+ * Why a signer refused, when it knows: `"expired"` (a `maxEpoch`-bound
+ * credential — a zkLogin proof — whose `maxEpoch` has passed or would pass
+ * before the bytes could land), `"rejected"` (the person, or the device or
+ * remote signer acting for them, declined), `"unavailable"` (the device or
+ * remote signer could not be reached, or the signer cannot sign this kind of
+ * thing). Absent for every other failure. A program branches on this, never
  * on `cause`.
  *
  * @since 0.5.0
  */
-export const SigningFailureReason = Schema.Literals(["expired", "locked", "rejected", "unavailable"])
+export const SigningFailureReason = Schema.Literals(["expired", "rejected", "unavailable"])
 export type SigningFailureReason = typeof SigningFailureReason.Type
 
+/** A signer refused or failed to produce a signature. */
 export class SigningError extends Schema.TaggedError<SigningError>()("SigningError", {
   cause: Schema.Defect(),
   /** Why the signer refused, when it knows; see {@link SigningFailureReason}. @since 0.5.0 */
@@ -479,30 +479,6 @@ export class GraphQLUnavailable extends Schema.TaggedError<GraphQLUnavailable>()
   }
 }
 
-/**
- * A synchronous member of a Promise-faced extension was called before its
- * runtime existed.
- *
- * `SuiExtension.fromService` builds its `ManagedRuntime` on first use, so until
- * something has been awaited there is no service object and no synchronous
- * member to read. Rather than hand back a Promise where the type says a value,
- * the face throws this. Two cures, both in the extension's own hands:
- * `await client.<name>.$ready()` once after registering, or register with
- * `warm`, which builds the runtime inside `register` and makes every member
- * real immediately.
- *
- * Outcome `not_applied`: nothing was sent.
- */
-export class ExtensionNotReady extends Schema.TaggedError<ExtensionNotReady>()(
-  "ExtensionNotReady",
-  { extension: Schema.String, member: Schema.String }
-) {
-  /** The one actionable line `SuiError.describe` produces for this error. */
-  override get message(): string {
-    return describe(this)
-  }
-}
-
 /** Every failure sui-effect can produce. */
 export type SuiError =
   | TransportError
@@ -522,7 +498,6 @@ export type SuiError =
   | JournalError
   | UnexpectedEffects
   | GraphQLUnavailable
-  | ExtensionNotReady
 
 /** The schema of the whole taxonomy, used for serialization. */
 export const SuiErrorSchema = Schema.Union([
@@ -542,8 +517,7 @@ export const SuiErrorSchema = Schema.Union([
   PolicyDenied,
   JournalError,
   UnexpectedEffects,
-  GraphQLUnavailable,
-  ExtensionNotReady
+  GraphQLUnavailable
 ])
 
 /**
@@ -577,8 +551,8 @@ export type Outcome = "applied" | "not_applied" | "unknown"
 export type OutcomePhase = "pre-submit" | "post-submit"
 
 /**
- * An extension error may declare its own `outcome`, and `SuiError.outcome` and
- * `Script.run` honour it before anything else.
+ * An application error may declare its own `outcome`, and `SuiError.outcome`
+ * honours it before anything else.
  *
  * An error that declares none and carries a tag the taxonomy does not own is
  * `"unknown"`, not `"not_applied"`: a tag this library has never heard of says
@@ -649,8 +623,7 @@ const TAXONOMY_TAGS: ReadonlySet<string> = new Set(
  * owns gets the taxonomy's answer, and **anything else is `"unknown"`**: a tag
  * this library has never heard of says nothing about whether a transaction
  * applied, and answering `"not_applied"` for it would tell a retry idiom to
- * send again on no evidence at all. `Script.exitCode` agrees by exiting 1 for
- * an unclassified error rather than 3.
+ * send again on no evidence at all.
  *
  * **`{ phase: "pre-submit" }` changes that last answer, and only that one.**
  * A failure caught while building, simulating or signing cannot have applied,
@@ -1080,8 +1053,6 @@ const describeTaxonomy = (error: SuiError): string => {
       return `UnexpectedEffects ${error.digest} expected ${error.expected} but found ${error.found.length}`
     case "GraphQLUnavailable":
       return `GraphQLUnavailable ${error.method}: ${error.reason}`
-    case "ExtensionNotReady":
-      return `ExtensionNotReady ${error.extension}.${error.member} was called before the runtime existed: await client.${error.extension}.$ready() first, or register with warm`
   }
 }
 
@@ -1129,9 +1100,9 @@ const withOutcome = (
 /**
  * The human sentence, in the same key for every error.
  *
- * Fifteen of the eighteen taxonomy classes carry `message` as an
+ * Most taxonomy classes carry `message` as an
  * `override get message()` rather than as a schema field, and a getter stays
- * out of the encoding — so a JSON log line had a sentence for three tags and
+ * out of the encoding — so a JSON log line had a sentence for a few tags and
  * none for the rest, and an operator had to special-case them. This adds it
  * when the encoding did not produce one. Additive: a decoder ignores the
  * excess key, so every round trip still holds. Never fails.
@@ -1159,11 +1130,11 @@ const withMessage = (
  * **`outcome` is always there when the error declares one**, including the
  * usual case where it is a class field rather than a schema field: it is read
  * off the instance and added to the encoded object. That is the field a
- * wrapper script acts on, and losing it in the log while `Script.exitCode` saw
- * it was the one inconsistency in the serialization.
+ * wrapper script acts on, and losing it in the log was the one inconsistency
+ * in the serialization.
  *
- * **`message` is always there too**, for the same reason: fifteen of the
- * eighteen taxonomy classes carry it as a getter, which stays out of the
+ * **`message` is always there too**, for the same reason: most taxonomy
+ * classes carry it as a getter, which stays out of the
  * encoding, so a log line had a sentence for three tags and nothing for the
  * rest. A taxonomy error gets {@link describe}; an extension error gets its own
  * `.message` when it is a non-empty string. Added only when the encoding

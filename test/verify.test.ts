@@ -179,10 +179,21 @@ describe("Verify through the client: zkLogin", () => {
         }
       }
     } as unknown as ClientWithCoreApi
-    return Sui.layerNoDepsPinned("stub-chain").pipe(Layer.provide(SuiCore.layerFromClient(client)))
+    // The stub answers no chain identifier, so the layer is given one.
+    const core = Layer.effect(
+      SuiCore,
+      Effect.gen(function*() {
+                const core = yield* SuiCore
+                return {
+        ...core,
+        getChainIdentifier: () => Effect.succeed({ chainIdentifier: "stub-chain" })
+                }
+      })
+    ).pipe(Layer.provide(SuiCore.layerFromClient(client)))
+    return Sui.layerNoDeps.pipe(Layer.provide(core))
   }
 
-  const runOn = <A, E>(layer: Layer.Layer<Sui>, effect: Effect.Effect<A, E, Sui>) =>
+  const runOn = <A, E, LE>(layer: Layer.Layer<Sui, LE>, effect: Effect.Effect<A, E, Sui>) =>
     Effect.runPromise(Effect.provide(effect, layer))
 
   test("the node's yes is a public key, and the request carried the Effect's signal", async () => {
