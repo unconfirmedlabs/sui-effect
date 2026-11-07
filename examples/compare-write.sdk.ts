@@ -36,8 +36,7 @@ const KEYPAIR_FOR: Record<string, undefined | ((secretKey: Uint8Array) => Keypai
  * Reads the escrow, claims it, and returns the created receipt's object id.
  *
  * Builds, signs and executes as three explicit steps rather than the
- * one-call `signAndExecuteTransaction`, so this can run against an in-memory
- * client with no live network or signer behind it.
+ * one-call `signAndExecuteTransaction`, so each step is visible.
  */
 export const claimEscrow = async (
   client: ClientWithCoreApi,

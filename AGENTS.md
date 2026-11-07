@@ -44,8 +44,8 @@ extensions); do not add any of it back.
 - No `any`. No `unknown` in an error channel. No `console.log` in `src/`. The
   one `console.warn` is `SuiCore.mapSdkError`'s duplicate-SDK warning, which
   fires at most once per process and is documented where it lives. **Nothing in
-  `src/` writes to stderr otherwise on its own** — `test/release-0-1-2.test.ts`
-  captures it around a full `Tx.run` on the fake and asserts it is empty.
+  `src/` writes to stderr otherwise on its own** — `test/observability.test.ts`
+  captures stdout and stderr around a full `Tx.run` and asserts they are empty.
   Library log lines go through the Effect logger in force, whose default writes
   to **stdout** (`console.log`), so a CLI whose stdout is machine output
   installs a logger of its own. A successful run logs nothing at the default level `Info`:
@@ -67,8 +67,8 @@ extensions); do not add any of it back.
 - **One Move type rule.** `typeMatches(expected, actual)` (`src/domain/bcs.ts`)
   is the only comparison: a bare expected tag matches every instantiation of the
   generic, a parameterized one is compared in full after normalization. The
-  bridge, `expectedType`, `SuiSchema.decode`'s `actualType` and the fake's
-  owned-object filter all go through it, and so must anything new.
+  bridge, `expectedType`, `SuiSchema.decode`'s `actualType` and the scripted
+  `SuiCore`'s owned-object filter all go through it, and so must anything new.
 - **A `TransportError` for your own transport** comes from
   `TransportError.fromUnknown(method, cause, retryable?)`, never from
   hand-building the three fields.
@@ -105,13 +105,13 @@ extensions); do not add any of it back.
 - Every SDK call forwards the Effect's `AbortSignal` into the SDK's `signal`
   option, so `Effect.timeout` and interruption cancel the request.
 - Tests run on `bun test` with `effect/testing` (`TestClock`, `TestSchema`).
-  Tests provide their own layers and never touch the network, with one gated
-  exception: `test/live.devnet.test.ts` runs against devnet behind `SUI_LIVE=1`
-  and is the only proof that a default-built transaction is accepted by a real
-  validator. Localnet tests sit behind `SUI_LOCALNET=1` (`SUI_LOCALNET_URL`,
-  `SUI_LOCALNET_FAUCET` override the endpoints). A test that runs
-  `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default
-  journal is process-wide.
+  Unit tests provide their own layers and never touch the network; the live
+  suites do, gated: `test/live.localnet*.test.ts` behind `SUI_LOCALNET=1`
+  (`SUI_LOCALNET_URL`, `SUI_LOCALNET_FAUCET` override the endpoints) and
+  `test/live.devnet.test.ts` behind `SUI_LIVE=1`. A test that runs
+  `Tx.submit` or `Tx.run` provides `Journal.layerMemory` (or runs through
+  `SuiTest.provide`), because the default journal is process-wide. See
+  "Testing" below.
 - Done means `bun run check` (typecheck, build, tests) is green. `LLMS.md` is generated — `bun run build &&
   bun run llms` after any public signature, JSDoc or example change, because the
   generator reads the emitted `.d.ts` in `dist/`, and a test fails if it is
@@ -119,8 +119,10 @@ extensions); do not add any of it back.
   failing, so a bare `bun test` does not prove `LLMS.md` current; `bun run
   check` builds first. Its head is `docs/llms-head.md`, whose
   `<!-- recipe: path -->` lines quote `examples/recipes/*.ts` and
-  `test/recipes/fake.test.ts` verbatim (relative `src/` imports rewritten to the
-  package subpaths); `test/recipes.test.ts` runs those recipes on the fake.
+  `test/recipes/scripted.test.ts` verbatim (relative `src/` imports rewritten to
+  the package subpaths); `test/recipes.test.ts` runs the recipes about decoding,
+  mapping and failure handling over scripted answers, and
+  `test/live.localnet-recipes.test.ts` the ones about what a validator does.
 
 ## The two read tiers
 
@@ -154,7 +156,7 @@ and nothing else.
 | `Tx.build/sign/cosign/fromBytes/attach/sponsored/gaslessStablecoinTransfer/sendFunds/planFold/fold/foldCoins/verifySponsored/submit/submitVia/reconcile/resubmit/run/reconcileAll/withSenderLock` | The lifecycle and canonical recipe helpers as functions, each Effect with a closed error union, all `R = Sui`. `Tx.build` always simulates before anything is signed: when the SDK's resolver will not, it runs one explicit simulate. `gaslessStablecoinTransfer` is the SDK's `tx.balance()` → `balance::send_funds` recipe and leaves eligibility and zero-gas selection to gRPC/GraphQL resolution; `{ requireZeroGas: true }` fails the build unless the resolved price and budget are 0. `fromBytes(bytes)` is a `Built` from bytes somebody else built (chain and expiration read off them; other-chain bytes refused) and `attach(builtOrSigned, signature)` adds a verified signature by the sender or the gas owner (or an alias of either: `PolicyDenied { rule: "alias.signer" }` otherwise) — with `cosign` and `submit`, the stateless sponsor. `verifySponsored(built, { sender, gasOwner?, transactionKind? })` (also flat on `/tx`) is the sender's check on sponsored bytes (`PolicyDenied`, rules `sponsored.*`). `submitVia` is `submit` for a submission somebody else makes; `resubmit(signedOrUnknown)` re-sends identical bytes, and `reconcileAll({ resubmit: true })` does it for every entry still unknown; `Journal.get(digest)` reads one entry (0.6.0 removed `Tx.recorded`). `Tx.run` takes `onSigned` (between the last signature and the first send) and `approve(prepared)` (after `preflight`, before the first signature, under the lock exactly when signing is; refusing is the caller's `E`, nothing signed or journalled); `Prepared` is `{ built, simulation }` and there is no public `Tx.prepare`. **Gas comes from the payer's SUI address balance by default** (span attribute `sui.gas_payment`). `sendFunds({ coinType?, amount, recipient })` is a `FundsWithdrawal` → `balance::redeem_funds` → `balance::send_funds`, **address balances only**; `planFold`/`fold`/`foldCoins({ signer, plan?, approve? })` move coins into the balance, SUI paying for its own fold. `withSenderLock(address)(effect)` is the sender lock `Tx.run` takes (0.6.0; was `Sui.withSenderLock`): one reference-counted semaphore per normalized address per `SuiCore`. `Signer.maxEpoch` (and the sponsor's) caps the default window via `Tx.build`'s `maxEpoch`; a passed one is `SigningError { reason: "expired" }` before anything resolves. |
 | `Built` / `Simulation` / `Executed` | `Built.gas { budget, price, owner, payment, source }` is read from the bytes by `build` and `fromBytes` and is required; `Built.simulation` exists only when `Tx.build` simulated exactly the returned bytes (never on gRPC), and is reused only when `Tx.build` made it in this process for the digest of these bytes. Neither reaches `Signed`. `Simulation` is a `Schema.Class` sharing **one** accessor implementation with `Executed` (`created`, `createdWhere`, `mutated`, `deleted`, `wrapped`, `transferred`, `packagesPublished`, `balanceChange`, `gasUsedTotal`, `expect*`, `eventsOf`), all skipping `AccumulatorWriteV1`; `Executed.sender` is filled from the bytes. DESIGN §4, §6. |
 | `Verify` | `Verify.verifyTransactionSignature(bytes, signature, opts?)` and `Verify.verifyPersonalMessageSignature(message, signature, opts?)`: the Effect face of `@mysten/sui/verify`, `R = Sui`. They answer the signer's public key; with `{ address }` the signature must also be that address's. An invalid signature is `SigningError`; a check that could not reach the node is `TransportError`, never a verdict. `{ address, checkAddressAliases: true }` (transactions only) is a validator's sender check: always one read of the `AddressAliases` object, else `PolicyDenied { rule: "alias.signer" }`. |
-| Address aliases (0.6.0) | `AddressAlias` on `/tx` (`src/services/AddressAlias.ts`; the pure half — `aliasesId`, the BCS, `AddressAliases`, `allows` — is `src/domain/address-alias.ts`, which the fake imports): `aliasesId(address)`, `getAliases(address)` → `AddressAliases` (`NotEnabled` / `Enabled { id, version, aliases }`), `requireSigner(address, signer)`, and the recipes `enable`, `add`, `remove`, `replaceAll`. Always the **object**, never transaction history. `Signer.alias(A, signer)` signs **as** A; everything keyed on the sender — build, sender lock, in-flight registry, `Built.sender`, the journal's `signed.sender` — is A's. `Tx.run` reads the set once per alias signer (or alias sponsor) before the build; a plain signer costs no read. `Tx.sign`/`cosign` stay offline. `Signer.multisig(publicKey, signers)` combines **in member order** (the SDK keeps the order it is given and validators pair the n-th signature with the n-th bitmap bit). DESIGN §14. |
+| Address aliases (0.6.0) | `AddressAlias` on `/tx` (`src/services/AddressAlias.ts`; the pure half — `aliasesId`, the BCS, `AddressAliases`, `allows` — is `src/domain/address-alias.ts`): `aliasesId(address)`, `getAliases(address)` → `AddressAliases` (`NotEnabled` / `Enabled { id, version, aliases }`), `requireSigner(address, signer)`, and the recipes `enable`, `add`, `remove`, `replaceAll`. Always the **object**, never transaction history. `Signer.alias(A, signer)` signs **as** A; everything keyed on the sender — build, sender lock, in-flight registry, `Built.sender`, the journal's `signed.sender` — is A's. `Tx.run` reads the set once per alias signer (or alias sponsor) before the build; a plain signer costs no read. `Tx.sign`/`cosign` stay offline. `Signer.multisig(publicKey, signers)` combines **in member order** (the SDK keeps the order it is given and validators pair the n-th signature with the n-th bitmap bit). DESIGN §14. |
 | `SubmitConfig` | A `Context.Reference`: expiration policy, the optional `validFor`, the gas-budget ceiling (`maxGasBudget`), `preflight`, the sender lock (`lockSender`: `"whenPinned"` default, `"always"`, `"never"`), `gasPayment` (`"preferAddressBalance"` default, `"requireAddressBalance"`), the resubmit schedule, attempts, timeout and expiry margin, `expiryEvidence`, `reconcileRecheck`, `awaitVisibility`, `visibilityTimeout` and `nonce`. **`SubmitConfig.with` merges over the config in force**; `SubmitConfig.layer` spreads over the defaults. Overrides take `Duration.Input`. |
 | `Journal` | A `Context.Reference` with an in-memory default (`put`, `get`, `listUnresolved`). `@unconfirmed/sui-effect/journal` swaps in a durable one over any `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore` and `pruneSettled(before, { prefix? })` are **module functions**, not statics on `Journal`. One key per entry, listed through `KeyValueStore.keys`; a terminal entry carries a `settled:<digest>` marker so a listing reads only unmarked entries. The marker's write order is the invariant (DESIGN §8). `Tx.reconcileAll()` is the explicit startup call. |
 | `SuiGraphQL` | A bare tag over the SDK's `SuiGraphQLClient` (`layer`, `layerConfig`, `layerUnavailable`). sui-effect wraps no GraphQL API. `SuiGraphQL.query(run, method?)` hands `run` the Effect's `AbortSignal`. |
@@ -205,121 +207,42 @@ schema field.
 
 ## Testing
 
-`@unconfirmed/sui-effect/testing` ships `SuiCoreFake.layer(script)`, `layerTest(script)`
-(the real `Sui` over the fake `SuiCore`; a service built on `Sui` composes
-`MyService.layer.pipe(Layer.provideMerge(layerTest(script)))`) and `SuiTest` (`putObject`, `bumpVersion`,
-`recordTransaction`, `deleteObject`, `setClock`, `setEpoch`, `scriptExecute`,
-`scriptSimulate`, `scriptGetObject`, `scriptGetTransaction`, `setVisibilityDelay`, `calls`,
-and `provide(layer)`, which provides a layer with a fresh `Journal.layerMemory`
-and `TestClock`, all `{ local: true }`), which is the whole harness. `layerTest` puts `testSubmitConfig` in force — a
-resubmit schedule with no delay — so a re-send test does not sleep on the real
-clock; a `SubmitConfig.with` inside the test wins. Fixtures: `fakeDigest(n)` is
-a branded `Digest`, `fakeCoin({ objectId, owner, balance, … })` a coin with no
-cast, and a `FakeEvent`'s `json` is optional. Call recording is reached through `SuiTest.calls`,
-not off the fake handle. The fake serves in-memory objects with
-BCS content, the Clock object `0x6`, and scripted outcomes
-(`FakeOutcome.succeed`, `failWith` — which takes the SDK's wire `ExecutionError`
-**or** sui-effect's decoded `ExecutionReason`, encoding the second and throwing
-on anything else — `transportError`, `notFound`, `timeoutThen`)
-(`transportError(status, message?)` carries the node's message) for simulate, execute, `getObject` (read-failure injection), `getTransaction` —
-which is also what drives every
-`waitForTransaction` outcome (an executed transaction is visible at once unless
-`FakeScript.visibilityDelay`, in `TestClock` milliseconds or `"never"`, holds
-the wait) — `coinMetadata`, and the resolver's budget simulation
-(`buildSimulate`, which is how a test makes `Tx.build` fail with
-`SimulationFailed`, and which since 0.5.0 also answers a later simulate when
-`simulate` is not scripted; with neither, that simulate dies naming
-`SuiTest.scriptSimulate`). A scripted `FakeScript.ledger` (`{}` is enough) also
-serves the gRPC ledger's `affectedAddress` listing from the fake's history.
-`TestServices` names what `layerTest` provides. Two journal layers share one
-memory store when the store is built once and handed over as a value
-(`Layer.succeed(KeyValueStore.KeyValueStore, store)`; the tag is itself the
-Effect — it has no `.asEffect()`). It records every call so a test can
-assert the include set that was sent, and serves an object's `json` and
-`display` (`FakeObject.json` / `.display`, `null` when unset) only when the
-include set asks for them (0.5.0), and a transaction's `bcs` include as the
-bytes it executed (or, for one scripted by digest with a `sender`, a minimal
-transaction naming it), which is how `Executed.sender` is read on the fake;
-`FakeChange.inputOwner` scripts an input's owner for `transferred()`. It also implements
-`resolveTransactionPlugin` and `listCoins`, so `transaction.build({ client })`
-against the fake's `client` resolves gas and object inputs from the script with
-no network, and it keys transactions by
-`TransactionDataBuilder.getDigestFromBytes` of the bytes it was handed — **an
-execute outcome scripted with any other digest stops the test with a defect**,
-because no node answers one transaction with another's digest. Any
-method the script does not cover dies with a message naming it: a test never
-silently passes against a stub. Its `client` implements `$extend`, so an SDK client
-extension runs on it as on a real client; `listOwnedObjects`
-filters through `typeMatches` rather than string equality, and `getDynamicField`
-matches an entry on **both** `name.type` (under `typeMatches`) and `name.bcs` — an entry scripted
-without `bcs` still matches any key of its type, so two same-typed keys on one
-parent can be told apart and a test can prove which key bytes a lookup used.
-`FakeScript.transactions` (and `SuiTest.recordTransaction`) answers
-`getTransaction` **by digest**, before the ordered script, which is what a
-`NotApplied { inputConsumed }` test needs: the rule reads
-`changedObjects[].inputVersion` off the consuming transaction, and
-`FakeChange.inputVersion` is how a test says which version that was.
-`listTransactions` and `listEvents` page through the fake's **ledger** — the
-transactions scripted by digest, then each one recorded or executed as it
-lands — filtering on the sender and Move calls read off the bytes (or
-`FakeExecution.sender` / `moveCalls` for one scripted by digest);
-`FakeScript.scanLimit` bounds how many ledger items one request examines, so a
-test can prove a consumer paginates on `hasNextPage` rather than the item
-count. `getDynamicObjectField` serves a `$kind: "DynamicObject"` entry's
-child from the object map, and `FakeScript.names` answers
-`resolveNameServiceAddress` and `defaultNameServiceName`.
-`FakeScript.ledger { lowestAvailableCheckpoint?, firstCheckpoints? }` serves
-the client's `ledgerService` (`GetServiceInfo`, `GetEpoch`) for reconcile's
-pruning guard; unscripted, the client has none, like a JSON-RPC transport. A
-read the fake never answers (a `timeoutThen` on a read) ends in `SuiCore`'s
-30 s per-attempt `requestTimeout` — a retryable `DEADLINE_EXCEEDED`, then the
-read retries — once a test advances `TestClock` past it; a test that means
-"hangs until interrupted" interrupts sooner. `FakeScript.readOptions`
-(`SuiCoreReadOptions`: `requestTimeout`, `readRetry`) builds the fake's
-`SuiCore` the way a layer's options would, so a custom read policy — and
-`Tx.build`'s resolver retry under it — is testable on the fake. A scripted
-`commandResults` entry may give either array; the missing one defaults to `[]`
-rather than failing a `Simulation` decode.
+Three kinds of test (DESIGN §13), and nothing that pretends to be a chain:
 
-**The fake models address alias sets** (0.6.0): `FakeScript.addressAliases`,
-`SuiTest.setAddressAliases(address, aliases | undefined)` and
-`SuiTest.addressAliases(address)` over an `AddressAliases` object at the derived
-id; `0xa` is served as the shared `AddressAliasState`; a successful execution
-follows `0x2::address_alias::enable`/`add`/`remove`/`replace_all` (no Move
-aborts); and the signature check resolves aliases for the sender and gas owner —
-a required address with a set is covered only by a member, a multisig signature
-counts as its multisig's address (zkLogin still stands the address check down).
-No signature is verified cryptographically: member order is proved by `Verify`
-locally and by `test/live.localnet-alias.test.ts` on a validator.
+- **Chain semantics only against a localnet.** What a transaction does, and
+  what a validator accepts or refuses, is tested in `test/live.localnet*.test.ts`
+  behind `SUI_LOCALNET=1` (and the devnet proof behind `SUI_LIVE=1`). Do not
+  write code — in `src/` or in a test — that simulates Move execution, address
+  balances, alias resolution or a validator's signature check. A behaviour that
+  needs a chain to be true gets a live test.
+- **Failure handling with per-test stubs.** Timeouts, transport errors,
+  refusals, `SubmissionUnknown`, identical-bytes resubmit, reconcile's
+  evidence, the sender lock and the journal are tested by replacing the one
+  `SuiCore` method the path reads with a scripted answer or fault
+  (`test/support.ts`: `layer(script, stubs)`, `run`, `fail`, `sequence`,
+  `bytes` for fully resolved bytes built offline). A stub is a few lines in the
+  test that uses it; there is no shared, stateful fake, and a stub never
+  decides what a node "would" do with a transaction.
+- **Pure code directly**, table-driven where cases repeat.
 
-The fake enforces the invariants the lifecycle depends on: a known digest
-executes idempotently, gas selection excludes object inputs, the coin set
-evolves (deleted, mutated with `FakeChange.balance`, gas-bumped, created), a
-submission whose signatures do not cover the addresses the bytes name — by count
-**and** by the addresses recovered from the signatures — is refused the way a
-validator refuses it (an `RpcError` carrying `INVALID_ARGUMENT`, so `Tx.submit`
-fails fast instead of reconciling into a scripted success), and a
-version history is served through `tryGetPastObject`, which is what
-`SuiCore.getObjectAtVersion` reads. The resolver mirrors the SDK's core
-resolver: its budget simulate runs only when the budget is unset, is recorded
-as a `simulateTransaction` call (`resolver: true`) and answered by
-`FakeScript.buildSimulate` when there is one and by the ordered `simulate`
-script otherwise, so "building always simulates" is observable on the harness.
-`getBalance` and `listBalances` are keyed by owner and coin type; a `FakeBalance`
-with no `owner` answers for everyone, and an unscripted owner gets zero — so a
-sponsored (empty-payment) build on the fake needs a balance whose
-`addressBalance` covers the budget, or `Tx.build` fails with `BuildError`.
-**The fake models address balances** (since 0.4.0): one per owner and coin type,
-seeded from `FakeScript.balances[].addressBalance`, set with
-`SuiTest.setAddressBalance(owner, amount, coinType?)`, read with
-`SuiTest.addressBalance(owner, coinType?)`. Its resolver mirrors the SDK's
-`setGasPayment`: `[]` when `tx.gas` is unused and the payer's SUI balance covers
-budget plus withdrawals (so an owner-less `addressBalance` seed beside coins
-means balance gas; script `addressBalance: "0"` for the payer to keep coin gas),
-a coin-reservation ref ahead of the coins for a `tx.gas` user with a balance,
-coins otherwise, and with neither it throws the SDK's "No valid gas coins found
-for the transaction." (`BuildError`). Executions charge net gas to the balance,
-debit `FundsWithdrawal`s, follow `coin::send_funds`/`balance::send_funds`
-deposits and delete consumed coins; like a node it refuses (`INVALID_ARGUMENT`)
-an empty payment or withdrawal the balance cannot cover and empty-payment bytes
-with no owned input and no `ValidDuring` expiration.
+One clear test per public behaviour and per documented failure path. No tests
+of private internals, of documentation text (the `LLMS.md` staleness test is
+the one exception), or of the test harness's own modelling.
+
+`@unconfirmed/sui-effect/testing` ships `ScriptedSuiCore.layer(script)` — an
+SDK `CoreClient` under the production `SuiCore`, answering from a `FakeScript`:
+objects with exact type and BCS (`listOwnedObjects` filters under
+`typeMatches`), the `Coin<T>` objects among them as coins, dynamic fields
+matched on the key's type and bytes (`dynamicFields`, `dynamicFieldValues`),
+address balances (`addressBalances`), the clock `0x6`, a fixed chain id, epoch
+and gas price, and — only when scripted — the next `execute` / `simulate`
+answers in order (`FakeOutcome.succeed`, `failWith`, `transportError`, `hang`;
+the last repeats), each stamped with the digest of the bytes it was handed.
+It never executes, applies or validates a transaction; every unscripted
+method dies naming itself. Builds run the SDK's own core resolver over its
+reads. `layerTest(script)` is the real `Sui` over it with `testSubmitConfig`
+(re-sends without delay) in force; `SuiTest` is `putObject`, `setClock`,
+`setAddressBalance`, `scriptExecute`, `scriptSimulate`, `calls` and
+`provide(layer)` (a fresh `Journal.layerMemory` and `TestClock`, built
+locally). `TestServices`, `fakeDigest`, `fakeCoin` and `transactionResultOf`
+complete it. Miso's SDK tests run on these names; keep them stable.

@@ -15,7 +15,8 @@ sui-effect adds what a program around it needs:
 - decoded, type-checked reads;
 - a crash-safe transaction lifecycle: simulate before signing, journal before
   sending, re-send identical bytes, reconcile against objects;
-- an in-memory fake chain, so every test runs with no network.
+- a scripted `SuiCore` for tests: reads answered from plain values, never a
+  simulated chain; what a validator does is proved on a localnet.
 
 Every public name mirrors the SDK name it wraps, so an agent or a person who
 knows `@mysten/sui` can guess this package.
@@ -68,8 +69,7 @@ export const program = Effect.gen(function*() {
 // BunRuntime.runMain(program.pipe(Effect.provide(Sui.layerConfig)))
 ```
 
-That is the program in `examples/compare-write.effect.ts`; a test runs it
-against the fake and asserts this README quotes it. Every failure it can
+That is the program in `examples/compare-write.effect.ts`. Every failure it can
 produce — the reads, the build, the signer, the submission, the config — is in
 the generator's inferred error type, with no handling lines anywhere.
 
@@ -86,7 +86,7 @@ the generator's inferred error type, with no handling lines anywhere.
 | [The journal](#the-journal) | `@unconfirmed/sui-effect/tx`, `/journal` | The record of signed bytes; in memory by default, durable over a `KeyValueStore` |
 | [Errors](#errors) | `@unconfirmed/sui-effect` | One flat tagged error per failure, and `SuiError.outcome` |
 | [Metrics and tracing](#metrics-and-tracing) | — | The span attributes and the `sui_effect_*` metrics |
-| [Testing](#testing) | `@unconfirmed/sui-effect/testing` | The real `Sui` over an in-memory fake chain |
+| [Testing](#testing) | `@unconfirmed/sui-effect/testing` | The real `Sui` over a scripted `SuiCore` |
 
 [Side by side](#side-by-side), at the end, is one read and one write against
 the plain SDK and against this package.
@@ -598,14 +598,19 @@ attribute value comes from a closed set — never a digest, address or coin type
 
 ## Testing
 
-`@unconfirmed/sui-effect/testing` ships `SuiCoreFake`, an in-memory chain, and
-`layerTest(script)`, the real `Sui` over it, so a test exercises the
-production tier with no network. `SuiTest` drives the fake's state and reads
-back what it was sent; `SuiTest.provide(layer)` adds a fresh
-`Journal.layerMemory` and `TestClock`, built locally.
+`@unconfirmed/sui-effect/testing` ships `ScriptedSuiCore`, a `SuiCore` that
+answers from a script of plain values, and `layerTest(script)`, the real `Sui`
+over it. It serves objects with their exact type and BCS bytes, dynamic
+fields, address balances and the Clock object `0x6`, and — only when a test
+scripts them — the next `executeTransaction` / `simulateTransaction` answers
+in order (`FakeOutcome.succeed`, `failWith`, `transportError`, `hang`). It
+never executes, applies or validates a transaction: an execute answer is
+whatever the script says, stamped with the digest of the bytes it was handed,
+and it changes no object and no balance. Anything unscripted dies naming the
+method.
 
 ```ts
-// A test on the in-memory fake: the real `Sui` over a scripted `SuiCore`, no network.
+// A test over the scripted SuiCore: the real `Sui`, objects served from a script, no network.
 import { expect, test } from "bun:test"
 import { bcs } from "@mysten/sui/bcs"
 import { Effect, Option } from "effect"
@@ -616,7 +621,7 @@ const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
 const CounterBcs = bcs.struct("Counter", { id: bcs.Address, value: bcs.u64() })
 const Counter = SuiSchema.bcs(CounterBcs, `${PKG}::counter::Counter`)
 
-test("a counter the fake serves decodes, and a missing one is None", async () => {
+test("a counter the script serves decodes, and a missing one is None", async () => {
   const id = ObjectId.normalize("0xc0")
   const content = CounterBcs.serialize({ id, value: 7n }).toBytes()
   const [found, missing] = await Effect.gen(function*() {
@@ -629,14 +634,17 @@ test("a counter the fake serves decodes, and a missing one is None", async () =>
 })
 ```
 
-The fake models objects, coins, dynamic fields, the clock, the epoch,
-**address balances** (`SuiTest.setAddressBalance`, executions charge gas,
-debit withdrawals and follow deposits), **address alias sets**
-(`FakeScript.addressAliases`, `SuiTest.setAddressAliases`; its signature check
-resolves aliases the way a validator does) and the ledger reads. It runs no
-Move and verifies no signature cryptographically; the localnet suites
-(`SUI_LOCALNET=1`) cover what only a validator can. A service built on `Sui`
-tests over `MyService.layer.pipe(Layer.provideMerge(layerTest(script)))`.
+`SuiTest` drives it from inside an Effect (`putObject`, `setClock`,
+`setAddressBalance`, `scriptExecute`, `scriptSimulate`, `calls`), and
+`SuiTest.provide(layer)` adds a fresh `Journal.layerMemory` and `TestClock`,
+built locally. A service built on `Sui` tests over
+`MyService.layer.pipe(Layer.provideMerge(layerTest(script)))`; a failure path
+is tested by replacing the one `SuiCore` method it reads with a stub that
+answers or fails, `{ ...core, getTransaction: () => Effect.fail(…) }`.
+
+What a transaction does on chain, and what a validator accepts, is not
+something a script can show: this repository proves it against a localnet
+(`test/live.localnet*.test.ts`, behind `SUI_LOCALNET=1`).
 
 ## Versions
 
@@ -777,7 +785,7 @@ const Escrow = SuiSchema.bcs(
 const Note = SuiSchema.bcs(bcs.u64())
 const NOTE_NAME = { type: "u64", bcs: bcs.u64().serialize(0).toBytes() }
 
-/** The program itself, exported so a test can run it against the fake. */
+/** The program itself, exported so a test can run it over scripted answers. */
 export const program = Effect.gen(function*() {
   const sui = yield* Sui
   const id = yield* Config.schema(ObjectId, "ESCROW_ID")
@@ -844,8 +852,7 @@ const KEYPAIR_FOR: Record<string, undefined | ((secretKey: Uint8Array) => Keypai
  * Reads the escrow, claims it, and returns the created receipt's object id.
  *
  * Builds, signs and executes as three explicit steps rather than the
- * one-call `signAndExecuteTransaction`, so this can run against an in-memory
- * client with no live network or signer behind it.
+ * one-call `signAndExecuteTransaction`, so each step is visible.
  */
 export const claimEscrow = async (
   client: ClientWithCoreApi,
@@ -938,7 +945,7 @@ const Escrow = SuiSchema.bcs(
 )
 
 /**
- * The program itself, exported so a test can run it against the fake. Every
+ * The program itself. Every
  * failure it can produce is in the generator's inferred error type, with no
  * handling lines anywhere in this file: `ObjectNotFound`, `ObjectDeleted`,
  * `ObjectUnavailable`, `DecodeError`, `TransportError`, `BuildError`,

@@ -11,7 +11,16 @@ it safer to use and takes advantage of Effect for reliability, convenience and
 a better developer experience. 0.5.0 had grown a wallet core around that
 wrapper; 0.6.0 removes it (it moves to the miso wallet's own codebase) and
 keeps `SuiCore`, `Sui`, the domain layer, the `Tx` lifecycle, signers, the
-journal, `SubmitConfig`, `SuiGraphQL`, the metrics and the fake chain.
+journal, `SubmitConfig`, `SuiGraphQL` and the metrics.
+
+It also stops simulating a chain in tests. `SuiCoreFake` — 3.2k lines that
+applied scripted effects, moved address balances, followed alias edits and
+checked signatures like a validator — is replaced by `ScriptedSuiCore`, a
+`SuiCore` that answers from a script of plain values and never executes,
+applies or validates a transaction. What a transaction does on chain, and what
+a validator accepts, is proved against a localnet; failure handling is tested
+with per-test stubs of the `SuiCore` method involved; pure code is tested
+directly. The suite shrinks from 18.7k to about 6.5k lines.
 
 It also adds **address aliases**: an account can be signed for by another
 address — a weighted multisig of a passkey, a zkLogin key, a recovery phrase
@@ -70,6 +79,19 @@ renamed export is in its table.
   `sui.core.listTransactions`, whose pages carry `endCursor`
   (`examples/recipes/indexer.ts`); `tailEvents` / `tailTransactions` stay.
 
+- **The simulated chain in `/testing`**: `SuiCoreFake` (its `layer`, handle
+  and `SuiCoreFakeState`), `FakeUnimplemented`, `ClockBcs`, `CLOCK_TYPE`,
+  `FakeBalance`; `SuiTest.bumpVersion`, `recordTransaction`, `deleteObject`,
+  `setEpoch`, `scriptGetObject`, `scriptGetTransaction`, `setVisibilityDelay`,
+  `addressBalance`, `setAddressAliases` and `addressAliases`;
+  `FakeOutcome.notFound` and `timeoutThen`; and the `FakeScript` fields that
+  drove the simulation — `coins`, `balances`, `gasBudget`, `getObject`,
+  `coinMetadata`, `names`, `pageSize`, `scanLimit`, `buildSimulate`,
+  `getTransaction`, `transactions`, `visibilityDelay`, `ledger`,
+  `readOptions`, `addressAliases`. Nothing in the package executes a
+  transaction, moves a balance or checks a signature in place of a validator
+  any more.
+
 ### Changed (breaking)
 
 - **`Tx.withSenderLock(address)(effect)` replaces `sui.withSenderLock(address)`.**
@@ -102,6 +124,25 @@ renamed export is in its table.
   `SigningError | PolicyDenied | TransportError`.
 - **`KeyErrorReason` gains `"invalidMultisig"`** (`Signer.multisig`).
 - `SigningFailureReason` is `"expired" | "rejected" | "unavailable"`.
+
+- **`/testing` answers from a script and simulates nothing.** `layerTest`,
+  `SuiTest.putObject` / `setClock` / `setAddressBalance` / `scriptExecute` /
+  `scriptSimulate` / `calls` / `provide`, `FakeScript.objects` /
+  `dynamicFields` / `dynamicFieldValues` / `chainId` / `network` / `epoch` /
+  `referenceGasPrice` / `clockTimestampMs` / `simulate` / `execute`,
+  `FakeObject`, `FakeChange`, `FakeExecution`, `FakeEvent`, `fakeDigest`,
+  `testSubmitConfig` and `TestServices` keep their names; what changed is
+  that an execute answer no longer changes any object or balance, signatures
+  are not checked, a second execute of the same bytes takes the next scripted
+  answer rather than the recorded one, list methods answer in one page, and
+  builds run the SDK's own resolver (so a Move call whose object inputs need
+  `getMoveFunction` dies unscripted). Address balances are
+  `FakeScript.addressBalances: [{ owner, coinType?, amount }]` (was
+  `balances`, the SDK's `Balance` shape); coins are `fakeCoin(...)` objects in
+  `FakeScript.objects` (was `FakeScript.coins`; `fakeCoin` now answers a
+  `FakeObject` with real BCS content). `TestServices` is
+  `Sui | SuiCore | ScriptedSuiCore` (was `… | SuiCoreFake`). `FakeChange.balance`
+  is gone.
 
 ### Added
 
@@ -144,15 +185,18 @@ renamed export is in its table.
   read — failing with `PolicyDenied { rule: "alias.signer" }`; `PolicyDenied`
   is in the union only under that literal. `@mysten/sui/verify` has no
   alias-aware option (2.38).
-- **The fake models address alias sets.** `FakeScript.addressAliases`,
-  `SuiTest.setAddressAliases(address, aliases | undefined)` and
-  `SuiTest.addressAliases(address)` over an `AddressAliases` object at the
-  derived id; `0xa` is served as the shared `AddressAliasState`; executed
-  `enable`/`add`/`remove`/`replace_all` calls edit the sets (Move's aborts are
-  not modeled); and the signature check resolves aliases for the sender and
-  the gas owner the way a validator does. The fake reads a **multisig**
-  signature's address off its public key (it used to stand the address check
-  down for any multisig).
+- **`ScriptedSuiCore`** in `/testing`: `ScriptedSuiCore.layer(script)` (and
+  `ScriptedSuiCore.make`) is the production `SuiCore` over an SDK `CoreClient`
+  that answers from a `FakeScript` — objects with their exact type and BCS
+  (`listOwnedObjects` filtering under `typeMatches`), the `Coin<T>` objects
+  among them as coins, dynamic fields matched on the key's type and bytes,
+  address balances, the clock `0x6`, a fixed chain id, epoch and gas price,
+  and only when scripted the next `execute` / `simulate` answers, in order,
+  stamped with the digest of the bytes handed over. Anything unscripted dies
+  naming the method (`Unscripted`). Builds run the SDK's own core resolver over
+  its reads. `FakeOutcome.hang()` is an answer that never comes;
+  `transactionResultOf(digest, outcome)` is the SDK result a stub returns;
+  `DEFAULT_CHAIN_ID` and `DEFAULT_EPOCH` are the constants it reports.
 - `Tx.withSenderLock` (see above); `Signer.zkLogin`'s options type
   `ZkLoginSignerOptions` and `ZkLoginSignatureInputs` stay on `/tx`.
 - Recipes: `examples/recipes/account-alias.ts` (hand an account over to a
@@ -170,27 +214,36 @@ renamed export is in its table.
 
 ### Testing
 
-- `test/address-alias-0-6-0.test.ts` (fake): the derived id, the read and the
-  check, the recipes; `Signer.multisig` member order (a reversed SDK combine
-  fails `Verify`), its construction refusals, a personal message, a passkey
-  member (`PasskeyKeypair` through `fromSdkSigner`) and a zkLogin member on
-  their bits; `Signer.alias`; `Tx.run` as A signed by M with the journal's
-  `Signed` entry naming A and the sender lock A's; a key A does not list
-  refused before any simulate; an alias sponsor; enable → add M → remove A →
-  run as M → the old key refused; `Tx.attach` and `Verify` against the set.
-- `test/live.localnet-alias.test.ts`, behind `SUI_LOCALNET=1`: on a validator,
-  `enable` creates the object at `AddressAlias.aliasesId(A)`; `add(M)` +
-  `remove(A)` in one transaction; `Tx.run` with `Signer.alias(A,
-  Signer.multisig(…))` given two members out of order lands; the same two
-  combined in the given order are refused; `Tx.build` → sign → `Tx.attach` →
-  `Tx.submit` lands; A's old key is refused by the node and by `Verify`.
-- `test/live.localnet-signers.test.ts` (was `live.localnet-wallet`) keeps the
-  mnemonic signers, the SDK passkey signer, the sponsored flows, the durable
-  journal over one `KeyValueStore` and the zkLogin `maxEpoch` bound;
-  `test/live.localnet.test.ts` proves `Tx.sendFunds` refuses a coin-only
-  account at the build. `test/approve-0-5-0.test.ts` (was `prepare-0-5-0`)
-  keeps `approve`, `Built.gas`, `Built.simulation`, the `maxEpoch` bound and
-  the shared accessors.
+- **Three kinds of test** (DESIGN §13). Chain semantics only against a
+  localnet; failure handling with per-test stubs of the one `SuiCore` method a
+  path reads (`test/support.ts`); pure code directly, table-driven where cases
+  repeat. `test/` goes from 18.7k to about 6.5k lines, of which 1.7k are the
+  live suites; `src/services/SuiCoreFake.ts` (3.2k lines) is replaced by 0.8k
+  lines of `src/testing.ts`, about half of them documentation.
+- Deleted: the version-named review files (`release-0-*`, `review-*`,
+  `codex-audit`, `final-batch`, the `*-0-4-0` / `*-0-5-0` / `*-0-6-0` files),
+  whose cases are folded into one file per area or dropped as duplicates;
+  every test of the fake's own modelling (`SuiCoreFake.test`,
+  `fake-address-balance`, the fake's alias and signature checks); tests of
+  private helpers; and tests that pinned README, CI or JSDoc text (the
+  `LLMS.md` staleness test stays).
+- Kept, rewritten over stubs or as pure tests: multisig member order (a
+  reversed SDK combine fails `Verify`), alias resolution read from the
+  object, `requireZeroGas`, `verifySponsored`, identical-bytes resubmit, the
+  outcome classification, an expired zkLogin `maxEpoch` refused, reconcile's
+  ordered expiry rule and `inputConsumed` on an exact `inputVersion`, the
+  sender lock and its policies, the journal under faults and races, metrics and
+  spans, and no output on a successful run.
+- **Moved to a localnet** (`SUI_LOCALNET=1`), the behaviours the fake modelled
+  and no live suite proved: `test/live.localnet-recipes.test.ts` runs
+  fold-coins, build-and-submit, both sponsored recipes (and a sponsored
+  submission missing the sponsor's signature, refused by the validator) and
+  account-alias; `test/live.localnet.test.ts` proves `NotApplied
+  { inputConsumed }` on the chain's own effects and a stale coin reservation
+  refused. `test/live.localnet-alias.test.ts` proves aliases and multisig
+  member order on a validator, `test/live.localnet-signers.test.ts` the
+  signers, sponsorship, the durable journal and the zkLogin `maxEpoch` bound
+  (now waiting for epoch 1 on a freshly regenesised localnet).
 
 **Not proven**: a zkLogin member's signature accepted on chain (no prover); a
 real WebAuthn authenticator (a software P-256 authenticator signs in the
@@ -238,6 +291,17 @@ git history).
 | `Tx.attach` failing with `SigningError` for a wrong party | `PolicyDenied { rule: "alias.signer" }` |
 | an exhaustive match on `KeyError.reason` | add `"invalidMultisig"` |
 | signing as an aliased account through the SDK client directly | `Tx.run(recipe, { signer: Signer.alias(account, yield* Signer.multisig(publicKey, members)) })` |
+| `SuiCoreFake.layer(script)`, `SuiCoreFake` (the handle) | `ScriptedSuiCore.layer(script)`, `ScriptedSuiCore` (`TestServices` names it) |
+| `FakeScript.balances: [{ owner?, coinType, balance, coinBalance, addressBalance }]` | `FakeScript.addressBalances: [{ owner, coinType?, amount }]`; `coinBalance` is the sum of the owner's `Coin<T>` objects |
+| `FakeScript.coins: [fakeCoin(…)]` | `FakeScript.objects: [fakeCoin(…)]` (`fakeCoin` answers a `FakeObject` with BCS content) |
+| `SuiTest.addressBalance(owner)` | `(yield* Sui).getBalance(owner)` |
+| `FakeOutcome.timeoutThen(found)` | `FakeOutcome.hang()`; what a later read finds is a stub of that read |
+| `FakeOutcome.notFound()`, `FakeScript.getTransaction` / `transactions`, `SuiTest.scriptGetTransaction` / `recordTransaction` | a stub: `{ ...core, getTransaction: () => Effect.fail(new TransactionNotFound({ digest })) }` |
+| `FakeScript.getObject`, `SuiTest.scriptGetObject`, `bumpVersion`, `deleteObject` | `SuiTest.putObject` for what a read serves; a stub of `getObject` for a fault |
+| `FakeScript.buildSimulate` | `FakeScript.simulate` (the SDK's resolver simulates through it) |
+| `FakeScript.epoch` with `SuiTest.setEpoch`, `visibilityDelay`, `ledger`, `names`, `coinMetadata`, `scanLimit`, `pageSize`, `readOptions`, `gasBudget` | `FakeScript.epoch` (fixed for the run); a stub of the method involved for the rest |
+| `FakeScript.addressAliases`, `SuiTest.setAddressAliases` / `addressAliases` | `SuiTest.putObject` of the `AddressAliases` object at `AddressAlias.aliasesId(address)` (`AddressAliasesBcs`) |
+| a test that relied on an execute changing objects or balances, or on the fake refusing a signature | a localnet test: nothing in `/testing` executes a transaction |
 
 ## 0.5.0
 
