@@ -547,6 +547,12 @@ describe.skipIf(!LOCALNET)("signers and sponsorship on localnet, with SUI_LOCALN
       let attempts = 0
       const result = await node(Effect.gen(function*() {
         yield* fundAndFold(funder)
+        // An expired proof needs an epoch before the current one: on a localnet
+        // regenesised less than an epoch ago (60 s by default) there is none yet.
+        yield* Effect.retry(Effect.filterOrFail(currentEpoch, (epoch) => epoch >= 1n, () => "still epoch 0" as const), {
+          schedule: Schedule.spaced("1 second"),
+          times: 150
+        })
         // Up to three tries: an epoch can roll over between reading it and building.
         const attempt = Effect.gen(function*() {
           attempts += 1

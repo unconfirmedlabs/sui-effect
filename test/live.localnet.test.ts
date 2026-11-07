@@ -1,7 +1,7 @@
 /**
  * Address-balance gas and coin folding, proved against a **localnet**.
  *
- * The fake models address balances (DESIGN §13) but runs no Move and enforces
+ * The unit suite runs over scripted answers, which execute no Move and enforce
  * no validator rule, so the claims this file checks are unfalsifiable without
  * a chain: that `0x2::coin::send_funds<SUI>(GasCoin, owner)` folds a coin-only
  * account in one transaction, that every later transaction then pays from the
@@ -26,6 +26,7 @@ import { requestSuiFromFaucetV2 } from "@mysten/sui/faucet"
 import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions"
 import { Effect, Layer, Schedule, Stream } from "effect"
 import type { Prepared } from "../src/services/Tx.ts"
+import { SuiError } from "../src/domain/errors.ts"
 import { CoinType } from "../src/domain/schemas.ts"
 import type { SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
@@ -336,6 +337,53 @@ describe.skipIf(!LOCALNET)("localnet, with SUI_LOCALNET=1", () => {
       }))
       expect(settled.effects.status.success).toBe(true)
       expect((await balanceOf(recipient)).addressBalance).toBe(7_000n)
+    },
+    5 * MINUTE
+  )
+
+  test(
+    "a gas coin another transaction consumed is NotApplied { inputConsumed } on the chain's own effects",
+    async () => {
+      const signer = await funded()
+      const recipient = (await Effect.runPromise(ephemeral)).address
+      const outcome = await local(Effect.gen(function*() {
+        // Coin gas: the account has no address balance. Signed, never sent.
+        const built = yield* Tx.build((tx) => {
+          tx.transferObjects([tx.splitCoins(tx.gas, [1_000n])], recipient)
+        }, { sender: signer.address })
+        expect(built.gas.source).toBe("coins")
+        const stale = yield* Tx.sign(built, signer)
+        // A different transaction spends the same gas coin first.
+        yield* Tx.run((tx) => {
+          tx.transferObjects([tx.splitCoins(tx.gas, [2_000n])], recipient)
+        }, { signer })
+        return yield* Effect.flip(Tx.reconcile(stale))
+      }))
+      console.error(`stale coin bytes: ${outcome._tag} ${outcome._tag === "NotApplied" ? outcome.evidence : outcome.message}`)
+      expect(outcome._tag === "NotApplied" && outcome.evidence).toBe("inputConsumed")
+    },
+    5 * MINUTE
+  )
+
+  test(
+    "a coin reservation is refused once a spend from the balance landed after the build",
+    async () => {
+      const signer = await funded()
+      await local(Tx.foldCoins({ signer }))
+      const recipient = (await Effect.runPromise(ephemeral)).address
+      const usesGas = (tx: Transaction) => {
+        tx.transferObjects([tx.splitCoins(tx.gas, [1_000n])], recipient)
+      }
+      const outcome = await local(Effect.gen(function*() {
+        const built = yield* Tx.build(usesGas, { sender: signer.address })
+        expect(built.gas.source).toBe("coinReservation")
+        const reserved = yield* Tx.sign(built, signer)
+        // Bytes that pin nothing, sent without the lock: the balance moves.
+        yield* Tx.run(Tx.sendFunds({ amount: 5_000n, recipient }), { signer }).pipe(SubmitConfig.with({ lockSender: "never" }))
+        return yield* Effect.flip(Tx.submit(reserved))
+      }))
+      console.error(`stale reservation: ${SuiError.describe(outcome)}`)
+      expect(SuiError.outcome(outcome)).toBe("not_applied")
     },
     5 * MINUTE
   )

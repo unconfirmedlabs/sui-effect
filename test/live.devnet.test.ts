@@ -1,12 +1,12 @@
 /**
  * The one test in this repository that touches a network.
  *
- * Everything else runs against the in-memory fake, which is what makes the
- * suite fast and deterministic — and which is exactly why it cannot answer the
- * question this file exists for: does a transaction sui-effect builds with its
- * *default* settings get accepted by a real validator? The fake has no Move
- * execution and no expiration validation, so the epoch bounds in the default
- * `ValidDuring` (DESIGN.md section 6) are unfalsifiable without a live chain.
+ * The unit suite runs over scripted answers, which is what makes it fast and
+ * deterministic — and which is exactly why it cannot answer the question this
+ * file exists for: does a transaction sui-effect builds with its *default*
+ * settings get accepted by a real validator? Scripted answers execute nothing
+ * and validate nothing, so the epoch bounds in the default `ValidDuring`
+ * (DESIGN.md section 6) are unfalsifiable without a live chain.
  *
  * Gated behind `SUI_LIVE=1`, so `bun run check` never opens a socket:
  *

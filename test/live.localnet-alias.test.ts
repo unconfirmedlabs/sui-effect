@@ -1,12 +1,12 @@
 /**
  * Address aliases and a multisig signer, proved against a **localnet**.
  *
- * The fake models alias sets (DESIGN §14) but runs no Move and verifies no
- * multisig, so what this file checks needs a chain: that `AddressAlias.aliasesId`
- * is the id the framework derives, that a validator accepts `Signer.alias(A,
- * Signer.multisig(…))` — partial signatures combined in member order — through
- * `Tx.run` and through `Tx.attach`, and that once A removed itself from its
- * own set its old key is refused.
+ * The unit suite runs over scripted answers, which execute no Move and verify
+ * no signature against an alias set, so what this file checks needs a chain:
+ * that `AddressAlias.aliasesId` is the id the framework derives, that a
+ * validator accepts `Signer.alias(A, Signer.multisig(…))` — partial signatures
+ * combined in member order — through `Tx.run` and through `Tx.attach`, and
+ * that once A removed itself from its own set its old key is refused.
  *
  * Gated behind `SUI_LOCALNET=1`, so `bun run check` never opens a socket:
  *
