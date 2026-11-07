@@ -30,6 +30,7 @@ import { Sui } from "../src/services/Sui.ts"
 import { SuiCore } from "../src/services/SuiCore.ts"
 import { FakeOutcome, fakeDigest, SuiCoreFake } from "../src/services/SuiCoreFake.ts"
 import { fromSimulationResult, SIMULATE_INCLUDE } from "../src/internal.ts"
+import { Tx } from "../src/services/Tx.ts"
 import { layerTest } from "../src/testing.ts"
 
 const PADDED = (suffix: string) => `0x${"0".repeat(64 - suffix.length)}${suffix}`
@@ -966,12 +967,12 @@ describe("getTransaction", () => {
   })
 })
 
-describe("Sui.withSenderLock", () => {
+describe("Tx.withSenderLock", () => {
   test("serializes two fibers on the same sender", async () => {
     const program = Effect.gen(function*() {
       const gate = yield* Deferred.make<void>()
       const order: Array<string> = []
-      const lock = (yield* Sui).withSenderLock(SuiAddress.make(ALICE))
+      const lock = Tx.withSenderLock(SuiAddress.make(ALICE))
       const first = yield* Effect.forkChild(
         lock(
           Effect.gen(function*() {
@@ -1010,7 +1011,7 @@ describe("Sui.withSenderLock", () => {
       const gate = yield* Deferred.make<void>()
       const order: Array<string> = []
       const first = yield* Effect.forkChild(
-        (yield* Sui).withSenderLock(SuiAddress.make(ALICE))(
+        Tx.withSenderLock(SuiAddress.make(ALICE))(
           Effect.gen(function*() {
             yield* Deferred.await(gate)
             order.push("alice")
@@ -1019,7 +1020,7 @@ describe("Sui.withSenderLock", () => {
       )
       yield* TestClock.adjust("1 milli")
       const second = yield* Effect.forkChild(
-        (yield* Sui).withSenderLock(SuiAddress.make(PADDED("b0b")))(
+        Tx.withSenderLock(SuiAddress.make(PADDED("b0b")))(
           Effect.sync(() => {
             order.push("bob")
           })

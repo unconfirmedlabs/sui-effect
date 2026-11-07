@@ -348,8 +348,8 @@ describe("Tx.run: sender A, signed by M", () => {
       )
       yield* Deferred.await(inApprove)
       // M's lock is free while A's run is approving under A's lock.
-      yield* (yield* Sui).withSenderLock(M)(Effect.sync(() => events.push("M")))
-      const waiting = yield* Effect.forkChild((yield* Sui).withSenderLock(A)(Effect.sync(() => events.push("A"))))
+      yield* Tx.withSenderLock(M)(Effect.sync(() => events.push("M")))
+      const waiting = yield* Effect.forkChild(Tx.withSenderLock(A)(Effect.sync(() => events.push("A"))))
       yield* Effect.yieldNow
       events.push("release")
       yield* Deferred.succeed(release, undefined)

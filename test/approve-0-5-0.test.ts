@@ -256,7 +256,7 @@ describe("Tx.run({ approve })", () => {
         approve: () => Effect.andThen(Deferred.succeed(inside, undefined), Deferred.await(gate))
       }))
       yield* Deferred.await(inside)
-      const other = yield* Effect.forkChild((yield* SuiNs).withSenderLock(SENDER)(Deferred.succeed(taken, undefined)))
+      const other = yield* Effect.forkChild(Tx.withSenderLock(SENDER)(Deferred.succeed(taken, undefined)))
       const free = yield* settleUntil(Deferred.isDone(taken))
       yield* Deferred.succeed(gate, undefined)
       yield* Fiber.join(running)

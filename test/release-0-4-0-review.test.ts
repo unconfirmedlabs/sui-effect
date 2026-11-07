@@ -9,7 +9,6 @@ import { Deferred, Effect, Fiber, Layer, Option, Schema, Tracer } from "effect"
 import { JournalError, SigningError, SubmissionUnknown, SuiError, TransportError } from "../src/domain/errors.ts"
 import { Digest, SuiAddress } from "../src/domain/schemas.ts"
 import { Journal } from "../src/services/Journal.ts"
-import { Sui } from "../src/services/Sui.ts"
 import { fromKeypair, type Signer } from "../src/services/Signer.ts"
 import { Tx } from "../src/services/Tx.ts"
 import { layerTest } from "../src/testing.ts"
@@ -28,9 +27,9 @@ const overlaps = Effect.gen(function*() {
     const upper = SuiAddress.make(UPPER)
     const lower = SuiAddress.make(LOWER)
     const release = yield* Deferred.make<void>()
-    const holder = yield* Effect.forkChild((yield* Sui).withSenderLock(lower)(Deferred.await(release)))
+    const holder = yield* Effect.forkChild(Tx.withSenderLock(lower)(Deferred.await(release)))
     for (let i = 0; i < 20; i++) yield* Effect.yieldNow
-    const second = yield* Effect.forkChild((yield* Sui).withSenderLock(upper)(Effect.succeed(true)))
+    const second = yield* Effect.forkChild(Tx.withSenderLock(upper)(Effect.succeed(true)))
     for (let i = 0; i < 50; i++) yield* Effect.yieldNow
     const entered = second.pollUnsafe() !== undefined
     yield* Deferred.succeed(release, undefined)
@@ -62,7 +61,7 @@ describe("sender locks are keyed on the normalized address", () => {
     const tracer = Tracer.make({
       span(options) {
         const span = new Tracer.NativeSpan(options)
-        if (options.name === "Sui.withSenderLock") {
+        if (options.name === "Tx.withSenderLock") {
           const attribute = span.attribute.bind(span)
           span.attribute = (key, value) => {
             if (key === "sui.sender") taken.push(normalizeSuiAddress(String(value)))

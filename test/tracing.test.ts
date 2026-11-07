@@ -155,6 +155,6 @@ describe("span attributes", () => {
     // Two sends, so the last value the span saw is attempt 2.
     expect(submit?.get("sui.attempt")).toBe(2)
     // And the sender lock names the address it serialized on.
-    expect(attributesOf("Sui.withSenderLock")[0]?.get("sui.sender")).toBe(signer.address)
+    expect(attributesOf("Tx.withSenderLock")[0]?.get("sui.sender")).toBe(signer.address)
   })
 })

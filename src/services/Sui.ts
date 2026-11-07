@@ -15,7 +15,6 @@ import { Transaction } from "@mysten/sui/transactions"
 import { fromBase64, normalizeSuiAddress, SUI_CLOCK_OBJECT_ID, toBase64 } from "@mysten/sui/utils"
 import {
   Array,
-  Clock,
   Config,
   Context,
   DateTime,
@@ -23,11 +22,9 @@ import {
   Effect,
   Layer,
   Option,
-  RcMap,
   Result,
   Schedule,
   Schema,
-  Semaphore,
   Stream
 } from "effect"
 import { bcs as bcsCodec, decodeContent, typeMatches } from "../domain/bcs.ts"
@@ -45,7 +42,6 @@ import {
   TransportError
 } from "../domain/errors.ts"
 import { EXECUTE_INCLUDE, Executed, fromTransactionResult, READ_INCLUDE, Simulation } from "../domain/executed.ts"
-import * as Metrics from "../domain/metrics.ts"
 import {
   Balance,
   Coin,
@@ -426,15 +422,6 @@ const unimplementedAffectedAddress = (): Error =>
     ),
     { code: "UNIMPLEMENTED" }
   )
-
-/**
- * The sender locks: one reference-counted semaphore per address, released a
- * minute after its last holder leaves.
- */
-const makeSenderLocks = RcMap.make({
-  lookup: (_address: string) => Effect.succeed(Semaphore.makeUnsafe(1)),
-  idleTimeToLive: "1 minute"
-})
 
 /**
  * Decodes the SDK's simulation envelope into sui-effect's stable shape.
@@ -1062,13 +1049,6 @@ export interface SuiService {
     opts?: TailOptions
   ) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>
 
-  /**
-   * Serializes work for one sender, so two transactions from the same address
-   * cannot pick the same gas coin. Adds no failures of its own.
-   */
-  readonly withSenderLock: (
-    address: SuiAddress
-  ) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 }
 
 const CHUNK = 50
@@ -1114,11 +1094,7 @@ const keyOf = (id: string): string => {
   }
 }
 
-const makeSui = (
-  core: SuiCore["Service"],
-  chainId: string,
-  locks: RcMap.RcMap<string, Semaphore.Semaphore>
-): SuiService => {
+const makeSui = (core: SuiCore["Service"], chainId: string): SuiService => {
   const envelopeOf = (object: SuiClientTypes.Object<typeof OBJECT_INCLUDE>) =>
     decodeEnvelope(object).pipe(Effect.mapError(boundaryError("getObject")))
 
@@ -1747,40 +1723,6 @@ const makeSui = (
         filter === undefined ? undefined : transactionsHead
       ).pipe(Stream.map((page) => page.items), Stream.flattenIterable))
 
-  const withSenderLock = (address: SuiAddress) =>
-    Effect.fn("Sui.withSenderLock")(function*<A, E, R>(
-      effect: Effect.Effect<A, E, R>
-    ): Effect.fn.Return<A, E, R> {
-      yield* Effect.annotateCurrentSpan({ "sui.sender": address })
-      // The semaphore is reference counted: whoever is inside the lock holds a
-      // reference, so a sender's semaphore cannot be dropped while it is in
-      // use, and an idle one is released a minute after the last holder leaves
-      // rather than sitting in the map for the life of the process. A service
-      // that sponsors thousands of addresses therefore holds entries for the
-      // senders it is actually working for, not for every sender it has ever
-      // seen.
-      //
-      // The time spent queued for the permit is `sui_effect_sender_lock_wait`,
-      // measured from asking for the semaphore to holding the permit; the
-      // sender is deliberately not an attribute.
-      const asked = yield* Clock.currentTimeMillis
-      const held = Clock.currentTimeMillis.pipe(
-        Effect.flatMap((now) => Metrics.recordDuration(Metrics.senderLockWait, Duration.millis(now - asked)))
-      )
-      //
-      // The key is the normalized spelling, not the raw string: `SuiAddress
-      // .make` validates without decoding, so an upper-case `0xAAAA…` is a
-      // valid brand of the same sender, and keying on the raw string would
-      // give that sender two semaphores — the gas-coin equivocation this lock
-      // exists to stop.
-      return yield* Effect.scoped(
-        Effect.flatMap(
-          RcMap.get(locks, normalizeSuiAddress(address)),
-          (semaphore) => Semaphore.withPermit(semaphore, Effect.andThen(held, effect))
-        )
-      )
-    })
-
   const chainTime = core
     .getObject({ objectId: SUI_CLOCK_OBJECT_ID, include: OBJECT_INCLUDE })
     .pipe(
@@ -1838,8 +1780,7 @@ const makeSui = (
     streamEvents,
     tailEvents,
     streamTransactions,
-    tailTransactions,
-    withSenderLock
+    tailTransactions
   }
 }
 
@@ -1929,8 +1870,7 @@ export class Sui extends Context.Service<Sui, SuiService>()("@unconfirmed/sui-ef
         if (expected !== undefined && expected !== chainIdentifier) {
           return yield* new NetworkMismatch({ expected, actual: chainIdentifier })
         }
-        const locks = yield* makeSenderLocks
-        return makeSui(core, chainIdentifier, locks)
+        return makeSui(core, chainIdentifier)
       })
     )
 

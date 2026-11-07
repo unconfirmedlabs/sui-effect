@@ -666,11 +666,11 @@ const lockSenderPolicyOf = (value: unknown): LockSenderPolicy => {
 }
 
 /**
- * The lock-free `Tx.run`s in flight on one address, as permits taken from a
- * semaphore with {@link IN_FLIGHT_PERMITS} of them, and how many runs hold a
- * reference to this entry (so an idle address is dropped).
+ * A semaphore per address and how many fibers hold a reference to it, so an
+ * idle address is dropped. The sender locks (one permit) and the lock-free
+ * runs in flight ({@link IN_FLIGHT_PERMITS}) are both registries of these.
  */
-interface InFlight {
+interface Permits {
   readonly semaphore: Semaphore.Semaphore
   refs: number
 }
@@ -682,37 +682,43 @@ interface InFlight {
 const IN_FLIGHT_PERMITS = Number.MAX_SAFE_INTEGER
 
 /**
- * The in-flight registries, one per sender-lock map. Keyed by the
- * `withSenderLock` function itself, which every spread of one `Sui` shares,
- * so every `Tx.run` that serializes on the same locks sees the same runs in
- * flight. A `WeakMap`, so a dropped `Sui` takes its registry with it.
+ * The registries, keyed by the `SuiCore` service a `Sui` is built on — the
+ * one object every spread of a `Sui` shares — so every `Tx.run` against the
+ * same client serializes on the same locks and sees the same runs in flight,
+ * and two layers over two clients share nothing. `WeakMap`s, so a dropped
+ * client takes its registries with it.
  */
-const IN_FLIGHT = new WeakMap<object, Map<string, InFlight>>()
+const SENDER_LOCKS = new WeakMap<object, Map<string, Permits>>()
+const IN_FLIGHT = new WeakMap<object, Map<string, Permits>>()
 
-const inFlightRegistryOf = (key: object): Map<string, InFlight> => {
-  let registry = IN_FLIGHT.get(key)
+const registryOf = (registries: WeakMap<object, Map<string, Permits>>, key: object): Map<string, Permits> => {
+  let registry = registries.get(key)
   if (registry === undefined) {
     registry = new Map()
-    IN_FLIGHT.set(key, registry)
+    registries.set(key, registry)
   }
   return registry
 }
 
 /**
- * A reference to `address`'s in-flight entry until the scope closes, creating
- * it on first use. The last reference out deletes it, so a sponsor serving
- * thousands of senders holds entries only for the ones with a run in flight.
+ * A reference to `address`'s entry until the scope closes, creating it with
+ * `permits` permits on first use. The last reference out deletes it, so a
+ * sponsor serving thousands of senders holds entries only for the ones it is
+ * working for. The key is the normalized spelling: `SuiAddress.make`
+ * validates without decoding, so an upper-case `0xAAAA…` is a valid brand of
+ * the same address, and keying on the raw string would give it two entries.
  */
-const inFlightEntry = (
-  registry: Map<string, InFlight>,
-  address: string
-): Effect.Effect<InFlight, never, Scope.Scope> => {
+const permitsOf = (
+  registry: Map<string, Permits>,
+  address: string,
+  permits: number
+): Effect.Effect<Permits, never, Scope.Scope> => {
   const key = normalizeSuiAddress(address)
   return Effect.acquireRelease(
     Effect.sync(() => {
       let entry = registry.get(key)
       if (entry === undefined) {
-        entry = { semaphore: Semaphore.makeUnsafe(IN_FLIGHT_PERMITS), refs: 0 }
+        entry = { semaphore: Semaphore.makeUnsafe(permits), refs: 0 }
         registry.set(key, entry)
       }
       entry.refs += 1
@@ -726,6 +732,75 @@ const inFlightEntry = (
   )
 }
 
+const inFlightEntry = (registry: Map<string, Permits>, address: string) =>
+  permitsOf(registry, address, IN_FLIGHT_PERMITS)
+
+/**
+ * `effect` holding `address`'s sender lock on `core`. The body of
+ * {@link withSenderLock}, for callers that already hold the `Sui`.
+ */
+const senderLocked = <A, E, R>(
+  core: object,
+  address: SuiAddress,
+  effect: Effect.Effect<A, E, R>
+): Effect.Effect<A, E, R> =>
+  Effect.gen(function*() {
+    yield* Effect.annotateCurrentSpan({ "sui.sender": address })
+    // The time spent queued for the permit is `sui_effect_sender_lock_wait`,
+    // measured from asking for the semaphore to holding the permit; the
+    // sender is deliberately not an attribute.
+    const asked = yield* Clock.currentTimeMillis
+    const held = Clock.currentTimeMillis.pipe(
+      Effect.flatMap((now) => Metrics.recordDuration(Metrics.senderLockWait, Duration.millis(now - asked)))
+    )
+    return yield* Effect.scoped(
+      Effect.flatMap(
+        permitsOf(registryOf(SENDER_LOCKS, core), address, 1),
+        (entry) => Semaphore.withPermit(entry.semaphore, Effect.andThen(held, effect))
+      )
+    )
+  }).pipe(Effect.withSpan("Tx.withSenderLock"))
+
+/**
+ * Serializes work for one sender, so two transactions from the same address
+ * cannot pick the same gas coin or owned object. `Tx.run` takes it itself
+ * (see `SubmitConfig.lockSender`); this is for a program that assembles
+ * `build → sign → submit` by hand and wants the same exclusion.
+ *
+ * One semaphore per address per client (the `SuiCore` the `Sui` in context is
+ * built on): two fibers locking one sender serialize, two senders never wait
+ * on each other. An entry exists only while someone holds or waits for it.
+ * The wait is recorded as `sui_effect_sender_lock_wait`. Before 0.6.0 this
+ * was `Sui.withSenderLock`.
+ *
+ * Adds no failures of its own; `R` gains `Sui`.
+ *
+ * @since 0.6.0
+ *
+ * @example
+ * ```ts
+ * import { Effect } from "effect"
+ * import { type Recipe } from "@unconfirmed/sui-effect"
+ * import { Tx, type Signer } from "@unconfirmed/sui-effect/tx"
+ *
+ * declare const signer: Signer
+ * declare const recipe: Recipe
+ *
+ * const program = Tx.withSenderLock(signer.address)(
+ *   Effect.gen(function*() {
+ *     const built = yield* Tx.build(recipe, { sender: signer.address })
+ *     return yield* Tx.submit(yield* Tx.sign(built, signer))
+ *   })
+ * )
+ * ```
+ */
+export const withSenderLock = (address: SuiAddress) =>
+<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | Sui> =>
+  Effect.gen(function*() {
+    const sui = yield* Sui
+    return yield* senderLocked(sui.core, address, effect)
+  })
+
 /**
  * Registers a lock-free run as in flight on each address until the scope
  * closes. Each step adds its own release to the scope as it acquires —
@@ -733,7 +808,7 @@ const inFlightEntry = (
  * so success, failure and interruption all return the permit. Never fails.
  */
 const registerInFlight = (
-  registry: Map<string, InFlight>,
+  registry: Map<string, Permits>,
   addresses: ReadonlyArray<string>
 ): Effect.Effect<void, never, Scope.Scope> =>
   Effect.forEach(
@@ -750,7 +825,7 @@ const registerInFlight = (
  * sender's lock) can, and is then simply not waited for. An interrupted wait
  * leaves the queue, so nothing leaks. Never fails.
  */
-const drainInFlight = (registry: Map<string, InFlight>, address: string): Effect.Effect<void> =>
+const drainInFlight = (registry: Map<string, Permits>, address: string): Effect.Effect<void> =>
   Effect.suspend(() =>
     registry.has(normalizeSuiAddress(address))
       ? Effect.scoped(
@@ -3424,7 +3499,7 @@ const lockedRun = <A, E1, E2, R1, R2>(opts: {
   const { sui, locked, build: buildIt, finish } = opts
   const withLocks = <B, E, R>(effect: Effect.Effect<B, E, R>): Effect.Effect<B, E, R> =>
     locked.reduceRight<Effect.Effect<B, E, R>>(
-      (inner, address) => sui.withSenderLock(address)(inner),
+      (inner, address) => senderLocked(sui.core, address, inner),
       effect
     )
   switch (lockSenderPolicyOf(opts.policy)) {
@@ -3447,10 +3522,10 @@ const lockedRun = <A, E1, E2, R1, R2>(opts: {
       // with the lock released — and registered as in flight, so that a
       // `tx.gas` run, whose reservation would take the whole balance as of its
       // build, waits for them first.
-      const registry = inFlightRegistryOf(sui.withSenderLock)
+      const registry = registryOf(IN_FLIGHT, sui.core)
       const drains = opts.drains
       // The scope the in-flight registration lives in: this one, not the one
-      // `Sui.withSenderLock` opens around its effect, which closes when the
+      // the sender lock opens around its effect, which closes when the
       // lock is released — exactly when the run starts being in flight.
       return Effect.scoped(Effect.gen(function*() {
         const scope = yield* Effect.scope
@@ -3465,7 +3540,7 @@ const lockedRun = <A, E1, E2, R1, R2>(opts: {
           return { _tag: "Built" as const, built }
         }))
         // On the caller's own span: inside the lock the current span is
-        // `Sui.withSenderLock`'s.
+        // `Tx.withSenderLock`'s.
         yield* Effect.annotateCurrentSpan({ "sui.sender_lock": step._tag === "Done" ? "held" : "build" })
         if (step._tag === "Done") return step.done
         return yield* finish(step.built)
@@ -3725,7 +3800,8 @@ export const foldCoins = Effect.fn("Tx.foldCoins")(function*<E = never>(opts: {
  * `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
  * `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
  * `Tx.foldCoins`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`,
- * `Tx.reconcile`, `Tx.resubmit`, `Tx.run`, `Tx.reconcileAll`.
+ * `Tx.reconcile`, `Tx.resubmit`, `Tx.run`, `Tx.reconcileAll`,
+ * `Tx.withSenderLock`.
  */
 export const Tx = {
   build,
@@ -3745,5 +3821,6 @@ export const Tx = {
   reconcile,
   resubmit,
   run,
-  reconcileAll
+  reconcileAll,
+  withSenderLock
 } as const
