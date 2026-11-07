@@ -874,10 +874,29 @@ recipe before any lock is taken, so a recipe that sets it itself needs no
 sender's bytes and signature over HTTP gets a `Built` back with
 `Tx.fromBytes(bytes)` (expiration and chain read off the bytes; other-chain
 bytes refused), adds the sender's signature with `Tx.attach(built, signature)`,
-which verifies it and requires the signer to be the sender or the gas owner,
+which verifies it and requires the signer to be the sender or the gas owner
+(or, since 0.6.0, an alias of either),
 then `Tx.cosign(signed, sponsor)` and `Tx.submit`. `Built.gasOwner` and
 `Signed.gasOwner` are read from the bytes, present only when the gas owner is
 not the sender.
+
+**An account signed for by its alias needs nothing from the extension**
+(0.6.0). Sui's address aliases (`0x2::address_alias`) let an account A list
+other addresses — a multisig M of a passkey, a zkLogin session and recovery
+keys, say — that may sign transactions whose sender is A. The consumer passes
+`Signer.alias(A, yield* Signer.multisig(publicKey, members))`: its `address`
+is A, so a fragment that reads `opts.signer.address` (an owner, a recipient)
+gets the account, and `Tx.run` builds, locks and journals as A while M signs.
+`Tx.run` reads A's `AddressAliases` object once before the build and refuses
+an M A does not list with `PolicyDenied { rule: "alias.signer" }`, so an
+extension member that runs `Tx.run` keeps `PolicyDenied` in its union (it
+already does for `preflight` and the gas ceiling). An owner check against
+`signer.address` keeps working, because A owns A's objects; `signer.alias` is
+the key's address, which owns nothing of A's. Whether a key may sign for an
+account is the chain's alias set — read with `AddressAlias.getAliases`, never
+from transaction history. A stateless sponsor gets the same answer from `Tx.attach`, which
+accepts a signature by an alias of the sender or the gas owner and refuses
+anyone else with `PolicyDenied { rule: "alias.signer" }`.
 
 ### A signer double, for tests
 
@@ -1993,6 +2012,15 @@ the harness's.
 - **`Tx.build` always simulates.** A test that asserts a `simulateTransaction`
   call count is asserting on that, so a conversion moving onto this build has to
   move those numbers.
+- **It models address alias sets** (0.6.0). `FakeScript.addressAliases`
+  (`{ [address]: aliases }`) and `SuiTest.setAddressAliases(address, aliases)`
+  put an `AddressAliases` object at the derived id, which `AddressAlias.getAliases`
+  and `Tx.run`'s check of a `Signer.alias` read; a submission whose signatures
+  the sets do not cover — M for an A that never listed it, or A's own key once A
+  removed itself — is refused with `INVALID_ARGUMENT`, as a validator refuses
+  it, and a multisig signature counts as the multisig's address. Executed
+  `AddressAlias.enable`/`add`/`remove`/`replaceAll` recipes edit the sets
+  (Move's aborts are not modeled; script a failure for those).
 - **It runs no Move code.** Execution outcomes are scripted (`FakeOutcome`), and
   what your recipe actually does on chain is localnet's business.
 
@@ -2296,7 +2324,7 @@ Effect, no mutable module-level state, no `run*` outside an entrypoint.
   "@mysten/bcs": "^2.1.3",
   "@mysten/sui": "^2.28",
   "effect": ">=4.1.1 <4.2",
-  "@unconfirmed/sui-effect": ">=0.5.0 <0.6.0"
+  "@unconfirmed/sui-effect": ">=0.6.0 <0.7.0"
 },
 "peerDependenciesMeta": {
   "@unconfirmed/sui-effect": {
@@ -2372,8 +2400,8 @@ change — the dependency needs a form that does not exist on the registry.
 
 ```bash
 cd /path/to/sui-effect && bun run build && npm pack
-mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-0.5.0.tgz vendor/
-cd /path/to/your-package && bun add -d ./vendor/unconfirmed-sui-effect-0.5.0.tgz
+mkdir -p vendor && cp /path/to/sui-effect/unconfirmed-sui-effect-0.6.0.tgz vendor/
+cd /path/to/your-package && bun add -d ./vendor/unconfirmed-sui-effect-0.6.0.tgz
 ```
 
 It is also the only form that proves anything: an isolated consumer of the
@@ -2417,7 +2445,7 @@ flight — fails the install. The escape is
 
 Put both halves of the swap on the release checklist:
 
-1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.5.0 <0.6.0"`, which is what the template ships for 0.5.x — a range rather than a caret, written out so the one minor it spans is explicit: a 0.x minor may break, and 0.4.0 and 0.5.0 both did, see `CHANGELOG.md`);
+1. replace the tarball with the published range (`"@unconfirmed/sui-effect": ">=0.6.0 <0.7.0"`, which is what the template ships for 0.6.x — a range rather than a caret, written out so the one minor it spans is explicit: a 0.x minor may break, and 0.4.0, 0.5.0 and 0.6.0 all did, see `CHANGELOG.md`);
 2. **delete the `peerDependenciesMeta` entry.** Left in, it turns a genuinely
    missing peer into a silent `undefined` at import time;
 3. re-run the isolated-consumer check against the published package.

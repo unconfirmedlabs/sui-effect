@@ -3,6 +3,139 @@
 All notable changes to `@unconfirmed/sui-effect`. The format is one line per
 change, newest release first.
 
+## 0.6.0
+
+Address aliases: an account can be signed for by another address — a
+weighted multisig of a passkey, a zkLogin session, a recovery phrase and a
+watchdog key, say — through Sui's `0x2::address_alias`, and the whole
+lifecycle (`Tx.run`, the sender lock, the journal, `Tx.attach`, `Verify`)
+keeps the account as the sender while the alias signs. `Signer.multisig`
+combines its members' signatures in the multisig's member order, which a
+validator requires. No peer dependency changes: `effect` stays
+`>=4.1.1 <4.2`, `@mysten/sui` `^2.28` (CI still proves 2.30.0 and 2.38.0).
+Two changes can break code; read "Migrating from 0.5.x".
+
+### Changed (breaking)
+
+- **`Tx.attach` refuses a signer outside the sender's and gas owner's alias
+  sets with `PolicyDenied { rule: "alias.signer" }`**, where it failed with
+  `SigningError` before. It now also **accepts** a valid signature by a member
+  of the sender's or the gas owner's alias set (one `AddressAliases` read per
+  address, made only for a signature by neither). Its union is
+  `SigningError | PolicyDenied | TransportError`. Why: the signature is valid
+  and the question is whether the chain lets that key sign for the account,
+  which is policy read from an object, not a signing failure — and the same
+  tag `Tx.run` and `Verify` use for it. A `catchTag("SigningError", …)` around
+  `Tx.attach` that handled "the wrong party signed" no longer sees that case.
+- **`KeyErrorReason` gains `"invalidMultisig"`** (`Signer.multisig`). An
+  exhaustive `switch` over `KeyError.reason` needs the new case.
+
+### Added
+
+- **`Signer.alias(address, signer)`**: a signer that signs transactions **as**
+  `address` with `signer`'s key, for an address whose alias set lists that key
+  — "sender A, signed by M". Its `address` is A and its `alias` the key's
+  address (the `Signer` interface gains an optional `alias?: SuiAddress`). Everything keyed on the sender is A's: `Tx.run`'s build,
+  **the sender lock** and the in-flight registry, `Built.sender`, the journal's
+  `signed.sender`, `onSigned`, the intent's and `approve`'s parties.
+  Personal messages are refused (`SigningError { reason: "unavailable" }`):
+  aliases cover transactions only.
+- **`Tx.run` and `Enoki.run` check an alias signer against the chain before
+  building**: one read of the account's `AddressAliases` object per
+  `Signer.alias` (signer, or a sponsor given as `Signer.alias(gasOwner, key)`),
+  after the intent gate and the locked-signer refusal, and a key the set does
+  not list is `PolicyDenied { rule: "alias.signer" }` with nothing built,
+  simulated, signed or journalled. A plain signer costs no read. Span
+  attribute `sui.signer_alias` on `Tx.run`, `Tx.sign` and `Tx.cosign`.
+- **`Signer.multisig(publicKey, signers)`**: a `MultiSig` signer over member
+  signers of any scheme (keys, `Signer.passkey`, `Signer.zkLogin`, wallets,
+  `Signer.remote`), signing sequentially and combining the partial signatures
+  **in the multisig's member order** whatever order the signers are given in
+  — the SDK's `combinePartialSignatures` keeps the order it is handed and a
+  validator pairs the n-th signature with the n-th bitmap bit, so the SDK's own
+  `MultiSigSigner` builds signatures a validator refuses unless its signers are
+  passed in member order. A non-member, a duplicate member or too little
+  weight is `KeyError { reason: "invalidMultisig" }`. `maxEpoch` is the
+  earliest member's; a structural `locked` is true when any member's is.
+- **`AddressAlias`** on `/tx`, named after `sui::address_alias`:
+  `aliasesId(address)` (the object derived from `0xa` at `AliasKey(address)`),
+  `getAliases(address)` answering `AddressAliases` (`NotEnabled` or
+  `Enabled { id, version, aliases }`, a `Schema.TaggedUnion`), the pure
+  `allows(aliases, signer)`, `requireSigner(address, signer)` (`PolicyDenied {
+  rule: "alias.signer" }`), the constants `ADDRESS_ALIAS_STATE_ID`,
+  `ADDRESS_ALIASES_TYPE`, `MAX_ALIASES` and `AddressAliasesBcs`, and the
+  recipes `enable()`, `add({ address, alias })`, `remove({ address, alias })`
+  and `replaceAll({ address, aliases })`. Every check reads the **object**,
+  never transaction history.
+- **`Verify.verifyTransactionSignature(bytes, signature, { address,
+  checkAddressAliases: true })`**: a validator's sender check — the signer must
+  be in `address`'s alias set (or be `address` while it has none), always one
+  read, so an address that removed itself is refused — failing with `PolicyDenied
+  { rule: "alias.signer" }`; `PolicyDenied` is in the union only under that
+  literal (`VerifyTransactionOptions`, `VerifyTransactionSignature`).
+  `@mysten/sui/verify` has no alias-aware option (2.38).
+- **The fake models address alias sets.** `FakeScript.addressAliases`,
+  `SuiTest.setAddressAliases(address, aliases | undefined)` and
+  `SuiTest.addressAliases(address)` over an `AddressAliases` object at the
+  derived id (and `SuiCoreFakeState.setAddressAliases` / `readAddressAliases`);
+  `0xa` is served as the shared `AddressAliasState`, so `AddressAlias.enable()`
+  resolves; executed `enable`/`add`/`remove`/`replace_all` calls edit the sets
+  (Move's aborts are not modeled); and the signature check resolves aliases for
+  the sender and the gas owner the way a validator does, so a key outside the
+  set — A's own key once A removed itself included — is refused with
+  `INVALID_ARGUMENT`.
+- A recipe, `examples/recipes/account-alias.ts` (hand an account over to a
+  multisig, then pay as the account), quoted in `LLMS.md`; DESIGN §21; README
+  "Address aliases and multisig accounts"; `docs/extensions.md` §5 and the
+  fake's notes.
+
+### Changed
+
+- The fake's signature check reads a **multisig** signature's address off its
+  public key (it used to stand the address check down for any multisig), so a
+  multisig signature for an address it does not cover is refused. A zkLogin
+  signature still stands it down.
+- The extension template's `@unconfirmed/sui-effect` peer range is
+  `>=0.6.0 <0.7.0`.
+
+### Testing
+
+- `test/address-alias-0-6-0.test.ts` (fake): the derived id, the read and the
+  check, the recipes; `Signer.multisig` member order (a reversed SDK combine
+  fails `Verify`), its construction refusals, a personal message, a passkey
+  member and a zkLogin member on their bits, a locked member; `Signer.alias`;
+  `Tx.run` as A signed by M with the journal's `Signed` entry naming A and the
+  sender lock A's (M's stays free); a key A does not list refused before any
+  simulate; an alias sponsor; enable → add M → remove A → run as M → the old
+  key refused (`INVALID_ARGUMENT`, settled refused); `Tx.attach` and `Verify`
+  against the set.
+- `test/live.localnet-alias.test.ts`, behind `SUI_LOCALNET=1`: on a validator,
+  `enable` creates the object at `AddressAlias.aliasesId(A)`; `add(M)` +
+  `remove(A)` in one transaction; `Tx.run` with `Signer.alias(A,
+  Signer.multisig(…))` given two members out of order lands; the same two
+  combined in the given order are refused by the validator; `Tx.build` → sign
+  → `Tx.attach` → `Tx.submit` lands; A's old key is refused by the node and by
+  `Verify` with `checkAddressAliases`, and a key A does not list by `Tx.run`
+  before building.
+
+**Not proven**: a zkLogin member's signature accepted on chain (no prover, as in
+0.5.0); a real WebAuthn authenticator as a multisig member (a software P-256
+authenticator signs in the fake test).
+
+### Migrating from 0.5.x
+
+1. Code that catches `SigningError` from `Tx.attach` to detect "signed by the
+   wrong party" catches `PolicyDenied` with `rule === "alias.signer"` instead
+   (`SigningError` still means an empty, unparseable or invalid signature).
+2. An exhaustive match on `KeyError.reason` adds `"invalidMultisig"`.
+3. An extension package built from `examples/extension-template` moves its
+   `@unconfirmed/sui-effect` peer range to `">=0.6.0 <0.7.0"`.
+4. Signing as an aliased account used to bypass sui-effect (the SDK client's
+   `executeTransaction` with a hand-combined multisig signature). Replace it
+   with `Tx.run(recipe, { signer: Signer.alias(account, yield*
+   Signer.multisig(publicKey, members)) })`, which also journals the
+   submission, takes the account's lock and combines in member order.
+
 ## 0.5.0
 
 The wallet core: a transaction can declare what it is for and is refused when

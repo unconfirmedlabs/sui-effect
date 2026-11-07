@@ -731,6 +731,83 @@ A swapped sender or an added command is a `PolicyDenied` before the sender
 signs. Sender and sponsor never need to sign in one process; when the backend
 also submits, end in `Tx.submitVia(signed, send)` instead.
 
+### Address aliases and multisig accounts (0.6.0)
+
+Sui's address aliases (`0x2::address_alias`) let an address A list other
+addresses that may sign transactions **as** A: validators accept a
+transaction whose sender (or gas owner) is A with a signature by any member of
+A's alias set, and once A has enabled aliases only by a member — A's own key
+too only while A is in its set. An account whose only alias is a weighted
+multisig M of a passkey, a zkLogin session, a recovery phrase and a watchdog
+key keeps one address while its keys change.
+
+```ts
+import type { MultiSigPublicKey } from "@mysten/sui/multisig"
+import { SuiAddress } from "@unconfirmed/sui-effect"
+import { AddressAlias, Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+declare const publicKey: MultiSigPublicKey // M: the members, their weights, the threshold
+declare const passkey: Signer // Signer.passkey(…)
+declare const phrase: Signer // Signer.fromMnemonic(…)
+declare const throwaway: Signer // A's own key, used once
+
+// Once, signed by A's own key: enable (its own transaction: `enable` returns
+// no object), then add M and remove A. A's key then signs for nothing.
+const handOver = Effect.gen(function*() {
+  const M = SuiAddress.normalize(publicKey.toSuiAddress())
+  yield* Tx.run(AddressAlias.enable(), { signer: throwaway })
+  yield* Tx.run((tx) => {
+    AddressAlias.add({ address: throwaway.address, alias: M })(tx)
+    AddressAlias.remove({ address: throwaway.address, alias: throwaway.address })(tx)
+  }, { signer: throwaway })
+})
+
+// Every transaction after: sender A, signed by M.
+const asAccount = (A: SuiAddress) =>
+  Effect.gen(function*() {
+    const m = yield* Signer.multisig(publicKey, [phrase, passkey]) // any order
+    return yield* Tx.run(recipe, { signer: Signer.alias(A, m) })
+  })
+```
+
+- **`Signer.multisig(publicKey, signers)`** signs with each member, one after
+  another, and combines the partial signatures **in the multisig's member
+  order** — whatever order the signers were given in. The SDK's
+  `combinePartialSignatures` keeps the order it is handed and a validator
+  pairs the n-th signature with the n-th set bit of the bitmap, so any other
+  order is refused on chain (the SDK's own `MultiSigSigner` has exactly that
+  trap). Members may be of any scheme: Ed25519/Secp256k1/Secp256r1 keys,
+  `Signer.passkey`, `Signer.zkLogin` (the multisig's `maxEpoch` is the
+  earliest member session's), wallets, `Signer.remote`. A non-member, a
+  duplicate or too little weight is `KeyError { reason: "invalidMultisig" }`.
+- **`Signer.alias(A, signer)`** is a signer whose `address` is A and whose
+  `alias` is the key that signs. Everything keyed on the sender is keyed on
+  **A**: the build, the sender lock, `Built.sender`, the journal's
+  `signed.sender`, the intent's parties. `Tx.run` (and `Enoki.run`, and a
+  sponsor given as `Signer.alias(gasOwner, key)`) reads A's `AddressAliases`
+  object once before building and refuses a key A does not list with
+  `PolicyDenied { rule: "alias.signer" }`, so nothing is built, simulated or
+  signed for it. Aliases cover transactions only: its `signPersonalMessage`
+  is `SigningError { reason: "unavailable" }`.
+- **`AddressAlias`** reads and checks the set from the **object** — the one
+  derived from `0xa` at `AliasKey(address)` (`AddressAlias.aliasesId`) —
+  never from transaction history: `getAliases(address)` answers
+  `AddressAliases` (`NotEnabled` or `Enabled { aliases }`),
+  `requireSigner(address, signer)` is the check, and `enable`, `add`,
+  `remove`, `replaceAll` are the recipes for the four entry functions.
+- **Verifying someone else's signature.** `Tx.attach` accepts a signature by
+  an alias of the sender or the gas owner (one alias read, made only for a
+  signature by neither) and refuses anyone else with `PolicyDenied { rule:
+  "alias.signer" }` (a `SigningError` before 0.6.0).
+  `Verify.verifyTransactionSignature(bytes, signature, { address, checkAddressAliases:
+  true })` checks a signature the way a validator checks a sender: always one
+  read, so A's own key is refused once A has removed itself.
+- `Tx.sign` and `Tx.cosign` make no read: they compare the address the signer
+  signs **as** with the bytes, and a key outside the set is the node's
+  refusal (`INVALID_ARGUMENT`, settled `NotApplied { evidence: "refused" }`).
+  Likewise a plain signer whose address removed itself from its own set is
+  not read for by `Tx.run`; the node refuses it.
+
 ## Keys at rest
 
 `Signer.fromMnemonic(phrase, { scheme?, account?, path? })` checks the BIP-39
@@ -1163,7 +1240,9 @@ and, when they apply, `sui.refused`, `sui.lock_conflict` and
 (`visible`, `timeout`, `failed`); `Tx.build`'s carry `sui.simulated_by`,
 `sui.gas_budget`, `sui.max_epoch` and `sui.gas_payment` (`addressBalance`,
 `coinReservation`, `coins`); `Tx.run`'s carries `sui.sender_lock` (`held`,
-`build`, `none`); `Sui.getObjects` carries
+`build`, `none`), and `Tx.run`'s, `Tx.sign`'s and `Tx.cosign`'s carry
+`sui.signer_alias`, the key's address, for a `Signer.alias` (0.6.0);
+`Sui.getObjects` carries
 `sui.object_count` and `sui.chunk_count`, and each `Sui.getObjectsPage`
 `sui.decode_failures`; a tail carries `sui.page_count` and `sui.caught_up`.
 
@@ -1238,6 +1317,18 @@ nor a balance fails the build with `BuildError` ("No valid gas coins found").
 Executions charge gas to the balance, debit withdrawals and follow
 `send_funds` deposits, so a fold or a `Tx.sendFunds` is observable.
 
+The fake models **address alias sets** (0.6.0): `FakeScript.addressAliases`
+(`{ [address]: aliases }`) and `SuiTest.setAddressAliases(address, aliases)`
+put an `AddressAliases` object at the derived id, `SuiTest.addressAliases(address)`
+reads the set back, and executed `AddressAlias.enable`/`add`/`remove`/`replaceAll`
+recipes edit it (the Move module's aborts are not modeled). Its signature check
+resolves aliases the way a validator does — a required address with a set is
+covered only by a member's signature, its own key included only while listed,
+and a multisig signature counts as the multisig's address — so "the old key is
+refused" is a test on the fake (`INVALID_ARGUMENT`, settled refused). The fake
+does not verify signatures cryptographically; `test/live.localnet-alias.test.ts`
+(behind `SUI_LOCALNET=1`) runs the whole hand-over against a validator.
+
 The fake also serves the ledger reads: `listTransactions` and `listEvents`
 page through every transaction it was scripted with or executed, filtered by
 the sender and Move calls in the bytes, and `FakeScript.scanLimit` makes pages
@@ -1294,12 +1385,13 @@ check.
 ## For agents
 
 `LLMS.md` ships in the package. It opens with a "start here" section — the
-subpath map, thirteen tested recipes (reads, a payment, sponsorship by address
-balance, by coins and by a stateless service, publish and upgrade, typed events,
+subpath map, fourteen tested recipes (reads, a payment, sponsorship by address
+balance, by coins and by a stateless service, an account signed for by its
+multisig alias, publish and upgrade, typed events,
 a resumable indexer, a durable journal in a script, re-sending a lost
 submission, mapping a Move abort, an extension and its Promise face called from
 plain TypeScript, a test on the fake), the error table with outcomes and exit
-codes, `SubmitConfig`'s defaults, ten invariants and an index of every export — then
+codes, `SubmitConfig`'s defaults, eleven invariants and an index of every export — then
 every public export with its signature and the error union its JSDoc states,
 plus every example verbatim. It is generated by
 `bun run llms` and a test fails when it is stale. `AGENTS.md` is the short list

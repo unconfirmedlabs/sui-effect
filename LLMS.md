@@ -31,7 +31,7 @@ subpath by subpath; the examples and the extension template come last.
 | Import | What it exports |
 |---|---|
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
-| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `foldMovement`, `sendAll`, `verifySponsored`, `submit`, `submitVia`, `verify`, `prepare`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, `fromMnemonic`, `fromSecretKey`, `zkLogin`, `passkey`, `wallet`, …), `LockableSigner`, `ZkLogin`, `verifySponsored`, `Intent`, `Verified`, `Gate`, `checkClaims`, `Verify`, `SubmitConfig`, `SubmitConfigOverrides`, `LockSenderPolicy` and `GasPaymentPolicy`, `FoldBatch` / `FoldPlan` / `FoldGas` / `FoldResult`, `Journal`, `JournalEntry` |
+| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `foldMovement`, `sendAll`, `verifySponsored`, `submit`, `submitVia`, `verify`, `prepare`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, `fromMnemonic`, `fromSecretKey`, `zkLogin`, `passkey`, `wallet`, `multisig`, `alias`, …), `LockableSigner`, `ZkLogin`, `AddressAlias` / `AddressAliases` (address aliases: the read, the check, the recipes; 0.6.0), `verifySponsored`, `Intent`, `Verified`, `Gate`, `checkClaims`, `Verify`, `SubmitConfig`, `SubmitConfigOverrides`, `LockSenderPolicy` and `GasPaymentPolicy`, `FoldBatch` / `FoldPlan` / `FoldGas` / `FoldResult`, `Journal`, `JournalEntry` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
 | `@unconfirmed/sui-effect/gate` | The Jev screen for `Tx.verify` over `effect/http`: `layerJev`, `layerJevConfig`, `makeJev` (0.5.0) |
 | `@unconfirmed/sui-effect/enoki` | Enoki sponsorship through the journal: `Enoki.fromFlow`, `fromWallet`, `sponsor`, `execute`, `run`, `EnokiError` (0.5.0) |
@@ -39,7 +39,7 @@ subpath by subpath; the examples and the extension template come last.
 | `@unconfirmed/sui-effect/storage` | `KeyValueStore` layers: `layerIndexedDb`, `layerAsyncStorage`, `layerMmkv`, `layerChromeStorage` (0.5.0) |
 | `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)` (an `Effect<Option<A>>` member becomes `Promise<A \| undefined>`, `FaceValue`), and `SuiExtension.leaf` |
 | `@unconfirmed/sui-effect/script` | `Script` / `ScriptReadOnly` (layers that read `SUI_NETWORK`, `SUI_PRIVATE_KEY`, …), `Script.run`, `Script.report`, `Script.exitCode` |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig`; the fake models address balances (`SuiTest.setAddressBalance`, `SuiTest.addressBalance`) |
+| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig`; the fake models address balances (`SuiTest.setAddressBalance`, `SuiTest.addressBalance`) and address alias sets (`FakeScript.addressAliases`, `SuiTest.setAddressAliases`, `SuiTest.addressAliases`) |
 
 ## Recipes
 
@@ -171,6 +171,43 @@ export const sponsorBytes = (sponsor: Signer) => (bytes: Uint8Array, senderSigna
     // Verified against the bytes; the signer must be their sender or gas owner.
     const withSender = yield* Tx.attach(built, senderSignature)
     return yield* Tx.submit(yield* Tx.cosign(withSender, sponsor))
+  })
+```
+
+An account signed for by its alias, a multisig (address aliases, 0.6.0):
+
+```ts
+// An account whose only alias is a multisig: hand it over once, then every transaction's sender
+// is the account and its signature the multisig's.
+import type { MultiSigPublicKey } from "@mysten/sui/multisig"
+import { Effect } from "effect"
+import type { SuiAddress } from "@unconfirmed/sui-effect"
+import { AddressAlias, Signer, Tx } from "@unconfirmed/sui-effect/tx"
+
+// Once, signed by the account's own key: `enable` (it returns no object, so the edit is a second
+// transaction), then add the multisig and remove the account itself. Its own key then signs nothing.
+export const handOver = (account: Signer, multisig: SuiAddress) =>
+  Effect.gen(function*() {
+    yield* Tx.run(AddressAlias.enable(), { signer: account })
+    return yield* Tx.run((tx) => {
+      AddressAlias.add({ address: account.address, alias: multisig })(tx)
+      AddressAlias.remove({ address: account.address, alias: account.address })(tx)
+    }, { signer: account })
+  })
+
+// Every transaction after: members in any order (they are combined in the multisig's member
+// order), `Signer.alias` to sign AS the account. `Tx.run` reads the account's alias set once and
+// refuses a multisig it does not list with `PolicyDenied { rule: "alias.signer" }` before
+// building; the sender lock and the journal are the account's.
+export const payAs = (
+  account: SuiAddress,
+  publicKey: MultiSigPublicKey,
+  members: ReadonlyArray<Signer>,
+  recipient: SuiAddress
+) =>
+  Effect.gen(function*() {
+    const multisig = yield* Signer.multisig(publicKey, members)
+    return yield* Tx.run(Tx.sendFunds({ amount: 1_000n, recipient }), { signer: Signer.alias(account, multisig) })
   })
 ```
 
@@ -465,7 +502,7 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 | `NetworkMismatch` | `not_applied` | 2 | The node is on another chain than the layer was built for |
 | `DecodeError` | `not_applied` | 4 | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
 | `SimulationFailed` | `not_applied` | 4 | Simulation reported an execution failure; no gas charged |
-| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, and the gas ceiling as `rule: "maxGasBudget"`); the journal write before the first send |
+| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, the gas ceiling as `rule: "maxGasBudget"`, and a signer that is neither the address nor in its alias set as `rule: "alias.signer"`); the journal write before the first send |
 | `GraphQLUnavailable` / `ExtensionNotReady` | `not_applied` | 4 | No usable GraphQL endpoint; a synchronous Promise-face member called before its runtime existed |
 | `NotApplied` | `not_applied` | 4 | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
 | `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged (none for `InsufficientFundsForWithdraw`, an overdrawn balance) |
@@ -550,6 +587,7 @@ process-wide.
 8. Every SDK call forwards the Effect's `AbortSignal`, so `Effect.timeout` and interruption cancel the request.
 9. One Move type rule everywhere: a bare expected tag matches every instantiation of the generic; a parameterized one is compared in full.
 10. A test that runs `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default journal is process-wide; `layerTest` is the production `Sui`, so fixtures use `localnet`.
+11. **The sender is the account, never the alias key** (0.6.0). `Tx.run(recipe, { signer: Signer.alias(A, m) })` builds, locks and journals as A and signs with `m`; A's `AddressAliases` object — never transaction history — is read once before the build, and an `m` it does not list is `PolicyDenied { rule: "alias.signer" }`. `Signer.multisig` combines its members' signatures in the multisig's member order, which is the order a validator pairs them with the bitmap in.
 
 ## Index
 
@@ -672,6 +710,8 @@ The full entries follow under "API".
 
 ### `@unconfirmed/sui-effect/tx`
 
+- `AddressAlias` — Sui's address aliases, named after the Move module `sui::address_alias`: `AddressAlias.getAliases`, `allows` and `requireSigner` read and check an address's set from its object; `enable`, `add`, `remove` and `replaceAll` are the recipes for its four entry functions; `aliasesId` is the derived id.
+- `AddressAliases` — Who may sign transactions as an address, read from its `AddressAliases` object.
 - `Built` — re-exported from `@unconfirmed/sui-effect`.
 - `ClaimViolation` — One way the simulated effects stepped outside the claims.
 - `ExpirationPolicy` — How `Tx.build` sets an expiration when the recipe left one unset.
@@ -727,8 +767,10 @@ The full entries follow under "API".
 - `UNRESOLVED_TAGS` — The tags whose entries still need an answer from the network.
 - `Verdict` — How far a transaction was checked.
 - `Verified` — A `Built` whose simulated effects stayed inside a declared `Intent`.
-- `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
+- `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature` (alias-aware with `checkAddressAliases`, 0.6.0), `Verify.verifyPersonalMessageSignature`.
 - `VerifyOptions` — The options both verifiers take.
+- `VerifyTransactionOptions` — The options of `verifyTransactionSignature`: `VerifyOptions`, plus whether `address` is checked through its address aliases.
+- `VerifyTransactionSignature` — The overloads of `verifyTransactionSignature`: `PolicyDenied` is in the union exactly when `checkAddressAliases: true` is.
 - `ZkLogin` — The zkLogin session schemas and store, namespaced: `ZkLogin.Session`, `ZkLogin.SignatureInputs`, `ZkLogin.StoredSession`, `ZkLogin.save`, `ZkLogin.load`, `ZkLogin.remove`.
 - `ZkLoginSession` — The public half of a zkLogin session: everything but the ephemeral secret.
 - `ZkLoginSignatureInputs` — The proof inputs a zkLogin signature carries: the SDK's `ZkLoginSignatureInputs` from `@mysten/sui/zklogin`, as a schema, so a session can be stored and read back.
@@ -1990,7 +2032,7 @@ failed; it never contains the phrase, a word of it, or the key.
 
 ```ts
 declare const KeyErrorReason: Schema
-// decodes to: "unavailable" | "invalidMnemonic" | "invalidSecretKey" | "invalidPath" | "unsupportedScheme"
+// decodes to: "unavailable" | "invalidMnemonic" | "invalidSecretKey" | "invalidPath" | "unsupportedScheme" | "invalidMultisig"
 ```
 
 Why a phrase, a secret key or a path was refused.
@@ -2007,6 +2049,9 @@ Why a phrase, a secret key or a path was refused.
   `scheme` option that contradicts the key's own flag.
 - `unavailable`: the platform has no `crypto.getRandomValues`, which a fresh
   mnemonic needs (React Native without a CSPRNG polyfill).
+- `invalidMultisig` (0.6.0): `Signer.multisig` was given a signer that is
+  not a member of the multisig, two signers for one member, or members whose
+  weights do not reach the threshold.
 
 ### `KnownNetwork` (const)
 
@@ -4268,7 +4313,74 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-99 exported symbols.
+103 exported symbols.
+
+### `AddressAlias` (const)
+
+```ts
+declare const AddressAlias: {
+    readonly ADDRESS_ALIAS_STATE_ID: ObjectId;
+    readonly ADDRESS_ALIASES_TYPE: "0x2::address_alias::AddressAliases";
+    readonly MAX_ALIASES: 8;
+    readonly AddressAliasesBcs: import("@mysten/bcs").BcsStruct<{
+        id: import("@mysten/bcs").BcsType<string, string | Uint8Array<ArrayBufferLike>, "bytes[32]">;
+        aliases: import("@mysten/bcs").BcsStruct<{
+            contents: import("@mysten/bcs").BcsType<string[], Iterable<string | Uint8Array<ArrayBufferLike>> & {
+                length: number;
+            }, string>;
+        }, string>;
+    }, string>;
+    readonly aliasesId: (address: string) => import("../index.ts").ObjectId;
+    readonly getAliases: (address: SuiAddress) => Effect.Effect<AddressAliases, ObjectUnavailable | DecodeError | TransportError, Sui>;
+    readonly allows: (aliases: AddressAliases, signer: string) => boolean;
+    readonly requireSigner: (address: SuiAddress, signer: SuiAddress) => Effect.Effect<AddressAliases, PolicyDenied | TransportError, Sui>;
+    readonly enable: () => Recipe;
+    readonly add: (opts: {
+        readonly address: SuiAddress;
+        readonly alias: SuiAddress;
+    }) => Recipe;
+    readonly remove: (opts: {
+        readonly address: SuiAddress;
+        readonly alias: SuiAddress;
+    }) => Recipe;
+    readonly replaceAll: (opts: {
+        readonly address: SuiAddress;
+        readonly aliases: ReadonlyArray<SuiAddress>;
+    }) => Recipe;
+}
+```
+
+Sui's address aliases, named after the Move module `sui::address_alias`:
+`AddressAlias.getAliases`, `allows` and `requireSigner` read and check an
+address's set from its object; `enable`, `add`, `remove` and `replaceAll`
+are the recipes for its four entry functions; `aliasesId` is the derived id.
+Signing as an address through one of its aliases is `Signer.alias`.
+
+### `AddressAliases` (const)
+
+```ts
+declare const AddressAliases: Schema
+// decodes to:
+// {
+//     readonly _tag: "NotEnabled";
+//     readonly address: SuiAddress;
+// } | {
+//     readonly _tag: "Enabled";
+//     readonly address: SuiAddress;
+//     readonly id: ObjectId;
+//     readonly version: Version;
+//     readonly aliases: readonly SuiAddress[];
+// }
+```
+
+Who may sign transactions as an address, read from its `AddressAliases`
+object.
+
+- `NotEnabled`: there is no such object, so the address signs only for
+  itself (Sui's default).
+- `Enabled`: `enable` has run, and exactly the addresses in `aliases` may
+  sign as `address` — the address itself only while it is in the set.
+  `version` is the object's version as read.
 
 ### `Built` (const)
 
@@ -5266,6 +5378,17 @@ export interface Signer {
      * @since 0.5.0
      */
     readonly maxEpoch?: bigint;
+    /**
+     * The address whose key actually signs, when this signer signs **as**
+     * `address` through Sui's address aliases (`0x2::address_alias`): `address`
+     * is the account a transaction names as its sender or gas owner, and `alias`
+     * a member of that account's alias set. Absent for a signer that signs as
+     * itself. `Signer.alias` sets it, and `Tx.run` checks it against the
+     * account's `AddressAliases` object before anything is built.
+     *
+     * @since 0.6.0
+     */
+    readonly alias?: SuiAddress;
 }
 ```
 
@@ -5304,6 +5427,8 @@ declare const Signer: {
         readonly chain: string;
         readonly scheme?: SignatureScheme;
     }) => Effect.Effect<Signer, SigningError, never>;
+    readonly multisig: (publicKey: import("@mysten/sui/multisig").MultiSigPublicKey, signers: ReadonlyArray<Signer>) => Effect.Effect<Signer, KeyError>;
+    readonly alias: (address: SuiAddress, signer: Signer) => Signer;
 }
 ```
 
@@ -5313,7 +5438,10 @@ The constructors, namespaced the way the spec spells them:
 `Signer.fromMnemonic`, `Signer.fromSecretKey`, `Signer.generateMnemonic`,
 `Signer.derivationPath` and `Signer.scoped`; and the account signers
 (0.5.0) `Signer.zkLogin`, `Signer.passkey`, `Signer.createPasskey`,
-`Signer.wallet`. The type `Signer` is the interface above.
+`Signer.wallet`; and signers made of signers (0.6.0) `Signer.multisig`
+(a weighted multisig over member signers, combined in member order) and
+`Signer.alias` (sign as an address through its address aliases). The type
+`Signer` is the interface above.
 
 ### `StandardWallet` (interface)
 
@@ -5578,7 +5706,7 @@ declare const Tx: {
     readonly sign: (built: Built, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
     readonly cosign: (signed: Signed, signer: Signer) => Effect.Effect<Signed, SigningError, never>;
     readonly fromBytes: (bytes: Uint8Array<ArrayBufferLike>) => Effect.Effect<Built, BuildError, Sui>;
-    readonly attach: (target: Built | Signed, signature: string) => Effect.Effect<Signed, TransportError | SigningError, Sui>;
+    readonly attach: (target: Built | Signed, signature: string) => Effect.Effect<Signed, TransportError | SigningError | PolicyDenied, Sui>;
     readonly sponsored: (opts: {
         readonly sender: SuiAddress;
         readonly gasOwner: SuiAddress;
@@ -5886,13 +6014,14 @@ brand is what says `Tx.verify` produced it.
 
 ```ts
 declare const Verify: {
-    readonly verifyTransactionSignature: (bytes: Uint8Array<ArrayBufferLike>, signature: string, options?: VerifyOptions | undefined) => Effect.Effect<PublicKey, TransportError | SigningError, Sui>;
+    readonly verifyTransactionSignature: VerifyTransactionSignature;
     readonly verifyPersonalMessageSignature: (message: Uint8Array<ArrayBufferLike>, signature: string, options?: VerifyOptions | undefined) => Effect.Effect<PublicKey, TransportError | SigningError, Sui>;
 }
 ```
 
 Signature verification, namespaced the way the SDK spells it:
-`Verify.verifyTransactionSignature`, `Verify.verifyPersonalMessageSignature`.
+`Verify.verifyTransactionSignature` (alias-aware with
+`checkAddressAliases`, 0.6.0), `Verify.verifyPersonalMessageSignature`.
 Both have `R = Sui`.
 
 ### `VerifyOptions` (interface)
@@ -5910,6 +6039,46 @@ export interface VerifyOptions {
 ```
 
 The options both verifiers take.
+
+### `VerifyTransactionOptions` (interface)
+
+```ts
+export interface VerifyTransactionOptions extends VerifyOptions {
+    /**
+     * Check `address` the way a validator checks a sender: the signature must be
+     * by a member of `address`'s alias set (`0x2::address_alias`), read from its
+     * `AddressAliases` object — or by `address` itself while it has not enabled
+     * aliases. One object read, made even when the signature is `address`'s own,
+     * since an address that removed itself from its set no longer signs for
+     * itself. A signer that is neither is `PolicyDenied { rule: "alias.signer" }`.
+     * Requires `address`.
+     *
+     * @since 0.6.0
+     */
+    readonly checkAddressAliases?: boolean;
+}
+```
+
+The options of `verifyTransactionSignature`: `VerifyOptions`,
+plus whether `address` is checked through its address aliases.
+
+### `VerifyTransactionSignature` (type)
+
+```ts
+export type VerifyTransactionSignature = {
+    (bytes: Uint8Array, signature: string, options: VerifyTransactionOptions & {
+        readonly address: SuiAddress;
+        readonly checkAddressAliases: true;
+    }): Effect.Effect<PublicKey, SigningError | PolicyDenied | TransportError, Sui>;
+    (bytes: Uint8Array, signature: string, options?: VerifyOptions & {
+        readonly checkAddressAliases?: false;
+    }): Effect.Effect<PublicKey, SigningError | TransportError, Sui>;
+};
+```
+
+The overloads of `verifyTransactionSignature`: `PolicyDenied` is in
+the union exactly when `checkAddressAliases: true` is. Pass the literal; a
+`boolean` variable matches neither.
 
 ### `ZkLogin` (const)
 
@@ -6118,7 +6287,7 @@ a `save` writes under its key.
 ### `attach` (const)
 
 ```ts
-declare const attach: (target: Built | Signed, signature: string) => Effect.Effect<Signed, TransportError | SigningError, Sui>
+declare const attach: (target: Built | Signed, signature: string) => Effect.Effect<Signed, TransportError | SigningError | PolicyDenied, Sui>
 ```
 
 Attaches a signature somebody else made — a sender's wallet, a remote
@@ -6126,9 +6295,14 @@ sponsor, an HSM — to built or already signed bytes, after checking it.
 
 The signature is verified against the bytes (`Verify.verifyTransactionSignature`,
 so a zkLogin or multisig signature is checked through the node), and the
-address it was made by must be the sender or the gas owner the bytes name.
-A `Built` becomes a `Signed` carrying that one signature; a `Signed` gains it.
-The same signature attached twice is attached once.
+address it was made by must be one the bytes accept: the sender or the gas
+owner they name, or — through Sui's address aliases (0.6.0) — a member of
+the sender's or the gas owner's alias set, read from their
+`AddressAliases` objects. That read is made only for a signature by neither
+address; a signature by the sender's own key is attached without one (an
+address that removed itself from its own set is refused by the node at
+submission). A `Built` becomes a `Signed` carrying that one signature; a
+`Signed` gains it. The same signature attached twice is attached once.
 
 ```ts
 const built = yield* Tx.fromBytes(senderBytes)
@@ -6136,7 +6310,7 @@ const withSender = yield* Tx.attach(built, senderSignature)
 const signed = yield* Tx.cosign(withSender, sponsor)
 ```
 
-**Fails with: `SigningError` (the signature is empty, does not parse, is not valid for these bytes, or was made by an address the bytes will not accept), `TransportError` (a zkLogin or multisig check could not reach a usable answer).**
+**Fails with: `SigningError` (the signature is empty, does not parse or is not valid for these bytes), `PolicyDenied` (`alias.signer`, 0.6.0: it was made by an address that is neither the sender, the gas owner, nor an alias of either — before 0.6.0 this was a `SigningError`), `TransportError` (a zkLogin or multisig check, or an alias read, could not reach a usable answer).**
 
 ### `build` (const)
 
@@ -6284,7 +6458,8 @@ multi-party transaction. The bytes are untouched, so both parties sign
 exactly the same transaction.
 
 As in `sign`, the co-signer's address must be the sender or the gas
-owner named in the bytes.
+owner named in the bytes; a `Signer.alias` is compared by the account it
+signs as.
 
 **Fails with: `SigningError`.**
 
@@ -7384,7 +7559,20 @@ anything resolves.
 `locked` answers `true` fails the run with `SigningError { reason:
 "locked" }` before anything is built or simulated.
 
-**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads; once bytes are sent, transport failures become `SubmissionUnknown`), and `E` — whatever `approve` fails with.**
+**Sender A, signed by M** (0.6.0). `signer: Signer.alias(A, m)` runs a
+transaction whose sender is the account A with the signature of M, a member
+of A's alias set (`0x2::address_alias`) — `m` is any signer, a
+`Signer.multisig` included. Everything that is keyed on the sender is keyed
+on **A**: the build's sender, the sender lock (and the in-flight registry),
+`Built.sender`, the journal's `signed.sender`, `onSigned`, the intent's and
+`approve`'s parties; M appears only in the signature (span attribute
+`sui.signer_alias`). Before anything is built the run reads A's
+`AddressAliases` object once and refuses an M it does not list with
+`PolicyDenied { rule: "alias.signer" }`; a sponsor given as
+`Signer.alias(gasOwner, key)` is read for the same way. A plain signer
+costs no such read.
+
+**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied` (also `alias.signer`, 0.6.0), `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads and an alias read; once bytes are sent, transport failures become `SubmissionUnknown`), and `E` — whatever `approve` fails with.**
 
 ### `sendAll` (const)
 
@@ -7483,6 +7671,13 @@ The signer's address must be the transaction's sender or, for a sponsored
 transaction, its gas owner; anything else is a `SigningError` rather than a
 rejection at execution time. A `Signer.remote` therefore has to report the
 address it signs as truthfully.
+
+A `Signer.alias(account, key)` signs as `account`, so it signs bytes whose
+sender (or gas owner) is `account` with `key`'s signature. This makes no
+chain read: that `key` is in `account`'s alias set is checked by `Tx.run`
+before it builds, or by `AddressAlias.requireSigner` / `Tx.attach` /
+`Verify.verifyTransactionSignature(…, { checkAddressAliases: true })`
+when you sign step by step; a key outside the set is refused by the node.
 
 **Fails with: `SigningError`.**
 
@@ -8732,11 +8927,13 @@ and so does its early refusal of a locked signer (`SigningError { reason:
 
 `options.signer` is the sender: an Enoki zkLogin session
 (`Enoki.fromFlow`, `Enoki.fromWallet`, `Signer.zkLogin`) or any other
-signer Enoki sponsors. `options.jwt`, `allowedAddresses` and
+signer Enoki sponsors — a `Signer.alias(account, key)` included (0.6.0),
+whose key is checked against the account's alias set before Enoki is
+asked anything (`PolicyDenied { rule: "alias.signer" }`), as in `Tx.run`. `options.jwt`, `allowedAddresses` and
 `allowedMoveCallTargets` are `sponsor`'s; `refused` is
 `execute`'s.
 
-**Fails with: `EnokiError` (a refusal: the sponsor request answered 4xx, or the execute call failed in a way `refused` recognises), `TransportError` (Enoki could not be reached for the sponsor request, or the simulate), `BuildError`, `PolicyDenied` (`enoki.digest`, `sponsored.*`, `prepare.sender`, `intent.*`, `preflight`), `SimulationFailed`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, and `E` — whatever `approve` fails with.**
+**Fails with: `EnokiError` (a refusal: the sponsor request answered 4xx, or the execute call failed in a way `refused` recognises), `TransportError` (Enoki could not be reached for the sponsor request, or the simulate), `BuildError`, `PolicyDenied` (`enoki.digest`, `sponsored.*`, `prepare.sender`, `intent.*`, `preflight`, `alias.signer`), `SimulationFailed`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, and `E` — whatever `approve` fails with.**
 
 ### `sponsor` (const)
 
@@ -9949,6 +10146,18 @@ export interface FakeScript {
      * @since 0.4.0
      */
     readonly readOptions?: SuiCoreReadOptions;
+    /**
+     * Address alias sets (`0x2::address_alias`), keyed by address: each becomes
+     * the address's `AddressAliases` object at its derived id (BCS content,
+     * party-owned by the address), which is what `AddressAlias.getAliases` reads
+     * and what the fake's signature check consults. An address not named here
+     * has not enabled aliases. Executions of `0x2::address_alias::enable`, `add`,
+     * `remove` and `replace_all` then edit the sets, and
+     * `SuiTest.setAddressAliases` replaces one.
+     *
+     * @since 0.6.0
+     */
+    readonly addressAliases?: Readonly<Record<string, ReadonlyArray<string>>>;
 }
 ```
 
@@ -10092,6 +10301,22 @@ export interface SuiCoreFakeState {
      * @since 0.4.0
      */
     readonly readAddressBalance: (owner: string, coinType: string) => Effect.Effect<bigint>;
+    /**
+     * Replaces `address`'s alias set: its `AddressAliases` object at the derived
+     * id, at the next version. `undefined` removes the object, so the address is
+     * back to signing only for itself (which no chain allows; a test may).
+     * Never fails.
+     *
+     * @since 0.6.0
+     */
+    readonly setAddressAliases: (address: string, aliases: ReadonlyArray<string> | undefined) => Effect.Effect<void>;
+    /**
+     * `address`'s alias set as the fake holds it, `None` when it has not enabled
+     * aliases. Never fails.
+     *
+     * @since 0.6.0
+     */
+    readonly readAddressAliases: (address: string) => Effect.Effect<Option.Option<ReadonlyArray<string>>>;
     /** Replaces the remaining scripted outcomes of a method. */
     readonly setOutcomes: (method: "simulate" | "execute" | "getTransaction" | "buildSimulate" | "getObject", outcomes: ReadonlyArray<FakeOutcome>) => Effect.Effect<void>;
 }
@@ -10119,6 +10344,8 @@ declare const SuiTest: {
     readonly setVisibilityDelay: (delay: number | "never" | undefined) => Effect.Effect<void, never, SuiCoreFake>;
     readonly setAddressBalance: (owner: string, amount: bigint, coinType?: string) => Effect.Effect<void, never, SuiCoreFake>;
     readonly addressBalance: (owner: string, coinType?: string) => Effect.Effect<bigint, never, SuiCoreFake>;
+    readonly setAddressAliases: (address: string, aliases: ReadonlyArray<string> | undefined) => Effect.Effect<void, never, SuiCoreFake>;
+    readonly addressAliases: (address: string) => Effect.Effect<Option.Option<ReadonlyArray<string>>, never, SuiCoreFake>;
     readonly calls: (method?: string) => Effect.Effect<ReadonlyArray<RecordedCall>, never, SuiCoreFake>;
     readonly provide: <ROut, E>(layer: Layer.Layer<ROut, E>) => <A, E2, R>(effect: Effect.Effect<A, E2, R>) => Effect.Effect<A, E | E2, Exclude<R, ROut | TestClock.TestClock>>;
 }

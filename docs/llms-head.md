@@ -31,7 +31,7 @@ subpath by subpath; the examples and the extension template come last.
 | Import | What it exports |
 |---|---|
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
-| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `foldMovement`, `sendAll`, `verifySponsored`, `submit`, `submitVia`, `verify`, `prepare`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, `fromMnemonic`, `fromSecretKey`, `zkLogin`, `passkey`, `wallet`, …), `LockableSigner`, `ZkLogin`, `verifySponsored`, `Intent`, `Verified`, `Gate`, `checkClaims`, `Verify`, `SubmitConfig`, `SubmitConfigOverrides`, `LockSenderPolicy` and `GasPaymentPolicy`, `FoldBatch` / `FoldPlan` / `FoldGas` / `FoldResult`, `Journal`, `JournalEntry` |
+| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `foldMovement`, `sendAll`, `verifySponsored`, `submit`, `submitVia`, `verify`, `prepare`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, `fromMnemonic`, `fromSecretKey`, `zkLogin`, `passkey`, `wallet`, `multisig`, `alias`, …), `LockableSigner`, `ZkLogin`, `AddressAlias` / `AddressAliases` (address aliases: the read, the check, the recipes; 0.6.0), `verifySponsored`, `Intent`, `Verified`, `Gate`, `checkClaims`, `Verify`, `SubmitConfig`, `SubmitConfigOverrides`, `LockSenderPolicy` and `GasPaymentPolicy`, `FoldBatch` / `FoldPlan` / `FoldGas` / `FoldResult`, `Journal`, `JournalEntry` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
 | `@unconfirmed/sui-effect/gate` | The Jev screen for `Tx.verify` over `effect/http`: `layerJev`, `layerJevConfig`, `makeJev` (0.5.0) |
 | `@unconfirmed/sui-effect/enoki` | Enoki sponsorship through the journal: `Enoki.fromFlow`, `fromWallet`, `sponsor`, `execute`, `run`, `EnokiError` (0.5.0) |
@@ -39,7 +39,7 @@ subpath by subpath; the examples and the extension template come last.
 | `@unconfirmed/sui-effect/storage` | `KeyValueStore` layers: `layerIndexedDb`, `layerAsyncStorage`, `layerMmkv`, `layerChromeStorage` (0.5.0) |
 | `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)` (an `Effect<Option<A>>` member becomes `Promise<A \| undefined>`, `FaceValue`), and `SuiExtension.leaf` |
 | `@unconfirmed/sui-effect/script` | `Script` / `ScriptReadOnly` (layers that read `SUI_NETWORK`, `SUI_PRIVATE_KEY`, …), `Script.run`, `Script.report`, `Script.exitCode` |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig`; the fake models address balances (`SuiTest.setAddressBalance`, `SuiTest.addressBalance`) |
+| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig`; the fake models address balances (`SuiTest.setAddressBalance`, `SuiTest.addressBalance`) and address alias sets (`FakeScript.addressAliases`, `SuiTest.setAddressAliases`, `SuiTest.addressAliases`) |
 
 ## Recipes
 
@@ -66,6 +66,10 @@ The explicit lifecycle, for a sponsored transaction, and the coin-paid alternati
 A stateless sponsor service, handed someone else's bytes:
 
 <!-- recipe: examples/recipes/sponsored-stateless.ts -->
+
+An account signed for by its alias, a multisig (address aliases, 0.6.0):
+
+<!-- recipe: examples/recipes/account-alias.ts -->
 
 Re-sending a lost submission:
 
@@ -136,7 +140,7 @@ the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
 | `NetworkMismatch` | `not_applied` | 2 | The node is on another chain than the layer was built for |
 | `DecodeError` | `not_applied` | 4 | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
 | `SimulationFailed` | `not_applied` | 4 | Simulation reported an execution failure; no gas charged |
-| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, and the gas ceiling as `rule: "maxGasBudget"`); the journal write before the first send |
+| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, the gas ceiling as `rule: "maxGasBudget"`, and a signer that is neither the address nor in its alias set as `rule: "alias.signer"`); the journal write before the first send |
 | `GraphQLUnavailable` / `ExtensionNotReady` | `not_applied` | 4 | No usable GraphQL endpoint; a synchronous Promise-face member called before its runtime existed |
 | `NotApplied` | `not_applied` | 4 | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
 | `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged (none for `InsufficientFundsForWithdraw`, an overdrawn balance) |
@@ -221,6 +225,7 @@ process-wide.
 8. Every SDK call forwards the Effect's `AbortSignal`, so `Effect.timeout` and interruption cancel the request.
 9. One Move type rule everywhere: a bare expected tag matches every instantiation of the generic; a parameterized one is compared in full.
 10. A test that runs `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default journal is process-wide; `layerTest` is the production `Sui`, so fixtures use `localnet`.
+11. **The sender is the account, never the alias key** (0.6.0). `Tx.run(recipe, { signer: Signer.alias(A, m) })` builds, locks and journals as A and signs with `m`; A's `AddressAliases` object — never transaction history — is read once before the build, and an `m` it does not list is `PolicyDenied { rule: "alias.signer" }`. `Signer.multisig` combines its members' signatures in the multisig's member order, which is the order a validator pairs them with the bitmap in.
 
 ## Index
 
