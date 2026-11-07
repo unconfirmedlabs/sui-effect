@@ -1,6 +1,6 @@
 /**
- * Folding coin objects into the owner's **address balance**, and sending into
- * one: the planning and the recipes. `Tx.foldCoins`, which runs a plan, lives
+ * Folding coin objects into the owner's **address balance**, and sending from
+ * one into another: the planning and the recipes. `Tx.foldCoins`, which runs a plan, lives
  * in `Tx.ts` beside `Tx.run`.
  *
  * An address balance has no object version, so a transaction that pays gas
@@ -257,24 +257,22 @@ export const fold = (batch: FoldBatch): Recipe => (tx: Transaction) => {
 }
 
 /**
- * Sends `amount` of a coin type into `recipient`'s **address balance**:
- * `0x2::balance::send_funds<T>(tx.balance({ type, balance: amount }), recipient)`,
- * the canonical transfer on an address-balance account.
+ * Sends `amount` of a coin type from the sender's **address balance** into
+ * `recipient`'s: a `FundsWithdrawal` of `amount` (`tx.withdrawal`), redeemed
+ * into a `Balance<T>` (`0x2::balance::redeem_funds<T>`) and deposited with
+ * `0x2::balance::send_funds<T>`. No versioned input at all, so with gas from
+ * the balance too the transaction pins nothing, and the recipient receives a
+ * balance rather than a coin object it would have to fold.
  *
- * The amount comes from the sender's address balance when that covers it — a
- * `FundsWithdrawal`, no versioned input at all, so with gas from the balance
- * too the transaction pins nothing. Otherwise it comes from coins: for SUI,
- * split from the gas coin, the SDK's default; for another type, the sender's
- * coins merged and split, the remainder returned to its balance. The recipient
- * receives a balance rather than a coin object it would have to fold.
- * `coinType` defaults to SUI; `amount` is in the type's smallest unit.
- *
- * `useGasCoin` is the SDK's option of that name and only matters for SUI that
- * the balance does not cover. Leave it `true` for the sender's own
- * transactions: `false` makes every SUI coin an input of the PTB, which leaves
- * none to pay gas with on an account whose SUI is all coins (a node refuses gas
- * selection then). Set it `false` under `Tx.sponsored`, where the gas coin
- * belongs to the sponsor.
+ * **Address balances only.** There is no fallback to coins or the gas coin:
+ * a withdrawal the sender's balance does not cover is refused by the node
+ * ("Invalid withdraw reservation", `INVALID_ARGUMENT`) when `Tx.build`
+ * resolves it, as a `BuildError`, so nothing is signed. (A balance spent
+ * between the build and the send is refused at submit instead, settled
+ * `NotApplied { refused }`.)
+ * Fold coins into the balance first (`Tx.foldCoins`), or write the coin
+ * transfer yourself (`tx.splitCoins`, `tx.transferObjects`). `coinType`
+ * defaults to SUI; `amount` is in the type's smallest unit.
  *
  * Never fails; the recipe throws only if the SDK rejects an input, which
  * `Tx.build` reports as `BuildError`.
@@ -285,17 +283,17 @@ export const sendFunds = (opts: {
   readonly coinType?: CoinType
   readonly amount: bigint
   readonly recipient: SuiAddress
-  /** Whether SUI the balance does not cover may be split from the gas coin. Default `true`. */
-  readonly useGasCoin?: boolean
 }): Recipe =>
 (tx: Transaction) => {
   const type = opts.coinType ?? SUI
+  const balance = tx.moveCall({
+    target: "0x2::balance::redeem_funds",
+    typeArguments: [type],
+    arguments: [tx.withdrawal({ amount: opts.amount, type })]
+  })
   tx.moveCall({
     target: "0x2::balance::send_funds",
     typeArguments: [type],
-    arguments: [
-      tx.balance({ type, balance: opts.amount, useGasCoin: opts.useGasCoin ?? true }),
-      tx.pure.address(opts.recipient)
-    ]
+    arguments: [balance, tx.pure.address(opts.recipient)]
   })
 }

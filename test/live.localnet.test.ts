@@ -239,16 +239,38 @@ describe.skipIf(!LOCALNET)("localnet, with SUI_LOCALNET=1", () => {
   )
 
   test(
-    "a coin-only account falls back to coins by default and is refused under requireAddressBalance",
+    "a coin-only account: sendFunds draws no coin, gas falls back to coins by default, requireAddressBalance refuses",
     async () => {
       const signer = await funded()
       const recipient = (await Effect.runPromise(ephemeral)).address
-      const fallback = await local(runShaped(Tx.sendFunds({ amount: 1_000n, recipient }), signer))
+      // Address balances only: the node refuses to resolve a withdrawal an
+      // empty balance cannot cover, so nothing is signed or sent.
+      const noBalance = await local(Effect.flip(Tx.run(Tx.sendFunds({ amount: 1_000n, recipient }), { signer })))
+      console.error(`sendFunds from a coin-only account: ${noBalance._tag} ${noBalance.message.slice(0, 160)}`)
+      expect(noBalance._tag).toBe("BuildError")
+      expect(noBalance.message).toContain("Invalid withdraw reservation")
+      expect((await balanceOf(recipient)).addressBalance).toBe(0n)
+
+      // Gas, though, still falls back to the account's coins.
+      const fallback = await local(runShaped((tx) => {
+        tx.transferObjects([tx.splitCoins(tx.gas, [1_000n])], recipient)
+      }, signer))
       expect(fallback.executed.effects.status.success).toBe(true)
       expect(fallback.shape.payment).toBeGreaterThan(0)
 
+      // A transaction that withdraws nothing still needs its gas from the
+      // balance under requireAddressBalance, and coins are refused.
       const refused = await local(
-        Effect.flip(Tx.build(Tx.sendFunds({ amount: 1_000n, recipient }), { sender: signer.address })).pipe(
+        Effect.flip(Tx.build((tx) => {
+          tx.moveCall({
+            target: "0x2::balance::send_funds",
+            typeArguments: ["0x2::sui::SUI"],
+            arguments: [
+              tx.moveCall({ target: "0x2::balance::zero", typeArguments: ["0x2::sui::SUI"] }),
+              tx.pure.address(recipient)
+            ]
+          })
+        }, { sender: signer.address })).pipe(
           SubmitConfig.with({ gasPayment: "requireAddressBalance" })
         )
       )

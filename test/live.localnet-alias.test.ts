@@ -67,6 +67,9 @@ describe.skipIf(!LOCALNET)("address aliases on localnet, with SUI_LOCALNET=1", (
         )
       }))
 
+      // Tx.sendFunds draws from the address balance only: fold the faucet's coins.
+      await local(Tx.foldCoins({ signer: account }))
+
       // M: a 2-of-3 multisig of fresh Ed25519 keys.
       const keys = [new Ed25519Keypair(), new Ed25519Keypair(), new Ed25519Keypair()]
       const publicKey = MultiSigPublicKey.fromPublicKeys({
