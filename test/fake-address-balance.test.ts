@@ -1,5 +1,5 @@
 /**
- * The fake's address-balance model (DESIGN §14, 0.4.0): seeding, the
+ * The fake's address-balance model (DESIGN §13, 0.4.0): seeding, the
  * `getBalance`/`listBalances` composition, the resolver's `setGasPayment`
  * mirror, the node-shaped execution refusals, and the balances a successful
  * (or failed) execution moves.

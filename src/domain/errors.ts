@@ -38,7 +38,7 @@ export class TransportError extends Schema.TaggedError<TransportError>()("Transp
    * status and the retryability the way `SuiCore` does for the SDK's own
    * failures.
    *
-   * This is for an extension that makes its own network calls — an operator
+   * This is for a library that makes its own network calls — an operator
    * HTTP API, a GraphQL endpoint, a sidecar — and wants its failures to sit on
    * the same axis as the library's: `retryable` read off a gRPC status name, an
    * HTTP status number (5xx and 429), or an abort or timeout, and `status`
@@ -224,7 +224,7 @@ export type DecodeKind = typeof DecodeKind.Type
  * `kind` says which of the three (`"type"`, `"bytes"`, `"shape"`) and is what a
  * consumer branches on; `issue` is the sentence for a human and is not stable.
  * It defaults to `"shape"` when neither a constructor nor an encoded value
- * carries one, so an extension that builds a `DecodeError` with no `kind` still
+ * carries one, so a library that builds a `DecodeError` with no `kind` still
  * compiles and still answers the question conservatively.
  */
 export class DecodeError extends Schema.TaggedError<DecodeError>()("DecodeError", {
@@ -457,15 +457,15 @@ export class UnexpectedEffects extends Schema.TaggedError<UnexpectedEffects>()(
 }
 
 /**
- * The GraphQL endpoint an extension needs is not usable: none was configured,
+ * The GraphQL endpoint a library needs is not usable: none was configured,
  * or the one that was could not be reached.
  *
  * sui-effect does not wrap the GraphQL API — it owns the {@link SuiGraphQL}
- * *tag*, so two extensions that both read GraphQL share one client rather than
+ * *tag*, so two libraries that both read GraphQL share one client rather than
  * opening two. This is the failure the tag's `layerUnavailable` produces, which
  * is what an application provides when it has no endpoint: every call rejects
- * with this instead of the extension discovering a missing dependency at
- * construction. An extension maps it into its own union, or lets it through.
+ * with this instead of the library discovering a missing dependency at
+ * construction. A library maps it into its own union, or lets it through.
  *
  * Outcome `not_applied`: a read that did not happen changed nothing.
  */
@@ -542,7 +542,7 @@ export type Outcome = "applied" | "not_applied" | "unknown"
  * `"post-submit"` (the default, and the 0.1.1 behaviour) is "bytes may have
  * gone out": a tag nobody here recognises proves nothing, so the answer is
  * `"unknown"`. `"pre-submit"` is a failure caught while **building, simulating
- * or signing** — an extension's own `PriceTooLow`, a validation error from the
+ * or signing** — a library's own `PriceTooLow`, a validation error from the
  * caller's code — where nothing has been sent by construction and the honest
  * answer is `"not_applied"`.
  *
@@ -614,12 +614,12 @@ const TAXONOMY_TAGS: ReadonlySet<string> = new Set(
 /**
  * What a failure says about the transaction it came from.
  *
- * Takes **any** value — a `SuiError`, an extension's error, a `SchemaError`, a
+ * Takes **any** value — a `SuiError`, a library's error, a `SchemaError`, a
  * `ConfigError`, whatever a Promise rejected with — so a `catch (e: unknown)`
  * needs no cast.
  *
- * An error that declares its own `outcome` is honoured first, which is how an
- * extension puts its failures on the same axis. Otherwise a tag the taxonomy
+ * An error that declares its own `outcome` is honoured first, which is how a
+ * library puts its failures on the same axis. Otherwise a tag the taxonomy
  * owns gets the taxonomy's answer, and **anything else is `"unknown"`**: a tag
  * this library has never heard of says nothing about whether a transaction
  * applied, and answering `"not_applied"` for it would tell a retry idiom to
@@ -629,7 +629,7 @@ const TAXONOMY_TAGS: ReadonlySet<string> = new Set(
  * A failure caught while building, simulating or signing cannot have applied,
  * whoever's error it is, so an unrecognised tag there is `"not_applied"`
  * rather than `"unknown"`. Use it where the code knows nothing has been sent —
- * a `catchAll` around `Tx.build`/`Tx.sign`, an extension's validation — and
+ * a `catchAll` around `Tx.build`/`Tx.sign`, a library's validation — and
  * leave the default everywhere a submission may already be on the wire.
  * {@link isTaxonomy} answers the same question a level lower: is this even one
  * of ours?
@@ -799,7 +799,7 @@ const causeLine = (cause: unknown): string | undefined => {
 /**
  * The objects whose line is being read right now.
  *
- * Reading a foreign error's line reads its `.message`, and an extension error
+ * Reading a foreign error's line reads its `.message`, and a library error
  * that does what the house classes do — `override get message() { return
  * SuiError.describe(this) }` — calls straight back in; so does a cyclic
  * `cause` chain. A value met again while its own line is being read answers
@@ -1063,7 +1063,7 @@ const encode = Schema.encodeUnknownResult(SuiErrorSchema)
  *
  * Every `Schema.TaggedError` class is itself a schema, and an instance's
  * `constructor` is that class, so an error the closed taxonomy has never heard
- * of — an extension's `EscrowSettlementUnknown { escrowId, outcome }` — still
+ * of — a library's `EscrowSettlementUnknown { escrowId, outcome }` — still
  * serializes with its fields instead of collapsing to a tag and a sentence.
  * `undefined` when the value is not a schema-backed error, or when its own
  * schema refuses it. Never fails.
@@ -1081,7 +1081,7 @@ const encodeThroughOwnSchema = (error: unknown): Record<string, unknown> | undef
  * The `outcome` of an error that declares one, when the encoded JSON has lost
  * it.
  *
- * `outcome` is almost always a **class field** on an extension error —
+ * `outcome` is almost always a **class field** on a library error —
  * `readonly outcome: Outcome = "unknown"` beside a `Schema.TaggedError`'s
  * schema fields — and a class field is not part of the schema, so encoding
  * through the error's own schema drops it. It is also the one field a wrapper
@@ -1121,7 +1121,7 @@ const withMessage = (
  *
  * A tag in the taxonomy encodes through {@link SuiErrorSchema}. **Anything
  * else that is a `Schema.TaggedError` encodes through its own schema**, which
- * is how an extension's errors serialize with their fields rather than arriving
+ * is how a library's errors serialize with their fields rather than arriving
  * as a bare `{ _tag, message }`. A value that is neither falls back to that
  * pair: a tagged value keeps its tag, an `Error` uses its `name`, and anything
  * else is `{ _tag: "UnknownError", message: String(value) }`. Takes `unknown`,
@@ -1136,7 +1136,7 @@ const withMessage = (
  * **`message` is always there too**, for the same reason: most taxonomy
  * classes carry it as a getter, which stays out of the
  * encoding, so a log line had a sentence for three tags and nothing for the
- * rest. A taxonomy error gets {@link describe}; an extension error gets its own
+ * rest. A taxonomy error gets {@link describe}; a library error gets its own
  * `.message` when it is a non-empty string. Added only when the encoding
  * produced none, and ignored on decode, so nothing round-trips differently.
  *
@@ -1196,7 +1196,7 @@ const toJsonOf = (error: unknown, tag: string | undefined): Record<string, unkno
  * Whether this error is one of the tags the closed taxonomy owns.
  *
  * The question a wrapper asks before trusting {@link outcome}'s default answer,
- * and the one a consumer asks before narrowing to `SuiError`. An extension's
+ * and the one a consumer asks before narrowing to `SuiError`. A library's
  * own error, a `ConfigError`, a `TypeError` — all `false`. Never fails.
  *
  * @since 0.1.2
@@ -1210,7 +1210,7 @@ const isTaxonomy = (error: unknown): error is SuiError => {
  * The digest of the transaction a failure refers to, when it has one:
  * `TransactionNotFound`, `ExecutionFailed`, `SubmissionUnknown`, `NotApplied`
  * and `UnexpectedEffects` carry one; every other value, taxonomy or not,
- * answers `undefined`. Takes `unknown`, so it can be pointed at an extension
+ * answers `undefined`. Takes `unknown`, so it can be pointed at a library
  * error's `cause` without narrowing first. Never fails.
  *
  * @since 0.4.0
@@ -1328,7 +1328,7 @@ const normalizeHex = (value: string): string =>
  * Whether a failure is a Move abort, and — given a {@link MoveAbortMatch} —
  * the one you mean: `SuiError.isMoveAbort(e, { module: "tipjar", constant:
  * "EWrongCap" })`. Narrows to `SimulationFailed | ExecutionFailed`, so the
- * usual next step is mapping it to an extension's own error. Takes any value.
+ * usual next step is mapping it to a library's own error. Takes any value.
  * Never fails.
  *
  * @example

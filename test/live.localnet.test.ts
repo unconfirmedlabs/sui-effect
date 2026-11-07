@@ -1,7 +1,7 @@
 /**
  * Address-balance gas and coin folding, proved against a **localnet**.
  *
- * The fake models address balances (DESIGN §14) but runs no Move and enforces
+ * The fake models address balances (DESIGN §13) but runs no Move and enforces
  * no validator rule, so the claims this file checks are unfalsifiable without
  * a chain: that `0x2::coin::send_funds<SUI>(GasCoin, owner)` folds a coin-only
  * account in one transaction, that every later transaction then pays from the

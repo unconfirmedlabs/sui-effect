@@ -8,7 +8,7 @@ const PKG = "0x00000000000000000000000000000000000000000000000000000000000000e5"
 
 export class AlreadyClaimed extends Schema.TaggedError<AlreadyClaimed>()("AlreadyClaimed", {
   escrow: Schema.String,
-  // A simulated abort charged nothing; an executed one did. Declare which, for `Script.exitCode`.
+  // A simulated abort charged nothing; an executed one did. Declare which, for `SuiError.outcome`.
   outcome: Schema.Literals(["applied", "not_applied"])
 }) {}
 

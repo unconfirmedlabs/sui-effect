@@ -1,7 +1,7 @@
 /**
  * Address aliases and a multisig signer, proved against a **localnet**.
  *
- * The fake models alias sets (DESIGN §21) but runs no Move and verifies no
+ * The fake models alias sets (DESIGN §14) but runs no Move and verifies no
  * multisig, so what this file checks needs a chain: that `AddressAlias.aliasesId`
  * is the id the framework derives, that a validator accepts `Signer.alias(A,
  * Signer.multisig(…))` — partial signatures combined in member order — through

@@ -3,11 +3,11 @@
  *
  * sui-effect does **not** wrap the GraphQL API. There is no Effect-native
  * GraphQL tier here, no per-query error union, no fake: what this module owns
- * is the *tag*, so that two extensions that both read GraphQL — and the
+ * is the *tag*, so that two libraries that both read GraphQL — and the
  * application that configures the endpoint — agree on one client instead of
  * each opening its own and each inventing a name for the failure.
  *
- * The service value is the SDK's own `SuiGraphQLClient`. An extension reaches
+ * The service value is the SDK's own `SuiGraphQLClient`. A library reaches
  * it, calls `query` or `execute` inside `Effect.tryPromise`, and maps whatever
  * comes back into its own error union — `GraphQLUnavailable` for an endpoint
  * that is not usable, `TransportError.fromUnknown` for a call that failed.
@@ -36,7 +36,7 @@ const unavailableClient = (reason: string): SuiGraphQLClient =>
   }) as unknown as SuiGraphQLClient
 
 /**
- * The SDK's GraphQL client as a service, so an extension can require it
+ * The SDK's GraphQL client as a service, so a library can require it
  * without constructing one.
  *
  * **The service value *is* the client.** `yield* SuiGraphQL` hands back the
@@ -96,9 +96,9 @@ export class SuiGraphQL extends Context.Service<SuiGraphQL, SuiGraphQLClient>()(
    * The tag over a client whose every call rejects with `GraphQLUnavailable`.
    *
    * This is what an application provides when it has no GraphQL endpoint and
-   * still wants to build an extension that can use one. The alternative — no
+   * still wants to build a library that can use one. The alternative — no
    * layer at all — is a compile error in code that may never run the GraphQL
-   * path; this turns the absence into the failure the extension already
+   * path; this turns the absence into the failure the library already
    * handles, at the call it would have made.
    *
    * Never fails to build; every call through it fails.
@@ -118,7 +118,7 @@ export class SuiGraphQL extends Context.Service<SuiGraphQL, SuiGraphQLClient>()(
   /**
    * One call against the GraphQL client, with the two failures already sorted.
    *
-   * Every extension that reads GraphQL was re-deriving the same three lines:
+   * Every library that reads GraphQL was re-deriving the same three lines:
    * yield the client, `Effect.tryPromise`, and remember that a rejection from
    * `layerUnavailable` is already a `GraphQLUnavailable` and must be passed
    * through rather than wrapped in a `TransportError` that hides why the

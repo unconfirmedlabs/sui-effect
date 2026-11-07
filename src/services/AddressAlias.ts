@@ -16,7 +16,7 @@
  *
  * Everything here reads the **object**, never transaction history: nodes prune
  * transactions, and a check that depended on one would answer differently on
- * different nodes. DESIGN §21.
+ * different nodes. DESIGN §14.
  *
  * @since 0.6.0
  */

@@ -105,7 +105,7 @@ const listKeys = (kv: KeyValueStore.KeyValueStore) =>
  * the marker back unless that read **confirms** a terminal entry — it found
  * an unresolved one, found none, or failed. The re-read is what keeps a
  * concurrent `put` of an unresolved entry for the same digest (another tab,
- * another extension context, another process) visible: that put clears the
+ * another tab, another process) visible: that put clears the
  * marker after its own write, so either it sees this marker and removes it,
  * or this re-read sees its entry. Used by a terminal `put` and by a listing
  * that found a settled entry with no marker.

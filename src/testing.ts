@@ -297,7 +297,7 @@ const addressAliases = (
 
 /**
  * The whole wiring of one test, as one `.pipe` step: provides `layer` (a
- * {@link layerTest} or {@link layerExtensionTest}) plus a **fresh**
+ * {@link layerTest}, or a service's own layer over it) plus a **fresh**
  * `Journal.layerMemory` and `TestClock.layer()`, built **locally** —
  * `{ local: true }`, so nothing is shared with another test through Effect's
  * global layer memo map, however the layer value was shared.
@@ -315,11 +315,11 @@ const addressAliases = (
  *
  * @example
  * ```ts
- * import { Effect } from "effect"
- * import { layerExtensionTest, SuiTest } from "@unconfirmed/sui-effect/testing"
+ * import { Effect, Layer } from "effect"
+ * import { layerTest, SuiTest } from "@unconfirmed/sui-effect/testing"
  *
  * const run = <A, E>(program: Effect.Effect<A, E, Escrow | Sui | SuiCoreFake>) =>
- *   program.pipe(SuiTest.provide(layerExtensionTest(Escrow.layerTest(), script)), Effect.runPromise)
+ *   program.pipe(SuiTest.provide(Escrow.layer.pipe(Layer.provideMerge(layerTest(script)))), Effect.runPromise)
  * ```
  */
 const provide =
@@ -337,8 +337,7 @@ const provide =
  * The harness: everything a test needs to drive the fake from
  * inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
  *
- * Every member requires `SuiCoreFake`, which {@link layerTest} and
- * {@link layerExtensionTest} provide.
+ * Every member requires `SuiCoreFake`, which {@link layerTest} provides.
  *
  * @example
  * ```ts

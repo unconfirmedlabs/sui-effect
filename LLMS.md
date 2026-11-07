@@ -6,10 +6,11 @@ repository. Do not edit it by hand; a test fails when it is stale.
 
 ## Start here
 
-@unconfirmed/sui-effect is an opinionated Effect v4 layer over `@mysten/sui`.
-Two client tiers (`SuiCore` mirrors the SDK, `Sui` makes the decisions), a
-closed error union on every function, the transaction lifecycle as functions
-with typed outcomes, and an in-memory fake so every test runs with no network.
+@unconfirmed/sui-effect is a light Effect v4 wrapper around the official
+`@mysten/sui` SDK that makes it safer to use: `SuiCore` mirrors the SDK's Core
+API one-to-one, `Sui` adds decoded reads, a closed error union on every
+function, the transaction lifecycle as functions with typed outcomes, and an
+in-memory fake chain so every test runs with no network.
 
 ```bash
 bun add @unconfirmed/sui-effect
@@ -22,24 +23,18 @@ and `instanceof` checks stop matching. A library built on this package puts all
 of them in its own `peerDependencies` and `devDependencies`, never in
 `dependencies`.
 
-`AGENTS.md` has the invariants, `README.md` the tour, `docs/extensions.md` the
-contract for an extension package. The API reference follows this section,
-subpath by subpath; the examples and the extension template come last.
+`AGENTS.md` has the invariants, `README.md` the tour, `DESIGN.md` the
+specification. The API reference follows this section, subpath by subpath; the
+examples come last.
 
 ## Subpaths
 
 | Import | What it exports |
 |---|---|
 | `@unconfirmed/sui-effect` | `Sui` and `SuiCore` (the two tiers), `SuiGraphQL`, `SuiSchema` (the BCS bridge), every domain schema (`ObjectId`, `SuiAddress`, `Digest`, `Mist`, `Simulation`, …), `Executed`, every error class and `SuiError` |
-| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `foldMovement`, `sendAll`, `verifySponsored`, `submit`, `submitVia`, `verify`, `prepare`, `reconcile`, `resubmit`, `recorded`, `run`, `reconcileAll`), `Signer` and its constructors (`Signer.fromKeypair`, `fromMnemonic`, `fromSecretKey`, `zkLogin`, `passkey`, `wallet`, `multisig`, `alias`, …), `LockableSigner`, `ZkLogin`, `AddressAlias` / `AddressAliases` (address aliases: the read, the check, the recipes; 0.6.0), `verifySponsored`, `Intent`, `Verified`, `Gate`, `checkClaims`, `Verify`, `SubmitConfig`, `SubmitConfigOverrides`, `LockSenderPolicy` and `GasPaymentPolicy`, `FoldBatch` / `FoldPlan` / `FoldGas` / `FoldResult`, `Journal`, `JournalEntry` |
+| `@unconfirmed/sui-effect/tx` | `Tx` (`build`, `sign`, `cosign`, `fromBytes`, `attach`, `sponsored`, `gaslessStablecoinTransfer`, `sendFunds`, `planFold`, `fold`, `foldCoins`, `verifySponsored`, `submit`, `submitVia`, `reconcile`, `resubmit`, `run`, `reconcileAll`, `withSenderLock`), `Signer` and its constructors (`fromKeypair`, `fromSdkSigner`, `fromSecretKey`, `fromMnemonic`, `generateMnemonic`, `derivationPath`, `ephemeral`, `remote`, `zkLogin`, `multisig`, `alias`), `Prepared` (what `Tx.run`'s `approve` is shown), `AddressAlias` / `AddressAliases`, `Verify`, `verifySponsored`, `SubmitConfig`, `Journal`, `JournalEntry`, `FoldBatch` / `FoldPlan` / `FoldResult` |
 | `@unconfirmed/sui-effect/journal` | The durable journal over Effect's `KeyValueStore`: `layerKeyValueStore`, `makeKeyValueStore`, `pruneSettled` (module functions, not statics on `Journal`) |
-| `@unconfirmed/sui-effect/gate` | The Jev screen for `Tx.verify` over `effect/http`: `layerJev`, `layerJevConfig`, `makeJev` (0.5.0) |
-| `@unconfirmed/sui-effect/enoki` | Enoki sponsorship through the journal: `Enoki.fromFlow`, `fromWallet`, `sponsor`, `execute`, `run`, `EnokiError` (0.5.0) |
-| `@unconfirmed/sui-effect/keystore` | `Keystore` (sealed keys at rest over `KeyValueStore`, WebCrypto), `Keystore.sealer` for zkLogin sessions, `KeyError`, `KeystoreError` (0.5.0) |
-| `@unconfirmed/sui-effect/storage` | `KeyValueStore` layers: `layerIndexedDb`, `layerAsyncStorage`, `layerMmkv`, `layerChromeStorage` (0.5.0) |
-| `@unconfirmed/sui-effect/extension` | `SuiExtension.fromService`, which derives an extension's Promise face for `client.$extend(...)` (an `Effect<Option<A>>` member becomes `Promise<A \| undefined>`, `FaceValue`), and `SuiExtension.leaf` |
-| `@unconfirmed/sui-effect/script` | `Script` / `ScriptReadOnly` (layers that read `SUI_NETWORK`, `SUI_PRIVATE_KEY`, …), `Script.run`, `Script.report`, `Script.exitCode` |
-| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `layerExtensionTest(layer, script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest` (a branded `Digest`), `testSubmitConfig`; the fake models address balances (`SuiTest.setAddressBalance`, `SuiTest.addressBalance`) and address alias sets (`FakeScript.addressAliases`, `SuiTest.setAddressAliases`, `SuiTest.addressAliases`) |
+| `@unconfirmed/sui-effect/testing` | `layerTest(script)`, `SuiTest` (`SuiTest.provide(layer)`: the layer plus a fresh `Journal.layerMemory` and `TestClock`, built locally), `SuiCoreFake`, `FakeOutcome`, `fakeCoin`, `fakeDigest`, `testSubmitConfig`, `TestServices`; the fake models address balances (`SuiTest.setAddressBalance`) and address alias sets (`FakeScript.addressAliases`, `SuiTest.setAddressAliases`) |
 
 ## Recipes
 
@@ -76,8 +71,8 @@ import { Mist, type SuiAddress } from "@unconfirmed/sui-effect"
 import { type Signer, SubmitConfig, Tx } from "@unconfirmed/sui-effect/tx"
 
 export const pay = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
-  // Into the recipient's address balance, out of the sender's when it covers
-  // the amount: with gas from the balance too, the bytes pin nothing.
+  // From the sender's address balance into the recipient's: with gas from the
+  // balance too, the bytes pin nothing.
   Tx.run(Tx.sendFunds({ amount, recipient }), { signer }).pipe(
     Effect.map((executed) => executed.digest),
     // A ceiling, not a budget: above it the build fails with `PolicyDenied { rule: "maxGasBudget" }`.
@@ -231,35 +226,28 @@ export const payOrResend = (signer: Signer, recipient: SuiAddress, amount: bigin
 export const startup = Tx.reconcileAll({ resubmit: true })
 ```
 
-A script with a durable journal:
+A durable journal, swept before anything new is sent:
 
 ```ts
-// A script whose submissions survive a crash: a durable journal, and a sweep of whatever the
-// last run left unresolved before anything new is sent.
+// Submissions that survive a crash: a durable journal, and a sweep of whatever the last run
+// left unresolved before anything new is sent.
 import { Effect, Layer } from "effect"
 import type { KeyValueStore } from "effect/persistence"
 import type { SuiAddress } from "@unconfirmed/sui-effect"
 import { layerKeyValueStore } from "@unconfirmed/sui-effect/journal"
-import { Script } from "@unconfirmed/sui-effect/script"
-import { Tx } from "@unconfirmed/sui-effect/tx"
+import { type Signer, Tx } from "@unconfirmed/sui-effect/tx"
 
 // In production `KeyValueStore.layerFileSystem("./journal")` over a platform's `FileSystem` and
 // `Path` (`BunServices.layer`); in a test `KeyValueStore.layerMemory`.
 export const durableJournal = <E>(store: Layer.Layer<KeyValueStore.KeyValueStore, E>) =>
   layerKeyValueStore({ onUnresolved: "ignore" }).pipe(Layer.provide(store))
 
-export const payOnce = (recipient: SuiAddress, amount: bigint) =>
+export const payOnce = (signer: Signer, recipient: SuiAddress, amount: bigint) =>
   Effect.gen(function*() {
     yield* Tx.reconcileAll({ resubmit: true })
-    const { signer } = yield* Script
     const executed = yield* Tx.run(Tx.sendFunds({ amount, recipient }), { signer })
     return executed.digest
   })
-
-// Given in `options.layer`, or provided inside the program with `Effect.provide(durableJournal(store))`:
-// `Script.run` finds the journal either way and reports only this run's entries on a failure.
-export const main = <E>(store: Layer.Layer<KeyValueStore.KeyValueStore, E>, recipient: SuiAddress) =>
-  Script.run(payOnce(recipient, 1_000n), { layer: Layer.merge(Script.layer, durableJournal(store)) })
 ```
 
 Publish a package, then upgrade it:
@@ -342,7 +330,7 @@ const PKG = "0x00000000000000000000000000000000000000000000000000000000000000e5"
 
 export class AlreadyClaimed extends Schema.TaggedError<AlreadyClaimed>()("AlreadyClaimed", {
   escrow: Schema.String,
-  // A simulated abort charged nothing; an executed one did. Declare which, for `Script.exitCode`.
+  // A simulated abort charged nothing; an executed one did. Declare which, for `SuiError.outcome`.
   outcome: Schema.Literals(["applied", "not_applied"])
 }) {}
 
@@ -357,89 +345,39 @@ export const claim = (signer: Signer, escrow: ObjectId) =>
   )
 ```
 
-A resumable indexer:
+A resumable indexer over the SDK's own cursors:
 
 ```ts
-// A resumable indexer: commit each page's items together with its `endCursor`, and start
-// again from the last committed cursor. The tail never ends; it polls once caught up.
+// A resumable indexer: page through `sui.core.listEvents`, commit each page's events together
+// with its `endCursor`, and start again from the last committed cursor. Once caught up it polls.
+// (`sui.tailEvents` is the same loop when nothing has to be committed: it never ends, and a
+// restart begins again from its `after`.)
 //
-// Pruning: a node keeps a bounded history. A cursor it has pruned past fails the tail with a
+// Pruning: a node keeps a bounded history. A cursor it has pruned past fails with a
 // non-retryable `TransportError` (gRPC `OUT_OF_RANGE`): resume from a node that still holds it.
-// A filtered tail keeps its cursor near the head while nothing matches (it emits an empty page
-// to say so), so commit empty pages too, or an idle indexer falls behind the pruning line.
-import { Effect, Stream } from "effect"
-import { type EventEntry, Sui } from "@unconfirmed/sui-effect"
+import type { SuiClientTypes } from "@mysten/sui/client"
+import { Effect } from "effect"
+import { Sui } from "@unconfirmed/sui-effect"
 
 const POSTED = "0x00000000000000000000000000000000000000000000000000000000000000b1::board::Posted"
 
 export const indexPosts = <E>(
   after: string | null,
-  commit: (items: ReadonlyArray<EventEntry>, cursor: string | null) => Effect.Effect<void, E>
+  commit: (events: ReadonlyArray<SuiClientTypes.EventEntry>, cursor: string | null) => Effect.Effect<void, E>
 ) =>
-  Stream.unwrap(Effect.map(Sui, (sui) =>
-    sui.tailEventPages({ eventType: POSTED }, { after }).pipe(
-      // One transaction in your store: the rows and the cursor, or neither.
-      Stream.mapEffect((page) => commit(page.items, page.endCursor))
-    )))
-```
-
-An extension and its Promise face:
-
-```ts
-// An extension: a service on `Sui`, and its Promise face derived for `$extend`.
-import { Context, Effect, Layer } from "effect"
-import { type GetObjectError, type ObjectId, Sui } from "@unconfirmed/sui-effect"
-import { SuiExtension } from "@unconfirmed/sui-effect/extension"
-
-export class Versions extends Context.Service<Versions, {
-  readonly of: (id: ObjectId) => Effect.Effect<bigint, GetObjectError>
-}>()("example/Versions") {
-  static readonly layer = Layer.effect(Versions, Effect.map(Sui, (sui) => ({
-    of: (id: ObjectId) => Effect.map(sui.getObject(id), (object) => object.version)
-  })))
-}
-
-// `new SuiGrpcClient({ … }).$extend(versions)`, then `await client.versions.of(id)`.
-export const versions = SuiExtension.fromService(Versions, { name: "versions", layer: Versions.layer })
-```
-
-Calling a Promise face from plain TypeScript:
-
-```ts
-// A Promise face from plain TypeScript: a `Signer` value, a branded id decoded from user input,
-// and one readable line on rejection. `SuiError.describe` takes any value, so no cast.
-import type { ClientWithCoreApi } from "@mysten/sui/client"
-import type { Keypair } from "@mysten/sui/cryptography"
-import { Context, Effect, Layer, Schema } from "effect"
-import { type Digest, ObjectId, Sui, SuiError } from "@unconfirmed/sui-effect"
-import { SuiExtension } from "@unconfirmed/sui-effect/extension"
-import { type RunError, Signer, Tx } from "@unconfirmed/sui-effect/tx"
-
-const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
-
-export class Counters extends Context.Service<Counters, {
-  readonly increment: (signer: Signer, counter: ObjectId) => Effect.Effect<Digest, RunError>
-}>()("example/Counters") {
-  static readonly layer = Layer.effect(Counters, Effect.map(Sui, (sui) => ({
-    increment: (signer: Signer, counter: ObjectId) =>
-      Tx.run((tx) => {
-        tx.moveCall({ target: `${PKG}::counter::increment`, arguments: [tx.object(counter)] })
-      }, { signer }).pipe(Effect.map((executed) => executed.digest), Effect.provideService(Sui, sui))
-  })))
-}
-
-export const counters = SuiExtension.fromService(Counters, { name: "counters", layer: Counters.layer })
-
-export const incrementCommand = (client: ClientWithCoreApi, keypair: Keypair) => {
-  const face = client.$extend(counters).counters
-  const signer = Signer.fromKeypair(keypair)
-  // `ObjectId.Strict` for what a person typed: exactly 64 hex digits, never padded.
-  return (input: string): Promise<string> =>
-    Schema.decodeUnknownPromise(ObjectId.Strict)(input)
-      .then((counter) => face.increment(signer, counter))
-      .then((digest) => `incremented in ${digest}`)
-      .catch((error) => SuiError.describe(error))
-}
+  Effect.gen(function*() {
+    const sui = yield* Sui
+    let cursor = after
+    while (true) {
+      const page = yield* sui.core.listEvents({ filter: { eventType: POSTED }, after: cursor })
+      if (page.events.length > 0) {
+        cursor = page.endCursor ?? cursor
+        // One transaction in your store: the rows and the cursor, or neither.
+        yield* commit(page.events, cursor)
+      }
+      if (!page.hasNextPage) yield* Effect.sleep("1 second")
+    }
+  })
 ```
 
 A test on the fake:
@@ -472,52 +410,45 @@ test("a counter the fake serves decodes, and a missing one is None", async () =>
 ## The two tiers
 
 - `SuiCore` is a 1:1 Effect wrap of the SDK's `ClientWithCoreApi`: one member per transport method, the SDK's `Include` generics, every call cancellable, reads retried on a retryable `TransportError`.
-- `Sui` is the opinionated tier over it: fixed include sets, BCS content decoded through a schema after the Move type is checked, `Option` where absence is normal, chunked batch reads, `Stream` pagination, one sender lock. Application and extension code reads through `Sui`.
+- `Sui` is the convenience tier over it: fixed include sets, BCS content decoded through a schema after the Move type is checked, `Option` where absence is normal, chunked batch reads, `Stream` pagination. Application code reads through `Sui`.
 - **`Sui` members are positional** — `sui.getObject(id, { schema })`, `sui.getBalance(owner, coinType)`. **`SuiCore` members take the SDK's options object** — `core.getObject({ objectId, include })`. Writing `sui.getObject({ objectId })` is the SDK habit, and it does not typecheck.
-- **The SDK's `listX` is `Sui.streamX`**, a `Stream` that follows every page and ends once caught up; `tailX` never ends and polls: `listOwnedObjects` → `streamOwnedObjects`, `listCoins` → `streamCoins`, `listBalances` → `streamBalances`, `listDynamicFields` → `streamDynamicFields`, `listEvents` → `streamEvents` / `tailEvents`, `listTransactions` → `streamTransactions` / `tailTransactions`. The `…Pages` forms (`streamEventPages`, `tailEventPages`, …) carry each page's `endCursor` for a resumable reader; `{ after }` resumes from one.
+- **The SDK's `listX` is `Sui.streamX`**, a `Stream` that follows every page and ends once caught up; `tailX` never ends and polls: `listOwnedObjects` → `streamOwnedObjects`, `listCoins` → `streamCoins`, `listBalances` → `streamBalances`, `listDynamicFields` → `streamDynamicFields`, `listEvents` → `streamEvents` / `tailEvents`, `listTransactions` → `streamTransactions` / `tailTransactions`. `{ after }` starts one at a cursor; a reader that commits its own cursor pages through `sui.core.listEvents` / `sui.core.listTransactions`, whose pages carry `endCursor`.
 - **A transaction `function` filter must be fully qualified** (`package::module::function`) on `streamTransactions` and `tailTransactions`: the SDK cannot continue a `package` or `package::module` filter past its first page, so it is refused up front. For one page of a module filter, call `sui.core.listTransactions`.
 - **Ids:** `ObjectId.Strict` / `SuiAddress.Strict` (through `Schema.decodeUnknownEffect`) for what a person typed — exactly 64 hex digits; `.normalize` for a shorthand literal such as `"0x6"`; `.make` for the padded form only. Decoding refuses `""` and a bare `"0x"`.
 - `sui.core` is the `SuiCore` a `Sui` was built over, which is why every `Tx.*` function needs only `R = Sui`.
 - Reads go through `Sui`; writes go through `Tx`. Nothing calls `SuiCore.executeTransaction` directly.
 - `Signer` is a value, never a service: pass it as a parameter. `SubmitConfig` and `Journal` are `Context.Reference`s with working defaults.
+- `Tx.withSenderLock(address)(effect)` is the sender lock `Tx.run` takes, for a program that assembles `build → sign → submit` by hand.
 
 ## Gas and the address balance
 
 - **Gas comes from the payer's SUI address balance by default** (`SubmitConfig.gasPayment: "preferAddressBalance"`): the resolver pays from it when it covers the budget and the transaction does not use `tx.gas`, and from coins otherwise. The `Tx.build` span attribute `sui.gas_payment` names the choice (`addressBalance`, `coinReservation`, `coins`). `"requireAddressBalance"` makes coins a `BuildError`.
 - **Bytes that pin nothing do not hold the sender lock past their build.** Under `lockSender: "whenPinned"` (the default) `Tx.run` locks every build, and keeps the lock through submit only when the bytes pin an owned input, a gas coin or a coin reservation (what a `tx.gas` user paying from a balance gets: it reserves the whole balance, so such a run also waits for the lock-free runs in flight before it builds). Lock-free runs can together overdraw a balance, budgets counted in full (refused at submission when the shortfall is already there; otherwise the overdrawing one is `ExecutionFailed`, `InsufficientFundsForWithdraw`, no gas charged): a spend-to-zero flow sets `lockSender: "always"`.
 - **Fold coins into the balance** with `Tx.foldCoins({ signer })`: `Tx.planFold` (reads only) then one `Tx.run(Tx.fold(batch))` per batch, SUI first. SUI pays for its own fold, so a coin-only account needs nothing first. Preview a batch with `Tx.build(Tx.fold(batch), { sender })` and `sui.simulate(built.bytes)`. The localnet faucet (V2) pays coins, so fold first; the devnet/testnet faucet (V3) pays the balance.
-- **Transfer into a balance** with `Tx.sendFunds({ coinType?, amount, recipient })` (`balance::send_funds`; keep `useGasCoin` at its default `true`, `false` under `Tx.sponsored`). In your own recipes prefer `tx.coin({ balance })` / `tx.balance(...)` to `tx.splitCoins(tx.gas, ...)`, which pays gas with a coin.
-- Address-balance gas is checked before signing: an explicit empty payment needs the budget plus the payer's SUI withdrawals in the balance, and with no owned input a `ValidDuring` expiration (the default), and must not use `tx.gas` (its coin is empty: the simulate passes, execution fails and charges gas); each miss is a `BuildError`. A sponsored recipe uses `tx.coin({ balance, useGasCoin: false })` / `Tx.sendFunds({ ..., useGasCoin: false })`, never `tx.splitCoins(tx.gas, ...)`.
+- **Transfer between balances** with `Tx.sendFunds({ coinType?, amount, recipient })`: a `FundsWithdrawal` from the sender's address balance, `balance::redeem_funds`, `balance::send_funds`. Address balances only — no coin fallback; a balance short of the amount is a `BuildError` ("Invalid withdraw reservation"). In your own recipes prefer `tx.coin({ balance })` / `tx.balance(...)` to `tx.splitCoins(tx.gas, ...)`, which pays gas with a coin.
+- Address-balance gas is checked before signing: an explicit empty payment needs the budget plus the payer's SUI withdrawals in the balance, and with no owned input a `ValidDuring` expiration (the default), and must not use `tx.gas` (its coin is empty: the simulate passes, execution fails and charges gas); each miss is a `BuildError`. A sponsored recipe uses `tx.coin({ balance, useGasCoin: false })` or `Tx.sendFunds`, never `tx.splitCoins(tx.gas, ...)`.
 
 ## Errors
 
 Every failure is one flat `Schema.TaggedError`. `SuiError.outcome(e)` puts it on
-the axis a caller acts on, and `Script.exitCode` turns that into an exit code.
+the axis a caller acts on.
 
-| Tag | Outcome | Exit | Means |
-|---|---|---|---|
-| `TransportError` | `not_applied` | 4 | The request did not reach a usable answer; `retryable` says whether a read may try again |
-| `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | `not_applied` | 4 | The three `ObjectError.reason` values |
-| `TransactionNotFound` | `not_applied` | 4 | No transaction with that digest is known |
-| `NetworkMismatch` | `not_applied` | 2 | The node is on another chain than the layer was built for |
-| `DecodeError` | `not_applied` | 4 | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
-| `SimulationFailed` | `not_applied` | 4 | Simulation reported an execution failure; no gas charged |
-| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | 4 | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, the gas ceiling as `rule: "maxGasBudget"`, and a signer that is neither the address nor in its alias set as `rule: "alias.signer"`); the journal write before the first send |
-| `GraphQLUnavailable` / `ExtensionNotReady` | `not_applied` | 4 | No usable GraphQL endpoint; a synchronous Promise-face member called before its runtime existed |
-| `NotApplied` | `not_applied` | 4 | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
-| `ExecutionFailed` | `applied` | 5 | Applied on chain and failed; gas charged (none for `InsufficientFundsForWithdraw`, an overdrawn balance) |
-| `UnexpectedEffects` | `applied` | 5 | It ran; the effects lack what the caller expected (`expectCreated`) |
-| `SubmissionUnknown` | `unknown` | 3 | Bytes may have been sent; the outcome is unknown. Carries the signed bytes |
-| anything else, with no `outcome` field | `unknown` | 1 | Unclassified; declare `outcome` on every extension error |
-
-`ConfigError` (whose one line names the variable) and `SchemaError` also exit 2;
-a defect exits 1, an interrupt with nothing outstanding 130. An error that
-declares an integer `exitCode` from 1 to 255 — the plain field, or Effect's
-`[Runtime.errorExitCode]` marker — exits with it. **Once a
-transaction of this run applied**, a failure that would exit 2, 4 or 130 exits
-5 instead, because a retry would send a second transaction; **while an entry of
-this run is unresolved**, the same failure exits 3 instead, applied or not,
-because an outstanding submission means "reconcile before anything else".
+| Tag | Outcome | Means |
+|---|---|---|
+| `TransportError` | `not_applied` | The request did not reach a usable answer; `retryable` says whether a read may try again |
+| `ObjectNotFound` / `ObjectDeleted` / `ObjectUnavailable` | `not_applied` | The three `ObjectError.reason` values |
+| `TransactionNotFound` | `not_applied` | No transaction with that digest is known |
+| `NetworkMismatch` | `not_applied` | The node is on another chain than the layer was built for |
+| `DecodeError` | `not_applied` | BCS or a schema boundary did not decode; branch on `kind` (`"type"`, `"bytes"`, `"shape"`) |
+| `SimulationFailed` | `not_applied` | Simulation reported an execution failure; no gas charged |
+| `SigningError` / `BuildError` / `PolicyDenied` / `JournalError` | `not_applied` | Signing; building (a resolver refusal, an address balance short of the budget plus withdrawals, coins under `gasPayment: "requireAddressBalance"`, address-balance gas without a `ValidDuring` expiration or using `tx.gas`); policy (`preflight`, the gas ceiling as `rule: "maxGasBudget"`, a signer that is neither the address nor in its alias set as `rule: "alias.signer"`, `sponsored.*`); the journal write before the first send |
+| `KeyError` | `not_applied` | A phrase, secret key, derivation path or multisig member set that is not one |
+| `GraphQLUnavailable` | `not_applied` | No usable GraphQL endpoint |
+| `NotApplied` | `not_applied` | Provably never applied: `evidence` is `"expired"`, `"inputConsumed"` or `"refused"` |
+| `ExecutionFailed` | `applied` | Applied on chain and failed; gas charged (none for `InsufficientFundsForWithdraw`, an overdrawn balance) |
+| `UnexpectedEffects` | `applied` | It ran; the effects lack what the caller expected (`expectCreated`) |
+| `SubmissionUnknown` | `unknown` | Bytes may have been sent; the outcome is unknown. Carries the signed bytes |
+| anything else, with no `outcome` field | `unknown` | Unclassified; declare `outcome` on every error of your own |
 
 Three rules:
 
@@ -588,6 +519,7 @@ process-wide.
 9. One Move type rule everywhere: a bare expected tag matches every instantiation of the generic; a parameterized one is compared in full.
 10. A test that runs `Tx.submit` or `Tx.run` provides `Journal.layerMemory`, because the default journal is process-wide; `layerTest` is the production `Sui`, so fixtures use `localnet`.
 11. **The sender is the account, never the alias key** (0.6.0). `Tx.run(recipe, { signer: Signer.alias(A, m) })` builds, locks and journals as A and signs with `m`; A's `AddressAliases` object — never transaction history — is read once before the build, and an `m` it does not list is `PolicyDenied { rule: "alias.signer" }`. `Signer.multisig` combines its members' signatures in the multisig's member order, which is the order a validator pairs them with the bitmap in.
+12. **Evidence comes from objects, never from transaction history**: reconcile's `inputConsumed`, the alias check, `Tx.attach`'s signer check. A history listing is a convenience read, never proof.
 
 ## Index
 
@@ -627,13 +559,12 @@ The full entries follow under "API".
 - `ExecutionFailed` — The transaction was applied on chain and failed.
 - `ExecutionReason` — Why a transaction failed on chain or in simulation.
 - `ExecutionStatus` — Whether a transaction succeeded.
-- `ExtensionNotReady` — A synchronous member of a Promise-faced extension was called before its runtime existed.
 - `GasCostSummary` — Gas cost breakdown.
 - `GasPaymentRef` — One entry of a transaction's gas payment, as the bytes name it: the SDK's own `{ objectId, version, digest }`.
 - `GasPaymentSource` — How built bytes pay for gas, as `Tx.build` reads it back out of them (and as the span attribute `sui.gas_payment` names it): - `"addressBalance"`: an empty payment; gas is drawn from the payer's SUI address balance at execution, and the bytes pin no gas coin.
 - `GetObjectError` — What can go wrong reading one object with a schema.
-- `GraphQLUnavailable` — The GraphQL endpoint an extension needs is not usable: none was configured, or the one that was could not be reached.
-- `HasOutcome` — An extension error may declare its own `outcome`, and `SuiError.outcome` and `Script.run` honour it before anything else.
+- `GraphQLUnavailable` — The GraphQL endpoint a library needs is not usable: none was configured, or the one that was could not be reached.
+- `HasOutcome` — An application error may declare its own `outcome`, and `SuiError.outcome` honours it before anything else.
 - `JournalError` — The submission journal could not be read or written.
 - `KNOWN_CHAIN_IDS` — The genesis checkpoint digest of each public network whose chain identifier is fixed and known.
 - `KeyError` — A recovery phrase, a secret key or a derivation path was refused.
@@ -641,7 +572,6 @@ The full entries follow under "API".
 - `KnownNetwork` — The four networks with a built-in default gRPC endpoint.
 - `ListOptions` — Where a ledger listing starts and which way it reads.
 - `ListOrder` — The ledger order a listing is read in.
-- `ListPage` — One page of a ledger listing (`streamEventPages`, `streamTransactionPages`, `tailEventPages`, `tailTransactionPages`): its items, and the cursor to resume from once they are processed.
 - `Mist` — An amount in MIST.
 - `MoveAbortInfo` — A Move abort, read off a `SimulationFailed` or an `ExecutionFailed` into the fields a caller matches on.
 - `MoveAbortMatch` — What `isMoveAbort` matches on.
@@ -669,8 +599,8 @@ The full entries follow under "API".
 - `ServiceInfo` — What a node says about itself: the chain, where its ledger head is, and — the part a reconciler or an indexer needs — how far back its history reaches.
 - `Signature` — A serialized signature, as every SDK signer returns it: the base64 of the flag, signature and public key bytes.
 - `SignedTransaction` — The signed bytes of a transaction, kept so an uncertain submission can be reconciled or re-submitted later without rebuilding.
-- `SigningError`
-- `SigningFailureReason` — Why a signer refused, when it knows: `"expired"` (a session-bound credential — a zkLogin proof — whose `maxEpoch` has passed or would pass before the bytes could land), `"locked"` (the secret was dropped by `lock` / `dispose` and must be unlocked again), `"rejected"` (the person, or the wallet acting for them, declined), `"unavailable"` (the device, wallet or remote signer could not be reached).
+- `SigningError` — A signer refused or failed to produce a signature.
+- `SigningFailureReason` — Why a signer refused, when it knows: `"expired"` (a `maxEpoch`-bound credential — a zkLogin proof — whose `maxEpoch` has passed or would pass before the bytes could land), `"rejected"` (the person, or the device or remote signer acting for them, declined), `"unavailable"` (the device or remote signer could not be reached, or the signer cannot sign this kind of thing).
 - `Simulation` — The result of a successful simulation, with the fixed include set `Sui` asks for: effects, events, balance changes, object types and command results.
 - `SimulationFailed` — Simulation reported an execution failure.
 - `SimulationLookupError` — The failures of a simulation.
@@ -683,7 +613,7 @@ The full entries follow under "API".
 - `SuiCoreReadOptions` — How the read tier behaves: the per-attempt request timeout and the retry schedule.
 - `SuiCoreService` — The mechanical tier: one member per `SuiClientTypes.TransportMethods` key, plus the four concrete conveniences `CoreClient` adds and the `use` hatch.
 - `SuiError` — Every failure sui-effect can produce.
-- `SuiGraphQL` — The SDK's GraphQL client as a service, so an extension can require it without constructing one.
+- `SuiGraphQL` — The SDK's GraphQL client as a service, so a library can require it without constructing one.
 - `SuiGrpcLayerOptions` — Options for `SuiCore.layerGrpc`: `SuiGrpcClientOptions`, plus the read tier's `SuiCoreReadOptions`.
 - `SuiLayerOptions` — Options for `Sui.layerNoDepsWith`.
 - `SuiObject` — An object read through `Sui`, with its BCS content already decoded to `S` and a `ref` ready to feed straight back into the transaction builder.
@@ -713,49 +643,30 @@ The full entries follow under "API".
 - `AddressAlias` — Sui's address aliases, named after the Move module `sui::address_alias`: `AddressAlias.getAliases`, `allows` and `requireSigner` read and check an address's set from its object; `enable`, `add`, `remove` and `replaceAll` are the recipes for its four entry functions; `aliasesId` is the derived id.
 - `AddressAliases` — Who may sign transactions as an address, read from its `AddressAliases` object.
 - `Built` — re-exported from `@unconfirmed/sui-effect`.
-- `ClaimViolation` — One way the simulated effects stepped outside the claims.
 - `ExpirationPolicy` — How `Tx.build` sets an expiration when the recipe left one unset.
 - `ExpiryEvidencePolicy` — Whether `Tx.reconcile` is allowed to conclude that an expiration window closed on a transaction the node does not know.
 - `FoldBatch` — One fold transaction's worth of coins: what `fold` turns into a recipe.
 - `FoldGas` — How one fold transaction pays for gas.
-- `FoldMovement` — What one fold moves, read off its simulation (or its execution): `consumed`, the batch's coins the effects delete, with the balances the plan read them at; `fromCoins`, their total; `toAddressBalance`, what the owner's address balance of the coin type gains; and `netChange`, the owner's net balance change, which is all `balanceChanges` reports.
 - `FoldPlan` — What `planFold` answers: the transactions that fold an owner's coins, in the order they must run, and the SUI dust that cannot pay for its own fold.
 - `FoldResult` — What `foldCoins` did: the plan it ran, and one `Executed` per batch, in order.
 - `FromMnemonicOptions` — Options of `Signer.fromMnemonic`.
 - `FromSecretKeyOptions` — Options of `Signer.fromSecretKey`.
 - `GasPaymentPolicy` — How `Tx.build` treats a gas payment the recipe left unset.
-- `Gate` — The intent policy and its screen.
-- `GateService` — Every decision `Tx.verify` and `Tx.run` read from context about intents.
-- `Intent` — A declared intent: one sentence for the screen, exact claims for the code.
-- `IntentAuthor` — Who wrote the intent.
-- `IntentClaims` — What the transaction is allowed to do to the sender, deny by default: a coin that is not listed may not decrease, an address that is not listed may not receive anything, and an object that is not listed may not leave.
 - `Journal` — The submission journal.
 - `JournalEntry` — One line of the submission journal.
 - `JournalService` — Reading and writing the submission journal.
-- `KeyScheme` — The schemes a key at rest can be: the three a BIP-39 phrase derives on the standard Sui paths.
+- `KeyScheme` — The schemes a held key can be: the three a BIP-39 phrase derives on the standard Sui paths.
 - `LockSenderPolicy` — When `Tx.run` holds the sender lock.
-- `LockableSigner` — A `Signer` that holds a secret and can drop it.
 - `MnemonicLength` — The BIP-39 word counts: 128 to 256 bits of entropy in 32-bit steps.
-- `OutflowClaim` — The most of one coin the sender may lose, in base units, gas excluded.
-- `Parties` — Whose transaction it is.
-- `PasskeyProvider` — What a passkey signer asks the authenticator for, structurally: the SDK's `PasskeyProvider` from `@mysten/sui/keypairs/passkey` (its `BrowserPasskeyProvider` is one) without the DOM types it is declared with, so a React Native or extension provider can be typed without a DOM `lib`.
-- `Prepared` — Built bytes and what the lifecycle learned about them before anything is signed: the simulation of exactly those bytes, and the verified intent when one was declared.
+- `Prepared` — Built bytes and what the lifecycle learned about them before anything is signed: the simulation of exactly those bytes.
 - `ReconcileInput` — What `Tx.reconcile` can be asked about.
 - `Reconciled` — What one entry of `Tx.reconcileAll` settled to, as a tagged union.
 - `RemoteSigner` — What `remote` needs to know about a credential it does not hold.
 - `RunError` — Everything `run` can fail with, as one name: `SubmitError` plus what building, preflighting and signing can produce.
-- `ScreenRequest` — What a screen is shown: the sentence, and both things it is compared with.
-- `ScreenedLine` — One rendered line and the probability that the declared summary covers it.
-- `Screening` — What a semantic screen answered: probabilities, never a decision.
-- `SecretSealer` — Seals and unseals a secret for storage.
-- `SendAllResult` — What `sendAll` did: the sweep it ran and the `Executed` it produced.
-- `SendAllSweep` — What one `sendAll` sweep takes: the coins and the address balance of one coin type, as read just before the build, and how the transaction pays for gas.
 - `Signature` — re-exported from `@unconfirmed/sui-effect`.
 - `SignatureScheme`
 - `Signed` — The schema of `Signed`.
 - `Signer` — A credential: who it signs as, how, and the two things it can sign.
-- `StandardWallet` — A Wallet Standard wallet, structurally: anything with a `features` record.
-- `StandardWalletAccount` — A Wallet Standard account, structurally: what `@wallet-standard/base`'s `WalletAccount` carries and this module reads.
 - `SubmitConfig` — The lifecycle settings.
 - `SubmitConfigOverrides` — What `SubmitConfig.with` and `SubmitConfig.layer` accept: any subset of `SubmitConfigService`, with every duration given as a `Duration.Input` — `"3 seconds"`, `Duration.seconds(3)`, a number of milliseconds — and converted on the way in.
 - `SubmitConfigService` — Every decision `Tx.build`, `Tx.submit` and `Tx.reconcile` read from context.
@@ -763,56 +674,43 @@ The full entries follow under "API".
 - `SubmitViaError` — Everything `submitVia` can fail with, before the sender's own errors.
 - `SubmitViaReply` — What a third party answers when it has submitted your bytes.
 - `TransactionExpiration` — re-exported from `@unconfirmed/sui-effect`.
-- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.foldMovement`, `Tx.sendAll`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`, `Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`, `Tx.reconcileAll`.
+- `Tx` — The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`, `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`, `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`, `Tx.foldCoins`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`, `Tx.reconcile`, `Tx.resubmit`, `Tx.run`, `Tx.reconcileAll`, `Tx.withSenderLock`.
 - `UNRESOLVED_TAGS` — The tags whose entries still need an answer from the network.
-- `Verdict` — How far a transaction was checked.
-- `Verified` — A `Built` whose simulated effects stayed inside a declared `Intent`.
 - `Verify` — Signature verification, namespaced the way the SDK spells it: `Verify.verifyTransactionSignature` (alias-aware with `checkAddressAliases`, 0.6.0), `Verify.verifyPersonalMessageSignature`.
 - `VerifyOptions` — The options both verifiers take.
 - `VerifyTransactionOptions` — The options of `verifyTransactionSignature`: `VerifyOptions`, plus whether `address` is checked through its address aliases.
 - `VerifyTransactionSignature` — The overloads of `verifyTransactionSignature`: `PolicyDenied` is in the union exactly when `checkAddressAliases: true` is.
-- `ZkLogin` — The zkLogin session schemas and store, namespaced: `ZkLogin.Session`, `ZkLogin.SignatureInputs`, `ZkLogin.StoredSession`, `ZkLogin.save`, `ZkLogin.load`, `ZkLogin.remove`.
-- `ZkLoginSession` — The public half of a zkLogin session: everything but the ephemeral secret.
-- `ZkLoginSignatureInputs` — The proof inputs a zkLogin signature carries: the SDK's `ZkLoginSignatureInputs` from `@mysten/sui/zklogin`, as a schema, so a session can be stored and read back.
-- `ZkLoginSignerOptions` — What `zkLogin` needs: the public session and the ephemeral signer.
-- `ZkLoginStoredSession` — One stored zkLogin session: the public session and the sealed ephemeral secret (an Ed25519 32-byte seed, sealed by a `SecretSealer`).
+- `ZkLoginSignatureInputs` — The proof inputs a zkLogin signature carries: the SDK's `ZkLoginSignatureInputs` from `@mysten/sui/zklogin`, as a schema, so a proof from a prover's JSON reply can be decoded rather than cast.
+- `ZkLoginSignerOptions` — What `zkLogin` needs, named as the SDK's `ZkLoginSignerOptions` (`@mysten/sui/zklogin`) names them.
 - `attach` — `Tx.attach`, also exported bare. Attaches a signature somebody else made — a sender's wallet, a remote sponsor, an HSM — to built or already signed bytes, after checking it.
 - `build` — `Tx.build`, also exported bare. Builds a transaction into signable bytes.
 - `chainOf` — re-exported from `@unconfirmed/sui-effect`.
-- `checkClaims` — Compares the simulated effects with the claims, exactly and in code.
 - `cosign` — `Tx.cosign`, also exported bare. Adds one more signature to already signed bytes, for a sponsored or multi-party transaction.
-- `describeClaims` — The claims as sentences, for the edge between the summary and the claims: a harmless sentence must not sit in front of permissions it has no use for.
-- `describeEffects` — The simulated effects as sentences a semantic screen can read: addresses become labels, types lose their package ids, and only SUI carries a number.
 - `ephemeral` — `Signer.ephemeral`, also exported bare. A fresh Ed25519 credential that exists only for this process.
 - `fold` — The recipe for one fold transaction: merge the batch's coins and deposit them into the owner's address balance with `0x2::coin::send_funds<T>`.
 - `foldCoins` — `Tx.foldCoins`, also exported bare. Folds the signer's coin objects into its address balance: `planFold` for `signer.address`, then one `run` of `fold` per batch, in order — SUI first, paying for its own fold, so a fresh account whose SUI is all coins needs no address balance to start.
-- `foldMovement` — The coin → address-balance movement of one fold, which its balance changes do not show: a node nets them per address, so a fold of 1,000 SUI of coins reports only the gas (`+3,939,506` MIST on localnet, protocol 139, for five faucet coins whose storage rebate beat the gas), and the coins' balances are not in the effects at all — the coins are simply deleted, and the deposit is an accumulator write with no amount on it.
 - `fromBytes` — `Tx.fromBytes`, also exported bare. Turns transaction bytes that came from somewhere else into a `Built`, reading everything the lifecycle needs out of the bytes themselves.
-- `fromConfig` — `Signer.fromConfig`, also exported bare. Reads a secret key from configuration and builds its signer.
 - `fromKeypair` — `Signer.fromKeypair`, also exported bare. `fromSdkSigner` under the name the spec gave it when a keypair was the only thing it took.
 - `fromMnemonic` — `Signer.fromMnemonic`, also exported bare. A signer derived from a BIP-39 recovery phrase, **checked first**: the word count (12, 15, 18, 21 or 24), every word in the English list, and the checksum.
 - `fromSdkSigner` — `Signer.fromSdkSigner`, also exported bare. Wraps any `@mysten/sui/cryptography` `Signer`.
-- `fromSecretKey` — `Signer.fromSecretKey`, also exported bare. A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag names the scheme; a contradicting `scheme` option is refused), a 32-byte hex seed (`0x` optional), or 32 raw bytes — the last two read as `options.scheme`, default `ED25519`.
+- `fromSecretKey` — `Signer.fromSecretKey`, also exported bare. A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag names the scheme — `ED25519`, `Secp256k1`, `Secp256r1` or `MLDSA65`; a contradicting `scheme` option is refused), a 32-byte hex seed (`0x` optional), or 32 raw bytes — the last two read as `options.scheme`, default `ED25519`.
 - `gaslessStablecoinTransfer` — `Tx.gaslessStablecoinTransfer`, also exported bare. Builds the canonical transfer shape that an eligible stablecoin can execute without SUI gas: a `Balance<T>` from the SDK's `Transaction#balance` intent, consumed by `0x2::balance::send_funds<T>`.
 - `isUnresolved` — Whether this entry is still waiting for an answer, and therefore something `Tx.reconcileAll` has work to do about.
 - `maxEpochOf` — re-exported from `@unconfirmed/sui-effect`.
 - `maxTimestampMsOf` — re-exported from `@unconfirmed/sui-effect`.
 - `planFold` — Plans the transactions that fold an owner's coin objects into its address balance.
-- `prepare` — `Tx.prepare`, also exported bare. Build (or take) a transaction, simulate exactly its bytes, run `SubmitConfig.preflight` and, given an intent, `Tx.verify`'s checks — and sign nothing.
 - `reconcile` — `Tx.reconcile`, also exported bare. Finds out what happened to a transaction that was sent but never answered for.
 - `reconcileAll` — `Tx.reconcileAll`, also exported bare. Settles every unresolved entry in the journal: the explicit startup call a long-lived application makes after building a durable `Journal`.
-- `recorded` — `Tx.recorded`, also exported bare. What the journal recorded for one digest, if anything.
 - `remote` — `Signer.remote`, also exported bare. Builds a signer around something that signs elsewhere: a KMS, a wallet, a hardware device, another process.
 - `resubmit` — `Tx.resubmit`, also exported bare. Re-sends signed bytes whose outcome is unknown — the **identical** bytes, never a rebuild — and settles them the way `submit` does.
 - `run` — `Tx.run`, also exported bare. Build, preflight, sign and submit, under the sender lock wherever two runs could race.
-- `sendAll` — `Tx.sendAll`, also exported bare. Sends **everything** the signer holds of one coin type — every coin object and the whole address balance — into `recipient`'s address balance, in one `run`, and leaves the sender **nothing** of it: no coin, no balance, no dust.
-- `sendFunds` — Sends `amount` of a coin type into `recipient`'s **address balance**: `0x2::balance::send_funds<T>(tx.balance({ type, balance: amount }), recipient)`, the canonical transfer on an address-balance account.
+- `sendFunds` — Sends `amount` of a coin type from the sender's **address balance** into `recipient`'s: a `FundsWithdrawal` of `amount` (`tx.withdrawal`), redeemed into a `Balance<T>` (`0x2::balance::redeem_funds<T>`) and deposited with `0x2::balance::send_funds<T>`.
 - `sign` — `Tx.sign`, also exported bare. Signs built bytes.
 - `sponsored` — `Tx.sponsored`, also exported bare. Turns a recipe into a sponsored one: the sender owns the transaction, the gas owner pays, and gas comes from the sponsor's address balance rather than from coin objects, so the two parties never have to agree on a gas coin and can sign in either order.
 - `submit` — `Tx.submit`, also exported bare. Sends signed bytes, and does not stop caring until it knows what happened.
 - `submitVia` — `Tx.submitVia`, also exported bare. Submits through **someone else** — a relay, a sponsorship service, a backend that holds the only key allowed to talk to the node — and keeps the journal and the evidence rules that `Tx.submit` would have kept.
-- `verify` — `Tx.verify`, also exported bare. Checks built bytes against a declared intent, before anything is signed.
 - `verifySponsored` — Checks that sponsored bytes a service assembled are the transaction the sender asked to have sponsored, before the sender signs them.
+- `withSenderLock` — `Tx.withSenderLock`, also exported bare. Serializes work for one sender, so two transactions from the same address cannot pick the same gas coin or owned object.
 
 ### `@unconfirmed/sui-effect/journal`
 
@@ -822,89 +720,6 @@ The full entries follow under "API".
 - `layerKeyValueStore` — The durable journal as a layer.
 - `makeKeyValueStore` — A journal backed by a `KeyValueStore`.
 - `pruneSettled` — Deletes every **settled** entry (`Executed`, `Failed`, `NotApplied`) whose answer was recorded strictly before `before`, and answers how many it deleted.
-
-### `@unconfirmed/sui-effect/gate`
-
-- `Gate` — re-exported from `@unconfirmed/sui-effect/tx`.
-- `GateService` — re-exported from `@unconfirmed/sui-effect/tx`.
-- `JevOptions` — How to reach Jev.
-- `ScreenRequest` — re-exported from `@unconfirmed/sui-effect/tx`.
-- `layerJev` — The `Gate` already in force, with Jev as its screen and `overrides` applied.
-- `layerJevConfig` — `layerJev` from the environment: `TYPESAFE_API_KEY` (required, redacted), `TYPESAFE_MODEL` and `TYPESAFE_BASE_URL` (optional).
-- `makeJev` — The screen itself, over an `HttpClient` you already have.
-
-### `@unconfirmed/sui-effect/keystore`
-
-- `DEFAULT_ITERATIONS` — PBKDF2-SHA256 iterations for a new seal: OWASP's 2023 recommendation.
-- `DEFAULT_PREFIX` — The `KeyValueStore` key prefix every record is stored under, by default.
-- `KEYSTORE_VERSION` — The format version this release writes and reads.
-- `KeyError` — re-exported from `@unconfirmed/sui-effect`.
-- `KeyErrorReason` — re-exported from `@unconfirmed/sui-effect`.
-- `Keystore` — The sealed keystore: `Keystore.layer(options?)` over a `KeyValueStore`, `Keystore.layerTest` in memory for tests.
-- `KeystoreAccount` — What the keystore says about an account.
-- `KeystoreError` — A keystore operation failed.
-- `KeystoreErrorReason` — Why a keystore operation failed.
-- `KeystoreOptions` — Options of `Keystore.layer` and `Keystore.make`.
-- `KeystoreService` — The keystore's members.
-- `LockableSigner` — re-exported from `@unconfirmed/sui-effect/tx`.
-- `MIN_LAYER_ITERATIONS` — The fewest iterations `Keystore.layer` accepts for a new seal.
-- `SealedKey` — One sealed account as stored, version 1.
-- `SealedSecret` — One secret sealed by `sealer`, as the string `seal` answers: the keystore's KDF and cipher parameters and its key-check value, version 1.
-- `sealer` — A `SecretSealer` (what `ZkLogin.save` and `ZkLogin.load` take) in the keystore's format: PBKDF2-HMAC-SHA256 over `password` (600 000 iterations by default, 16-byte random salt, 512 bits: the AES key and the key-check value), AES-256-GCM with a fresh 12-byte IV per seal, and as AAD `sui-effect/keystore/sealer/v1`, a newline, then the caller's `aad` — for a zkLogin session, its address — so a blob copied under another account's entry does not unseal.
-
-### `@unconfirmed/sui-effect/storage`
-
-- `AsyncStorageLike` — The part of `@react-native-async-storage/async-storage` (or anything shaped like it) this adapter calls.
-- `ChromeStorageAreaLike` — The part of a `chrome.storage` `StorageArea` this adapter calls, in its promise form.
-- `IndexedDbDatabase` — The part of an `IDBDatabase` this adapter calls.
-- `IndexedDbFactory` — The part of an `IDBFactory` (`globalThis.indexedDB`) this adapter calls.
-- `IndexedDbObjectStore` — The part of an `IDBObjectStore` this adapter calls.
-- `IndexedDbOpenRequest` — The part of an `IDBOpenDBRequest` this adapter reads.
-- `IndexedDbOptions` — Options for `layerIndexedDb`.
-- `IndexedDbRequest` — The part of an `IDBRequest` this adapter reads.
-- `IndexedDbTransaction` — The part of an `IDBTransaction` this adapter calls.
-- `MmkvLike` — The part of a `react-native-mmkv` instance this adapter calls: `delete` (2.x/3.x) or `remove` (4.x).
-- `layerAsyncStorage` — A `KeyValueStore` over an AsyncStorage-shaped store.
-- `layerChromeStorage` — A `KeyValueStore` over a `chrome.storage` area.
-- `layerIndexedDb` — A `KeyValueStore` backed by IndexedDB.
-- `layerMmkv` — A `KeyValueStore` over an MMKV-shaped synchronous store.
-
-### `@unconfirmed/sui-effect/enoki`
-
-- `Enoki` — The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`, `Enoki.sponsor`, `Enoki.execute`, `Enoki.run`.
-- `EnokiClient` — The two `EnokiClient` methods sponsorship uses, as `@mysten/enoki` 1.3.2 declares them (the input of `createSponsoredTransaction` narrowed to the `sender` form, plus `jwt`).
-- `EnokiError` — Enoki refused a request: an HTTP 4xx from the Enoki API, or a refusal the caller's `refused` predicate recognised.
-- `EnokiFlow` — The two `EnokiFlow` methods `fromFlow` uses.
-- `execute` — `Enoki.execute`, also exported bare. Executes a sponsored transaction through Enoki's `executeSponsoredTransaction`, **through the journal**: this is `Tx.submitVia(signed, send)`, so the `Signed` entry is written before Enoki is called, Enoki is called once, and its answer — a bare digest, never effects — is settled by asking the chain for the digest of the bytes that were signed.
-- `fromFlow` — `Enoki.fromFlow`, also exported bare. The signed-in `EnokiFlow` session as a `Signer`: `scheme: "ZkLogin"`, `maxEpoch` and the expiry checks of `Signer.zkLogin`, signing with the flow's own `EnokiKeypair` (`getKeypair`, which asks Enoki for the proof the first time and caches it in the flow's store).
-- `fromWallet` — `Enoki.fromWallet`, also exported bare. An Enoki wallet (from `registerEnokiWallets`) as a `Signer`: `Signer.wallet` over its Wallet Standard features, plus the session bound its `enoki:getSession` feature reports, so the signer carries `maxEpoch` and refuses after it like `Signer.zkLogin`.
-- `run` — `Enoki.run`, also exported bare. The whole Enoki-sponsored run, with the same front half as `Tx.run`: `sponsor` → `Tx.prepare(built, { sender, intent })` (one simulate of exactly Enoki's bytes, `SubmitConfig.preflight`, the intent's claims and screen) → `approve(prepared)` → `Tx.sign` (`prepared.verified` when there is an intent) → `onSigned` → `execute`, through the journal.
-- `sponsor` — `Enoki.sponsor`, also exported bare. Asks Enoki to sponsor a transaction, and answers its sponsored bytes as a `Built` that has been checked: `Tx.fromBytes` (the chain), Enoki's digest is the digest of its bytes, and `verifySponsored` (on `/tx`) — the sender is `options.sender`, the gas owner is someone else, and the transaction kind is **exactly** the kind that was sent.
-
-### `@unconfirmed/sui-effect/extension`
-
-- `ExtensionFace` — What every registration carries besides the service's own members, under `$`-prefixed names so an extension is free to call a member `ready` or `dispose` itself.
-- `FaceValue` — What an `Effect` member's success becomes at the Promise boundary: an `Option<A>` is `A | undefined`, everything else is itself.
-- `Leaf` — `T`, marked as a leaf of the Promise face: it is handed to a Promise consumer exactly as the Effect service holds it.
-- `PromiseFace` — The Promise face of a service interface.
-- `SuiExtension` — The namespace the spec spells: `SuiExtension.fromService(...)`, plus the leaf marker a service uses to say "this member is a value, not a namespace" (`SuiExtension.leaf(value)`, typed `SuiExtension.Leaf<T>`).
-- `SuiExtensionOptions` — What `fromService` needs to know beyond the service key itself.
-- `fromService` — `SuiExtension.fromService`, also exported bare. Turns an Effect service into a `SuiClientRegistration` a Promise consumer passes to `client.$extend(...)`.
-- `leaf` — `SuiExtension.leaf`, also exported bare. Marks a value as a `Leaf`: the Promise face passes it through untouched instead of walking into it.
-
-### `@unconfirmed/sui-effect/script`
-
-- `ReportOptions` — What `report` needs beyond the `Exit`.
-- `Script` — The script preset: the two tiers and the signer.
-- `ScriptReadOnly` — The read-only script service, which has no `signer` in its type.
-- `ScriptReadOnlyService` — What a read-only script gets: everything except a way to sign.
-- `ScriptRunOptions` — Where a script's diagnostics go, and how it stops.
-- `ScriptService` — What a script gets from its one service.
-- `SignalSource` — The part of `process` `run` uses, so a test can stand in for it.
-- `exitCode` — The exit code one failure deserves.
-- `readNetwork` — `SUI_NETWORK`, with no default and with the mainnet gate.
-- `report` — Prints what `run` prints, and answers the exit code, for a program that owns its own process.
-- `run` — Runs a script: builds `Script.layer`, forks the program, interrupts it on SIGINT or SIGTERM so finalizers run, writes one diagnostic line per failure to stderr, and exits with `exitCode`.
 
 ### `@unconfirmed/sui-effect/testing`
 
@@ -922,11 +737,10 @@ The full entries follow under "API".
 - `RecordedCall` — One call the fake received, in order.
 - `SuiCoreFake` — The in-memory `SuiCore`.
 - `SuiCoreFakeState` — What a test can do to the fake while it runs.
-- `SuiTest` — The harness: everything an extension's tests need to drive the fake from inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
+- `SuiTest` — The harness: everything a test needs to drive the fake from inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
 - `TestServices` — What `layerTest` provides, under one name: `Sui`, `SuiCore` and the fake's handle, `SuiCoreFake`.
 - `fakeCoin` — A gas coin for `FakeScript.coins`, in the SDK's `SuiClientTypes.Coin` shape, with the fields a fixture rarely cares about filled in: `coinType` defaults to SUI, `version` to 1 and `digest` to a `fakeDigest`.
 - `fakeDigest` — A deterministic base58 32-byte digest, for fixtures, already branded as a `Digest` so it compares with `executed.digest` and fills any field typed `Digest` without a cast.
-- `layerExtensionTest` — An extension's own layer over `layerTest`, which is the whole wiring an extension test needs.
 - `layerTest` — The real `Sui` over the fake `SuiCore`, plus the fake's own handle so a test can script outcomes and inspect what the fake received.
 - `testSubmitConfig` — The lifecycle settings every test layer puts in force: `SubmitConfig.defaults` with the re-send schedule a fake has no use for taken out: re-sends of identical bytes follow each other with no delay (still `resubmitAttempts` of them), so a test that drives a `SubmissionUnknown` takes milliseconds on the real clock — it took seconds on the production schedule — and needs no `TestClock.adjust` for the re-sends.
 
@@ -935,7 +749,7 @@ The full entries follow under "API".
 ## `@unconfirmed/sui-effect`
 
 
-111 exported symbols.
+109 exported symbols.
 
 ### `AffectedAddressFilter` (interface)
 
@@ -1072,8 +886,8 @@ present only when `Tx.build` itself simulated **exactly these bytes** — the
 explicit simulate it runs when the SDK's resolver did not (a preset budget
 off gRPC, or nothing to resolve). On gRPC the resolver simulates the
 transaction before its budget is set, which is a different transaction, so
-there is no `simulation` there. The lifecycle reuses it (`Tx.run`,
-`Tx.prepare`, `Tx.verify`) only when it is the very object `Tx.build` made
+there is no `simulation` there. `Tx.run` reuses it (for `preflight` and
+`approve`) only when it is the very object `Tx.build` made
 in this process; one that arrived inside a decoded `Built` is simulated
 again. Neither field is carried into `Signed` or the journal.
 
@@ -1304,7 +1118,7 @@ BCS content or a schema boundary did not decode.
 `kind` says which of the three (`"type"`, `"bytes"`, `"shape"`) and is what a
 consumer branches on; `issue` is the sentence for a human and is not stable.
 It defaults to `"shape"` when neither a constructor nor an encoded value
-carries one, so an extension that builds a `DecodeError` with no `kind` still
+carries one, so a library that builds a `DecodeError` with no `kind` still
 compiles and still answers the question conservatively.
 
 ### `DecodeKind` (const)
@@ -1578,7 +1392,7 @@ export declare class Executed extends Executed_base {
      * `CoinType.SUI` — compared under the one Move type rule. It covers coin
      * objects and the address balance alike, netted per address: a fold that
      * moves 1,000 SUI of coins into its owner's address balance reports only
-     * the gas it cost (`Tx.foldMovement` reports the movement). Never fails.
+     * the gas it cost (the fold's `FoldBatch.amount` is the movement). Never fails.
      */
     balanceChange(address: SuiAddress, coinType: CoinType | string): bigint;
     /** Computation plus storage less the storage rebate, in MIST. Can be negative. Never fails. */
@@ -1871,30 +1685,6 @@ minus its `error` payload: the failure detail is carried by `ExecutionFailed`
 and `SimulationFailed` as an `ExecutionReason`, so there is exactly one
 representation of an on-chain failure.
 
-### `ExtensionNotReady` (class)
-
-```ts
-export declare class ExtensionNotReady extends ExtensionNotReady_base {
-    readonly extension: string;
-    readonly member: string;
-    /** The one actionable line `SuiError.describe` produces for this error. */
-    get message(): string;
-}
-```
-
-A synchronous member of a Promise-faced extension was called before its
-runtime existed.
-
-`SuiExtension.fromService` builds its `ManagedRuntime` on first use, so until
-something has been awaited there is no service object and no synchronous
-member to read. Rather than hand back a Promise where the type says a value,
-the face throws this. Two cures, both in the extension's own hands:
-`await client.<name>.$ready()` once after registering, or register with
-`warm`, which builds the runtime inside `register` and makes every member
-real immediately.
-
-Outcome `not_applied`: nothing was sent.
-
 ### `GasCostSummary` (const)
 
 ```ts
@@ -1952,15 +1742,15 @@ export declare class GraphQLUnavailable extends GraphQLUnavailable_base {
 }
 ```
 
-The GraphQL endpoint an extension needs is not usable: none was configured,
+The GraphQL endpoint a library needs is not usable: none was configured,
 or the one that was could not be reached.
 
 sui-effect does not wrap the GraphQL API — it owns the `SuiGraphQL`
-*tag*, so two extensions that both read GraphQL share one client rather than
+*tag*, so two libraries that both read GraphQL share one client rather than
 opening two. This is the failure the tag's `layerUnavailable` produces, which
 is what an application provides when it has no endpoint: every call rejects
-with this instead of the extension discovering a missing dependency at
-construction. An extension maps it into its own union, or lets it through.
+with this instead of the library discovering a missing dependency at
+construction. A library maps it into its own union, or lets it through.
 
 Outcome `not_applied`: a read that did not happen changed nothing.
 
@@ -1972,8 +1762,8 @@ export interface HasOutcome {
 }
 ```
 
-An extension error may declare its own `outcome`, and `SuiError.outcome` and
-`Script.run` honour it before anything else.
+An application error may declare its own `outcome`, and `SuiError.outcome`
+honours it before anything else.
 
 An error that declares none and carries a tag the taxonomy does not own is
 `"unknown"`, not `"not_applied"`: a tag this library has never heard of says
@@ -2012,13 +1802,6 @@ export declare class KeyError extends KeyError_base {
     readonly message: string;
     /** Nothing was derived or sent. */
     readonly outcome: Outcome;
-    /**
-     * `Script.exitCode`'s answer: 2, like a `ConfigError`. Every reason is input
-     * (or a platform) a person has to fix; retrying the same call cannot succeed.
-     *
-     * @since 0.5.0
-     */
-    get exitCode(): number;
 }
 ```
 
@@ -2076,8 +1859,8 @@ export interface ListOptions {
 
 Where a ledger listing starts and which way it reads. The SDK's own
 pagination options, under its own names: `after` resumes an ascending read
-strictly after a cursor (a `ListPage.endCursor` you committed), `before` a
-descending one; `before` implies `order: "descending"`. Give at most one.
+strictly after a cursor (an `endCursor` from `sui.core.listEvents` or
+`sui.core.listTransactions`), `before` a descending one; `before` implies `order: "descending"`. Give at most one.
 
 ### `ListOrder` (type)
 
@@ -2086,29 +1869,6 @@ export type ListOrder = "ascending" | "descending";
 ```
 
 The ledger order a listing is read in. Mirrors the SDK's `order` option.
-
-### `ListPage` (interface)
-
-```ts
-export interface ListPage<A> {
-    readonly items: ReadonlyArray<A>;
-    /** Where to resume: pass as `after` (or `before` when descending). `null` only before any position is known. */
-    readonly endCursor: string | null;
-    /** Whether the node said there was more after this page. */
-    readonly hasNextPage: boolean;
-}
-```
-
-One page of a ledger listing (`streamEventPages`, `streamTransactionPages`,
-`tailEventPages`, `tailTransactionPages`): its items, and the cursor to
-resume from once they are processed.
-
-Commit `endCursor` **with** the items — in the same database transaction —
-and a restarted reader that passes it back as `after` (`before` for a
-descending read) neither skips nor repeats a page. Unlike the SDK's own
-`endCursor`, it is never `null` once there is a position to resume from: an
-empty page keeps the cursor it was read from, and a tail that has caught up
-on a filtered listing moves it to the ledger head (see `tailEvents`).
 
 ### `Mist` (const)
 
@@ -2437,7 +2197,7 @@ can classify an error the taxonomy does not own.
 `"post-submit"` (the default, and the 0.1.1 behaviour) is "bytes may have
 gone out": a tag nobody here recognises proves nothing, so the answer is
 `"unknown"`. `"pre-submit"` is a failure caught while **building, simulating
-or signing** — an extension's own `PriceTooLow`, a validation error from the
+or signing** — a library's own `PriceTooLow`, a validation error from the
 caller's code — where nothing has been sent by construction and the honest
 answer is `"not_applied"`.
 
@@ -2621,25 +2381,27 @@ The expiration the transaction was built with rides along, because it is what
 ```ts
 export declare class SigningError extends SigningError_base {
     readonly cause: unknown;
-    readonly reason?: "expired" | "locked" | "rejected" | "unavailable" | undefined;
+    readonly reason?: "expired" | "rejected" | "unavailable" | undefined;
     /** The one actionable line `SuiError.describe` produces for this error. */
     get message(): string;
 }
 ```
 
+A signer refused or failed to produce a signature.
+
 ### `SigningFailureReason` (const)
 
 ```ts
 declare const SigningFailureReason: Schema
-// decodes to: "expired" | "locked" | "rejected" | "unavailable"
+// decodes to: "expired" | "rejected" | "unavailable"
 ```
 
-Why a signer refused, when it knows: `"expired"` (a session-bound credential —
-a zkLogin proof — whose `maxEpoch` has passed or would pass before the bytes
-could land), `"locked"` (the secret was dropped by `lock` / `dispose` and must
-be unlocked again), `"rejected"` (the person, or the wallet acting for them,
-declined), `"unavailable"` (the device, wallet or remote signer could not be
-reached). Absent for every other failure. A program branches on this, never
+Why a signer refused, when it knows: `"expired"` (a `maxEpoch`-bound
+credential — a zkLogin proof — whose `maxEpoch` has passed or would pass
+before the bytes could land), `"rejected"` (the person, or the device or
+remote signer acting for them, declined), `"unavailable"` (the device or
+remote signer could not be reached, or the signer cannot sign this kind of
+thing). Absent for every other failure. A program branches on this, never
 on `cause`.
 
 ### `Simulation` (class)
@@ -2786,21 +2548,6 @@ export declare class Sui extends Sui_base {
      * Fails with: `NetworkMismatch`, `TransportError`.
      */
     static readonly layerNoDepsWith: (options: SuiLayerOptions) => Layer.Layer<Sui, NetworkMismatch | TransportError, SuiCore>;
-    /**
-     * `Sui` over whatever `SuiCore` is provided, **without reading the chain
-     * identifier**: the one given is taken as the chain's.
-     *
-     * This exists for one caller: `SuiExtension.fromService` with `warm`, which
-     * builds its runtime synchronously inside `register` and therefore cannot
-     * await a `getChainIdentifier` round trip. Nothing is asserted, because
-     * nothing is asked — a node on another chain is not detected here. What still
-     * protects a warm registration is the chain itself: `Tx.build` stamps this id
-     * on the transaction's `ValidDuring` expiration, and a validator refuses
-     * bytes signed for another chain.
-     *
-     * Prefer `layerNoDeps`, which asks. Never fails.
-     */
-    static readonly layerNoDepsPinned: (chainId: string) => Layer.Layer<Sui, never, SuiCore>;
     /**
      * Builds `Sui` over whatever `SuiCore` is provided, reading the chain
      * identifier once.
@@ -3057,7 +2804,7 @@ plus the four concrete conveniences `CoreClient` adds and the `use` hatch.
 ### `SuiError` (type + const)
 
 ```ts
-export type SuiError = TransportError | ObjectNotFound | ObjectDeleted | ObjectUnavailable | TransactionNotFound | NetworkMismatch | DecodeError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError | UnexpectedEffects | GraphQLUnavailable | ExtensionNotReady;
+export type SuiError = TransportError | ObjectNotFound | ObjectDeleted | ObjectUnavailable | TransactionNotFound | NetworkMismatch | DecodeError | SimulationFailed | ExecutionFailed | SubmissionUnknown | NotApplied | SigningError | BuildError | PolicyDenied | JournalError | UnexpectedEffects | GraphQLUnavailable;
 ```
 
 Every failure sui-effect can produce.
@@ -3109,9 +2856,9 @@ export declare class SuiGraphQL extends SuiGraphQL_base {
      * The tag over a client whose every call rejects with `GraphQLUnavailable`.
      *
      * This is what an application provides when it has no GraphQL endpoint and
-     * still wants to build an extension that can use one. The alternative — no
+     * still wants to build a library that can use one. The alternative — no
      * layer at all — is a compile error in code that may never run the GraphQL
-     * path; this turns the absence into the failure the extension already
+     * path; this turns the absence into the failure the library already
      * handles, at the call it would have made.
      *
      * Never fails to build; every call through it fails.
@@ -3125,7 +2872,7 @@ export declare class SuiGraphQL extends SuiGraphQL_base {
     /**
      * One call against the GraphQL client, with the two failures already sorted.
      *
-     * Every extension that reads GraphQL was re-deriving the same three lines:
+     * Every library that reads GraphQL was re-deriving the same three lines:
      * yield the client, `Effect.tryPromise`, and remember that a rejection from
      * `layerUnavailable` is already a `GraphQLUnavailable` and must be passed
      * through rather than wrapped in a `TransportError` that hides why the
@@ -3153,7 +2900,7 @@ export declare class SuiGraphQL extends SuiGraphQL_base {
 }
 ```
 
-The SDK's GraphQL client as a service, so an extension can require it
+The SDK's GraphQL client as a service, so a library can require it
 without constructing one.
 
 **The service value *is* the client.** `yield* SuiGraphQL` hands back the
@@ -3213,9 +2960,7 @@ export interface SuiLayerOptions {
      * every later use of that runtime fails with the same stale
      * `TransportError`, until something disposes it. A short schedule here is the
      * cheap half of the cure; disposing the runtime when its build failed is the
-     * other half (see the guide's "Application consumers" section), and
-     * `layerNoDepsPinned` avoids the read altogether when the chain id is already
-     * known.
+     * other half.
      *
      * Unset, the read is made once, as it always was.
      *
@@ -3286,7 +3031,7 @@ Decodes BCS `content` bytes with a codec, turning any schema failure into a
 This is what `Sui.getObject(id, { schema })` does after it has checked the
 object's type tag, exposed as `SuiSchema.decode` for the places that already
 have bytes: a dynamic field's value, an event payload, a `Stream` of
-envelopes an extension decodes itself. Without it every caller reinvents the
+envelopes a library decodes itself. Without it every caller reinvents the
 same `Schema.decodeUnknownEffect(...).pipe(Effect.mapError(...))`, and the
 `DecodeError` it produces is worse than this one.
 
@@ -3308,7 +3053,7 @@ declare const decodeWith: <T extends Input, Input, A>(bcsType: BcsType<T, Input>
 
 A BCS layout plus the mapping into a domain value, as one codec.
 
-This is the shape every extension writes by hand and writes slightly
+This is the shape every library writes by hand and writes slightly
 differently: parse the bytes with a layout, then hand the raw struct to a
 constructor or a mapping function that may throw (an id that has to be
 branded, a `bigint` that has to be range-checked, a discriminant that has to
@@ -3693,8 +3438,9 @@ export interface SuiService {
      * entry.eventType })`. The stream follows `hasNextPage`, not the item count,
      * so a scan-limited server's empty pages do not end it early, and it **ends**
      * once it has caught up — `tailEvents` is the one that follows the chain.
-     * `opts.after` / `opts.before` resume from a committed cursor; to commit one,
-     * read `streamEventPages` instead, which carries it.
+     * `opts.after` / `opts.before` resume from a cursor; a reader that commits
+     * its position page by page uses `sui.core.listEvents`, whose pages carry
+     * `endCursor`.
      *
      * A malformed filter is a defect carrying the SDK's sentence, not a
      * `TransportError`. Fails with: `TransportError` (an `OUT_OF_RANGE` status
@@ -3704,23 +3450,13 @@ export interface SuiService {
      */
     readonly streamEvents: (filter?: EventFilter, opts?: ListOptions) => Stream.Stream<EventEntry, TransportError>;
     /**
-     * `streamEvents` a page at a time, each page carrying the cursor to resume
-     * from: commit `page.endCursor` with the page's items and pass it back as
-     * `after`.
-     *
-     * Fails with: `TransportError`.
-     *
-     * @since 0.4.0
-     */
-    readonly streamEventPages: (filter?: EventFilter, opts?: ListOptions) => Stream.Stream<ListPage<EventEntry>, TransportError>;
-    /**
      * Every event matching `filter`, oldest first, **without end**: once caught
      * up it waits `opts.poll` (one second) and asks again from its last cursor.
      *
      * It survives a node restart: a retryable `TransportError` is retried every
      * `poll` from the last cursor, logged at warning level. On a filtered tail it
-     * also keeps its cursor near the ledger head while nothing matches (see
-     * `ListPage`), so a pruning node does not prune past it. **That reads the
+     * also keeps its cursor near the ledger head while nothing matches, so a
+     * pruning node does not prune past it. **That reads the
      * unfiltered head and the filtered page as two requests**, which agree only
      * when they reach the same node (or nodes at the same height): behind a
      * load-balanced endpoint such as a public fullnode, a head from a node that
@@ -3728,9 +3464,9 @@ export interface SuiService {
      * matches the lagging node had not reached, and they are never read. Point a
      * filtered tail whose completeness matters at a single (sticky) node.
      * `Stream.retry` on
-     * the result starts again from `opts.after`, not from where it stopped: for a
-     * restartable indexer use `tailEventPages` and commit each page's
-     * `endCursor`.
+     * the result starts again from `opts.after`, not from where it stopped: a
+     * restartable indexer that commits its cursor pages through
+     * `sui.core.listEvents` itself.
      *
      * Fails with: `TransportError`, only when it is not retryable (a cursor the
      * node has pruned past answers `OUT_OF_RANGE`).
@@ -3738,20 +3474,6 @@ export interface SuiService {
      * @since 0.4.0
      */
     readonly tailEvents: (filter?: EventFilter, opts?: TailOptions) => Stream.Stream<EventEntry, TransportError>;
-    /**
-     * `tailEvents` a page at a time, each page carrying the cursor to resume
-     * from. A caught-up filtered tail emits an **empty** page whenever it moves
-     * its cursor to the ledger head, so that position can be committed too —
-     * with `tailEvents`' caveat: that move is sound only when the head and the
-     * page come from one node (or nodes at the same height), so a filtered tail
-     * whose completeness matters uses a single (sticky) node, not a
-     * load-balanced endpoint.
-     *
-     * Fails with: `TransportError`, only when it is not retryable.
-     *
-     * @since 0.4.0
-     */
-    readonly tailEventPages: (filter?: EventFilter, opts?: TailOptions) => Stream.Stream<ListPage<EventEntry>, TransportError>;
     /**
      * Every transaction matching `filter` (all transactions when omitted),
      * paginated in ledger order, oldest first unless `{ order: "descending" }`.
@@ -3789,15 +3511,6 @@ export interface SuiService {
      */
     readonly streamTransactions: (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
     /**
-     * `streamTransactions` a page at a time, each page carrying the cursor to
-     * resume from (see `streamEventPages`).
-     *
-     * Fails with: `TransportError`.
-     *
-     * @since 0.4.0
-     */
-    readonly streamTransactionPages: (filter?: TransactionFilter | AffectedAddressFilter, opts?: ListOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
-    /**
      * Every transaction matching `filter`, oldest first, without end — the
      * transaction twin of `tailEvents`, with the same polling, retry and
      * filtered-cursor behaviour, and `streamTransactions`' rule for function
@@ -3812,22 +3525,6 @@ export interface SuiService {
      * @since 0.4.0
      */
     readonly tailTransactions: (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) => Stream.Stream<Result.Result<Executed, ExecutionFailed>, TransportError>;
-    /**
-     * `tailTransactions` a page at a time (see `tailEventPages`), with the
-     * same caveat: a filtered tail whose completeness matters uses a single
-     * (sticky) node, because its move to the head is sound only when the head
-     * and the page come from the same ledger height.
-     *
-     * Fails with: `TransportError`, only when it is not retryable.
-     *
-     * @since 0.4.0
-     */
-    readonly tailTransactionPages: (filter?: TransactionFilter | AffectedAddressFilter, opts?: TailOptions) => Stream.Stream<ListPage<Result.Result<Executed, ExecutionFailed>>, TransportError>;
-    /**
-     * Serializes work for one sender, so two transactions from the same address
-     * cannot pick the same gas coin. Adds no failures of its own.
-     */
-    readonly withSenderLock: (address: SuiAddress) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
 }
 ```
 
@@ -3837,7 +3534,7 @@ The opinionated tier over `SuiCore`.
 
 ```ts
 export interface TailOptions {
-    /** Resume strictly after this cursor (a committed `ListPage.endCursor`); `null` is the start. */
+    /** Resume strictly after this cursor (a `sui.core.list…` `endCursor`); `null` is the start. */
     readonly after?: string | null;
     readonly poll?: Duration.Input;
 }
@@ -3845,8 +3542,8 @@ export interface TailOptions {
 
 Where a tail starts and how often it asks once it has caught up.
 
-`after` is a cursor to resume strictly after — a `ListPage.endCursor` the
-caller committed — and, omitted, the tail starts at the beginning of the
+`after` is a cursor to resume strictly after — an `endCursor` from
+`sui.core.listEvents` / `sui.core.listTransactions` — and, omitted, the tail starts at the beginning of the
 history the node serves. `poll` is the wait between requests while there is
 nothing new, one second unless given.
 
@@ -4098,7 +3795,7 @@ export declare class TransportError extends TransportError_base {
      * status and the retryability the way `SuiCore` does for the SDK's own
      * failures.
      *
-     * This is for an extension that makes its own network calls — an operator
+     * This is for a library that makes its own network calls — an operator
      * HTTP API, a GraphQL endpoint, a sidecar — and wants its failures to sit on
      * the same axis as the library's: `retryable` read off a gRPC status name, an
      * HTTP status number (5xx and 429), or an abort or timeout, and `status`
@@ -4313,7 +4010,7 @@ object has no output version, and nothing can be consumed without both.
 ## `@unconfirmed/sui-effect/tx`
 
 
-103 exported symbols.
+71 exported symbols.
 
 ### `AddressAlias` (const)
 
@@ -4385,17 +4082,6 @@ object.
 ### `Built` (const)
 
 Re-exported from `@unconfirmed/sui-effect`.
-
-### `ClaimViolation` (interface)
-
-```ts
-export interface ClaimViolation {
-    readonly rule: "outflow" | "recipient" | "object";
-    readonly message: string;
-}
-```
-
-One way the simulated effects stepped outside the claims.
 
 ### `ExpirationPolicy` (type)
 
@@ -4470,41 +4156,6 @@ How one fold transaction pays for gas.
 - `"auto"`: any other coin type. The payment is left to the resolver, which
   pays from the SUI balance when it covers the budget and from SUI coins
   otherwise.
-
-### `FoldMovement` (interface)
-
-```ts
-export interface FoldMovement {
-    readonly owner: SuiAddress;
-    readonly coinType: CoinType;
-    /** The batch's coins this fold consumes, at the versions and balances the plan read. */
-    readonly consumed: ReadonlyArray<Coin>;
-    /** The batch's coins the effects do **not** consume. Empty for a fold that does what it says. */
-    readonly missing: ReadonlyArray<Coin>;
-    /** The total of `consumed`, in the coin type's smallest unit. */
-    readonly fromCoins: bigint;
-    /**
-     * What the owner's address balance of this coin type gains: `netChange +
-     * fromCoins`. For a SUI batch paying for itself, the coins less the net gas
-     * (more than the coins when the storage rebates exceed the gas).
-     */
-    readonly toAddressBalance: bigint;
-    /** The owner's net balance change for the coin type, coins and balance together. */
-    readonly netChange: bigint;
-    /**
-     * Whether `toAddressBalance` is exact: every coin of the batch is consumed,
-     * and the owner ends up with no coin object of this type created or
-     * mutated, so nothing but the address balance can hold the difference.
-     */
-    readonly exact: boolean;
-}
-```
-
-What one fold moves, read off its simulation (or its execution):
-`consumed`, the batch's coins the effects delete, with the balances the plan
-read them at; `fromCoins`, their total; `toAddressBalance`, what the owner's
-address balance of the coin type gains; and `netChange`, the owner's net
-balance change, which is all `balanceChanges` reports.
 
 ### `FoldPlan` (interface)
 
@@ -4594,126 +4245,6 @@ How `Tx.build` treats a gas payment the recipe left unset.
   `Tx.foldCoins`.
 
 A payment the recipe set itself is the recipe's choice under either policy.
-
-### `Gate` (const)
-
-```ts
-declare const Gate: Context.Reference<GateService> & {
-    defaults: GateService;
-    layer: (overrides: Partial<GateService>) => Layer.Layer<never>;
-    with: (overrides: Partial<GateService>) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
-}
-```
-
-The intent policy and its screen.
-
-Because this is a `Context.Reference`, `Tx.verify` keeps `R = Sui`: with
-nothing provided the claims are checked and the verdict is `Unscreened`.
-`Gate.layer(overrides)` spreads `defaults`; `Gate.with(overrides)`
-merges over the gate in force.
-
-### `GateService` (interface)
-
-```ts
-export interface GateService {
-    /**
-     * The semantic screen. It answers in probabilities and decides nothing.
-     *
-     * Fails with: `TransportError`, which is what `GateService.onUnavailable`
-     * is about.
-     */
-    readonly screen?: (request: ScreenRequest) => Effect.Effect<Screening, TransportError>;
-    /**
-     * Whether `Tx.run` refuses a transaction that declares no intent, with
-     * `PolicyDenied { rule: "intent.required" }`, before it builds anything.
-     * Off by default; on is the setting for a wallet an agent drives. It binds
-     * `Tx.run` only: the explicit lifecycle (`Tx.build`, `Tx.sign`, `Tx.submit`)
-     * is not gated, and a caller assembling it calls `Tx.verify` itself.
-     */
-    readonly requireIntent: boolean;
-    /**
-     * What a screen that could not answer means. `"deny"` refuses the transaction
-     * with `PolicyDenied { rule: "gate.unavailable" }`: a gate that was configured
-     * and is down is not a gate that passed. `"unscreened"` lets the claims check
-     * stand alone and records why on the verdict.
-     */
-    readonly onUnavailable: "deny" | "unscreened";
-    /** An effect line the summary covers with less probability than this is refused. */
-    readonly minEffectInScope: number;
-    /** A claim line the summary has less use for than this is refused. */
-    readonly minClaimInScope: number;
-    /** A summary less specific than this (0 to 2) covers nothing and is refused. */
-    readonly minSpecificity: number;
-    /** A summary more likely than this to be addressing the screen is refused. */
-    readonly maxInjection: number;
-}
-```
-
-Every decision `Tx.verify` and `Tx.run` read from context about intents.
-
-### `Intent` (const)
-
-```ts
-declare const Intent: Schema
-// decodes to:
-// {
-//     readonly summary: string;
-//     readonly author: "user" | "task" | "dapp";
-//     readonly claims: {
-//         readonly outflows: readonly {
-//             readonly coinType: CoinType;
-//             readonly max: bigint;
-//         }[];
-//         readonly recipients: readonly SuiAddress[];
-//         readonly objects: readonly ObjectId[];
-//     };
-// }
-```
-
-A declared intent: one sentence for the screen, exact claims for the code.
-
-`Intent.fromSimulation(simulation: Simulation, parties: Parties, opts: {
-summary: string; author: IntentAuthor }): Intent` renders a simulation as
-the exact claims it implies: every coin the sender loses at exactly the
-amount lost (net of gas), every address other than the sender that receives
-a coin or an object, every non-coin object that leaves the sender. So
-`checkClaims(Intent.fromSimulation(s, p, opts), s, p)` is empty. It is how a
-wallet shows a dapp's bytes as claims a person can approve, then holds what
-it signs to them with `Tx.verify`; `parties` may be the `Built` itself.
-
-**Never fails; the summary is checked by `Tx.verify` (`intent.invalid`).**
-
-### `IntentAuthor` (const)
-
-```ts
-declare const IntentAuthor: Schema
-// decodes to: "user" | "task" | "dapp"
-```
-
-Who wrote the intent. Provenance for the audit record, and nothing else: the
-checks are the same for all three, because none of them can be verified from
-here.
-
-`"user"` is a person describing their own transaction. `"task"` is the scope
-a person gave an agent **before** the agent built anything, which is the only
-form that constrains a prompt-injected agent; an agent describing its own PTB
-after the fact is `"dapp"` in all but name. `"dapp"` is a third party's
-description of a transaction it built, which is a claim to check and never
-evidence.
-
-### `IntentClaims` (const)
-
-```ts
-declare const IntentClaims: Schema
-// decodes to: { readonly outflows: readonly { readonly coinType: CoinType; readonly max: bigint; }[]; readonly recipients: readonly SuiAddress[]; readonly objects: readonly ObjectId[]; }
-```
-
-What the transaction is allowed to do to the sender, deny by default: a coin
-that is not listed may not decrease, an address that is not listed may not
-receive anything, and an object that is not listed may not leave.
-
-Gas is not an outflow. It is bounded by `SubmitConfig.maxGasBudget`, and
-counting it would make every claim a guess about the reference gas price.
 
 ### `Journal` (const)
 
@@ -4971,9 +4502,8 @@ Reading and writing the submission journal.
 export type KeyScheme = "ED25519" | "Secp256k1" | "Secp256r1";
 ```
 
-The schemes a key at rest can be: the three a BIP-39 phrase derives on the
-standard Sui paths. (`MLDSA65` has its own path family and is read only by
-`Signer.fromConfig`; `ZkLogin`, `Passkey` and `MultiSig` hold no secret key.)
+The schemes a held key can be: the three a BIP-39 phrase derives on the
+standard Sui paths. (`ZkLogin`, `Passkey` and `MultiSig` hold no secret key.)
 
 ### `LockSenderPolicy` (type)
 
@@ -5002,32 +4532,6 @@ A config provided directly rather than through `SubmitConfig.with` may still
 hold the pre-0.4.0 boolean or another value: `Tx.run` reads `true` as
 `"always"`, `false` as `"never"`, and anything else as `"always"`.
 
-### `LockableSigner` (interface)
-
-```ts
-export interface LockableSigner extends Signer {
-    /** Drops the secret; every later signature fails with `reason: "locked"`. Never fails. */
-    readonly lock: Effect.Effect<void>;
-    /** Whether `lock` has run. Never fails. */
-    readonly locked: Effect.Effect<boolean>;
-}
-```
-
-A `Signer` that holds a secret and can drop it.
-
-`lock` is **disposal, one way**: it zeroes the secret bytes the signer owns,
-zeroes the keypair's own copy where the SDK keeps one, and releases the
-keypair. Afterwards both members fail with `SigningError { reason:
-"locked" }`; there is no unlock — open the account again (`Keystore.unlock`,
-`Signer.fromMnemonic`) for a new signer. `lock` is idempotent and never
-fails. A `lock` racing a signature cannot land mid-signature: the signature
-either answers by the real key (it was computed before the lock) or fails
-with `reason: "locked"`.
-
-A `LockableSigner` **is** a `Signer`: every function that takes a signer
-takes this one, and it carries no secret either — the keypair lives in a
-closure, not on the value.
-
 ### `MnemonicLength` (type)
 
 ```ts
@@ -5036,78 +4540,24 @@ export type MnemonicLength = 12 | 15 | 18 | 21 | 24;
 
 The BIP-39 word counts: 128 to 256 bits of entropy in 32-bit steps.
 
-### `OutflowClaim` (const)
-
-```ts
-declare const OutflowClaim: Schema
-// decodes to: { readonly coinType: CoinType; readonly max: bigint; }
-```
-
-The most of one coin the sender may lose, in base units, gas excluded.
-
-### `Parties` (interface)
-
-```ts
-export interface Parties {
-    readonly sender: SuiAddress;
-    readonly gasOwner?: SuiAddress | undefined;
-}
-```
-
-Whose transaction it is. Gas spent by whoever pays it is never an outflow.
-
-A `Built` is a `Parties` as it is: `sender`, and `gasOwner` only when someone
-else pays.
-
-### `PasskeyProvider` (interface)
-
-```ts
-export interface PasskeyProvider {
-    readonly create: () => Promise<{
-        readonly rawId: ArrayBuffer;
-        readonly response: {
-            readonly getPublicKey: () => ArrayBuffer | null;
-        };
-    }>;
-    readonly get: (challenge: Uint8Array, credentialId?: Uint8Array) => Promise<{
-        readonly response: {
-            readonly authenticatorData: ArrayBuffer;
-            readonly clientDataJSON: ArrayBuffer;
-            readonly signature: ArrayBuffer;
-        };
-    }>;
-}
-```
-
-What a passkey signer asks the authenticator for, structurally: the SDK's
-`PasskeyProvider` from `@mysten/sui/keypairs/passkey` (its
-`BrowserPasskeyProvider` is one) without the DOM types it is declared with,
-so a React Native or extension provider can be typed without a DOM `lib`.
-`create()` answers the `navigator.credentials.create()` credential (its
-`rawId` and `response.getPublicKey()`), `get()` the
-`navigator.credentials.get()` assertion for `challenge`.
-
 ### `Prepared` (interface)
 
 ```ts
 export interface Prepared {
     readonly built: Built;
     readonly simulation: Simulation;
-    readonly verified?: Verified;
 }
 ```
 
 Built bytes and what the lifecycle learned about them before anything is
-signed: the simulation of exactly those bytes, and the verified intent when
-one was declared. What `prepare` answers and what `Tx.run`'s
-`approve` is shown.
+signed: the simulation of exactly those bytes. What `Tx.run`'s `approve` is
+shown.
 
 `built.gas` is the gas the bytes carry (budget, price, payer, payment and
 where it comes from) and `built.gasOwner` the sponsor, when there is one;
 `simulation` has `Executed`'s accessors (`created`, `transferred`,
 `balanceChange`, ...), and `simulation.gasUsedTotal` is the gas it is
-expected to cost. `verified` is present exactly when an intent was given,
-and is the `Built` to sign when it is.
+expected to cost.
 
 ### `ReconcileInput` (type)
 
@@ -5173,123 +4623,6 @@ export type RunError = BuildError | SimulationFailed | PolicyDenied | SigningErr
 
 Everything `run` can fail with, as one name: `SubmitError` plus
 what building, preflighting and signing can produce.
-
-### `ScreenRequest` (interface)
-
-```ts
-export interface ScreenRequest {
-    readonly intent: Intent;
-    /** `describeEffects` of the simulation. Never empty. */
-    readonly effects: ReadonlyArray<string>;
-    /** `describeClaims` of the intent. Empty when it claims nothing. */
-    readonly claims: ReadonlyArray<string>;
-}
-```
-
-What a screen is shown: the sentence, and both things it is compared with.
-
-### `ScreenedLine` (const)
-
-```ts
-declare const ScreenedLine: Schema
-// decodes to: { readonly text: string; readonly inScope: number; }
-```
-
-One rendered line and the probability that the declared summary covers it.
-
-### `Screening` (const)
-
-```ts
-declare const Screening: Schema
-// decodes to:
-// {
-//     readonly effects: readonly {
-//         readonly text: string;
-//         readonly inScope: number;
-//     }[];
-//     readonly claims: readonly {
-//         readonly text: string;
-//         readonly inScope: number;
-//     }[];
-//     readonly specificity: number;
-//     readonly injection: number;
-// }
-```
-
-What a semantic screen answered: probabilities, never a decision. The
-decision is `Gate`'s thresholds, applied in code by `Tx.verify`.
-
-### `SecretSealer` (interface)
-
-```ts
-export interface SecretSealer {
-    /** Fails with: `SigningError`. */
-    readonly seal: (secret: Redacted.Redacted<Uint8Array>, aad: Uint8Array) => Effect.Effect<string, SigningError>;
-    /** Fails with: `SigningError` (`reason: "locked"` when the keystore is locked is the convention). */
-    readonly unseal: (sealed: string, aad: Uint8Array) => Effect.Effect<Redacted.Redacted<Uint8Array>, SigningError>;
-}
-```
-
-Seals and unseals a secret for storage. The keystore that owns the wrapping
-key implements this: `Keystore.sealer(password)` on
-`@unconfirmed/sui-effect/keystore` is one (PBKDF2 and AES-GCM, the
-keystore's format), and WebCrypto under a key the platform keeps or the OS
-keychain are others.
-
-`aad` is additional authenticated data the sealer must bind the blob to —
-here, the UTF-8 bytes of the session's address — so a sealed key copied
-under another account's entry does not unseal. A sealer that returns its
-input unchanged stores the ephemeral key in plain text; that is a decision
-the caller makes by writing one, never a default.
-
-### `SendAllResult` (interface)
-
-```ts
-export interface SendAllResult {
-    readonly sweep: SendAllSweep;
-    readonly executed: Executed;
-    readonly received: bigint;
-}
-```
-
-What `sendAll` did: the sweep it ran and the `Executed` it produced.
-`received` is what the recipient's balance of the coin type gained, read
-off the effects: for SUI, the sweep less the net gas (more than the sweep
-when the deleted coins' storage rebate beats the gas); for any other type,
-exactly `sweep.amount`.
-
-### `SendAllSweep` (interface)
-
-```ts
-export interface SendAllSweep {
-    readonly owner: SuiAddress;
-    readonly recipient: SuiAddress;
-    /** The coin type, normalized. */
-    readonly coinType: CoinType;
-    /** The coin objects swept, largest first, at the versions read. */
-    readonly coins: ReadonlyArray<Coin>;
-    /** The owner's address balance of the coin type as read: all of it is swept. */
-    readonly addressBalance: bigint;
-    /** `coins` plus `addressBalance`, before gas. */
-    readonly amount: bigint;
-    readonly gas: "coinReservation" | "coins" | "auto";
-}
-```
-
-What one `sendAll` sweep takes: the coins and the address balance of
-one coin type, as read just before the build, and how the transaction pays
-for gas. What `Tx.sendAll`'s `approve` is shown beside the prepared
-transaction, and what its answer reports.
-
-- `"coinReservation"` (SUI): gas is a reservation of the **whole** SUI
-  address balance, the coins are merged into that gas coin, and the gas
-  coin is deposited — what is left after gas is the recipient's.
-- `"coins"` (SUI): the coins are the gas payment (the first 256; the rest
-  are merged into the gas coin), the address balance is redeemed into a
-  coin and merged into it, and the gas coin is deposited.
-- `"auto"` (any other coin type): the coins are merged and deposited, the
-  balance is withdrawn and deposited, and SUI pays the gas, from wherever
-  the resolver finds it.
 
 ### `Signature` (const)
 
@@ -5370,7 +4703,7 @@ export interface Signer {
      */
     readonly signPersonalMessage: (bytes: Uint8Array) => Effect.Effect<Signature, SigningError>;
     /**
-     * The last epoch this credential can sign for, when it is session-bound (a
+     * The last epoch this credential can sign for, when it is bounded (a
      * zkLogin proof's `maxEpoch`). Absent for a credential that does not expire.
      * `Tx.run` keeps the built bytes' validity window inside it, and a signer
      * whose bound has passed fails with `SigningError { reason: "expired" }`.
@@ -5402,73 +4735,27 @@ caller's error union does not grow a branch per credential kind.
 declare const Signer: {
     readonly fromSdkSigner: (keypair: SdkSigner) => Signer;
     readonly fromKeypair: (keypair: Keypair) => Signer;
-    readonly fromConfig: (name?: string) => Effect.Effect<Signer, Config.ConfigError>;
     readonly ephemeral: Effect.Effect<Signer, never, never>;
     readonly remote: (signer: RemoteSigner) => Signer;
-    readonly fromMnemonic: (phrase: Redacted.Redacted<string> | string, options?: FromMnemonicOptions) => Effect.Effect<LockableSigner, KeyError>;
-    readonly fromSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, options?: FromSecretKeyOptions) => Effect.Effect<LockableSigner, KeyError>;
+    readonly fromMnemonic: (phrase: Redacted.Redacted<string> | string, options?: FromMnemonicOptions) => Effect.Effect<Signer, KeyError>;
+    readonly fromSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, options?: FromSecretKeyOptions) => Effect.Effect<Signer, KeyError>;
     readonly generateMnemonic: (words?: MnemonicLength) => Effect.Effect<Redacted.Redacted<string>, KeyError>;
     readonly derivationPath: (scheme: KeyScheme, account?: number) => string;
-    readonly scoped: <E, R>(acquire: Effect.Effect<LockableSigner, E, R>) => Effect.Effect<LockableSigner, E, R | Scope.Scope>;
     readonly zkLogin: (options: import("./ZkLoginSigner.ts").ZkLoginSignerOptions) => Effect.Effect<Signer, SigningError, never>;
-    readonly passkey: (options: {
-        readonly publicKey: Uint8Array;
-        readonly provider: import("./AccountSigners.ts").PasskeyProvider;
-        readonly credentialId?: Uint8Array;
-    }) => Effect.Effect<Signer, SigningError, never>;
-    readonly createPasskey: (provider: import("./AccountSigners.ts").PasskeyProvider) => Effect.Effect<{
-        readonly signer: Signer;
-        readonly publicKey: Uint8Array;
-        readonly credentialId?: Uint8Array;
-    }, SigningError, never>;
-    readonly wallet: (options: {
-        readonly wallet: import("./AccountSigners.ts").StandardWallet;
-        readonly account: import("./AccountSigners.ts").StandardWalletAccount;
-        readonly chain: string;
-        readonly scheme?: SignatureScheme;
-    }) => Effect.Effect<Signer, SigningError, never>;
     readonly multisig: (publicKey: import("@mysten/sui/multisig").MultiSigPublicKey, signers: ReadonlyArray<Signer>) => Effect.Effect<Signer, KeyError>;
     readonly alias: (address: SuiAddress, signer: Signer) => Signer;
 }
 ```
 
 The constructors, namespaced the way the spec spells them:
-`Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.fromConfig`,
-`Signer.ephemeral`, `Signer.remote`; for keys the process holds
-`Signer.fromMnemonic`, `Signer.fromSecretKey`, `Signer.generateMnemonic`,
-`Signer.derivationPath` and `Signer.scoped`; and the account signers
-(0.5.0) `Signer.zkLogin`, `Signer.passkey`, `Signer.createPasskey`,
-`Signer.wallet`; and signers made of signers (0.6.0) `Signer.multisig`
-(a weighted multisig over member signers, combined in member order) and
-`Signer.alias` (sign as an address through its address aliases). The type
-`Signer` is the interface above.
-
-### `StandardWallet` (interface)
-
-```ts
-export interface StandardWallet {
-    readonly name?: string;
-    readonly features: Readonly<Record<string, unknown>>;
-}
-```
-
-A Wallet Standard wallet, structurally: anything with a `features` record.
-A `Wallet` from `@wallet-standard/base` (or a `WalletWithRequiredFeatures`
-from `@mysten/wallet-standard`) is one.
-
-### `StandardWalletAccount` (interface)
-
-```ts
-export interface StandardWalletAccount {
-    readonly address: string;
-    readonly publicKey: ArrayLike<number>;
-    readonly chains: ReadonlyArray<string>;
-    readonly features?: ReadonlyArray<string>;
-}
-```
-
-A Wallet Standard account, structurally: what `@wallet-standard/base`'s
-`WalletAccount` carries and this module reads.
+`Signer.fromSdkSigner`, `Signer.fromKeypair`, `Signer.ephemeral`,
+`Signer.remote`; for keys the process holds `Signer.fromMnemonic`,
+`Signer.fromSecretKey`, `Signer.generateMnemonic` and
+`Signer.derivationPath`; `Signer.zkLogin` (a proof and an ephemeral key);
+and signers made of signers (0.6.0) `Signer.multisig` (a weighted multisig
+over member signers, combined in member order) and `Signer.alias` (sign as
+an address through its address aliases). The type `Signer` is the
+interface above.
 
 ### `SubmitConfig` (const)
 
@@ -5655,7 +4942,7 @@ export type SubmitError = ExecutionFailed | NotApplied | SubmissionUnknown | Jou
 
 Everything `submit` can fail with, as one name.
 
-An extension that wraps a submission spells its own errors plus this, rather
+A library that wraps a submission spells its own errors plus this, rather
 than repeating four tags that will grow with the taxonomy.
 
 ### `SubmitViaError` (type)
@@ -5694,8 +4981,8 @@ declare const Tx: {
         readonly sender: SuiAddress;
         readonly gasOwner?: SuiAddress;
         /**
-         * The last epoch the transaction may be valid in: a signer's session
-         * bound (`Signer.maxEpoch`). The default expiration's `maxEpoch` is capped
+         * The last epoch the transaction may be valid in: a signer's
+         * `Signer.maxEpoch` (a zkLogin proof's). The default expiration's `maxEpoch` is capped
          * at it, and a bound already below the current epoch fails the build
          * before anything resolves.
          *
@@ -5726,7 +5013,6 @@ declare const Tx: {
         readonly coinType?: CoinType;
         readonly amount: bigint;
         readonly recipient: SuiAddress;
-        readonly useGasCoin?: boolean;
     }) => Recipe;
     readonly planFold: (opts: {
         readonly owner: SuiAddress;
@@ -5752,31 +5038,7 @@ declare const Tx: {
          * @since 0.5.0
          */
         readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>;
-        /**
-         * The intent every batch is verified against, as `Tx.run`'s `intent`. When
-         * omitted and `Gate.requireIntent` is on, each batch declares the fold's own
-         * intent — a summary saying the coins go into the owner's own address
-         * balance, and **no claims**, so the claims check refuses a batch whose
-         * simulation moves anything out of the account. When omitted and the gate
-         * requires nothing, no intent is checked (0.4.0's cost: no extra simulate).
-         *
-         * @since 0.5.0
-         */
-        readonly intent?: Intent;
     }) => Effect.Effect<FoldResult, RunError | E, Sui>;
-    readonly foldMovement: (batch: FoldBatch, effects: Simulation | Executed) => import("./Fold.ts").FoldMovement;
-    readonly sendAll: <E = never>(opts: {
-        readonly signer: Signer;
-        readonly recipient: SuiAddress;
-        /** The coin type to sweep. Default SUI. */
-        readonly coinType?: CoinType;
-        /** What the sweep is declared to do; see `Tx.run`. */
-        readonly intent?: Intent;
-        /** `Tx.run`'s `approve`, with the sweep it is about to send. */
-        readonly approve?: (prepared: Prepared, sweep: SendAllSweep) => Effect.Effect<void, E>;
-        /** `Tx.run`'s `onSigned`. */
-        readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
-    }) => Effect.Effect<SendAllResult, RunError | E, Sui>;
     readonly verifySponsored: (built: Built, expect: {
         readonly sender: string;
         readonly gasOwner?: string;
@@ -5784,18 +5046,8 @@ declare const Tx: {
     }) => Effect.Effect<Built, PolicyDenied, never>;
     readonly submit: (signed: Signed) => Effect.Effect<Executed, SubmitError, Sui>;
     readonly submitVia: <E, R>(signed: Signed, send: (bytes: Uint8Array, signatures: ReadonlyArray<Signature>) => Effect.Effect<SubmitViaReply, E, R>) => Effect.Effect<Executed, SubmitViaError | E, Sui | R>;
-    readonly verify: (built: Built, intent: Intent) => Effect.Effect<Verified, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
-    readonly prepare: (input: Built | Transaction | Recipe, opts: {
-        readonly sender: SuiAddress;
-        readonly gasOwner?: SuiAddress;
-        /** What the transaction is declared to do; `verified` is present when given. */
-        readonly intent?: Intent;
-        /** A session bound for what is built here (`Signer.maxEpoch`); see `Tx.build`. Ignored for a `Built`. */
-        readonly maxEpoch?: bigint;
-    }) => Effect.Effect<Prepared, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>;
     readonly reconcile: (input: ReconcileInput) => Effect.Effect<Executed, ExecutionFailed | SubmissionUnknown | NotApplied, Sui>;
     readonly resubmit: (input: SubmissionUnknown | Signed) => Effect.Effect<Executed, SubmitError, Sui>;
-    readonly recorded: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never>;
     readonly run: <E = never>(recipe: Transaction | Recipe, opts: {
         readonly signer: Signer;
         readonly gasOwner?: SuiAddress;
@@ -5827,18 +5079,9 @@ declare const Tx: {
          */
         readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
         /**
-         * What this transaction is declared to do. When present, the built bytes
-         * go through `verify` before anything is signed, sharing its
-         * simulate with `SubmitConfig.preflight`. `Gate.requireIntent` makes it
-         * mandatory.
-         *
-         * @since 0.5.0
-         */
-        readonly intent?: Intent;
-        /**
          * Shown the `Prepared` transaction — the built bytes with their gas,
-         * the simulation of exactly those bytes, the verified intent — **after**
-         * `preflight` and the intent checks and **before the first signature**.
+         * the simulation of exactly those bytes — **after** `preflight` and
+         * **before the first signature**.
          * Succeeding approves; failing refuses with the caller's own error (a
          * wallet's `UserRejected`), which `Tx.run` fails with, nothing signed and
          * nothing journalled. It runs where signing runs: under the sender lock
@@ -5872,15 +5115,16 @@ declare const Tx: {
         readonly _tag: "Executed";
         readonly executed: Executed;
     })[], JournalError, Sui>;
+    readonly withSenderLock: (address: SuiAddress) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R | Sui>;
 }
 ```
 
 The lifecycle, namespaced the way the spec spells it: `Tx.build`, `Tx.sign`,
 `Tx.cosign`, `Tx.fromBytes`, `Tx.attach`, `Tx.sponsored`,
 `Tx.gaslessStablecoinTransfer`, `Tx.sendFunds`, `Tx.planFold`, `Tx.fold`,
-`Tx.foldCoins`, `Tx.foldMovement`, `Tx.sendAll`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`, `Tx.verify`,
-`Tx.prepare`, `Tx.reconcile`, `Tx.resubmit`, `Tx.recorded`, `Tx.run`,
-`Tx.reconcileAll`.
+`Tx.foldCoins`, `Tx.verifySponsored`, `Tx.submit`, `Tx.submitVia`,
+`Tx.reconcile`, `Tx.resubmit`, `Tx.run`, `Tx.reconcileAll`,
+`Tx.withSenderLock`.
 
 ### `UNRESOLVED_TAGS` (const)
 
@@ -5889,126 +5133,6 @@ declare const UNRESOLVED_TAGS: readonly ["Signed", "Unknown"]
 ```
 
 The tags whose entries still need an answer from the network.
-
-### `Verdict` (const)
-
-```ts
-declare const Verdict: Schema
-// decodes to:
-// {
-//     readonly _tag: "Screened";
-//     readonly screening: {
-//         readonly effects: readonly {
-//             readonly text: string;
-//             readonly inScope: number;
-//         }[];
-//         readonly claims: readonly {
-//             readonly text: string;
-//             readonly inScope: number;
-//         }[];
-//         readonly specificity: number;
-//         readonly injection: number;
-//     };
-// } | {
-//     readonly _tag: "Unscreened";
-//     readonly reason: string;
-// }
-```
-
-How far a transaction was checked. The claims always held, or there would be
-a `PolicyDenied` instead of a verdict; what varies is whether anything read
-the sentence. `Unscreened` is never silent: it is on the record with a reason.
-
-### `Verified` (const)
-
-```ts
-declare const Verified: Schema
-// decodes to:
-// {
-//     readonly bytes: Uint8Array<ArrayBufferLike>;
-//     readonly digest: Digest;
-//     readonly sender: SuiAddress;
-//     readonly gas: {
-//         readonly budget: Mist;
-//         readonly price: Mist;
-//         readonly owner: SuiAddress;
-//         readonly payment: readonly {
-//             readonly objectId: ObjectId;
-//             readonly version: Version;
-//             readonly digest: string;
-//         }[];
-//         readonly source: "addressBalance" | "coinReservation" | "coins";
-//     };
-//     readonly intent: {
-//         readonly summary: string;
-//         readonly author: "user" | "task" | "dapp";
-//         readonly claims: {
-//             readonly outflows: readonly {
-//                 readonly coinType: CoinType;
-//                 readonly max: bigint;
-//             }[];
-//             readonly recipients: readonly SuiAddress[];
-//             readonly objects: readonly ObjectId[];
-//         };
-//     };
-//     readonly verdict: {
-//         readonly _tag: "Screened";
-//         readonly screening: {
-//             readonly effects: readonly {
-//                 readonly text: string;
-//                 readonly inScope: number;
-//             }[];
-//             readonly claims: readonly {
-//                 readonly text: string;
-//                 readonly inScope: number;
-//             }[];
-//             readonly specificity: number;
-//             readonly injection: number;
-//         };
-//     } | {
-//         readonly _tag: "Unscreened";
-//         readonly reason: string;
-//     };
-//     readonly gasOwner?: SuiAddress | undefined;
-//     readonly expiration?: {
-//         readonly $kind: "None";
-//         readonly None: true;
-//     } | {
-//         readonly $kind: "Epoch";
-//         readonly Epoch: bigint;
-//     } | {
-//         readonly $kind: "ValidDuring";
-//         readonly ValidDuring: {
-//             readonly minEpoch: bigint | null;
-//             readonly maxEpoch: bigint | null;
-//             readonly minTimestamp: bigint | null;
-//             readonly maxTimestamp: bigint | null;
-//             readonly chain: string;
-//             readonly nonce: number;
-//         };
-//     } | {
-//         readonly $kind: "Validity";
-//         readonly Validity: {
-//             readonly allowedProposers: {
-//                 readonly epoch: bigint;
-//                 readonly proposers: readonly number[];
-//             } | null;
-//             readonly minEpoch: bigint | null;
-//             readonly maxEpoch: bigint | null;
-//             readonly minTimestamp: bigint | null;
-//             readonly maxTimestamp: bigint | null;
-//             readonly chain: string;
-//             readonly nonce: number;
-//         };
-//     } | undefined;
-//     readonly chain?: string | undefined;
-//     readonly simulation?: SimulationClass | undefined;
-// } & Brand<"Verified">
-```
-
-A `Built` whose simulated effects stayed inside a declared
-`Intent`. Structurally a `Built`, so `Tx.sign` takes it as it is; the
-brand is what says `Tx.verify` produced it.
 
 ### `Verify` (const)
 
@@ -6080,127 +5204,6 @@ The overloads of `verifyTransactionSignature`: `PolicyDenied` is in
 the union exactly when `checkAddressAliases: true` is. Pass the literal; a
 `boolean` variable matches neither.
 
-### `ZkLogin` (const)
-
-```ts
-declare const ZkLogin: {
-    readonly Session: Schema.Struct<{
-        readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress"> & {
-            normalize: (input: string) => SuiAddress;
-            Strict: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-        };
-        readonly maxEpoch: Schema.BigIntFromString;
-        readonly proof: Schema.Struct<{
-            readonly proofPoints: Schema.Struct<{
-                readonly a: Schema.$Array<Schema.String>;
-                readonly b: Schema.$Array<Schema.$Array<Schema.String>>;
-                readonly c: Schema.$Array<Schema.String>;
-            }>;
-            readonly issBase64Details: Schema.Struct<{
-                readonly value: Schema.String;
-                readonly indexMod4: Schema.Int;
-            }>;
-            readonly headerBase64: Schema.String;
-            readonly addressSeed: Schema.String;
-        }>;
-        readonly expiresAt: Schema.optionalKey<Schema.Finite>;
-    }>;
-    readonly SignatureInputs: Schema.Struct<{
-        readonly proofPoints: Schema.Struct<{
-            readonly a: Schema.$Array<Schema.String>;
-            readonly b: Schema.$Array<Schema.$Array<Schema.String>>;
-            readonly c: Schema.$Array<Schema.String>;
-        }>;
-        readonly issBase64Details: Schema.Struct<{
-            readonly value: Schema.String;
-            readonly indexMod4: Schema.Int;
-        }>;
-        readonly headerBase64: Schema.String;
-        readonly addressSeed: Schema.String;
-    }>;
-    readonly StoredSession: Schema.Struct<{
-        readonly session: Schema.Struct<{
-            readonly address: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress"> & {
-                normalize: (input: string) => SuiAddress;
-                Strict: Schema.brand<Schema.decodeTo<Schema.toType<Schema.String>, Schema.String, never, never>, "SuiAddress">;
-            };
-            readonly maxEpoch: Schema.BigIntFromString;
-            readonly proof: Schema.Struct<{
-                readonly proofPoints: Schema.Struct<{
-                    readonly a: Schema.$Array<Schema.String>;
-                    readonly b: Schema.$Array<Schema.$Array<Schema.String>>;
-                    readonly c: Schema.$Array<Schema.String>;
-                }>;
-                readonly issBase64Details: Schema.Struct<{
-                    readonly value: Schema.String;
-                    readonly indexMod4: Schema.Int;
-                }>;
-                readonly headerBase64: Schema.String;
-                readonly addressSeed: Schema.String;
-            }>;
-            readonly expiresAt: Schema.optionalKey<Schema.Finite>;
-        }>;
-        readonly ephemeral: Schema.Struct<{
-            readonly scheme: Schema.Literal<"ED25519">;
-            readonly sealed: Schema.String;
-        }>;
-    }>;
-    readonly save: (store: KeyValueStore.KeyValueStore, key: string, input: {
-        readonly session: ZkLoginSession;
-        readonly ephemeralSecretKey: Redacted.Redacted<Uint8Array>;
-        readonly sealer: SecretSealer;
-    }) => Effect.Effect<void, SigningError, never>;
-    readonly load: (store: KeyValueStore.KeyValueStore, key: string, options: {
-        readonly sealer: SecretSealer;
-    }) => Effect.Effect<Option.Option<Signer>, SigningError, never>;
-    readonly remove: (store: KeyValueStore.KeyValueStore, key: string) => Effect.Effect<void, SigningError, never>;
-}
-```
-
-The zkLogin session schemas and store, namespaced: `ZkLogin.Session`,
-`ZkLogin.SignatureInputs`, `ZkLogin.StoredSession`, `ZkLogin.save`,
-`ZkLogin.load`, `ZkLogin.remove`. The signer itself is `Signer.zkLogin`.
-
-### `ZkLoginSession` (const)
-
-```ts
-declare const ZkLoginSession: Schema
-// decodes to:
-// {
-//     readonly address: SuiAddress;
-//     readonly maxEpoch: bigint;
-//     readonly proof: {
-//         readonly proofPoints: {
-//             readonly a: readonly string[];
-//             readonly b: readonly (readonly string[])[];
-//             readonly c: readonly string[];
-//         };
-//         readonly issBase64Details: {
-//             readonly value: string;
-//             readonly indexMod4: number;
-//         };
-//         readonly headerBase64: string;
-//         readonly addressSeed: string;
-//     };
-//     readonly expiresAt?: number | undefined;
-// }
-```
-
-The public half of a zkLogin session: everything but the ephemeral secret.
-
-- `address` is the zkLogin address. It is checked against the proof (its
-  address seed and issuer) when a signer is made, legacy and current
-  derivations both, so a session for another account is refused.
-- `maxEpoch` is the last epoch the proof is accepted in, the bound the
-  ephemeral key's nonce committed to.
-- `expiresAt`, when known, is a wall-clock deadline in milliseconds since
-  the Unix epoch (Enoki's `ZkLoginSession.expiresAt`). It is a cheap local
-  approximation of `maxEpoch` the signer checks against `Clock`.
-
-Nothing here is secret: the proof is public on chain in every signature the
-session makes. The JWT is deliberately not part of it — a session that can
-sign never needs the token again.
-
 ### `ZkLoginSignatureInputs` (const)
 
 ```ts
@@ -6223,66 +5226,34 @@ declare const ZkLoginSignatureInputs: Schema
 
 The proof inputs a zkLogin signature carries: the SDK's
 `ZkLoginSignatureInputs` from `@mysten/sui/zklogin`, as a schema, so a
-session can be stored and read back. Exactly what Enoki's
-`createZkLoginZkp` and `EnokiFlow.getProof` answer.
+proof from a prover's JSON reply can be decoded rather than cast.
 
 ### `ZkLoginSignerOptions` (interface)
 
 ```ts
 export interface ZkLoginSignerOptions {
-    readonly session: {
-        readonly address: string;
-        readonly maxEpoch: bigint | number | string;
-        readonly proof: ZkLoginSignatureInputs;
-        readonly expiresAt?: number;
-    };
-    readonly ephemeral: SdkSigner;
+    readonly ephemeralSigner: SdkSigner;
+    readonly inputs: ZkLoginSignatureInputs;
+    readonly maxEpoch: bigint | number | string;
+    readonly address: string;
 }
 ```
 
-What `zkLogin` needs: the public session and the ephemeral signer.
+What `zkLogin` needs, named as the SDK's `ZkLoginSignerOptions`
+(`@mysten/sui/zklogin`) names them.
 
-`ephemeral` is any `@mysten/sui/cryptography` `Signer` — an
-`Ed25519Keypair`, or a `WebCryptoSigner` over a non-extractable key held in
-IndexedDB (what Enoki's `experimental_nativeCryptoSigner` stores). It is the
-key the proof's nonce committed to; that commitment is inside the proof and
-cannot be checked here, so a wrong ephemeral key produces signatures the node
-refuses (`INVALID_ARGUMENT`, which `Tx.submit` reports as itself).
-
-### `ZkLoginStoredSession` (const)
-
-```ts
-declare const ZkLoginStoredSession: Schema
-// decodes to:
-// {
-//     readonly session: {
-//         readonly address: SuiAddress;
-//         readonly maxEpoch: bigint;
-//         readonly proof: {
-//             readonly proofPoints: {
-//                 readonly a: readonly string[];
-//                 readonly b: readonly (readonly string[])[];
-//                 readonly c: readonly string[];
-//             };
-//             readonly issBase64Details: {
-//                 readonly value: string;
-//                 readonly indexMod4: number;
-//             };
-//             readonly headerBase64: string;
-//             readonly addressSeed: string;
-//         };
-//         readonly expiresAt?: number | undefined;
-//     };
-//     readonly ephemeral: {
-//         readonly scheme: "ED25519";
-//         readonly sealed: string;
-//     };
-// }
-```
-
-One stored zkLogin session: the public session and the sealed ephemeral
-secret (an Ed25519 32-byte seed, sealed by a `SecretSealer`). The JSON
-a `save` writes under its key.
+- `ephemeralSigner` is any `@mysten/sui/cryptography` `Signer` — an
+  `Ed25519Keypair`, or a `WebCryptoSigner` over a non-extractable key. It
+  is the key the proof's nonce committed to; that commitment is inside the
+  proof and cannot be checked here, so a wrong ephemeral key produces
+  signatures the node refuses (`INVALID_ARGUMENT`).
+- `inputs` is the proof (`ZkLoginSignatureInputs`).
+- `maxEpoch` is the epoch the proof was generated for: the last epoch it is
+  accepted in.
+- `address` is the zkLogin address. It is checked against the proof (its
+  address seed and issuer), legacy and current derivations both, so a proof
+  for another account is refused; the SDK's `legacyAddress` flag is not
+  needed.
 
 ### `attach` (const)
 
@@ -6319,8 +5290,8 @@ declare const build: (input: Transaction | Recipe, opts: {
     readonly sender: SuiAddress;
     readonly gasOwner?: SuiAddress;
     /**
-     * The last epoch the transaction may be valid in: a signer's session
-     * bound (`Signer.maxEpoch`). The default expiration's `maxEpoch` is capped
+     * The last epoch the transaction may be valid in: a signer's
+     * `Signer.maxEpoch` (a zkLogin proof's). The default expiration's `maxEpoch` is capped
      * at it, and a bound already below the current epoch fails the build
      * before anything resolves.
      *
@@ -6409,43 +5380,18 @@ simulate above when it ran, which is a simulation of exactly the returned
 bytes; when the SDK's resolver simulated instead (always on gRPC) it
 simulated the transaction before its budget was set, and there is none.
 
-**`opts.maxEpoch` keeps the window inside a session** (0.5.0): the default
+**`opts.maxEpoch` keeps the window inside a signer's bound** (0.5.0): the default
 expiration's `maxEpoch` is the current epoch plus one or the bound,
 whichever is lower, and a bound below the current epoch fails before
 anything resolves. `Tx.run` passes the signer's (and sponsor's)
 `Signer.maxEpoch` here. A recipe's own expiration is the recipe's choice
 and is not changed.
 
-**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the session bound `opts.maxEpoch` is below the current epoch — its `cause` is the `SigningError { reason: "expired" }` `Tx.run` reports instead, the node refused to resolve the transaction, a zero-gas requirement was not met, the payer's address balance cannot cover the budget and withdrawals, coins were chosen under `gasPayment: "requireAddressBalance"`, or an address-balance payment lacks an epoch-bounded expiration or is used with `tx.gas`), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
+**Fails with: `BuildError` (the recipe threw, an input could not be resolved, the bound `opts.maxEpoch` is below the current epoch — its `cause` is the `SigningError { reason: "expired" }` `Tx.run` reports instead, the node refused to resolve the transaction, a zero-gas requirement was not met, the payer's address balance cannot cover the budget and withdrawals, coins were chosen under `gasPayment: "requireAddressBalance"`, or an address-balance payment lacks an epoch-bounded expiration or is used with `tx.gas`), `SimulationFailed` (the transaction would abort on chain), `PolicyDenied` (rule `"maxGasBudget"`: the budget the node chose is over `SubmitConfig.maxGasBudget`), `TransportError`.**
 
 ### `chainOf` (const)
 
 Re-exported from `@unconfirmed/sui-effect`.
-
-### `checkClaims` (const)
-
-```ts
-declare const checkClaims: (intent: Intent, simulation: Simulation, parties: Parties) => ReadonlyArray<ClaimViolation>
-```
-
-Compares the simulated effects with the claims, exactly and in code.
-
-Deny by default: a coin the sender loses needs an outflow claim that covers
-the amount (net of gas), an address that gains a coin or an object needs to
-be a claimed recipient, and a non-coin object that leaves the sender —
-transferred, shared, wrapped or deleted — needs to be a claimed object.
-
-**Gas is gas wherever it is paid from.** A node's balance changes cover coin
-objects and address balances alike, so the payer's SUI delta carries the
-gas whether the payment was a gas coin or the payer's address balance (an
-empty payment), and it is taken back out either way. Anything else that
-leaves the sender's address balance — a `balance::send_funds` of a
-`tx.balance()` withdrawal — is an outflow like any coin transfer, and its
-receiver a recipient. Accumulator writes are bookkeeping and never an object.
-
-An empty answer means the claims held.
-
-**Never fails.**
 
 ### `cosign` (const)
 
@@ -6462,33 +5408,6 @@ owner named in the bytes; a `Signer.alias` is compared by the account it
 signs as.
 
 **Fails with: `SigningError`.**
-
-### `describeClaims` (const)
-
-```ts
-declare const describeClaims: (intent: Intent) => ReadonlyArray<string>
-```
-
-The claims as sentences, for the edge between the summary and the claims: a
-harmless sentence must not sit in front of permissions it has no use for.
-
-Answers with no lines when the intent claims nothing.
-
-**Never fails.**
-
-### `describeEffects` (const)
-
-```ts
-declare const describeEffects: (simulation: Simulation, parties: Parties) => ReadonlyArray<string>
-```
-
-The simulated effects as sentences a semantic screen can read: addresses
-become labels, types lose their package ids, and only SUI carries a number.
-What it cannot say reliably it does not say.
-
-Always answers with at least one line.
-
-**Never fails.**
 
 ### `ephemeral` (const)
 
@@ -6551,17 +5470,6 @@ declare const foldCoins: <E = never>(opts: {
      * @since 0.5.0
      */
     readonly approve?: (prepared: Prepared, batch: FoldBatch) => Effect.Effect<void, E>;
-    /**
-     * The intent every batch is verified against, as `Tx.run`'s `intent`. When
-     * omitted and `Gate.requireIntent` is on, each batch declares the fold's own
-     * intent — a summary saying the coins go into the owner's own address
-     * balance, and **no claims**, so the claims check refuses a batch whose
-     * simulation moves anything out of the account. When omitted and the gate
-     * requires nothing, no intent is checked (0.4.0's cost: no extra simulate).
-     *
-     * @since 0.5.0
-     */
-    readonly intent?: Intent;
 }) => Effect.Effect<FoldResult, RunError | E, Sui>
 ```
 
@@ -6584,34 +5492,12 @@ shown and it is not re-planned — `coinType` and `maxCoinsPerTransaction` are
 then ignored — so what runs is exactly what was previewed; a coin in it that
 has moved since fails that batch's build with `BuildError`, as any pinned
 input does. A plan for another owner — the plan's or any batch's — is a
-`BuildError` before anything runs. `approve` is `Tx.run`'s, once per batch, shown the batch beside the
-prepared transaction: `foldMovement` of the two is what the fold
-moves from coins into the balance, which the simulation's balance changes
-alone do not show.
+`BuildError` before anything runs. `approve` is `Tx.run`'s, once per batch,
+shown the batch beside the prepared transaction: `batch.amount` is what the
+fold moves from coins into the balance, which the simulation's balance
+changes alone do not show (they net to the gas).
 
 **Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` — exactly `run`'s, for the batch that failed — and `E`, whatever `approve` fails with.**
-
-### `foldMovement` (const)
-
-```ts
-declare const foldMovement: (batch: FoldBatch, effects: Simulation | Executed) => FoldMovement
-```
-
-The coin → address-balance movement of one fold, which its balance changes
-do not show: a node nets them per address, so a fold of 1,000 SUI of coins
-reports only the gas (`+3,939,506` MIST on localnet, protocol 139, for five
-faucet coins whose storage rebate beat the gas), and the coins' balances are
-not in the effects at all — the coins are simply deleted, and the deposit is
-an accumulator write with no amount on it. So the movement is computed from
-what is known exactly: the batch's coins were pinned at the versions the plan
-read (`tx.objectRef`), so their balances are the plan's; the effects say
-which of them were consumed; and the owner's net balance change is the rest.
-
-For `simulation` pass `prepared.simulation` (`Tx.prepare(Tx.fold(batch),
-{ sender })`, or what `Tx.foldCoins`' `approve` is shown), or the
-`Executed` the fold produced.
-
-**Never fails.**
 
 ### `fromBytes` (const)
 
@@ -6638,37 +5524,10 @@ be for this chain.
 `gas` is read out of the bytes too (budget, price, payer, payment and its
 source); there is never a `simulation`.
 
-Unlike `Tx.build`, nothing is simulated: `Tx.prepare(built, { sender })`
-simulates the bytes (with `preflight` and an intent) and shows them to an
-`approve` step, or run `sui.simulate(built.bytes)` before co-signing bytes
-you did not build.
+Unlike `Tx.build`, nothing is simulated: run `sui.simulate(built.bytes)`
+before co-signing bytes you did not build.
 
 **Fails with: `BuildError` (the bytes are not a full transaction this SDK can read, name no sender or no gas data, or are bound to another chain).**
-
-### `fromConfig` (const)
-
-```ts
-declare const fromConfig: (name?: string) => Effect.Effect<Signer, Config.ConfigError>
-```
-
-Reads a secret key from configuration and builds its signer.
-
-Two spellings, told apart by the text itself:
-
-- a **Bech32 `suiprivkey1…`**, whose flag names one of the four schemes (`ED25519`, `Secp256k1`, `Secp256r1`, `MLDSA65`);
-- a **32-byte hex seed** (64 hex characters, `0x` optional), which carries no
-  scheme and is read as **Ed25519** — the default every Sui tool uses for a
-  raw seed. This is what a secret manager or another language's SDK hands
-  over, and reading it here is what keeps `fromHex` and the decoded bytes out
-  of application code.
-
-The key is read with `Config.Redacted`, which is wiped
-(`Redacted.wipeUnsafe`) as soon as it has been decoded, and the decoded
-bytes never leave this function. Neither does anything derived from them: the failure carries
-one fixed sentence and no `cause`, because the decoder's own message quotes
-the input it rejected.
-
-**Fails with: `ConfigError` when the variable is missing, is neither spelling, or names a scheme that has no keypair class (`MultiSig`, `ZkLogin`, `Passkey` — use `remote` for those).**
 
 ### `fromKeypair` (const)
 
@@ -6685,7 +5544,7 @@ alias kept for callers who hold one.
 ### `fromMnemonic` (const)
 
 ```ts
-declare const fromMnemonic: (phrase: Redacted.Redacted<string> | string, options?: FromMnemonicOptions) => Effect.Effect<LockableSigner, KeyError>
+declare const fromMnemonic: (phrase: Redacted.Redacted<string> | string, options?: FromMnemonicOptions) => Effect.Effect<Signer, KeyError>
 ```
 
 A signer derived from a BIP-39 recovery phrase, **checked first**: the word
@@ -6703,10 +5562,9 @@ Paths are the standard Sui ones (`Signer.derivationPath`):
 `isValidHardenedPath` / `isValidBIP32Path`, with the scheme's own purpose)
 and every level below 2^31.
 
-The answer is a `LockableSigner`: it holds the derived key in a buffer
-nobody else references, and `lock` zeroes it. The BIP-39 seed and the HD
-nodes are zeroed before this returns. A `Redacted` phrase is read, not
-wiped: it is the caller's (`Redacted.wipeUnsafe` it when done).
+Once the phrase is checked the derivation is the SDK's own
+(`Ed25519Keypair.deriveKeypair` and its ECDSA siblings). A `Redacted`
+phrase is read, not wiped: it is the caller's.
 
 **Fails with: `KeyError` (`invalidMnemonic`, `invalidPath`, `unsupportedScheme`). The message names a bad word's position, never a word.**
 
@@ -6752,23 +5610,25 @@ failure a program recovers from.
 ### `fromSecretKey` (const)
 
 ```ts
-declare const fromSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, options?: FromSecretKeyOptions) => Effect.Effect<LockableSigner, KeyError>
+declare const fromSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, options?: FromSecretKeyOptions) => Effect.Effect<Signer, KeyError>
 ```
 
 A signer over an imported secret key: a Bech32 `suiprivkey1…` (its flag
-names the scheme; a contradicting `scheme` option is refused), a 32-byte hex
-seed (`0x` optional), or 32 raw bytes — the last two read as
-`options.scheme`, default `ED25519`.
+names the scheme — `ED25519`, `Secp256k1`, `Secp256r1` or `MLDSA65`; a
+contradicting `scheme` option is refused), a 32-byte hex seed (`0x`
+optional), or 32 raw bytes — the last two read as `options.scheme`, default
+`ED25519`.
+
+Reading a key from the environment is
+`Config.Redacted("SUI_PRIVATE_KEY").pipe(Effect.flatMap(Signer.fromSecretKey))`.
 
 **The bytes are copied before any keypair is built over them.** The SDK's
 Secp256k1/Secp256r1 keypairs keep a reference to the array they are given,
 so building over the caller's buffer would let a later write to it change
-the key, and zeroing it break the signer. Here the caller's `Uint8Array` is
-copied and left untouched, decoded bytes are zeroed once copied, and the
-answer is a `LockableSigner` whose `lock` zeroes the copy. A
-`Redacted` input is read, not wiped.
+the key. A `Redacted` input is read, not wiped. `MLDSA65Keypair` is
+imported on demand: its subpath first shipped in `@mysten/sui` 2.36.
 
-**Fails with: `KeyError` (`invalidSecretKey` — the message is fixed and never quotes the input — or `unsupportedScheme` for `MLDSA65`, `ZkLogin`, … and a contradicting `scheme`).**
+**Fails with: `KeyError` (`invalidSecretKey` — the message is fixed and never quotes the input — or `unsupportedScheme` for `ZkLogin`, `MultiSig`, … and a contradicting `scheme`).**
 
 ### `gaslessStablecoinTransfer` (const)
 
@@ -7127,61 +5987,10 @@ after the earlier batches covers that estimate, and is `skipped` otherwise.
 Other coin types fold with `gas: "auto"`, after every SUI batch, so the SUI
 just folded pays for them.
 
-Preview a batch with `Tx.prepare(Tx.fold(batch), { sender })`, nothing
-signed, and read what it moves with `foldMovement`; pass the plan
-you previewed to `Tx.foldCoins({ plan, approve })` to run exactly it.
+Preview a plan — `batch.amount` is what each batch moves into the balance —
+and pass it to `Tx.foldCoins({ plan, approve })` to run exactly it.
 
 **Fails with: `TransportError`.**
-
-### `prepare` (const)
-
-```ts
-declare const prepare: (input: Built | Transaction | Recipe, opts: {
-    readonly sender: SuiAddress;
-    readonly gasOwner?: SuiAddress;
-    /** What the transaction is declared to do; `verified` is present when given. */
-    readonly intent?: Intent;
-    /** A session bound for what is built here (`Signer.maxEpoch`); see `Tx.build`. Ignored for a `Built`. */
-    readonly maxEpoch?: bigint;
-}) => Effect.Effect<Prepared, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>
-```
-
-Build (or take) a transaction, simulate exactly its bytes, run
-`SubmitConfig.preflight` and, given an intent, `Tx.verify`'s checks — and
-sign nothing. The front half of `Tx.run`, for previews, dry runs, sign-only
-flows and transactions a dapp hands over; the answer is a `Prepared`
-to show a person, then `Tx.sign` (`prepared.verified ?? prepared.built`)
-and `Tx.submit`, `Tx.submitVia`, or another party's co-signature.
-
-**A `Built` is not rebuilt.** Bytes from `Tx.fromBytes` — a dapp's request,
-a sponsor's reply — are what is simulated and what will be signed;
-`opts.sender` must be the sender the bytes name and `opts.gasOwner`, when
-given, their payer, or it fails with `PolicyDenied` (`prepare.sender`,
-`prepare.gasOwner`) before anything is asked of the node. A recipe or a
-`Transaction` goes through `Tx.build` with `sender`, `gasOwner` and
-`maxEpoch`, and when the build already simulated exactly the bytes it
-returned (`built.simulation`), that simulation is the one used.
-
-**One simulate.** On gRPC the build's resolver simulates a pre-budget
-transaction, so a prepare costs that plus one simulate of the final bytes;
-off gRPC with a preset budget the build's own simulate is reused and the
-prepare costs one in all.
-
-**No sender lock**, unlike `Tx.run`: the answer is a value that may wait for
-a person, a second device or a sponsor for as long as it likes, and a lock
-held across that would stall every other transaction from the account. The
-cost is the one `Tx.build` already documents — two prepares from one sender
-can resolve the same gas coin or owned object, and the second to land fails
-— so a flow that signs straight after approval uses `Tx.run({ approve })`,
-which runs this same front half under the lock exactly when the bytes pin.
-
-**`Gate.requireIntent` does not apply**: it binds `Tx.run`, the call that
-signs. A prepare without an intent is how a wallet first sees a dapp's
-effects, to render them (`Intent.fromSimulation`) and ask; give the intent
-then — here, to `Tx.verify`, or to `Tx.run` — and `verified` is what gets
-signed.
-
-**Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied` (the gas ceiling, `preflight`, the intent's rules, `prepare.sender`, `prepare.gasOwner`), `TransportError`.**
 
 ### `reconcile` (const)
 
@@ -7293,7 +6102,7 @@ long-lived application makes after building a durable `Journal`.
 **Only unresolved entries come back.** `Signed` and `Unknown` are the tags
 that still need an answer; a digest that already settled is not among the
 journal's unresolved entries and is not in this array. Ask about one of those
-with `recorded`.
+with `Journal.get(digest)`.
 
 Nothing here fails per entry: each one settles to an `Executed`, an
 `ExecutionFailed`, a `NotApplied` or a `SubmissionUnknown`, in the order the
@@ -7315,28 +6124,6 @@ before sending anything new is stuck that long.
 The whole call fails only if the journal itself cannot be **read**: a write
 that fails after an entry has been settled is logged and the answer stands,
 the same rule `Tx.submit` follows.
-
-**Fails with: `JournalError`.**
-
-### `recorded` (const)
-
-```ts
-declare const recorded: (digest: Digest) => Effect.Effect<Option.Option<JournalEntry>, JournalError, never>
-```
-
-What the journal recorded for one digest, if anything.
-
-`Tx.reconcileAll` returns **only the entries that were still unresolved**,
-because those are the ones it had work to do about; a transaction that had
-already settled — executed, failed, or proven never applied — is not in its
-answer and never will be. This is how to ask about one of those: the entry is
-`Executed`, `Failed` or `NotApplied` for a settled digest, `Signed` or
-`Unknown` for one still in flight, and `None` for a digest this journal has
-never seen (including every digest at all, when the journal is the in-memory
-default and the process restarted).
-
-It is exactly `(yield* Journal).get(digest)`, named so that the recovery path
-does not have to reach for the reference.
 
 **Fails with: `JournalError`.**
 
@@ -7425,18 +6212,9 @@ declare const run: <E = never>(recipe: Transaction | Recipe, opts: {
      */
     readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
     /**
-     * What this transaction is declared to do. When present, the built bytes
-     * go through `verify` before anything is signed, sharing its
-     * simulate with `SubmitConfig.preflight`. `Gate.requireIntent` makes it
-     * mandatory.
-     *
-     * @since 0.5.0
-     */
-    readonly intent?: Intent;
-    /**
      * Shown the `Prepared` transaction — the built bytes with their gas,
-     * the simulation of exactly those bytes, the verified intent — **after**
-     * `preflight` and the intent checks and **before the first signature**.
+     * the simulation of exactly those bytes — **after** `preflight` and
+     * **before the first signature**.
      * Succeeding approves; failing refuses with the caller's own error (a
      * wallet's `UserRejected`), which `Tx.run` fails with, nothing signed and
      * nothing journalled. It runs where signing runs: under the sender lock
@@ -7507,13 +6285,6 @@ When `SubmitConfig.preflight` is set it costs one extra simulate, and is
 where spend limits and target policies refuse a transaction before anything
 is signed.
 
-**`intent` puts the bytes through `verify` before anything is
-signed**, on the same simulate `preflight` uses — one extra simulate for
-either or both, run after the build exactly where signing runs (under the
-lock when the bytes pin). `Gate.requireIntent` makes it mandatory: a run
-that declares none fails with `PolicyDenied { rule: "intent.required" }`
-before the recipe is even applied.
-
 **A sponsored run needs both signatures.** A transaction whose gas owner is
 not its sender is signed by *both* parties; one signature is bytes a
 validator rejects. So when `opts.gasOwner` differs from the signer's address
@@ -7540,32 +6311,27 @@ hand. Pass `onSigned` instead: it runs inside the sender lock, after the last
 signature and before `Tx.submit`'s first `executeTransaction`, and failing it
 fails the run with nothing sent.
 
-**`approve` is the person in the loop** (0.5.0). After `preflight` and the
-intent, before the first signature, `approve` is shown the `Prepared`
-transaction — the same thing `prepare` answers — and refuses by
-failing with its own error, which is then `Tx.run`'s: nothing is signed,
+**`approve` is the person (or the policy) in the loop** (0.5.0). After
+`preflight`, before the first signature, `approve` is shown the
+`Prepared` transaction — the built bytes and the simulation of exactly
+those bytes — and refuses by failing with its own error, which is then `Tx.run`'s: nothing is signed,
 `onSigned` does not run and nothing is journalled. It runs under the lock
 exactly when signing does. A sponsored run approves too: `built.gasOwner`
 and `built.gas.owner` name the sponsor.
 
-**The session bound** (0.5.0). A signer with a `maxEpoch` (a zkLogin
-session) — and a sponsor with one — bounds the window the build sets:
+**The `maxEpoch` bound** (0.5.0). A signer with a `maxEpoch` (a zkLogin
+proof's) — and a sponsor with one — bounds the window the build sets:
 `Tx.build`'s `maxEpoch` is the earlier of the two, and a bound already below
 the current epoch fails with `SigningError { reason: "expired" }` before
 anything resolves.
-
-**A locked signer is refused first** (0.5.0). A `LockableSigner`
-(`Signer.fromMnemonic`, `Keystore.unlock`) — signer or sponsor — whose
-`locked` answers `true` fails the run with `SigningError { reason:
-"locked" }` before anything is built or simulated.
 
 **Sender A, signed by M** (0.6.0). `signer: Signer.alias(A, m)` runs a
 transaction whose sender is the account A with the signature of M, a member
 of A's alias set (`0x2::address_alias`) — `m` is any signer, a
 `Signer.multisig` included. Everything that is keyed on the sender is keyed
 on **A**: the build's sender, the sender lock (and the in-flight registry),
-`Built.sender`, the journal's `signed.sender`, `onSigned`, the intent's and
-`approve`'s parties; M appears only in the signature (span attribute
+`Built.sender`, the journal's `signed.sender`, `onSigned` and `approve`'s
+`built.sender`; M appears only in the signature (span attribute
 `sui.signer_alias`). Before anything is built the run reads A's
 `AddressAliases` object once and refuses an M it does not list with
 `PolicyDenied { rule: "alias.signer" }`; a sponsor given as
@@ -7574,58 +6340,6 @@ costs no such read.
 
 **Fails with: `BuildError`, `SimulationFailed`, `PolicyDenied` (also `alias.signer`, 0.6.0), `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` (from the build reads and an alias read; once bytes are sent, transport failures become `SubmissionUnknown`), and `E` — whatever `approve` fails with.**
 
-### `sendAll` (const)
-
-```ts
-declare const sendAll: <E = never>(opts: {
-    readonly signer: Signer;
-    readonly recipient: SuiAddress;
-    /** The coin type to sweep. Default SUI. */
-    readonly coinType?: CoinType;
-    /** What the sweep is declared to do; see `Tx.run`. */
-    readonly intent?: Intent;
-    /** `Tx.run`'s `approve`, with the sweep it is about to send. */
-    readonly approve?: (prepared: Prepared, sweep: SendAllSweep) => Effect.Effect<void, E>;
-    /** `Tx.run`'s `onSigned`. */
-    readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
-}) => Effect.Effect<SendAllResult, RunError | E, Sui>
-```
-
-Sends **everything** the signer holds of one coin type — every coin object
-and the whole address balance — into `recipient`'s address balance, in one
-`run`, and leaves the sender **nothing** of it: no coin, no balance,
-no dust.
-
-**SUI pays for its own sweep out of the sweep.** The gas coin is made to be
-everything — a coin reservation of the whole address balance with every
-coin merged into it, or, when the coins hold more, the coins as the gas
-payment with the balance redeemed and merged in — and
-`0x2::coin::send_funds<SUI>(GasCoin, recipient)` deposits it; gas is
-charged against that coin, so the recipient gets the rest and the sender
-keeps 0 (localnet, protocol 139: a coin-only, a balance-only and a mixed
-account all end at 0 coins and 0 balance). There is no budget to guess and
-no refund left behind, which is what a send of `balance − budget` from the
-address balance leaves (the unused budget comes back to the sender). **Any
-other coin type** sends every coin (`coin::send_funds`) and the whole
-balance (`balance::send_funds` of a `FundsWithdrawal`), and gas comes from
-the signer's SUI as usual, so the signer needs some.
-
-**What can remain**: anything that arrives after the read — a deposit into
-the balance, a coin — stays with the sender; a spend from the balance that
-lands after the read makes the withdrawal too large, and the sweep executes
-as a failure (`ExecutionFailed`, `InsufficientFundsForWithdraw`) or is
-refused at submit, moving nothing. A SUI sweep paid from a reservation holds
-the sender lock through submission and waits for lock-free runs in flight
-first, like every `tx.gas` run. More than 500 coin objects do not fit
-one transaction: `BuildError`, and `Tx.foldCoins` first.
-A SUI account worth less than about twice a budget cannot pay for its own
-sweep: that build fails.
-
-`intent`, `approve` (shown the sweep beside the prepared transaction) and
-`onSigned` are `Tx.run`'s.
-
-**Fails with: `BuildError` (nothing to send, the signer is the recipient, too many coins, or the build), `SimulationFailed`, `PolicyDenied`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, `TransportError` — `run`'s — and `E`, whatever `approve` fails with.**
-
 ### `sendFunds` (const)
 
 ```ts
@@ -7633,29 +6347,25 @@ declare const sendFunds: (opts: {
     readonly coinType?: CoinType;
     readonly amount: bigint;
     readonly recipient: SuiAddress;
-    /** Whether SUI the balance does not cover may be split from the gas coin. Default `true`. */
-    readonly useGasCoin?: boolean;
 }) => Recipe
 ```
 
-Sends `amount` of a coin type into `recipient`'s **address balance**:
-`0x2::balance::send_funds<T>(tx.balance({ type, balance: amount }), recipient)`,
-the canonical transfer on an address-balance account.
+Sends `amount` of a coin type from the sender's **address balance** into
+`recipient`'s: a `FundsWithdrawal` of `amount` (`tx.withdrawal`), redeemed
+into a `Balance<T>` (`0x2::balance::redeem_funds<T>`) and deposited with
+`0x2::balance::send_funds<T>`. No versioned input at all, so with gas from
+the balance too the transaction pins nothing, and the recipient receives a
+balance rather than a coin object it would have to fold.
 
-The amount comes from the sender's address balance when that covers it — a
-`FundsWithdrawal`, no versioned input at all, so with gas from the balance
-too the transaction pins nothing. Otherwise it comes from coins: for SUI,
-split from the gas coin, the SDK's default; for another type, the sender's
-coins merged and split, the remainder returned to its balance. The recipient
-receives a balance rather than a coin object it would have to fold.
-`coinType` defaults to SUI; `amount` is in the type's smallest unit.
-
-`useGasCoin` is the SDK's option of that name and only matters for SUI that
-the balance does not cover. Leave it `true` for the sender's own
-transactions: `false` makes every SUI coin an input of the PTB, which leaves
-none to pay gas with on an account whose SUI is all coins (a node refuses gas
-selection then). Set it `false` under `Tx.sponsored`, where the gas coin
-belongs to the sponsor.
+**Address balances only.** There is no fallback to coins or the gas coin:
+a withdrawal the sender's balance does not cover is refused by the node
+("Invalid withdraw reservation", `INVALID_ARGUMENT`) when `Tx.build`
+resolves it, as a `BuildError`, so nothing is signed. (A balance spent
+between the build and the send is refused at submit instead, settled
+`NotApplied { refused }`.)
+Fold coins into the balance first (`Tx.foldCoins`), or write the coin
+transfer yourself (`tx.splitCoins`, `tx.transferObjects`). `coinType`
+defaults to SUI; `amount` is in the type's smallest unit.
 
 **Never fails; the recipe throws only if the SDK rejects an input, which `Tx.build` reports as `BuildError`.**
 
@@ -7800,51 +6510,6 @@ whatever the service returns. What this owns is everything around it:
 
 **Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown` (carrying the signed bytes, with the sender's failure as its `cause`), `JournalError` (only from the write before `send`), and `E` — whatever `send` fails with — when that error declares `outcome: "not_applied"`.**
 
-### `verify` (const)
-
-```ts
-declare const verify: (built: Built, intent: Intent) => Effect.Effect<Verified, TransportError | SimulationFailed | BuildError | PolicyDenied, Sui>
-```
-
-Checks built bytes against a declared intent, before anything is signed.
-
-One simulate of exactly `built.bytes`, then two checkers. The claims are
-compared with the simulated effects exactly, in code, deny by default (gas
-is never an outflow, whether a gas coin or the payer's address balance paid
-it; an address-balance withdrawal sent to someone is). Then `Gate.screen`,
-when the gate in force has one, reads the summary against the effects and
-the claims rendered as words, and `Gate`'s thresholds turn its
-probabilities into a refusal. With no screen configured the claims check
-stands alone and the verdict is `Unscreened`. `SubmitConfig.preflight` is
-not run here; `Tx.run` runs it on the same simulate.
-
-**Whose transaction it is comes from the bytes.** The sender and gas owner
-the claims are checked for are the ones `built.bytes` name, and a value whose
-`digest`, `sender` or `gasOwner` field disagrees with its bytes (spread from
-another build, decoded from a queue) is refused as `intent.invalid`; a
-`built.simulation` is reused only when `Tx.build` made it in this process
-for the digest of these bytes.
-
-The answer is structurally a `Built`, so it goes straight to `Tx.sign`. The
-explicit lifecycle is not gated: `Tx.sign` takes any `Built`, so a caller
-assembling `build`/`sign`/`submit` by hand calls this itself.
-
-**What it does not prove.** A simulation is one execution against the state
-the node had; a package that branches on a shared object, the clock or
-randomness can behave differently when the bytes land. The claims bound what
-was simulated, not what will execute.
-
-Gas is not counted because it is bounded: bytes whose budget is over
-`SubmitConfig.maxGasBudget` are refused (`maxGasBudget`) before the
-simulate, as `Tx.build` refuses them, whoever built them.
-
-Every refusal is a `PolicyDenied` whose `rule` says which check:
-`maxGasBudget`, `intent.invalid`, `intent.outflow`, `intent.recipient`, `intent.object`,
-`gate.unavailable`, `intent.injection`, `intent.vague`, `intent.effect`,
-`intent.claim`.
-
-**Fails with: `PolicyDenied`, `SimulationFailed`, `BuildError`, `TransportError`.**
-
 ### `verifySponsored` (const)
 
 ```ts
@@ -7858,8 +6523,8 @@ declare const verifySponsored: (built: Built, expect: {
 Checks that sponsored bytes a service assembled are the transaction the
 sender asked to have sponsored, before the sender signs them.
 
-A sponsorship service (Enoki's `createSponsoredTransaction`, or an
-application's own sponsor) takes a transaction **kind** and answers full
+A sponsorship service (a hosted sponsor such as Enoki, or an application's
+own) takes a transaction **kind** and answers full
 bytes with its gas data added. Those bytes are what the sender's signature
 will authorize, so they are read back, not trusted:
 
@@ -7871,9 +6536,29 @@ will authorize, so they are read back, not trusted:
   command, swap an input or change an argument and still get a signature.
 
 The chain is `Tx.fromBytes`'s check, which made the `Built`. Simulating the
-bytes before signing them is still the caller's (or `Tx.prepare`'s) job.
+bytes before signing them (`sui.simulate(built.bytes)`) is still the
+caller's job.
 
 **Fails with: `PolicyDenied` (rule `sponsored.sender`, `sponsored.gasOwner` or `sponsored.kind`).**
+
+### `withSenderLock` (const)
+
+```ts
+declare const withSenderLock: (address: SuiAddress) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R | Sui>
+```
+
+Serializes work for one sender, so two transactions from the same address
+cannot pick the same gas coin or owned object. `Tx.run` takes it itself
+(see `SubmitConfig.lockSender`); this is for a program that assembles
+`build → sign → submit` by hand and wants the same exclusion.
+
+One semaphore per address per client (the `SuiCore` the `Sui` in context is
+built on): two fibers locking one sender serialize, two senders never wait
+on each other. An entry exists only while someone holds or waits for it.
+The wait is recorded as `sui_effect_sender_lock_wait`. Before 0.6.0 this
+was `Sui.withSenderLock`.
+
+Adds no failures of its own; `R` gains `Sui`.
 
 ## `@unconfirmed/sui-effect/journal`
 
@@ -7984,7 +6669,7 @@ A store written by 0.3 or earlier also holds an `index` key: dead data here
 safe as is.** 0.3 lists unresolved entries only through that index, so a
 `Signed` or `Unknown` entry this journal wrote is invisible to a 0.3
 `listUnresolved`, `Tx.reconcileAll` and `onUnresolved: "fail"` (only
-`Tx.recorded(digest)` finds it), and a 0.3 reader cannot decode a
+`Journal.get(digest)` finds it), and a 0.3 reader cannot decode a
 `NotApplied { evidence: "refused" }` entry at all. Before rolling back, or
 while 0.3 and later processes share a store, drain it with
 `Tx.reconcileAll()` (or settle the entries by hand) and delete the
@@ -8013,7 +6698,7 @@ every one, and some stores pay for that in values; this is what keeps the
 store short in a service that runs for months. It reads every entry itself
 (it deletes nothing on the strength of a marker alone), removes each pruned
 entry's marker before the entry, and removes markers whose entry is gone.
-After it, `Journal.get` and `Tx.recorded` answer `None` for a pruned
+After it, `Journal.get` answers `None` for a pruned
 digest, so choose `before` older than anything you still look up by digest —
 and older than any bytes you might still hand to `Tx.submit` again, because a
 resubmission puts a fresh `Signed` entry that a concurrent prune of the same
@@ -8025,1655 +6710,10 @@ same `prefix`. The dead `index` key a 0.3 journal kept is not touched.
 
 **Fails with: `JournalError`, when the store cannot be listed, read or written, or holds an entry that does not decode (nothing is deleted on the strength of an entry it could not read).**
 
-## `@unconfirmed/sui-effect/gate`
-
-
-7 exported symbols.
-
-### `Gate` (const)
-
-Re-exported from `@unconfirmed/sui-effect/tx`.
-
-### `GateService` (interface)
-
-Re-exported from `@unconfirmed/sui-effect/tx`.
-
-### `JevOptions` (interface)
-
-```ts
-export interface JevOptions {
-    readonly apiKey: Redacted.Redacted<string>;
-    /** Defaults to `"jev-latest"`. Pin a version to keep thresholds meaningful. */
-    readonly model?: string;
-    /** Defaults to `https://api.typesafe.ai`. */
-    readonly baseUrl?: string;
-    /** The bound on one screen, retries included. Defaults to 10 seconds. */
-    readonly timeout?: Duration.Input;
-}
-```
-
-How to reach Jev.
-
-### `ScreenRequest` (interface)
-
-Re-exported from `@unconfirmed/sui-effect/tx`.
-
-### `layerJev` (const)
-
-```ts
-declare const layerJev: (options: JevOptions, overrides?: Partial<Omit<GateService, "screen">>) => Layer.Layer<never, never, HttpClient.HttpClient>
-```
-
-The `Gate` already in force, with Jev as its screen and `overrides` applied.
-
-Requires an `HttpClient`: `FetchHttpClient.layer` from
-`effect/http` needs no platform package.
-
-**Never fails.**
-
-### `layerJevConfig` (const)
-
-```ts
-declare const layerJevConfig: (overrides?: Partial<Omit<GateService, "screen">>) => Layer.Layer<never, Config.ConfigError, HttpClient.HttpClient>
-```
-
-`layerJev` from the environment: `TYPESAFE_API_KEY` (required,
-redacted), `TYPESAFE_MODEL` and `TYPESAFE_BASE_URL` (optional).
-
-**Fails with: `ConfigError` when the key is absent.**
-
-### `makeJev` (const)
-
-```ts
-declare const makeJev: (options: JevOptions) => Effect.Effect<NonNullable<GateService["screen"]>, never, HttpClient.HttpClient>
-```
-
-The screen itself, over an `HttpClient` you already have.
-
-One `POST /v1/systemone` per screen, retried on 429, 5xx and a dropped
-connection inside `timeout`. An answer that is missing a question it was
-asked is a non-retryable `TransportError`, never a default.
-
-The screen fails with: `TransportError`.
-
-**Never fails to build.**
-
-## `@unconfirmed/sui-effect/keystore`
-
-
-16 exported symbols.
-
-### `DEFAULT_ITERATIONS` (const)
-
-```ts
-declare const DEFAULT_ITERATIONS = 600000
-```
-
-PBKDF2-SHA256 iterations for a new seal: OWASP's 2023 recommendation.
-
-### `DEFAULT_PREFIX` (const)
-
-```ts
-declare const DEFAULT_PREFIX = "sui-effect/keystore/"
-```
-
-The `KeyValueStore` key prefix every record is stored under, by default.
-
-### `KEYSTORE_VERSION` (const)
-
-```ts
-declare const KEYSTORE_VERSION = 1
-```
-
-The format version this release writes and reads.
-
-### `KeyError` (class)
-
-Re-exported from `@unconfirmed/sui-effect`.
-
-### `KeyErrorReason` (const)
-
-Re-exported from `@unconfirmed/sui-effect`.
-
-### `Keystore` (class)
-
-```ts
-export declare class Keystore extends Keystore_base {
-    /**
-     * The service over the `KeyValueStore` in context, for an application that
-     * builds its own layer. **Throws** a `RangeError` for `iterations` that is
-     * not an integer in `[1 000, 10 000 000]`; the effect never fails.
-     */
-    static readonly make: (options?: KeystoreOptions) => Effect.Effect<KeystoreService, never, KeyValueStore.KeyValueStore>;
-    /** See `sealer`: a `SecretSealer` (for `ZkLogin.save`/`load`) in the keystore's format. */
-    static readonly sealer: (password: Redacted.Redacted<string>, options?: {
-        readonly iterations?: number;
-    }) => SecretSealer;
-    /**
-     * The keystore over the `KeyValueStore` in context. Builds without reading
-     * anything.
-     *
-     * **Throws** a `RangeError` when `options.iterations` is not an integer from
-     * `MIN_LAYER_ITERATIONS` to 10 000 000 — fewer would make every
-     * record cheap to brute-force, more would seal records `unlock` refuses.
-     * Otherwise never fails.
-     */
-    static readonly layer: (options?: KeystoreOptions) => Layer.Layer<Keystore, never, KeyValueStore.KeyValueStore>;
-    /**
-     * An in-memory keystore (`KeyValueStore.layerMemory`) sealing with 1 000
-     * PBKDF2 iterations, so a test does not spend seconds per seal. **Not for
-     * production**: those records are cheap to brute-force. Never fails.
-     */
-    static readonly layerTest: Layer.Layer<Keystore>;
-}
-```
-
-The sealed keystore: `Keystore.layer(options?)` over a `KeyValueStore`,
-`Keystore.layerTest` in memory for tests.
-
-### `KeystoreAccount` (interface)
-
-```ts
-export interface KeystoreAccount {
-    readonly address: SuiAddress;
-    readonly scheme: KeyScheme;
-    /** Whether the account was derived from a recovery phrase (exportable) or imported as a key. */
-    readonly source: "mnemonic" | "secretKey";
-    /** The derivation path, for a mnemonic account. */
-    readonly path?: string;
-    readonly label?: string;
-    readonly createdAt: DateTime.Utc;
-}
-```
-
-What the keystore says about an account. Never carries secret material.
-
-### `KeystoreError` (class)
-
-```ts
-export declare class KeystoreError extends KeystoreError_base {
-    readonly message: string;
-    readonly reason: "unavailable" | "wrongPassword" | "invalidPassword" | "notFound" | "exists" | "noMnemonic" | "corrupt" | "unsupported" | "storage";
-    readonly address?: SuiAddress | undefined;
-    readonly cause?: unknown;
-    /** Nothing was sent. */
-    readonly outcome: Outcome;
-    /**
-     * `Script.exitCode`'s answer: 2, like a `ConfigError`, for every reason a
-     * person has to fix (a wrong password, a missing or existing account, a
-     * corrupt or newer record, no WebCrypto); `undefined` for `"storage"`, a
-     * store failure that may pass on retry, which therefore exits 4 like any
-     * other `not_applied` failure.
-     *
-     * @since 0.5.0
-     */
-    get exitCode(): number | undefined;
-}
-```
-
-A keystore operation failed. Nothing was sent: outcome `not_applied`.
-
-A wrong password is this error with `reason: "wrongPassword"`, never a
-defect. `message` never contains the password or anything sealed.
-
-### `KeystoreErrorReason` (const)
-
-```ts
-declare const KeystoreErrorReason: Schema
-// decodes to: "unavailable" | "wrongPassword" | "invalidPassword" | "notFound" | "exists" | "noMnemonic" | "corrupt" | "unsupported" | "storage"
-```
-
-Why a keystore operation failed.
-
-- `wrongPassword`: the password does not open this account's record (its
-  key-check value does not match).
-- `invalidPassword`: a new password is empty.
-- `notFound`: no record for this address.
-- `exists`: a record for this address is already stored (`import*`).
-- `noMnemonic`: `exportMnemonic` of an account imported from a secret key.
-- `corrupt`: the record does not decode, was moved onto another address, was
-  edited (the AES-GCM tag over the ciphertext and its bound metadata does not
-  verify under a password whose check value matched), or holds a key that is
-  not the address's key.
-- `unsupported`: the record was written by a newer format version, or names
-  a KDF or cipher this version does not know.
-- `unavailable`: the platform has no WebCrypto (`crypto.subtle` or
-  `crypto.getRandomValues`), which React Native lacks without a polyfill.
-- `storage`: the `KeyValueStore` failed; `cause` is its error.
-
-### `KeystoreOptions` (interface)
-
-```ts
-export interface KeystoreOptions {
-    /** The `KeyValueStore` key prefix. Default `DEFAULT_PREFIX`. */
-    readonly prefix?: string;
-    /**
-     * PBKDF2-SHA256 iterations for records sealed from now on (existing records
-     * keep their own until `changePassword`). Default `DEFAULT_ITERATIONS`.
-     * An integer of at most 10 000 000; `Keystore.layer` refuses fewer than
-     * `MIN_LAYER_ITERATIONS`, `Keystore.make` fewer than 1 000.
-     */
-    readonly iterations?: number;
-}
-```
-
-Options of `Keystore.layer` and `Keystore.make`.
-
-### `KeystoreService` (interface)
-
-```ts
-export interface KeystoreService {
-    /**
-     * Every account, oldest first. Reads no secret and needs no password.
-     *
-     * Fails with: `KeystoreError` (`storage`; `unsupported` when a record is a
-     * newer format version or names a KDF or cipher this release does not know,
-     * `corrupt` when it otherwise does not decode).
-     */
-    readonly list: Effect.Effect<ReadonlyArray<KeystoreAccount>, KeystoreError>;
-    /**
-     * One account's public description.
-     *
-     * Fails with: `KeystoreError` (`notFound`, `corrupt`, `unsupported`, `storage`).
-     */
-    readonly account: (address: SuiAddress) => Effect.Effect<KeystoreAccount, KeystoreError>;
-    /**
-     * A fresh recovery phrase (`Signer.generateMnemonic`), its account on the
-     * standard path sealed under `password`. Answers the phrase once, redacted,
-     * for the person to write down.
-     *
-     * Fails with: `KeyError` (`unavailable`), `KeystoreError` (`invalidPassword`,
-     * `exists`, `unavailable`, `storage`).
-     */
-    readonly generate: (password: Redacted.Redacted<string>, options?: FromMnemonicOptions & {
-        readonly words?: MnemonicLength;
-        readonly label?: string;
-    }) => Effect.Effect<{
-        readonly account: KeystoreAccount;
-        readonly mnemonic: Redacted.Redacted<string>;
-    }, KeyError | KeystoreError>;
-    /**
-     * Checks a recovery phrase (`Signer.fromMnemonic`'s rules: word list and
-     * checksum), derives it and seals the key and the phrase under `password`.
-     *
-     * Fails with: `KeyError` (`invalidMnemonic`, `invalidPath`,
-     * `unsupportedScheme`), `KeystoreError` (`invalidPassword`, `exists`,
-     * `unavailable`, `storage`).
-     */
-    readonly importMnemonic: (phrase: Redacted.Redacted<string> | string, password: Redacted.Redacted<string>, options?: FromMnemonicOptions & {
-        readonly label?: string;
-    }) => Effect.Effect<KeystoreAccount, KeyError | KeystoreError>;
-    /**
-     * Seals an imported secret key (`Signer.fromSecretKey`'s spellings) under
-     * `password`. The caller's bytes are copied and left as they were.
-     *
-     * Fails with: `KeyError` (`invalidSecretKey`, `unsupportedScheme`),
-     * `KeystoreError` (`invalidPassword`, `exists`, `unavailable`, `storage`).
-     */
-    readonly importSecretKey: (secret: Redacted.Redacted<string> | string | Uint8Array, password: Redacted.Redacted<string>, options?: FromSecretKeyOptions & {
-        readonly label?: string;
-    }) => Effect.Effect<KeystoreAccount, KeyError | KeystoreError>;
-    /**
-     * Opens an account into a `LockableSigner`. The caller locks it
-     * (`signer.lock`), or acquires it with `Signer.scoped` so the scope does.
-     *
-     * Fails with: `KeystoreError` (`wrongPassword`, `notFound`, `corrupt`,
-     * `unsupported`, `unavailable`, `storage`).
-     */
-    readonly unlock: (address: SuiAddress, password: Redacted.Redacted<string>) => Effect.Effect<LockableSigner, KeystoreError>;
-    /**
-     * Deletes an account's record. Needs no password: it destroys, it reveals
-     * nothing.
-     *
-     * Fails with: `KeystoreError` (`notFound`, `storage`).
-     */
-    readonly remove: (address: SuiAddress) => Effect.Effect<void, KeystoreError>;
-    /**
-     * Re-seals one account under a new password, with a fresh salt and IV and
-     * the layer's current iteration count. The new record is opened under the
-     * new password (one more PBKDF2 derivation) before it is written, so a
-     * re-seal that does not open never replaces the stored record; that failure
-     * is `corrupt` and leaves the store as it was.
-     *
-     * Fails with: `KeystoreError` (`wrongPassword`, `invalidPassword`,
-     * `notFound`, `corrupt`, `unsupported`, `unavailable`, `storage`).
-     */
-    readonly changePassword: (address: SuiAddress, oldPassword: Redacted.Redacted<string>, newPassword: Redacted.Redacted<string>) => Effect.Effect<void, KeystoreError>;
-    /**
-     * The recovery phrase of a mnemonic account, redacted.
-     *
-     * Fails with: `KeystoreError` (`noMnemonic` for an imported key,
-     * `wrongPassword`, `notFound`, `corrupt`, `unsupported`, `unavailable`,
-     * `storage`).
-     */
-    readonly exportMnemonic: (address: SuiAddress, password: Redacted.Redacted<string>) => Effect.Effect<Redacted.Redacted<string>, KeystoreError>;
-    /**
-     * The account's secret key as a Bech32 `suiprivkey1…`, redacted.
-     *
-     * Fails with: `KeystoreError` (`wrongPassword`, `notFound`, `corrupt`,
-     * `unsupported`, `unavailable`, `storage`).
-     */
-    readonly exportSecretKey: (address: SuiAddress, password: Redacted.Redacted<string>) => Effect.Effect<Redacted.Redacted<string>, KeystoreError>;
-}
-```
-
-The keystore's members.
-
-### `LockableSigner` (interface)
-
-Re-exported from `@unconfirmed/sui-effect/tx`.
-
-### `MIN_LAYER_ITERATIONS` (const)
-
-```ts
-declare const MIN_LAYER_ITERATIONS = 100000
-```
-
-The fewest iterations `Keystore.layer` accepts for a new seal.
-
-### `SealedKey` (const)
-
-```ts
-declare const SealedKey: Schema
-// decodes to:
-// {
-//     readonly address: SuiAddress;
-//     readonly version: 1;
-//     readonly source: "mnemonic" | "secretKey";
-//     readonly scheme: "ED25519" | "Secp256k1" | "Secp256r1";
-//     readonly createdAt: DateTime.Utc;
-//     readonly kdf: {
-//         readonly name: "PBKDF2-SHA256";
-//         readonly iterations: number;
-//         readonly salt: string;
-//     };
-//     readonly cipher: {
-//         readonly name: "AES-256-GCM";
-//         readonly iv: string;
-//     };
-//     readonly check: string;
-//     readonly ciphertext: string;
-//     readonly path?: string | undefined;
-//     readonly label?: string | undefined;
-// }
-```
-
-One sealed account as stored, version 1. Every byte field is standard
-base64; `createdAt` is epoch milliseconds from the Effect `Clock`.
-
-The AAD binds `address`, `scheme`, `source` and `path` (an absent `path`
-and `path: ""` are the same AAD); an edit to one of them, to the `iv` or to
-the ciphertext is `corrupt`. `label` and `createdAt` are outside it and may
-be edited in place. An edited `salt`, `iterations` or `check` derives a
-check value that does not match, so it reads as `wrongPassword`.
-
-### `SealedSecret` (const)
-
-```ts
-declare const SealedSecret: Schema
-// decodes to:
-// {
-//     readonly version: 1;
-//     readonly kdf: {
-//         readonly name: "PBKDF2-SHA256";
-//         readonly iterations: number;
-//         readonly salt: string;
-//     };
-//     readonly cipher: {
-//         readonly name: "AES-256-GCM";
-//         readonly iv: string;
-//     };
-//     readonly check: string;
-//     readonly ciphertext: string;
-// }
-```
-
-One secret sealed by `sealer`, as the string `seal` answers: the
-keystore's KDF and cipher parameters and its key-check value, version 1.
-Every byte field is standard base64.
-
-### `sealer` (const)
-
-```ts
-declare const sealer: (password: Redacted.Redacted<string>, options?: {
-    readonly iterations?: number;
-}) => SecretSealer
-```
-
-A `SecretSealer` (what `ZkLogin.save` and `ZkLogin.load` take) in the
-keystore's format: PBKDF2-HMAC-SHA256 over `password` (600 000 iterations
-by default, 16-byte random salt, 512 bits: the AES key and the key-check
-value), AES-256-GCM with a fresh 12-byte IV per seal, and as AAD
-`sui-effect/keystore/sealer/v1`, a newline, then the caller's `aad` — for
-a zkLogin session, its address — so a blob copied under another account's
-entry does not unseal. The blob is `SealedSecret` as JSON.
-
-The password is held by the sealer for as long as the sealer lives: make
-one when the person unlocks and drop it when they lock. Each `seal` and
-`unseal` costs one PBKDF2 derivation.
-
-**Throws** a `RangeError` when `options.iterations` is not an integer from
-`MIN_LAYER_ITERATIONS` to 10 000 000, `Keystore.layer`'s bounds
-(`unseal` refuses a blob naming more than 10 000 000). Its members
-fail with: `SigningError` — `reason: "locked"` for a wrong password,
-`reason: "unavailable"` without WebCrypto, and no reason for an empty
-password, an empty secret or a blob that was edited, moved or is not one.
-
-## `@unconfirmed/sui-effect/storage`
-
-
-14 exported symbols.
-
-### `AsyncStorageLike` (interface)
-
-```ts
-export interface AsyncStorageLike {
-    getItem(key: string): Promise<string | null | undefined>;
-    setItem(key: string, value: string): Promise<unknown>;
-    removeItem(key: string): Promise<unknown>;
-    getAllKeys(): Promise<ReadonlyArray<string>>;
-    clear?(): Promise<unknown>;
-}
-```
-
-The part of `@react-native-async-storage/async-storage` (or anything shaped
-like it) this adapter calls. `clear` is optional; without it, `clear` removes
-every key one by one.
-
-### `ChromeStorageAreaLike` (interface)
-
-```ts
-export interface ChromeStorageAreaLike {
-    get(keys: string | ReadonlyArray<string> | null): Promise<Readonly<Record<string, unknown>>>;
-    set(items: Readonly<Record<string, unknown>>): Promise<unknown>;
-    remove(keys: string | ReadonlyArray<string>): Promise<unknown>;
-    clear(): Promise<unknown>;
-    getKeys?(): Promise<ReadonlyArray<string>>;
-}
-```
-
-The part of a `chrome.storage` `StorageArea` this adapter calls, in its
-promise form. `getKeys` (Chrome 130+) is used when present; without it,
-`keys` is `get(null)`, which reads every value in the area.
-
-### `IndexedDbDatabase` (interface)
-
-```ts
-export interface IndexedDbDatabase {
-    readonly version: number;
-    readonly objectStoreNames: {
-        contains(name: string): boolean;
-    };
-    createObjectStore(name: string): unknown;
-    transaction(storeName: string, mode: "readonly" | "readwrite", options?: {
-        readonly durability?: "default" | "strict" | "relaxed";
-    }): IndexedDbTransaction;
-    close(): void;
-    onversionchange: ((event: never) => void) | null;
-    onclose: ((event: never) => void) | null;
-}
-```
-
-The part of an `IDBDatabase` this adapter calls.
-
-### `IndexedDbFactory` (interface)
-
-```ts
-export interface IndexedDbFactory {
-    open(name: string, version?: number): IndexedDbOpenRequest;
-}
-```
-
-The part of an `IDBFactory` (`globalThis.indexedDB`) this adapter calls.
-
-### `IndexedDbObjectStore` (interface)
-
-```ts
-export interface IndexedDbObjectStore {
-    get(key: string): IndexedDbRequest<unknown>;
-    put(value: unknown, key: string): IndexedDbRequest<unknown>;
-    delete(key: string): IndexedDbRequest<unknown>;
-    clear(): IndexedDbRequest<unknown>;
-    count(): IndexedDbRequest<number>;
-    getAllKeys(): IndexedDbRequest<ReadonlyArray<unknown>>;
-}
-```
-
-The part of an `IDBObjectStore` this adapter calls.
-
-### `IndexedDbOpenRequest` (interface)
-
-```ts
-export interface IndexedDbOpenRequest extends IndexedDbRequest<IndexedDbDatabase> {
-    onupgradeneeded: ((event: never) => void) | null;
-    onblocked: ((event: never) => void) | null;
-}
-```
-
-The part of an `IDBOpenDBRequest` this adapter reads.
-
-### `IndexedDbOptions` (interface)
-
-```ts
-export interface IndexedDbOptions {
-    /** The factory to open the database with. Defaults to `globalThis.indexedDB`. */
-    readonly indexedDB?: IndexedDbFactory;
-    /** The database name. Defaults to `"sui-effect"`. */
-    readonly databaseName?: string;
-    /** The object store name. Defaults to `"keyvalue"`. */
-    readonly storeName?: string;
-    /**
-     * The durability hint every write transaction carries. Defaults to
-     * `"strict"`: the journal's `Signed` entry is written before any bytes are
-     * sent, and a write that a power loss can undo is not a journal. Browsers
-     * that do not know the hint ignore it.
-     */
-    readonly durability?: "default" | "strict" | "relaxed";
-}
-```
-
-Options for `layerIndexedDb`.
-
-### `IndexedDbRequest` (interface)
-
-```ts
-export interface IndexedDbRequest<T> {
-    readonly result: T;
-    readonly error: unknown;
-    onsuccess: ((event: never) => void) | null;
-    onerror: ((event: never) => void) | null;
-}
-```
-
-The part of an `IDBRequest` this adapter reads.
-
-### `IndexedDbTransaction` (interface)
-
-```ts
-export interface IndexedDbTransaction {
-    readonly error: unknown;
-    objectStore(name: string): IndexedDbObjectStore;
-    abort(): void;
-    oncomplete: ((event: never) => void) | null;
-    onerror: ((event: never) => void) | null;
-    onabort: ((event: never) => void) | null;
-}
-```
-
-The part of an `IDBTransaction` this adapter calls.
-
-### `MmkvLike` (type)
-
-```ts
-export type MmkvLike = (MmkvBase & {
-    delete(key: string): void;
-}) | (MmkvBase & {
-    remove(key: string): unknown;
-});
-```
-
-The part of a `react-native-mmkv` instance this adapter calls: `delete`
-(2.x/3.x) or `remove` (4.x).
-
-### `layerAsyncStorage` (const)
-
-```ts
-declare const layerAsyncStorage: (storage: AsyncStorageLike) => Layer.Layer<KeyValueStore.KeyValueStore>
-```
-
-A `KeyValueStore` over an AsyncStorage-shaped store.
-
-Every operation is one call (`clearPrefix` is `getAllKeys` and a
-`removeItem` per match; `size` is `getAllKeys`). AsyncStorage has no
-transactions, so a `set` that resolved is as durable as AsyncStorage makes
-it, and nothing groups two calls. Android's default backend caps the whole
-store (6 MB by default) and each value (about 2 MB); a journal or keystore is
-far below either.
-
-**Never fails to build; every operation fails with `KeyValueStoreError`.**
-
-### `layerChromeStorage` (const)
-
-```ts
-declare const layerChromeStorage: (area: ChromeStorageAreaLike) => Layer.Layer<KeyValueStore.KeyValueStore>
-```
-
-A `KeyValueStore` over a `chrome.storage` area.
-
-The area holds JSON values; this store writes only strings (a `Uint8Array`
-as base64, through `KeyValueStore.makeStringOnly`) and fails `get` with
-`KeyValueStoreError` on a key that holds anything else, which only another
-writer to the same area can have put there. Every operation is one call;
-`clearPrefix` is one `keys` and one `remove` of the matches.
-
-`chrome.storage.local` is the area that survives the browser restarting; it
-holds 10 MB unless the extension asks for `"unlimitedStorage"`, and it is
-reachable from the MV3 service worker, where `localStorage` is not. Unlike
-IndexedDB it is shared by every context of the extension and gives no
-transactions. `chrome.storage.session` is memory only and lost when the
-browser closes: not a journal.
-
-**Never fails to build; every operation fails with `KeyValueStoreError`.**
-
-### `layerIndexedDb` (const)
-
-```ts
-declare const layerIndexedDb: (options?: IndexedDbOptions) => Layer.Layer<KeyValueStore.KeyValueStore>
-```
-
-A `KeyValueStore` backed by IndexedDB.
-
-Strings and `Uint8Array`s are stored as themselves (IndexedDB clones both),
-so `getUint8Array` returns stored bytes unchanged and `get` returns them as
-base64; a stored string read with `getUint8Array` is its UTF-8 encoding —
-the semantics of `KeyValueStore.layerMemory`.
-
-The database is opened on first use, not when the layer is built, so
-building never fails; an IndexedDB that cannot be opened (absent, blocked,
-refused in a private window) fails each operation with
-`KeyValueStoreError`, `method` naming the operation. The object store is
-created when missing, by reopening at the next version. A `versionchange`
-from another tab closes this connection and the next operation reopens it;
-the layer's scope closes it for good.
-
-Each operation is one transaction, and a write resolves when its
-transaction **completes** (not when its request succeeds), so a write this
-store reported done is committed. Interrupting an operation aborts its
-transaction. `clearPrefix` reads every key and deletes the matching ones in
-the same transaction: IndexedDB's key ranges need `IDBKeyRange`, which is
-not structural.
-
-**Never fails to build; every operation fails with `KeyValueStoreError`.**
-
-### `layerMmkv` (const)
-
-```ts
-declare const layerMmkv: (mmkv: MmkvLike) => Layer.Layer<KeyValueStore.KeyValueStore>
-```
-
-A `KeyValueStore` over an MMKV-shaped synchronous store.
-
-Every operation is one synchronous call, wrapped in `Effect.try`. MMKV
-writes through a memory map, so a `set` survives the app being killed once
-it returns; it does not group two writes either.
-
-**Never fails to build; every operation fails with `KeyValueStoreError`.**
-
-## `@unconfirmed/sui-effect/enoki`
-
-
-9 exported symbols.
-
-### `Enoki` (const)
-
-```ts
-declare const Enoki: {
-    readonly fromFlow: (flow: EnokiFlow, options?: {
-        readonly network?: "mainnet" | "testnet" | "devnet";
-    } | undefined) => Effect.Effect<Signer, SigningError, never>;
-    readonly fromWallet: (options: {
-        readonly wallet: StandardWallet;
-        readonly account: StandardWalletAccount;
-        readonly chain: string;
-        readonly scheme?: SignatureScheme;
-    }) => Effect.Effect<Signer, SigningError, never>;
-    readonly sponsor: (client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
-        readonly sender: SuiAddress;
-        readonly network?: "mainnet" | "testnet" | "devnet";
-        readonly jwt?: string;
-        readonly allowedAddresses?: ReadonlyArray<string>;
-        readonly allowedMoveCallTargets?: ReadonlyArray<string>;
-    }) => Effect.Effect<Built, TransportError | BuildError | PolicyDenied | EnokiError, Sui>;
-    readonly execute: (client: EnokiClient, signed: Signed, options?: {
-        readonly refused?: (cause: unknown) => boolean;
-    } | undefined) => Effect.Effect<Executed, SubmitViaError | EnokiError, Sui>;
-    readonly run: <E = never>(client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
-        readonly signer: Signer;
-        readonly network?: "mainnet" | "testnet" | "devnet";
-        readonly jwt?: string;
-        readonly allowedAddresses?: ReadonlyArray<string>;
-        readonly allowedMoveCallTargets?: ReadonlyArray<string>;
-        /** What the transaction is declared to do; see `Tx.run`. */
-        readonly intent?: Intent;
-        /** Shown the prepared, sponsored transaction before the sender signs; failing refuses. */
-        readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
-        /** `Tx.run`'s `onSigned`: after the sender's signature, before Enoki is called. */
-        readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
-        /** `execute`'s `refused`. */
-        readonly refused?: (cause: unknown) => boolean;
-    }) => Effect.Effect<Executed, TransportError | SimulationFailed | SigningError | BuildError | PolicyDenied | SubmitViaError | EnokiError | E, Sui>;
-}
-```
-
-The Enoki helpers, namespaced: `Enoki.fromFlow`, `Enoki.fromWallet`,
-`Enoki.sponsor`, `Enoki.execute`, `Enoki.run`.
-
-### `EnokiClient` (interface)
-
-```ts
-export interface EnokiClient {
-    readonly createSponsoredTransaction: (input: {
-        readonly network?: "mainnet" | "testnet" | "devnet";
-        readonly transactionKindBytes: string;
-    } & ({
-        readonly jwt: string;
-        readonly sender?: never;
-        readonly allowedAddresses?: never;
-        readonly allowedMoveCallTargets?: never;
-    } | {
-        readonly sender: string;
-        readonly allowedAddresses?: Array<string>;
-        readonly allowedMoveCallTargets?: Array<string>;
-        readonly jwt?: never;
-    })) => Promise<{
-        readonly bytes: string;
-        readonly digest: string;
-    }>;
-    readonly executeSponsoredTransaction: (input: {
-        readonly digest: string;
-        readonly signature: string;
-    }) => Promise<{
-        readonly digest: string;
-    }>;
-}
-```
-
-The two `EnokiClient` methods sponsorship uses, as `@mysten/enoki` 1.3.2
-declares them (the input of `createSponsoredTransaction` narrowed to the
-`sender` form, plus `jwt`).
-
-### `EnokiError` (class)
-
-```ts
-export declare class EnokiError extends EnokiError_base {
-    readonly refused: boolean;
-    readonly cause: unknown;
-    readonly method: string;
-    readonly status?: number | undefined;
-    readonly code?: string | undefined;
-    /** `not_applied` for a refusal; `unknown` otherwise. */
-    get outcome(): "not_applied" | "unknown";
-    get message(): string;
-}
-```
-
-Enoki refused a request: an HTTP 4xx from the Enoki API, or a refusal the
-caller's `refused` predicate recognised. `refused: true` is the claim that
-nothing was submitted, which makes the outcome `not_applied`; any other
-failure of the execute call is ambiguous, is reconciled by `Tx.submitVia`,
-and only ever surfaces as the `cause` of a `SubmissionUnknown`.
-
-### `EnokiFlow` (interface)
-
-```ts
-export interface EnokiFlow {
-    readonly getSession: () => Promise<{
-        readonly maxEpoch: number;
-        readonly expiresAt: number;
-    } | null>;
-    readonly getKeypair: (input?: {
-        readonly network?: "mainnet" | "testnet" | "devnet";
-    }) => Promise<SdkSigner>;
-}
-```
-
-The two `EnokiFlow` methods `fromFlow` uses. `EnokiFlow` is deprecated
-in `@mysten/enoki` 1.x in favour of `registerEnokiWallets`, whose wallets
-`fromWallet` reads; both are supported.
-
-### `execute` (const)
-
-```ts
-declare const execute: (client: EnokiClient, signed: Signed, options?: {
-    readonly refused?: (cause: unknown) => boolean;
-} | undefined) => Effect.Effect<Executed, SubmitViaError | EnokiError, Sui>
-```
-
-Executes a sponsored transaction through Enoki's
-`executeSponsoredTransaction`, **through the journal**: this is
-`Tx.submitVia(signed, send)`, so the `Signed` entry is written before Enoki
-is called, Enoki is called once, and its answer — a bare digest, never
-effects — is settled by asking the chain for the digest of the bytes that
-were signed. A failure that may have reached the chain is reconciled with the
-full evidence rules and is `SubmissionUnknown` (carrying the bytes) when the
-chain cannot say yet; `Tx.reconcileAll()` settles it later.
-
-The signature sent is `signed.signatures[0]`, the sender's: Enoki holds the
-sponsor's.
-
-`refused` says which Enoki failures are refusals before anything was
-submitted, which fail straight through as `EnokiError { refused: true }`
-and settle the journal entry as `NotApplied { refused }`. The default is an
-HTTP 401 or 403 (Enoki refused the API key or the session); every other
-failure — a 400 included, since Enoki submits to a node and does not say
-whether it got that far — is treated as ambiguous and reconciled.
-
-**Fails with: `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError` (only from the write before Enoki is called), and `EnokiError` (only `refused: true`).**
-
-### `fromFlow` (const)
-
-```ts
-declare const fromFlow: (flow: EnokiFlow, options?: {
-    readonly network?: "mainnet" | "testnet" | "devnet";
-} | undefined) => Effect.Effect<Signer, SigningError, never>
-```
-
-The signed-in `EnokiFlow` session as a `Signer`: `scheme: "ZkLogin"`,
-`maxEpoch` and the expiry checks of `Signer.zkLogin`, signing with the
-flow's own `EnokiKeypair` (`getKeypair`, which asks Enoki for the proof the
-first time and caches it in the flow's store).
-
-The keypair and the session are read once, here: a session refreshed or
-signed out later is a different signer, made again.
-
-**Fails with: `SigningError` — `reason: "expired"` when the session or its proof has expired, `reason: "unavailable"` when nobody is signed in or the proof could not be fetched.**
-
-### `fromWallet` (const)
-
-```ts
-declare const fromWallet: (options: {
-    readonly wallet: StandardWallet;
-    readonly account: StandardWalletAccount;
-    readonly chain: string;
-    readonly scheme?: SignatureScheme;
-}) => Effect.Effect<Signer, SigningError, never>
-```
-
-An Enoki wallet (from `registerEnokiWallets`) as a `Signer`: `Signer.wallet`
-over its Wallet Standard features, plus the session bound its
-`enoki:getSession` feature reports, so the signer carries `maxEpoch` and
-refuses after it like `Signer.zkLogin`.
-
-**Fails with: `SigningError` — everything `Signer.wallet` fails with, `reason: "unavailable"` when the wallet has no `enoki:getSession` or nobody is signed in, and `reason: "expired"` when the session has expired.**
-
-### `run` (const)
-
-```ts
-declare const run: <E = never>(client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
-    readonly signer: Signer;
-    readonly network?: "mainnet" | "testnet" | "devnet";
-    readonly jwt?: string;
-    readonly allowedAddresses?: ReadonlyArray<string>;
-    readonly allowedMoveCallTargets?: ReadonlyArray<string>;
-    /** What the transaction is declared to do; see `Tx.run`. */
-    readonly intent?: Intent;
-    /** Shown the prepared, sponsored transaction before the sender signs; failing refuses. */
-    readonly approve?: (prepared: Prepared) => Effect.Effect<void, E>;
-    /** `Tx.run`'s `onSigned`: after the sender's signature, before Enoki is called. */
-    readonly onSigned?: (signed: Signed) => Effect.Effect<void, JournalError>;
-    /** `execute`'s `refused`. */
-    readonly refused?: (cause: unknown) => boolean;
-}) => Effect.Effect<Executed, TransportError | SimulationFailed | SigningError | BuildError | PolicyDenied | SubmitViaError | EnokiError | E, Sui>
-```
-
-The whole Enoki-sponsored run, with the same front half as `Tx.run`:
-`sponsor` → `Tx.prepare(built, { sender, intent })` (one simulate of
-exactly Enoki's bytes, `SubmitConfig.preflight`, the intent's claims and
-screen) → `approve(prepared)` → `Tx.sign` (`prepared.verified` when there
-is an intent) → `onSigned` → `execute`, through the journal.
-
-**The sender lock follows `Tx.run`'s rule for the sender's own pins.**
-Under `SubmitConfig.lockSender: "whenPinned"` (the default) the sponsor
-request — which resolves the sender's object inputs — runs under the
-sender's lock, and the lock is held on through approval, signing and
-execution only when Enoki's bytes pin an owned or receiving input. The gas
-coins are Enoki's and are not the sender's to race, so a sponsored
-transaction that pins nothing of the sender's (pure values, shared objects,
-withdrawals) is approved, signed and executed with the lock released, and
-a person taking their time never holds it. `"always"` holds it throughout,
-`"never"` takes none. `Gate.requireIntent` applies, as it does to `Tx.run`,
-and so does its early refusal of a locked signer (`SigningError { reason:
-"locked" }` before Enoki is asked anything).
-
-`options.signer` is the sender: an Enoki zkLogin session
-(`Enoki.fromFlow`, `Enoki.fromWallet`, `Signer.zkLogin`) or any other
-signer Enoki sponsors — a `Signer.alias(account, key)` included (0.6.0),
-whose key is checked against the account's alias set before Enoki is
-asked anything (`PolicyDenied { rule: "alias.signer" }`), as in `Tx.run`. `options.jwt`, `allowedAddresses` and
-`allowedMoveCallTargets` are `sponsor`'s; `refused` is
-`execute`'s.
-
-**Fails with: `EnokiError` (a refusal: the sponsor request answered 4xx, or the execute call failed in a way `refused` recognises), `TransportError` (Enoki could not be reached for the sponsor request, or the simulate), `BuildError`, `PolicyDenied` (`enoki.digest`, `sponsored.*`, `prepare.sender`, `intent.*`, `preflight`, `alias.signer`), `SimulationFailed`, `SigningError`, `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`, and `E` — whatever `approve` fails with.**
-
-### `sponsor` (const)
-
-```ts
-declare const sponsor: (client: EnokiClient, transaction: Uint8Array<ArrayBufferLike> | Recipe, options: {
-    readonly sender: SuiAddress;
-    readonly network?: "mainnet" | "testnet" | "devnet";
-    readonly jwt?: string;
-    readonly allowedAddresses?: ReadonlyArray<string>;
-    readonly allowedMoveCallTargets?: ReadonlyArray<string>;
-}) => Effect.Effect<Built, TransportError | BuildError | PolicyDenied | EnokiError, Sui>
-```
-
-Asks Enoki to sponsor a transaction, and answers its sponsored bytes as a
-`Built` that has been checked: `Tx.fromBytes` (the chain), Enoki's
-digest is the digest of its bytes, and `verifySponsored` (on `/tx`) — the sender is
-`options.sender`, the gas owner is someone else, and the transaction kind is
-**exactly** the kind that was sent.
-
-`transaction` is a recipe, built kind-only against the `Sui` in context (so
-its object inputs are resolved), or kind bytes already built. Pass `jwt` to
-let Enoki derive the sender from the session instead (Enoki's `jwt` form);
-`sender` is still what the bytes are checked against.
-
-Then: `Tx.sign(built, signer)` (or `Tx.prepare` first, to simulate the
-bytes), then `execute`.
-
-**Fails with: `EnokiError` (`refused: true`: Enoki answered 4xx), `TransportError` (Enoki could not be reached, answered 5xx or 429, or answered something unreadable), `BuildError` (the recipe did not build, or the bytes are not a transaction for this chain), `PolicyDenied` (`enoki.digest`, `sponsored.sender`, `sponsored.gasOwner`, `sponsored.kind`).**
-
-## `@unconfirmed/sui-effect/extension`
-
-
-8 exported symbols.
-
-### `ExtensionFace` (interface)
-
-```ts
-export interface ExtensionFace {
-    /**
-     * Builds the runtime and resolves the service, so every member afterwards is
-     * the real thing — synchronous members included.
-     *
-     * Call it once after `$extend` when the extension has synchronous members
-     * (recipe builders, ids, codecs) and the registration is not `warm`. It is
-     * idempotent and costs nothing after the first time.
-     */
-    readonly $ready: () => Promise<void>;
-    /**
-     * Releases everything the layer acquired and forgets the runtime. Not final:
-     * the next call builds a fresh one.
-     */
-    readonly $dispose: () => Promise<void>;
-    /**
-     * `Tx.reconcileAll()` over this registration's runtime: settles every entry
-     * the journal in force (the one `SuiExtensionOptions.journal` gave, or
-     * the in-memory default) still holds unresolved, and answers what each one
-     * turned out to be. The startup call for a Promise consumer with a durable
-     * journal.
-     *
-     * Rejects with `JournalError` when the journal cannot be read, and with
-     * whatever the layer fails with when the runtime cannot be built.
-     *
-     * @since 0.4.0
-     */
-    readonly $reconcileAll: () => Promise<ReadonlyArray<Reconciled>>;
-}
-```
-
-What every registration carries besides the service's own members, under
-`$`-prefixed names so an extension is free to call a member `ready` or
-`dispose` itself.
-
-### `FaceValue` (type)
-
-```ts
-export type FaceValue<A> = A extends Option.Option<infer B> ? B | undefined : A;
-```
-
-What an `Effect` member's success becomes at the Promise boundary: an
-`Option<A>` is `A | undefined`, everything else is itself.
-
-A Promise consumer has no `Option` and should not need one: a member that
-answers `Option.none()` where absence is normal resolves to `undefined`, and
-`Option.some(a)` resolves to `a`. Distributive, so `Option<A> | B` is
-`A | undefined | B`. Stream items are not unwrapped.
-
-### `Leaf` (type)
-
-```ts
-export type Leaf<T> = T & LeafBrand;
-```
-
-`T`, marked as a leaf of the Promise face: it is handed to a Promise consumer
-exactly as the Effect service holds it.
-
-Declare the member as `Leaf<MyClass>` and build it with `leaf`. A
-`Leaf<T>` is still a `T` — every consumer of the Effect face is unaffected.
-
-### `PromiseFace` (type)
-
-```ts
-export type PromiseFace<S> = {
-    readonly [K in keyof S]: S[K] extends Stream.Stream<infer A, infer _E, infer _R> ? AsyncIterable<A> : S[K] extends Effect.Effect<infer A, infer _E2, infer _R2> ? () => Promise<FaceValue<A>> : S[K] extends (...args: infer Args) => Stream.Stream<infer A, infer _E3, infer _R3> ? (...args: Args) => AsyncIterable<A> : S[K] extends (...args: infer Args) => Effect.Effect<infer A, infer _E4, infer _R4> ? (...args: Args) => Promise<FaceValue<A>> : S[K] extends FaceLeaf ? S[K] : S[K] extends (...args: ReadonlyArray<never>) => unknown ? S[K] : S[K] extends object ? PromiseFace<S[K]> : S[K];
-};
-```
-
-The Promise face of a service interface.
-
-An `Effect` member becomes a zero-argument method returning a Promise, a
-function returning an `Effect` keeps its arguments and returns a Promise, a
-`Stream` member becomes an `AsyncIterable`, a nested object of members is
-mapped the same way (platform SDKs namespace their surface as
-`client.miso.protocol.*`), and anything else passes through untouched.
-
-**An `Option` result is `A | undefined`** (`FaceValue`): `Effect<Option<A>>`
-is `Promise<A | undefined>`, in the type and at runtime, so one service can
-return `Option` to its Effect callers and `undefined` to its Promise ones.
-
-**A synchronous member stays synchronous**: a recipe builder
-`(p: Params) => Recipe` is still `(p: Params) => Recipe` here, and a plain
-value is still that value. The type says so and, once the runtime exists, the
-runtime agrees — see `warm` and `$ready` on `fromService` for the
-window before it does.
-
-**The recursion is by type, not by declaration style.** Every object-typed
-member that is not a function, an array, an `Effect`, a `Stream`, a
-`Uint8Array`, a `Date`, a `Promise`, a BCS codec (both `parse` and
-`serialize`) or a `Leaf` is mapped as a namespace — an `interface`
-exactly like a type alias. Before 0.1.1 the bound was
-`Record<string, unknown>`, which an interface is not assignable to, so an
-interface-typed namespace (`readonly protocol: ProtocolService`) kept its
-`Effect` members **in the type** while the runtime mapped them to Promises.
-The type lied; it no longer does.
-
-**A class instance that is a value, not a namespace, is marked.** The runtime
-maps plain-prototype objects and passes class instances through, so a class
-whose methods return `Effect`s would be typed as mapped and arrive unmapped.
-Declare such a member `Leaf<T>` and build it with `leaf`: the type and
-the runtime then agree that it is a value. `Uint8Array`, `Date`, `Promise`,
-arrays and BCS codecs need no marker.
-
-**A plain-object *value* member is the one place the two faces cannot agree.**
-`{ packageId: "0x…" }` is indistinguishable from a namespace of members, so
-the type maps it as a value while the **cold** runtime treats it as a
-namespace and hands back a placeholder for each key. Reading one throws
-`ExtensionNotReady` naming the path (`deployment.packageId`) rather than
-returning something the type says cannot be awaited — so the disagreement is
-typed and named, not silent — but the cure is `warm` or `$ready()`, not a
-retry. An extension that is registered lazily should expose such a value
-through an `Effect` member instead.
-
-### `SuiExtension` (const + namespace)
-
-```ts
-declare const SuiExtension: {
-    readonly fromService: <Self, Shape, E, const Name extends string>(service: Context.Key<Self, Shape>, options: SuiExtensionOptions<Self, E, Name>) => SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & ExtensionFace>;
-    readonly leaf: <T>(value: T) => Leaf<T>;
-}
-```
-
-The namespace the spec spells: `SuiExtension.fromService(...)`, plus the
-leaf marker a service uses to say "this member is a value, not a namespace"
-(`SuiExtension.leaf(value)`, typed `SuiExtension.Leaf<T>`).
-
-```ts
-export declare namespace SuiExtension {
-    /** `Leaf` under the namespace the spec spells. */
-    type Leaf<T> = T & LeafBrand;
-}
-```
-
-### `SuiExtensionOptions` (interface)
-
-```ts
-export interface SuiExtensionOptions<Self, E, Name extends string = string> {
-    /**
-     * The property the extension takes on the client: `client.<name>`.
-     *
-     * It is inferred as a string **literal**, which is what makes
-     * `client.escrow` a property rather than an index signature. Widening it to
-     * `string` is why the registered member used to arrive as `T | undefined`
-     * under `noUncheckedIndexedAccess`.
-     */
-    readonly name: Name;
-    /**
-     * The extension's layer.
-     *
-     * The bound is `Layer<Self, E, Sui | SuiCore>`: it may require either tier,
-     * because this module builds both over the client `$extend` was called on,
-     * and **nothing else**. An extension with a dependency of its own — an
-     * `HttpClient`, a `SuiGraphQL` — provides it inside this layer
-     * (`Layer.provide(SuiGraphQL.layerConfig)`) or in the function that builds
-     * the registration. The rule is not "requires `Sui` and nothing else"; it is
-     * "requires nothing the consumer's client could have provided".
-     */
-    readonly layer: Layer.Layer<Self, E, Sui | SuiCore>;
-    /**
-     * Options for the `Sui` layer built under the extension's own.
-     *
-     * `sui.chainId` pins the chain identifier the node must report, overriding
-     * the built-in table for `mainnet` and `testnet` and asserting one where
-     * there is none — which is how an extension whose deployment names a custom
-     * network's `chainIdentifier` refuses to run against a different chain.
-     */
-    readonly sui?: SuiLayerOptions;
-    /**
-     * Build the runtime **inside `register`**, synchronously, instead of on the
-     * first call.
-     *
-     * Give it when the extension has synchronous members — recipe builders, a
-     * package id, a codec — that a consumer expects to read the moment it
-     * registers. Every member is then the real thing immediately, and
-     * `$ready()` has nothing left to do.
-     *
-     * **Every failure of the layer becomes a synchronous throw.** The whole
-     * layer is built inside `register`, so a missing deployment, a bad
-     * configuration, a `NetworkMismatch` — anything the layer can fail with —
-     * comes out of `client.$extend(...)` as a thrown value rather than as the
-     * rejection of a first call. That is the trade `warm` makes, and a consumer
-     * has to catch it where it registers.
-     *
-     * After `$dispose()`, the next use re-runs this same build rather than
-     * degrading to a cold registration.
-     *
-     * Two conditions, both enforced:
-     *
-     * - **The layer must not perform an asynchronous step.** A layer that reads
-     *   the network, opens a connection or awaits anything cannot be built
-     *   synchronously and `register` throws. This is the documented contract of
-     *   `warm`, not an accident: an extension that needs the network at build is
-     *   registered without it.
-     * - **The chain identifier is not read — not at registration, and not
-     *   later.** `Sui` normally calls `getChainIdentifier` at layer build, which
-     *   is a round trip. A warm registration takes `warm.chainId` (or
-     *   `sui.chainId`, or the entry in the built-in table for `mainnet` and
-     *   `testnet`) as the chain's identifier and asks nothing. **The node is
-     *   consulted for the first time when the extension itself makes a call**,
-     *   and that call does not check the identifier either: the pinned id is what
-     *   `Sui.chainId` reports for the life of the registration. A node on another
-     *   chain is therefore never detected here — it is detected by the chain,
-     *   because `Tx.build` stamps that id on the expiration and a validator
-     *   refuses bytes signed for another chain. Register lazily when the
-     *   assertion is what you want. On `devnet`, `localnet` or a custom network
-     *   there is no table entry, so `warm` without a `chainId` throws rather than
-     *   guess.
-     *
-     * A **lazy** registration that joins a chain id another registration already
-     * pinned still performs its own `getChainIdentifier` assertion — once, shared
-     * across every lazy registration on that base — so mixing the two on one
-     * client neither loses the check nor duplicates it.
-     */
-    readonly warm?: {
-        readonly chainId?: string;
-    };
-    /**
-     * Lifecycle overrides for every member call on this registration, the
-     * `SubmitConfig.layer` of a Promise consumer: `maxGasBudget`, `resubmit`,
-     * `executeTimeout: "10 seconds"` and the rest. Provided under the
-     * extension's layer and to every call.
-     *
-     * @since 0.4.0
-     */
-    readonly submit?: SubmitConfigOverrides;
-    /**
-     * The journal every member call on this registration records submissions
-     * in, instead of the process-wide in-memory default — a durable one from
-     * `@unconfirmed/sui-effect/journal` (`makeKeyValueStore(store)`) for a
-     * consumer that must survive a restart. `$reconcileAll()` settles what it
-     * holds.
-     *
-     * @since 0.4.0
-     */
-    readonly journal?: JournalService;
-}
-```
-
-What `fromService` needs to know beyond the service key itself.
-
-### `fromService` (const)
-
-```ts
-declare const fromService: <Self, Shape, E, const Name extends string>(service: Context.Key<Self, Shape>, options: SuiExtensionOptions<Self, E, Name>) => SuiClientRegistration<ClientWithCoreApi, Name, PromiseFace<Shape> & ExtensionFace>
-```
-
-Turns an Effect service into a `SuiClientRegistration` a Promise consumer
-passes to `client.$extend(...)`.
-
-`register(client)` does no work by default: the `ManagedRuntime` over
-`SuiCore.layerFromClient(client)`, a `Sui` for the client's effective chain
-id and the extension's own layer is built on the first call and shared by
-every call after it. The `Sui` and `SuiCore` underneath are shared with every
-other registration on that client that names the same chain id — one
-transport and one chain identity — and the sender lock is **process-wide**:
-every registration, on every client, takes the same lock per address, so a
-warm and a lazy registration (or two clients) cannot race one gas coin. A
-rejection carries
-the original tagged error instance, so a Promise consumer can still switch on
-`_tag`.
-
-`name` is generic in a string literal, so `client.escrow` is a property of
-the extended client's type and not an index lookup: no cast, and no
-`| undefined` under `noUncheckedIndexedAccess`.
-
-**The window before the runtime exists.** Until then nothing knows what a
-member *is*, so a member read off the face is a placeholder. An `Effect` or
-`Stream` member behaves exactly as its type says — the call returns a
-Promise, the iteration works — because that is what the face promises for
-them anyway. A **synchronous** member does not: `PromiseFace` types a recipe
-builder as returning a `Recipe` and a plain value as that value, and a
-placeholder has neither. So a synchronous member used in that window fails
-with `ExtensionNotReady` naming itself, rather than quietly handing back a
-Promise where the type says `Recipe` — which is a bug that only shows up on
-the *second* call, when the member has become real. Two cures:
-
-- `await client.<name>.$ready()` once after `$extend`, which builds the
-  runtime and resolves the service; every member is real from then on;
-- register with `warm`, which does the same synchronously inside `register`,
-  for a layer that needs no network.
-
-Two lifetimes worth knowing:
-
-- **`$dispose()` is not final.** It releases everything the layer acquired
-  and forgets the runtime; the next call builds a fresh one — and a `warm`
-  registration re-runs its **warm** build, with the same options, on the next
-  use, so it does not silently degrade to cold with every synchronous member
-  throwing `ExtensionNotReady`. That is what a
-  long-lived page wants (a disposed extension is usable again after a
-  reconnect) and it does mean a `$dispose()` that races an in-flight call can
-  leave the caller's Promise rejected while a new runtime starts behind it.
-  Dispose when the consumer is done, not between calls.
-- **Each `register` is independent.** Registering the same extension on two
-  clients — or twice on one — gives two runtimes, two layer builds and two
-  copies of whatever the layer holds (a cache, a connection). Register once
-  per client and keep the extended client.
-
-**A cold call is a callable Promise.** The placeholder a member call returns
-before the runtime exists is a `Proxy` over a function whose prototype is a
-`Promise` subclass that also implements `Symbol.asyncIterator`:
-`instanceof Promise` holds, `await` and `then` work, iteration works, and
-applying it — a cold recipe builder's result used as `recipe(tx)` — throws
-`ExtensionNotReady` naming the member. `typeof` is `"function"`, so
-`bun:test`'s `expect(...).rejects`, which wants a native Promise, takes
-`Promise.resolve(cold)`. Its rejection is **pre-handled** (a no-op `catch`
-is attached at creation), so a cold call nobody awaits —
-`client.ext.doThing()` as a statement — cannot abort the process with an
-unhandled rejection; an `await` of it still throws `ExtensionNotReady`.
-
-**A cold value placeholder refuses value-only use.** A plain value member
-read before the runtime exists throws `ExtensionNotReady` on the names only
-a value has (`.length`, `.startsWith`, `toString`, `valueOf`, `toJSON`, …),
-on spread and on string conversion, and prints as
-`<ExtensionNotReady ext.member>`.
-
-A warm registration builds the
-**whole layer** synchronously inside `register`, so **any** failure of that
-layer — a missing deployment for the network, a configuration error, a
-`NetworkMismatch`, not only an asynchronous step or an unknown chain
-identifier — is thrown synchronously out of `register`, which means out of
-`client.$extend(...)`. Catch it where you register. A lazy registration has
-nowhere to put such a failure at registration time, so it surfaces as the
-rejection of the first call that needs the layer.
-
-**Never fails, except that a `warm` registration throws any failure of its layer synchronously out of `register`.**
-
-### `leaf` (const)
-
-```ts
-declare const leaf: <T>(value: T) => Leaf<T>
-```
-
-Marks a value as a `Leaf`: the Promise face passes it through untouched
-instead of walking into it.
-
-The registry is a `WeakSet`, so a frozen value can be marked and nothing is
-added to the value itself.
-
-**Never fails.**
-
-## `@unconfirmed/sui-effect/script`
-
-
-11 exported symbols.
-
-### `ReportOptions` (interface)
-
-```ts
-export interface ReportOptions {
-    /** Where the lines go, one at a time. Defaults to `process.stderr`. */
-    readonly stderr?: (line: string) => void;
-    /**
-     * The journal the program ran with, for the unresolved entries.
-     *
-     * A program with its own `ManagedRuntime` has to hand it over — reading the
-     * bare `Journal` reference here would look in the process-wide in-memory
-     * default and find nothing, which is precisely wrong for the program that
-     * provided a durable one. Left out, the default reference is read, which is
-     * right for a program that never provided a journal at all.
-     *
-     * Every unresolved entry in it is reported, including entries another
-     * process wrote to a shared store. `Script.run` does better: it records the
-     * entries its own program wrote, wherever the journal was provided, and
-     * reports only those.
-     */
-    readonly journal?: JournalService;
-    /**
-     * How many transactions the program submitted that the network answered as
-     * applied, for `ExitCodeOptions.applied`: above zero, with nothing
-     * unresolved, a failure that would exit 2, 4 or 130 exits 5. `report` cannot
-     * count them itself — the journal it reads may hold other processes'
-     * entries — so a CLI that runs several commands keeps the count (one per
-     * `Executed`, or `ExecutionFailed`, it saw) and hands it over. Left out, it
-     * is zero.
-     *
-     * @since 0.5.0
-     */
-    readonly applied?: number;
-}
-```
-
-What `report` needs beyond the `Exit`.
-
-### `Script` (class)
-
-```ts
-export declare class Script extends Script_base {
-    /**
-     * Everything a script needs, with `Sui` and `SuiCore` merged in so `Tx.*`
-     * works inside a script with no further wiring.
-     *
-     * Reads `SUI_NETWORK` (required, no default; `mainnet` refused unless
-     * `SUI_ALLOW_MAINNET=1`), `SUI_RPC_URL` (optional, defaulted per network) and
-     * `SUI_PRIVATE_KEY` (a Bech32 `suiprivkey1…` or a 32-byte hex seed, through
-     * `Config.Redacted`; see `Signer.fromConfig`).
-     *
-     * Fails with: `ConfigError`, `NetworkMismatch`, `TransportError`.
-     */
-    static readonly layer: Layer.Layer<Script | Sui | SuiCore, Config.ConfigError | NetworkMismatch | TransportError>;
-    /**
-     * Like `layer`, but over a `Sui` and `SuiCore` the caller already has,
-     * which is how a test runs a script against the fake.
-     *
-     * The network is the one that `SuiCore` reports, not `SUI_NETWORK`: the
-     * client already knows where it points, so only `SUI_PRIVATE_KEY` is read.
-     * A `mainnet` client still needs `SUI_ALLOW_MAINNET=1`.
-     *
-     * Fails with: `ConfigError`.
-     */
-    static readonly layerNoDeps: Layer.Layer<Script, Config.ConfigError, Sui | SuiCore>;
-    /**
-     * A script with a signer the caller built, for a credential that does not
-     * come from `SUI_PRIVATE_KEY` (a KMS, a wallet, a test key).
-     *
-     * Reads nothing from the environment except the mainnet gate: the network is
-     * the one the provided `SuiCore` reports, and `SUI_ALLOW_MAINNET=1` is
-     * required only when that is `mainnet`.
-     *
-     * Fails with: `ConfigError`.
-     */
-    static readonly layerWithSigner: (signer: Signer) => Layer.Layer<Script, Config.ConfigError, Sui | SuiCore>;
-    /**
-     * The read-only preset, which has no signer at all: a script built on this
-     * cannot sign, and the compiler says so.
-     *
-     * Fails with: `ConfigError`, `NetworkMismatch`, `TransportError`.
-     */
-    static readonly layerReadOnly: Layer.Layer<ScriptReadOnly | Sui | SuiCore, Config.ConfigError | NetworkMismatch | TransportError>;
-    /**
-     * `layerReadOnly` over a `Sui` and `SuiCore` the caller already has,
-     * which is how a test exercises the read-only preset against the fake. The
-     * network is the one that `SuiCore` reports, as in `layerNoDeps`.
-     *
-     * Fails with: `ConfigError`.
-     */
-    static readonly layerReadOnlyNoDeps: Layer.Layer<ScriptReadOnly, Config.ConfigError, Sui | SuiCore>;
-    /**
-     * The logger `Script.run` installs, as a layer for a program that owns its
-     * process: every `Effect.log` — the program's and the library's (the
-     * `SuiCore` read retries at debug, `Tx.submit`'s visibility warning, a
-     * tail's retry warnings) — rendered as logfmt on stderr, and nothing on
-     * stdout.
-     *
-     * Effect's default logger writes to `console.log`, which is **stdout**, so
-     * without this a CLI whose stdout is one JSON document (`--json`) gets a
-     * library warning in the middle of it. It replaces the loggers in force.
-     * `stderr` defaults to `process.stderr`; a writer that throws loses its line.
-     * It does not read `SUI_LOG_LEVEL` (that is `Script.run`'s); set
-     * `References.MinimumLogLevel` yourself. Never fails.
-     *
-     * @example
-     * ```ts
-     * const exit = await Effect.runPromiseExit(
-     *   command.pipe(Effect.provide(Script.layerStderrLogger()))
-     * )
-     * process.exitCode = await Script.report(exit)
-     * ```
-     *
-     * @since 0.5.0
-     */
-    static readonly layerStderrLogger: (options?: {
-        readonly stderr?: (line: string) => void;
-    }) => Layer.Layer<never>;
-    /** See `exitCode`. */
-    static readonly exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number;
-    /** See `run`. */
-    static readonly run: <A, E>(effect: Effect.Effect<A, E, Script | Sui | SuiCore>, options?: ScriptRunOptions) => Promise<number>;
-    /** See `report`. */
-    static readonly report: <A, E>(exit: Exit.Exit<A, E>, options?: ReportOptions) => Promise<number>;
-}
-```
-
-The script preset: the two tiers and the signer.
-
-### `ScriptReadOnly` (class)
-
-```ts
-export declare class ScriptReadOnly extends ScriptReadOnly_base {
-  readonly Service: ScriptReadOnlyService;
-  readonly key: "@unconfirmed/sui-effect/ScriptReadOnly";
-}
-```
-
-The read-only script service, which has no `signer` in its type.
-
-### `ScriptReadOnlyService` (interface)
-
-```ts
-export interface ScriptReadOnlyService {
-    readonly sui: SuiService;
-    readonly core: SuiCoreService;
-    readonly network: string;
-}
-```
-
-What a read-only script gets: everything except a way to sign.
-
-### `ScriptRunOptions` (interface)
-
-```ts
-export interface ScriptRunOptions {
-    /**
-     * The layer to run the script over. Defaults to `Script.layer`, which
-     * reads the environment; a test passes `Script.layerNoDeps` over
-     * `layerTest(script)` and never touches the network.
-     *
-     * It may fail with **anything**: a layer that also opens a durable journal
-     * (`Layer.merge(Script.layer, journalLayer)`) fails with `JournalError` or a
-     * `PlatformError`, and that failure is mapped to an exit code like any other
-     * — never `Layer.orDie` it, which turns a failed journal open into exit 1.
-     * It may also provide more than the three services, a `Journal` above all.
-     */
-    readonly layer?: Layer.Layer<Script | Sui | SuiCore, unknown>;
-    /** How the process ends. Defaults to `process.exit`. */
-    readonly exit?: (code: number) => void;
-    /** Where diagnostics go, one line at a time. Defaults to `process.stderr`. */
-    readonly stderr?: (line: string) => void;
-    /** The signal source. Defaults to `process`. */
-    readonly signals?: SignalSource;
-    /** Which signals interrupt the script. Defaults to SIGINT and SIGTERM. */
-    readonly signalNames?: ReadonlyArray<string>;
-}
-```
-
-Where a script's diagnostics go, and how it stops. Injectable for tests.
-
-### `ScriptService` (interface)
-
-```ts
-export interface ScriptService {
-    /** The opinionated tier, already pointed at the configured network. */
-    readonly sui: SuiService;
-    /** The mechanical tier, for the calls `Sui` does not expose. */
-    readonly core: SuiCoreService;
-    /** The credential read from `SUI_PRIVATE_KEY`. */
-    readonly signer: Signer;
-    /** The network this script is running against. */
-    readonly network: string;
-}
-```
-
-What a script gets from its one service.
-
-### `SignalSource` (interface)
-
-```ts
-export interface SignalSource {
-    readonly on: (signal: string, handler: () => void) => unknown;
-    readonly off?: (signal: string, handler: () => void) => unknown;
-}
-```
-
-The part of `process` `run` uses, so a test can stand in for it.
-
-### `exitCode` (const)
-
-```ts
-declare const exitCode: <A, E>(exit: Exit.Exit<A, E>, options?: ExitCodeOptions) => number
-```
-
-The exit code one failure deserves.
-
-The axis is what a wrapper can act on: did the transaction apply (5, gas was
-charged, do not retry), is the outcome unknown (3, reconcile before doing
-anything else), or did nothing apply (4, safe to retry)? Configuration
-problems are 2 because no amount of retrying fixes them, a defect is 1, and
-an interrupt is 130 the way a shell expects — unless the journal says there
-is a submission outstanding, in which case it is 3, because a wrapper that
-sees 130 has no reason to go looking for one.
-
-**A declared `exitCode` wins.** An error carrying an integer `exitCode`
-field from 1 to 255 — or Effect's own `[Runtime.errorExitCode]` marker, read
-when there is no such field — exits with it — which is how a script's own `BadInput`
-says 2 ("fix the input, retrying will not help") instead of the 4 its
-`outcome: "not_applied"` would give. Below that, an extension error that
-declares an `outcome` is honoured, so a downstream SDK's own failures land
-on the same axis. `SchemaError` — what Effect's own `Config.schema` and
-`Schema.decodeUnknownEffect` fail with — is exit 2 with `ConfigError`,
-because in a script it can only mean the input a person gave did not fit the
-schema, and no retry fixes that.
-
-**effect/cli's `CliError` (0.5.0)** is recognised by its marker, without an
-import: a bad command line (an unknown option or subcommand, a missing or
-invalid value, `ShowHelp` carrying parse errors) exits 2, `ShowHelp` with no
-errors — `--help` — exits 0, and a `UserError` exits as the `cause` it wraps
-would. It is read before a declared exit code, because `ShowHelp` declares
-`[Runtime.errorExitCode]` 1, which on this axis means a defect.
-
-**While a submission is outstanding** (`ExitCodeOptions.unresolved`),
-any failure that would exit 2, 4 or 130 — a declared `exitCode` included —
-exits 3, applied transactions or not: reconcile before anything else.
-**Once this run applied a transaction** (`ExitCodeOptions.applied`)
-and nothing is outstanding, the same failures exit 5: none of them may be
-read as "nothing happened" any more. 1, 3 and 5 are never rewritten.
-
-An error with a tag this library has never heard of and no `outcome` is
-*unclassified* and exits 1, the code that also means defect. It deliberately
-does not follow `SuiError.outcome`, which answers `"unknown"` for the same
-value: 3 would tell a wrapper there is a transaction to reconcile, and an
-unrecognised error is not evidence that anything was ever sent. Extensions
-are told to declare `outcome` on every error precisely so their failures
-never land here.
-
-**Never fails.**
-
-### `readNetwork` (const)
-
-```ts
-declare const readNetwork: Effect.Effect<string, Config.ConfigError>
-```
-
-`SUI_NETWORK`, with no default and with the mainnet gate.
-
-There is no default network on purpose: a script that runs against whatever
-happened to be configured is how a test transaction reaches mainnet. And a
-script that means mainnet has to say so twice, in `SUI_NETWORK` and in
-`SUI_ALLOW_MAINNET=1`.
-
-**Fails with: `ConfigError`.**
-
-### `report` (const)
-
-```ts
-declare const report: <A, E>(exit: Exit.Exit<A, E>, options?: ReportOptions) => Promise<number>
-```
-
-Prints what `run` prints, and answers the exit code, for a program that
-owns its own process.
-
-`Script.run` is a whole entrypoint: it builds the layer, forks the root
-fiber, installs signal handlers and exits. A CLI with its own argv parser and
-twenty subcommands has all of that already and still wants the two things
-`run` does at the end — one diagnostic line per failure (with the bytes of a
-`SubmissionUnknown`), and every unresolved journal entry on a non-zero exit —
-plus the code itself. That is this: hand it the `Exit` of whatever you ran,
-get the lines on stderr and the number back, and call `process.exitCode = …`
-yourself rather than `process.exit`, so buffered output still flushes.
-
-It is not quite `run`'s tail. It counts **every** unresolved entry in the
-journal it is given — in a shared durable store, another process's too —
-and any one of them turns a would-be 2, 4 or 130 into 3. It cannot count
-what applied, so a multi-command CLI hands that over as
-`ReportOptions.applied` (0.5.0), and then a failure after an applied
-transaction exits 5 as it does under `run`.
-
-**effect/cli (0.5.0).** A `CliError` is mapped without importing
-`effect/cli`: `ShowHelp` with no errors exits 0, `UserError` exits as its
-`cause` would, and every other `CliError` exits 2; no failure line is
-printed for one, because the CLI runner has already rendered it. Library
-log lines are the program's logger's business: provide
-`Script.layerStderrLogger` so they reach stderr, not a JSON stdout.
-
-**Never fails.**
-
-### `run` (const)
-
-```ts
-declare const run: <A, E>(effect: Effect.Effect<A, E, Script | Sui | SuiCore>, options?: ScriptRunOptions) => Promise<number>
-```
-
-Runs a script: builds `Script.layer`, forks the program, interrupts it on
-SIGINT or SIGTERM so finalizers run, writes one diagnostic line per failure
-to stderr, and exits with `exitCode`.
-
-stdout carries only what the script itself printed: the logger is bound to
-stderr for the whole run, so `Effect.log` from the script or from anything it
-calls cannot land in the script's output. `SUI_LOG_LEVEL` (`Debug`, `Warn`,
-… spelled as `Config.LogLevel` spells them) sets the run's minimum level;
-unset, it is Effect's default, `Info`, and a value that is not a level is a
-`ConfigError` (exit 2). A `SubmissionUnknown` additionally
-prints the base64 of the signed bytes and a line saying to reconcile, because
-those bytes are the durable record a script has.
-
-**What the run wrote, wherever its journal lives.** Every journal entry
-`Tx` writes during the run is also recorded by the run itself, so it does
-not matter where the program provided its journal — in `options.layer`, or
-inside the program with `Effect.provide(journalLayer)` — and entries other
-processes wrote to a shared durable journal are not this run's business.
-On **every** non-zero exit the run prints the submissions *it* left
-unresolved, which is the only record of bytes that may be on the wire when a
-script is killed — or fails — between signing and the answer. Any of those
-entries turns a would-be 2, 4 or 130 — a timeout, an interrupt, a
-not-applied error — into 3 (see `ExitCodeOptions.unresolved`); with
-none, a submission of this run that the network answered as applied turns
-the same codes into 5 (see `ExitCodeOptions.applied`).
-
-**A second SIGINT does nothing.** The handler interrupts the root fiber once;
-pressing Ctrl-C again while finalizers run is ignored, because the whole
-point of the first interrupt is to let those finalizers — the journal write
-that records what was sent, above all — complete. A script whose finalizers
-hang has to be killed with SIGKILL, which by construction no process can
-handle.
-
-Returns the exit code as well as passing it to `exit`, so a test can inject
-`exit` and assert on the number without ending the test process.
-
-**Never fails: every failure of the program — and of `options.layer`, whatever its error type — becomes an exit code, and a `stderr` writer that throws loses its line, not the exit.**
-
 ## `@unconfirmed/sui-effect/testing`
 
 
-21 exported symbols.
+20 exported symbols.
 
 ### `CLOCK_TYPE` (const)
 
@@ -9981,7 +7021,7 @@ export interface FakeScript {
      *
      * This is transport-error injection on a **read**: `FakeOutcome.transportError`
      * and `FakeOutcome.timeoutThen` are what it is for, and they are how a test
-     * drives `SuiCore`'s read retry policy or an extension's own fallback.
+     * drives `SuiCore`'s read retry policy or a program's own fallback.
      * `FakeOutcome.notFound` answers the way a missing object does
      * (`ObjectNotFound`). A `succeed` entry — and an empty or exhausted script —
      * means "serve the object map", which is the normal behaviour.
@@ -9995,7 +7035,7 @@ export interface FakeScript {
      * Unscripted, the method dies naming itself the way every uncovered method
      * does. Scripted, a coin type the record does not name answers
      * `{ coinMetadata: null }` — which is what a node says about a type that has
-     * no metadata object, and the case an extension that formats balances has to
+     * no metadata object, and the case a program that formats balances has to
      * handle.
      *
      * @since 0.1.1
@@ -10068,7 +7108,7 @@ export interface FakeScript {
      * `simulate: [FakeOutcome.failWith(...)]` surfaces through `Tx.build` too),
      * else not at all, and the budget comes from `gasBudget`. Script
      * `failWith` here to make `Tx.build` fail with `SimulationFailed` without
-     * touching the `simulate` script a later `Tx.verify` or `preflight` reads;
+     * touching the `simulate` script a later `approve` or `preflight` reads;
      * `timeoutThen` blocks the build until it is interrupted.
      *
      * Since 0.5.0 it also answers, in turn, an ordinary `simulateTransaction`
@@ -10204,9 +7244,9 @@ What a test has to know about it, because none of it is visible from the
 outside:
 
 - **Its `client` implements `$extend`.** `SuiCoreFakeState.client` is a
-  `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` gives a
-  derived Promise face over the fake and a test can exercise a registration
-  exactly the way a consumer writes it, with no network.
+  `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` runs an
+  SDK client extension over the fake exactly the way a consumer writes it,
+  with no network.
 - **`listOwnedObjects` filters like a node.** The `type` option goes through
   the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
   instantiation of a generic rather than only its own spelling.
@@ -10220,7 +7260,7 @@ outside:
 - **Call recording is reached through `SuiTest.calls`.** Every call the fake
   received, oldest first, optionally filtered by method:
   `yield* SuiTest.calls("getDynamicField")`. That is how a test asserts what
-  an extension *sent* — the include set on a read, the fact that a recipe
+  a program *sent* — the include set on a read, the fact that a recipe
   fragment reached exactly one `executeTransaction` — rather than only what it
   got back.
 - **`getTransaction` can be answered by digest.** `FakeScript.transactions`
@@ -10351,11 +7391,10 @@ declare const SuiTest: {
 }
 ```
 
-The harness: everything an extension's tests need to drive the fake from
+The harness: everything a test needs to drive the fake from
 inside an Effect, without reaching for the `SuiCoreFake` handle by hand.
 
-Every member requires `SuiCoreFake`, which `layerTest` and
-`layerExtensionTest` provide.
+Every member requires `SuiCoreFake`, which `layerTest` provides.
 
 ### `TestServices` (type)
 
@@ -10366,7 +7405,8 @@ export type TestServices = Sui | SuiCore | SuiCoreFake;
 What `layerTest` provides, under one name: `Sui`, `SuiCore` and the
 fake's handle, `SuiCoreFake`. A test helper that runs programs against the
 fake takes `Effect.Effect<A, E, TestServices>` instead of spelling the union
-out (an extension test adds its own service: `TestServices | Escrow`).
+out (a test of a service built on `Sui` adds it: `TestServices | Escrow`,
+over `Escrow.layer.pipe(Layer.provideMerge(layerTest(script)))`).
 
 ### `fakeCoin` (const)
 
@@ -10399,35 +7439,6 @@ A deterministic base58 32-byte digest, for fixtures, already branded as a
 typed `Digest` without a cast.
 
 **Never fails.**
-
-### `layerExtensionTest` (const)
-
-```ts
-declare const layerExtensionTest: <Self, E, RExtra = never, EExtra = never>(layer: Layer.Layer<Self, E, Sui | SuiCore | SuiGraphQL | RExtra>, script?: FakeScript, options?: {
-    readonly extra?: Layer.Layer<RExtra, EExtra>;
-}) => Layer.Layer<Self | Sui | SuiCore | SuiCoreFake, E | EExtra | NetworkMismatch | TransportError>
-```
-
-An extension's own layer over `layerTest`, which is the whole wiring an
-extension test needs.
-
-`layerTest` provides `Sui`, `SuiCore` and `SuiCoreFake`, and an extension's
-`layerTest` (or `layer`, for an extension with no fake of its own) may
-require `Sui | SuiCore` and nothing else — the same requirement
-`SuiExtension.fromService` satisfies in production. So composing the two is
-the recipe, and everything the extension's layer provides plus the fake's
-handle comes out the other side.
-
-**`SuiGraphQL` is provided too**, as `SuiGraphQL.layerUnavailable`: an
-extension that reads GraphQL requires the tag, its layer would otherwise not
-build in a test, and "there is no endpoint" is the answer a test wants by
-default — every GraphQL call fails with `GraphQLUnavailable`, which is a
-failure the extension already handles. Pass `extra` to override it with a
-real or scripted client, or to provide anything else the extension's layer
-requires that the client could not have given it (an `HttpClient`, an
-operator service, a sibling extension's test layer).
-
-**Fails with: whatever the extension's layer fails with, whatever `extra` fails with, plus `NetworkMismatch` and `TransportError` when the script asks for them.**
 
 ### `layerTest` (const)
 
@@ -10633,9 +7644,8 @@ if (import.meta.main) {
  */
 import { bcs } from "@mysten/sui/bcs"
 import { Config, Console, Effect } from "effect"
-import { ObjectId, SuiSchema } from "../src/index.ts"
-import { Script } from "../src/script.ts"
-import { Tx } from "../src/tx.ts"
+import { ObjectId, Sui, SuiSchema } from "../src/index.ts"
+import { Signer, Tx } from "../src/tx.ts"
 
 const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
 
@@ -10651,10 +7661,11 @@ const Escrow = SuiSchema.bcs(
  * `ObjectUnavailable`, `DecodeError`, `TransportError`, `BuildError`,
  * `SimulationFailed`, `SigningError`, `PolicyDenied`, `NotApplied`,
  * `JournalError`, `UnexpectedEffects`, `ExecutionFailed`, `SubmissionUnknown`,
- * plus `ConfigError` and `NetworkMismatch` from the layer.
+ * `KeyError` and `ConfigError`, plus `NetworkMismatch` from the layer.
  */
 export const program = Effect.gen(function*() {
-  const { signer, sui } = yield* Script
+  const sui = yield* Sui
+  const signer = yield* Effect.flatMap(Config.Redacted("SUI_PRIVATE_KEY"), Signer.fromSecretKey)
   const id = yield* Config.schema(ObjectId, "ESCROW_ID")
   const escrow = yield* sui.getObject(id, { schema: Escrow })
   const executed = yield* Tx.run((tx) => {
@@ -10668,7 +7679,8 @@ export const program = Effect.gen(function*() {
 })
 
 if (import.meta.main) {
-  await Script.run(program)
+  const { BunRuntime } = await import("@effect/platform-bun")
+  BunRuntime.runMain(program.pipe(Effect.provide(Sui.layerConfig)))
 }
 ```
 
@@ -10702,7 +7714,7 @@ const EscrowBcs = bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() })
 // The scheme flag on a Bech32 key names one of four keypair classes and
 // nothing decodes it for you. ML-DSA-65's class (2.36+) is left out so this
 // file compiles on every SDK the peer range admits; sui-effect's
-// `Signer.fromConfig` loads it on demand where it exists.
+// `Signer.fromSecretKey` loads it on demand where it exists.
 const KEYPAIR_FOR: Record<string, undefined | ((secretKey: Uint8Array) => Keypair)> = {
   ED25519: Ed25519Keypair.fromSecretKey,
   Secp256k1: Secp256k1Keypair.fromSecretKey,
@@ -10773,157 +7785,6 @@ if (import.meta.main) {
 }
 ```
 
-### `examples/extension-consumer.ts`
-
-```ts
-/**
- * Both faces of one extension.
- *
- * The first half is the extension itself, cut down to the smallest thing that
- * is still honest: a service on `Sui` and `Tx`, one read, one recipe fragment,
- * one submit-on-behalf operation, one tagged error that declares its outcome.
- * `examples/extension-template/` is the same shape as a whole package.
- *
- * The second half is the two ways to consume it. An Effect script provides
- * `Escrow.layer` and yields the service. A Promise consumer registers the
- * derived face on an SDK client with `$extend` and never sees Effect at all.
- *
- * Run with:
- *
- * ```bash
- * SUI_NETWORK=testnet SUI_PRIVATE_KEY=suiprivkey1… ESCROW_ID=0x… bun examples/extension-consumer.ts
- * ```
- */
-import { bcs } from "@mysten/sui/bcs"
-import type { ClientWithCoreApi } from "@mysten/sui/client"
-import { Config, Console, Context, Effect, Layer, Schema } from "effect"
-import type { ChangedRef, DecodeError, Recipe, SuiObject, UnexpectedEffects } from "../src/index.ts"
-import { ObjectId, type Outcome, SuiSchema, Sui, TransportError } from "../src/index.ts"
-import { SuiExtension } from "../src/extension.ts"
-import { Script } from "../src/script.ts"
-import type { RunError, Signer } from "../src/tx.ts"
-import { Tx } from "../src/tx.ts"
-
-const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
-
-const EscrowContent = SuiSchema.bcs(
-  bcs.struct("Escrow", { id: bcs.Address, owner: bcs.Address, amount: bcs.u64() }),
-  `${PKG}::escrow::Escrow`
-)
-
-type EscrowObject = SuiObject<typeof EscrowContent extends Schema.Codec<infer T, Uint8Array> ? T : never>
-
-/** The extension's own failure, with the outcome a script's exit code uses. */
-export class EscrowNotFound extends Schema.TaggedError<EscrowNotFound>()(
-  "escrow/EscrowNotFound",
-  { escrowId: ObjectId }
-) {
-  readonly outcome: Outcome = "not_applied"
-}
-
-/** The extension: reads through `Sui`, writes through `Tx`, signer as a parameter. */
-export class Escrow extends Context.Service<Escrow, {
-  readonly get: (
-    id: ObjectId
-  ) => Effect.Effect<EscrowObject, EscrowNotFound | DecodeError | TransportError>
-  readonly claim: (escrow: EscrowObject) => Recipe
-  readonly claimFor: (
-    id: ObjectId,
-    opts: { readonly signer: Signer }
-  ) => Effect.Effect<
-    ChangedRef,
-    EscrowNotFound | DecodeError | TransportError | UnexpectedEffects | RunError
-  >
-}>()("example/Escrow") {
-  static readonly layer: Layer.Layer<Escrow, never, Sui> = Layer.effect(
-    Escrow,
-    Effect.gen(function*() {
-      const sui = yield* Sui
-
-      const get = Effect.fn("Escrow.get")(function*(id: ObjectId) {
-        return yield* sui.getObject(id, { schema: EscrowContent }).pipe(
-          Effect.catchTag(
-            ["ObjectNotFound", "ObjectDeleted"],
-            () => Effect.fail(new EscrowNotFound({ escrowId: id }))
-          ),
-          // `TransportError.fromUnknown`, never the constructor: it classifies
-          // the cause — gRPC status, HTTP status, abort — instead of guessing
-          // `retryable: false` and dropping it.
-          Effect.catchTag("ObjectUnavailable", (cause) =>
-            Effect.fail(TransportError.fromUnknown("escrow.get", cause)))
-        )
-      })
-
-      const claim = (escrow: EscrowObject): Recipe => (tx) => {
-        tx.moveCall({
-          target: `${PKG}::escrow::claim`,
-          arguments: [tx.object(escrow.id), tx.pure.u64(escrow.content.amount)]
-        })
-      }
-
-      const claimFor = Effect.fn("Escrow.claimFor")(function*(
-        id: ObjectId,
-        opts: { readonly signer: Signer }
-      ) {
-        const escrow = yield* get(id)
-        const executed = yield* Tx.run(claim(escrow), { signer: opts.signer })
-        // The claim is on chain and gas was charged; only the receipt is
-        // missing. `UnexpectedEffects` says exactly that, and `outcome` puts it
-        // on "applied". Mapping it to `TransportError` would say the opposite —
-        // "not applied, safe to retry" — about a transaction that ran.
-        return yield* executed.expectCreated(`${PKG}::escrow::Receipt`)
-        // `Tx.*` requires `Sui`; providing the one the layer already has is
-        // what keeps the service's own members free of requirements.
-      }, Effect.provideService(Sui, sui))
-
-      return { get, claim, claimFor }
-    })
-  )
-}
-
-/** The derived Promise face, for a consumer that has an SDK client and no Effect. */
-export const escrow = () =>
-  SuiExtension.fromService(Escrow, { name: "escrow", layer: Escrow.layer })
-
-/**
- * The Effect consumer: a script that provides the extension's layer and yields
- * the service. `Script` brings `Sui` and `SuiCore`, which is everything
- * `Escrow.layer` requires.
- */
-export const program = Effect.gen(function*() {
-  const { signer } = yield* Script
-  const service = yield* Escrow
-  const id = yield* Config.schema(ObjectId, "ESCROW_ID")
-  const receipt = yield* service.claimFor(id, { signer })
-  yield* Console.log(receipt.id)
-})
-
-/**
- * The Promise consumer, unchanged from what a dapp-kit user writes today: one
- * `$extend`, then plain `await`s. A rejection is the same tagged error
- * instance, so `error._tag === "escrow/EscrowNotFound"` still narrows.
- */
-export const readWithPromises = async (
-  client: ClientWithCoreApi,
-  id: string
-): Promise<bigint> => {
-  // `fromService` is generic in the registration name, so `extended.escrow` is
-  // a property of the extended client's type: no cast, and no `| undefined`
-  // under `noUncheckedIndexedAccess`.
-  const api = client.$extend(escrow()).escrow
-  try {
-    const found = await api.get(ObjectId.make(id))
-    return BigInt(found.content.amount)
-  } finally {
-    await api.$dispose()
-  }
-}
-
-if (import.meta.main) {
-  await Script.run(program.pipe(Effect.provide(Escrow.layer)))
-}
-```
-
 ### `examples/read-escrow.ts`
 
 ```ts
@@ -10963,954 +7824,4 @@ if (import.meta.main) {
   const { BunRuntime } = await import("@effect/platform-bun")
   BunRuntime.runMain(program.pipe(Effect.provide(Sui.layerConfig)))
 }
-```
-
-### `examples/script-claim.ts`
-
-```ts
-/**
- * The spec's section 12 script: read an escrow object, claim it, print the
- * receipt's id.
- *
- * Run with:
- *
- * ```bash
- * SUI_NETWORK=testnet SUI_PRIVATE_KEY=suiprivkey1… ESCROW_ID=0x… bun examples/script-claim.ts
- * ```
- *
- * Every failure this program can produce is in the generator's inferred error
- * type, and each one has its own exit code with zero handling lines here:
- * `ConfigError` and `NetworkMismatch` exit 2, `ObjectNotFound`,
- * `ObjectDeleted`, `ObjectUnavailable`, `DecodeError`, `TransportError`,
- * `BuildError`, `SimulationFailed`, `SigningError`, `PolicyDenied`,
- * `NotApplied` and `JournalError` exit 4 (nothing applied), `ExecutionFailed`
- * and `UnexpectedEffects` exit 5 (applied on chain: gas was charged, and for
- * the second only the receipt is missing), and `SubmissionUnknown` exits 3
- * with the signed bytes on stderr so the submission can be reconciled.
- */
-import { bcs } from "@mysten/sui/bcs"
-import { Config, Console, Effect } from "effect"
-import { ObjectId, SuiSchema } from "../src/index.ts"
-import { Script } from "../src/script.ts"
-import { Tx } from "../src/tx.ts"
-
-const PKG = "0x0000000000000000000000000000000000000000000000000000000000000002"
-
-const Escrow = SuiSchema.bcs(
-  bcs.struct("Escrow", { id: bcs.Address, amount: bcs.u64() }),
-  `${PKG}::escrow::Escrow`
-)
-
-/** The script itself, exported so a test can run it against the fake. */
-export const program = Effect.gen(function*() {
-  const { signer, sui } = yield* Script
-  const id = yield* Config.schema(ObjectId, "ESCROW_ID")
-  const escrow = yield* sui.getObject(id, { schema: Escrow })
-  const executed = yield* Tx.run((tx) => {
-    tx.moveCall({
-      target: `${PKG}::escrow::claim`,
-      arguments: [tx.object(id), tx.pure.u64(escrow.content.amount)]
-    })
-  }, { signer })
-  const receipt = yield* executed.expectCreated(`${PKG}::escrow::Receipt`)
-  yield* Console.log(receipt.id)
-})
-
-if (import.meta.main) {
-  await Script.run(program)
-}
-```
-
-# The extension worked example
-
-`examples/extension-template/` is a complete, copyable extension package, and
-the source of every code block in `docs/extensions.md`. It ships inside this
-package (`node_modules/@unconfirmed/sui-effect/examples/extension-template/`).
-Its source files are below; these are in the template too and are not
-reprinted here: `test/escrow.test.ts`, `test/durable-object.test.ts`, `recipes/durable-object.ts`, `package.json`, `scripts/check-package.ts`.
-
-### `examples/extension-template/src/index.ts`
-
-```ts
-/**
- * `@your-org/example-extension`: the public surface.
- *
- * One service, its layers, its errors, its schemas, and the derived Promise
- * registration. Nothing from `upstream.ts` is re-exported: upstream types are
- * narrowed to sui-effect schemas inside the service and never reach a consumer.
- */
-export {
-  DEPLOYMENTS,
-  Escrow,
-  type ClaimForError,
-  type EscrowDeployment,
-  type EscrowFields,
-  type EscrowObject,
-  type EscrowOptions,
-  type EscrowService
-} from "./Escrow.ts"
-export { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
-export { escrow, type EscrowRegistrationOptions } from "./extension.ts"
-export {
-  Platform,
-  platform,
-  type PlatformOptions,
-  type PlatformRegistrationOptions,
-  type PlatformService
-} from "./Platform.ts"
-export {
-  ESCROW_PACKAGE,
-  EscrowContent,
-  escrowType,
-  receiptType,
-  Settlement,
-  SettlementContent
-} from "./schema.ts"
-```
-
-### `examples/extension-template/src/schema.ts`
-
-```ts
-/**
- * The Move layouts this package reads, bridged into `Schema`.
- *
- * `SuiSchema.bcs(layout, type)` is a `Schema.Codec<T, Uint8Array>` that also
- * records the Move type, so `sui.getObject(id, { schema })` checks the object's
- * type tag before it parses a single byte and a mismatch is a `DecodeError`
- * naming both types rather than a confusing parse failure.
- */
-import { bcs } from "@mysten/sui/bcs"
-import { DateTime, Effect, Schema, SchemaIssue, SchemaTransformation } from "effect"
-import { ObjectId, SuiAddress, SuiSchema } from "@unconfirmed/sui-effect"
-
-/**
- * The package the template's example type lives in, and the default this
- * release ships. Replace it with yours.
- */
-export const ESCROW_PACKAGE = "0x0000000000000000000000000000000000000000000000000000000000000002"
-
-/** The BCS layout of `escrow::Escrow`, which is the same whatever it was published to. */
-const EscrowBcs = bcs.struct("Escrow", {
-  id: bcs.Address,
-  owner: bcs.Address,
-  amount: bcs.u64()
-})
-
-/** The Move type of an escrow, under a given type origin. */
-export const escrowType = (typeOrigin: string): string =>
-  `${typeOrigin}::escrow::Escrow`
-
-/** The Move type of a claim receipt, which `claimFor` expects to be created. */
-export const receiptType = (typeOrigin: string): string =>
-  `${typeOrigin}::escrow::Receipt`
-
-/**
- * `escrow::Escrow`, the object this extension reads, **as a function of the
- * package it lives in**.
- *
- * A Move type name contains its package id, so a codec built from a hard-coded
- * constant checks the wrong type the moment a consumer configures a different
- * package: `getObject(id, { schema })` compares the object's tag before it
- * parses a byte, and a correctly encoded object under the configured package
- * fails with `DecodeError`. Every type-shaped constant in an extension takes
- * the package id the service was built with, and the service passes its own.
- *
- * **Which package id.** The one that appears in a type name is the **type
- * origin**: the package the type was *first* published in. Upgrading a package
- * gives it a new id for *calls*, and the type origin does not move. So an
- * extension over an upgraded package carries two ids — `packageId` for
- * `moveCall` targets, `typeOrigin` for codecs, filters and receipt types — and
- * they are the same value until the first upgrade. `Escrow.layer` takes both.
- */
-export const EscrowContent = (typeOrigin: string) => SuiSchema.bcs(
-  EscrowBcs,
-  escrowType(typeOrigin)
-)
-
-/**
- * The Move layout of `escrow::Settlement`, whose fields are `snake_case`
- * because Move's are.
- */
-const SettlementBcs = bcs.struct("Settlement", {
-  escrow_id: bcs.Address,
-  settled_at_ms: bcs.u64(),
-  claimed_by: bcs.Address
-})
-
-/**
- * The domain type a consumer of this package sees: `camelCase`, branded ids,
- * a `DateTime` instead of a string of milliseconds.
- *
- * The mapping lives in `Schema.decodeTo`, never in a custom `parse`: the bridge
- * needs a real `BcsType` so it can re-serialize what it parsed and reject
- * trailing bytes, and a domain type is not a BCS layout.
- */
-export class Settlement extends Schema.Class<Settlement>("escrow/Settlement")({
-  escrowId: ObjectId,
-  settledAt: Schema.DateTimeUtc,
-  claimedBy: SuiAddress
-}) {}
-
-/**
- * The composed codec: BCS bytes to `Settlement`, and back.
- *
- * `SuiSchema.bcs(...)` decodes the bytes into the Move shape;
- * `Schema.decodeTo(Settlement, SchemaTransformation.transform({ decode, encode }))`
- * renames the fields, and `Settlement` itself does the rest — branding the ids
- * and checking them. The Move type the bridge recorded survives the
- * composition, so
- * `sui.getObject(id, { schema: SettlementContent })` still checks the object's
- * type tag before parsing a byte.
- *
- * Two details worth copying:
- *
- * - **`decode` produces the target's `Encoded` side, not an instance.**
- *   `typeof Settlement.Encoded` is exactly that shape, so nothing has to be
- *   written out by hand and nothing can drift. `decodeTo` sits between the
- *   source type and the target schema, which is what lets the target's own
- *   checks — the `ObjectId` and `SuiAddress` brands here — run afterwards.
- * - **`encode` is the inverse mapper and is not optional.** A codec that cannot
- *   encode is one `Schema.encodeUnknownEffect` fails on, and the compiler asks
- *   for it here rather than at the call site.
- * - **A mapping that can fail uses `transformEffect`.** `transform` is for total
- *   mappings; a body that throws produces a defect, and a byte that was wrong on
- *   the wire deserves a failure.
- *
- * A failure *inside* this transform — an id that is not an address, a timestamp
- * that is not a time — is still a `DecodeError` from `SuiSchema.decode` and
- * `sui.getObject`, with the same fields: the domain mapping is part of the
- * boundary, not a step after it.
- */
-export const SettlementContent = (typeOrigin: string) =>
-  SuiSchema.bcs(
-    SettlementBcs,
-    `${typeOrigin}::escrow::Settlement`
-  ).pipe(
-    Schema.decodeTo(
-      Settlement,
-      SchemaTransformation.transformEffect<typeof Settlement.Encoded, typeof SettlementBcs.$inferType>({
-        decode: (fields, options) =>
-          // `transformEffect`, not `transform`, because one of these mappings can
-          // fail: a `u64` of milliseconds is not necessarily a time. A `transform`
-          // whose body throws is a **defect**, which is not what a bad byte on the
-          // wire should be; failing with a `SchemaIssue` here is what makes it a
-          // `DecodeError` like any other.
-          Effect.map(
-            Effect.fromOption(
-              DateTime.make(Number(fields.settled_at_ms)),
-              () =>
-                new SchemaIssue.InvalidValue(
-                  { message: `settled_at_ms ${fields.settled_at_ms} is not a time` },
-                  fields,
-                  options
-                )
-            ),
-            (settledAt): typeof Settlement.Encoded => ({
-              escrowId: fields.escrow_id,
-              settledAt,
-              claimedBy: fields.claimed_by
-            })
-          ),
-        encode: (settlement) =>
-          Effect.succeed({
-            escrow_id: settlement.escrowId,
-            settled_at_ms: String(DateTime.toEpochMillis(settlement.settledAt)),
-            claimed_by: settlement.claimedBy
-          })
-      })
-    )
-  )
-```
-
-### `examples/extension-template/src/errors.ts`
-
-```ts
-/**
- * The extension's own failures.
- *
- * Two rules from the authoring guide are visible here. Every error is a
- * `Schema.TaggedError`, so it serializes into a log line, an RPC response or a
- * journal entry the same way sui-effect's own errors do. And every one of them
- * declares an `outcome`, which is the axis a wrapper script acts on:
- * `SuiError.outcome` and `Script.exitCode` read that field, and an extension
- * error that does not declare one is "unclassified" and exits 1.
- *
- * The tags are prefixed with the package name because `EscrowNotFound` is a
- * name two packages could plausibly both want.
- *
- * And every one of them has a real `.message`. `Schema.TaggedError` leaves it
- * empty, so an error that supplies neither an `override get message()` nor a
- * `message` schema field surfaces an empty string everywhere a consumer
- * catches it, and `SuiError.toJson` emits no `message` key at all. The getter
- * is the usual answer — it stays out of the encoding, so it costs nothing at
- * the constructor — and a `message` schema field is for the case where the
- * sentence comes from somewhere else, as `EscrowSettlementUnknown`'s does.
- */
-import { Schema } from "effect"
-import { Digest, type Outcome, ObjectId } from "@unconfirmed/sui-effect"
-
-/**
- * No escrow object with this id, or it is not an escrow at all.
- *
- * Nothing was submitted, so the outcome is `not_applied` and a wrapper may
- * retry with a different id.
- */
-export class EscrowNotFound extends Schema.TaggedError<EscrowNotFound>()(
-  "escrow/EscrowNotFound",
-  { escrowId: ObjectId }
-) {
-  readonly outcome: Outcome = "not_applied"
-
-  /**
-   * `Schema.TaggedError` leaves `.message` empty, so anything surfacing
-   * `error.message` — a log line, a `catch` in a consumer's UI,
-   * `SuiError.toJson` — shows nothing unless the class supplies one. This is
-   * the idiom sui-effect's own errors use, and the reason every error here has
-   * one: define a getter over the fields, never a `message` schema field you
-   * then have to pass to every constructor.
-   */
-  override get message(): string {
-    return `no escrow ${this.escrowId}`
-  }
-}
-
-/**
- * The claim is on chain, but the operator's settlement service never confirmed
- * it, so the escrow's off-chain state and its on-chain state may disagree.
- *
- * This is the case the `outcome` field exists for: the transaction applied, the
- * operation as a whole did not finish, and the only safe next step is to
- * reconcile rather than to retry. A script that fails with this exits 3.
- *
- * Its `message` is a **schema field** rather than a getter, because the
- * sentence comes from the settlement service rather than from these fields.
- * Either way `.message` is a real string and `SuiError.toJson` carries it.
- */
-export class EscrowSettlementUnknown extends Schema.TaggedError<EscrowSettlementUnknown>()(
-  "escrow/EscrowSettlementUnknown",
-  { escrowId: ObjectId, digest: Digest, message: Schema.String }
-) {
-  readonly outcome: Outcome = "unknown"
-}
-
-/**
- * This release bundles no deployment for the network the client is on.
- *
- * The typed failure of `Escrow.layerBundled`: a layer that picks its package id
- * from `sui.network` has exactly one way to fail, and a caller that can run on
- * an unknown network wants to see it in the type rather than in a log line.
- *
- * Nothing was submitted — nothing was even built — so the outcome is
- * `not_applied`. A predecessor library's `DeploymentError` becomes this: your
- * own tag, prefixed with your package name, declaring its outcome.
- */
-export class EscrowUnsupportedNetwork extends Schema.TaggedError<EscrowUnsupportedNetwork>()(
-  "escrow/EscrowUnsupportedNetwork",
-  { network: Schema.String }
-) {
-  readonly outcome: Outcome = "not_applied"
-
-  /** See {@link EscrowNotFound.message}: a getter, not a schema field. */
-  override get message(): string {
-    return `this release bundles no escrow deployment for ${this.network}`
-  }
-}
-```
-
-### `examples/extension-template/src/Escrow.ts`
-
-```ts
-/**
- * The extension service.
- *
- * Everything the authoring guide asks for is in this one file: an interface
- * whose every method returns an `Effect` with a closed error union, reads
- * through `Sui`, writes through `Tx`, a recipe fragment a consumer can compose
- * with other extensions, a submit-on-behalf operation that exists because that
- * is this package's job, and three layers — `layer`, `layerConfig`, `layerTest`.
- */
-import {
-  Config,
-  Context,
-  Effect,
-  Layer,
-  Redacted,
-  Schema,
-  Stream
-} from "effect"
-import type { ChangedRef, Recipe, SuiObject, UnexpectedEffects } from "@unconfirmed/sui-effect"
-import { normalizeSuiAddress } from "@mysten/sui/utils"
-import {
-  DecodeError,
-  Digest,
-  ObjectId,
-  StructTag,
-  Sui,
-  SuiAddress,
-  SuiSchema,
-  TransportError
-} from "@unconfirmed/sui-effect"
-import type { RunError, Signer } from "@unconfirmed/sui-effect/tx"
-import { Tx } from "@unconfirmed/sui-effect/tx"
-import { EscrowNotFound, EscrowSettlementUnknown, EscrowUnsupportedNetwork } from "./errors.ts"
-import { escrowType, EscrowContent, ESCROW_PACKAGE, receiptType } from "./schema.ts"
-import type { SettlementApi } from "./upstream.ts"
-import { settlementApi } from "./upstream.ts"
-
-/** The decoded content of an escrow object, inferred from the BCS bridge. */
-export type EscrowFields = ReturnType<typeof EscrowContent> extends
-  Schema.Codec<infer T, Uint8Array> ? T
-  : never
-
-/** An escrow object: the envelope `Sui` returns plus its decoded content. */
-export type EscrowObject = SuiObject<EscrowFields>
-
-/**
- * Everything `claimFor` can fail with, spelled once because it is long.
- *
- * `RunError` is the union `Tx.run` declares — build, preflight, signing,
- * execution, reconcile and journal failures — so an extension that submits adds
- * its own errors to it instead of repeating a dozen tags that will grow with
- * the taxonomy.
- */
-export type ClaimForError =
-  | EscrowNotFound
-  | EscrowSettlementUnknown
-  | DecodeError
-  | UnexpectedEffects
-  | RunError
-
-/**
- * The escrow package, as an Effect service.
- *
- * No member returns a `Promise`, no member's error channel is `unknown`, and
- * no member takes a signer from the layer: `claimFor` is handed one.
- */
-export interface EscrowService {
-  /** The package this service calls into. */
-  readonly packageId: string
-  /**
-   * The package the types this service decodes were **first** published in,
-   * which is what appears inside every Move type name. It is the same as
-   * `packageId` until the package is upgraded.
-   */
-  readonly typeOrigin: string
-  /**
-   * The address the package collects fees at, read through the upstream SDK.
-   *
-   * Fails with: `DecodeError` (the upstream answer was not an address),
-   * `TransportError`.
-   */
-  readonly feeCollector: Effect.Effect<SuiAddress, DecodeError | TransportError>
-  /**
-   * Reads one escrow object and decodes its content.
-   *
-   * Fails with: `EscrowNotFound` (no such object, or it was deleted),
-   * `DecodeError` (it is not an escrow), `TransportError`.
-   */
-  readonly get: (id: ObjectId) => Effect.Effect<
-    EscrowObject,
-    EscrowNotFound | DecodeError | TransportError
-  >
-  /**
-   * The commands that claim one escrow, as a recipe fragment.
-   *
-   * This is the composable half of the package: a consumer appends it to a
-   * transaction that also carries other extensions' fragments and submits once.
-   * Never fails; a recipe is synchronous, and `Tx.build` reports a recipe that
-   * throws as a `BuildError`.
-   */
-  readonly claim: (escrow: EscrowObject) => Recipe
-  /**
-   * Claims one escrow on the signer's behalf and tells the operator about it.
-   *
-   * The signer is a parameter, never a layer field. The write goes through
-   * `Tx.run`, so the journal, the expiration, the sender lock and reconcile all
-   * apply.
-   *
-   * Fails with: `EscrowNotFound`, `DecodeError`, `TransportError`,
-   * `BuildError`, `SimulationFailed`, `PolicyDenied`, `SigningError`,
-   * `ExecutionFailed`, `NotApplied`, `SubmissionUnknown`, `JournalError`,
-   * `UnexpectedEffects` (the claim applied but produced no receipt), and
-   * `EscrowSettlementUnknown` when the claim is on chain but the operator never
-   * confirmed it.
-   */
-  readonly claimFor: (
-    id: ObjectId,
-    opts: { readonly signer: Signer }
-  ) => Effect.Effect<ChangedRef, ClaimForError>
-  /** A namespace, which the Promise face maps recursively. */
-  readonly owned: {
-    /**
-     * Every escrow an address owns, paginated.
-     *
-     * Fails with: `DecodeError`, `TransportError`.
-     */
-    readonly stream: (
-      owner: SuiAddress
-    ) => Stream.Stream<EscrowObject, DecodeError | TransportError>
-    /**
-     * How many escrows an address owns.
-     *
-     * Fails with: `DecodeError`, `TransportError`.
-     */
-    readonly count: (
-      owner: SuiAddress
-    ) => Effect.Effect<number, DecodeError | TransportError>
-  }
-}
-
-/** What {@link Escrow.layer} needs to know. */
-export interface EscrowOptions {
-  /** The published package id, which is what `moveCall` targets name. */
-  readonly packageId: string
-  /**
-   * The type origin: the package the Move **types** were first published in,
-   * which is what appears inside `pkg::escrow::Escrow`.
-   *
-   * Defaults to `packageId`, which is right until the package is upgraded —
-   * an upgrade gives the package a new id for calls and leaves every type name
-   * pointing at the original. Set it then, and codecs, owned-object filters and
-   * the receipt type keep checking the type that exists.
-   */
-  readonly typeOrigin?: string
-  /** The operator's settlement service. */
-  readonly url: string
-  /** The extension's own credential — never the consumer's. */
-  readonly apiKey: Redacted.Redacted<string>
-}
-
-/** The shape of the settlement service's answer, narrowed before it is used. */
-const SettlementStatus = Schema.Struct({
-  status: Schema.Literals(["settled", "pending"])
-})
-
-const decodeSettlement = Schema.decodeUnknownEffect(SettlementStatus)
-const decodeAddress = Schema.decodeUnknownEffect(SuiAddress)
-
-/**
- * The one mapping from a third-party rejection to this package's error union.
- *
- * Always `TransportError.fromUnknown`, never the constructor: building one by
- * hand makes the author guess `retryable` and throws away the gRPC status, the
- * HTTP status or the abort a caller needs to decide whether to try again. The
- * guide's rule, applied in the guide's own template.
- */
-const transport = (method: string) => (cause: unknown): TransportError =>
-  TransportError.fromUnknown(method, cause)
-
-const make = (
-  options: {
-    readonly packageId: string
-    readonly typeOrigin?: string
-    readonly api: SettlementApi
-  }
-): Effect.Effect<EscrowService, never, Sui> =>
-  Effect.gen(function*() {
-    const sui = yield* Sui
-    const { api, packageId } = options
-    // Every type-shaped value is derived here, from the configured origin, and
-    // never from the module-level constant: configuring a package id has to
-    // move the codecs with it.
-    const typeOrigin = options.typeOrigin ?? packageId
-    const content = EscrowContent(typeOrigin)
-    const receipt = receiptType(typeOrigin)
-    const ownedFilter = StructTag.make(escrowType(typeOrigin))
-
-    // `Sui` carries the `SuiCore` it was built over, so an extension reaches
-    // the mechanical tier — and through `use`, the SDK client object an
-    // upstream package wants — without adding `SuiCore` to its own
-    // requirements.
-    const feeCollector = sui.core
-      .use((client, signal) => api.resolveFeeCollector(client, packageId, signal))
-      .pipe(
-        Effect.catchTag(
-          ["ObjectNotFound", "ObjectDeleted", "ObjectUnavailable", "TransactionNotFound", "SimulationFailed"],
-          (error) => Effect.fail(transport("escrow.feeCollector")(error))
-        ),
-        // Upstream answered with `unknown`; it becomes a sui-effect schema
-        // before anything else in this package sees it. A value that does not
-        // decode is a `DecodeError` and stays one: it says which boundary was
-        // wrong, where `TransportError` would claim the node was unreachable.
-        Effect.flatMap((raw) =>
-          decodeAddress(raw).pipe(
-            Effect.mapError((issue) =>
-              new DecodeError({ expectedType: "SuiAddress", kind: "shape", issue: issue.message })
-            )
-          )
-        ),
-        Effect.withSpan("Escrow.feeCollector")
-      )
-
-    const get = Effect.fn("Escrow.get")(function*(id: ObjectId) {
-      return yield* sui.getObject(id, { schema: content }).pipe(
-        Effect.catchTag(
-          ["ObjectNotFound", "ObjectDeleted"],
-          () => Effect.fail(new EscrowNotFound({ escrowId: id }))
-        ),
-        Effect.catchTag(
-          "ObjectUnavailable",
-          (error) => Effect.fail(transport("escrow.get")(error))
-        )
-      )
-    })
-
-    const claim = (escrow: EscrowObject): Recipe => (tx) => {
-      tx.moveCall({
-        target: `${packageId}::escrow::claim`,
-        arguments: [tx.object(escrow.id), tx.pure.u64(escrow.content.amount)]
-      })
-    }
-
-    const notify = Effect.fn("Escrow.notify")(function*(escrowId: ObjectId, digest: Digest) {
-      const unknownOutcome = (message: string) =>
-        new EscrowSettlementUnknown({ escrowId, digest, message })
-      // A pure upstream helper: `Effect.tryPromise` with a mapping function,
-      // and the signal forwarded so an interrupted claim cancels the request.
-      const response = yield* Effect.tryPromise({
-        try: (signal) => api.notifyClaim({ escrowId, digest }, signal),
-        catch: (cause) => unknownOutcome(`the settlement service failed: ${String(cause)}`)
-      })
-      const settlement = yield* decodeSettlement(response).pipe(
-        Effect.mapError((issue) =>
-          unknownOutcome(`the settlement service answered something unreadable: ${issue.message}`)
-        )
-      )
-      if (settlement.status !== "settled") {
-        return yield* unknownOutcome("the settlement service is still holding the claim")
-      }
-    })
-
-    const claimFor = Effect.fn("Escrow.claimFor")(function*(
-      id: ObjectId,
-      opts: { readonly signer: Signer }
-    ) {
-      const escrow = yield* get(id)
-      const executed = yield* Tx.run(claim(escrow), { signer: opts.signer })
-      // The transaction applied and gas was charged; what is missing is the
-      // receipt. That is what `UnexpectedEffects` means, and `outcome` puts it
-      // on "applied". Mapping it to `TransportError` would tell a wrapper the
-      // opposite — nothing happened, retry — about a claim that ran.
-      const created = yield* executed.expectCreated(receipt)
-      yield* notify(id, executed.digest)
-      return created
-    // `Tx.*` requires `Sui`, and the layer has one: providing it here is what
-    // keeps every member's requirement channel empty, which is what
-    // `SuiExtension.fromService` and every consumer expect.
-    }, Effect.provideService(Sui, sui))
-
-    const stream = (owner: SuiAddress) =>
-      sui.streamOwnedObjects(owner, { type: ownedFilter }).pipe(
-        Stream.mapEffect((object) =>
-          // `SuiSchema.decode` is the same decode `sui.getObject({ schema })`
-          // does, for the places that already have bytes. Bytes that do not
-          // decode are a `DecodeError` naming the object and the type — not a
-          // transport failure, which is what a node that could not be reached
-          // is.
-          SuiSchema.decode(content, object.content, {
-            objectId: object.id,
-            // The type the object actually has. Give it and `SuiSchema.decode`
-            // runs the same tag check `getObject` does, under the same rule: a
-            // bare expected tag matches every instantiation of it, a
-            // parameterized one is compared in full.
-            actualType: object.type
-          }).pipe(Effect.map((content): EscrowObject => ({ ...object, content })))
-        )
-      )
-
-    return {
-      packageId,
-      typeOrigin,
-      feeCollector,
-      get,
-      claim,
-      claimFor,
-      owned: {
-        stream,
-        count: (owner: SuiAddress) => Stream.runCount(stream(owner))
-      }
-    }
-  })
-
-/**
- * What this release knows about a network: the package it was published to,
- * and the operator that settles for it.
- */
-export interface EscrowDeployment {
-  readonly packageId: string
-  readonly url: string
-}
-
-/**
- * The deployments this release bundles.
- *
- * Every extension over a Move package has one of these, because a package id is
- * per network and a consumer should not have to carry a table of them. Replace
- * the ids with yours.
- */
-export const DEPLOYMENTS: Readonly<Record<string, EscrowDeployment>> = {
-  testnet: { packageId: ESCROW_PACKAGE, url: "https://settlement.testnet.example" },
-  mainnet: { packageId: ESCROW_PACKAGE, url: "https://settlement.example" }
-}
-
-/** The in-memory settlement service `layerTest` runs against. */
-const fakeApi = (settled: boolean): SettlementApi => ({
-  notifyClaim: async () => ({ status: settled ? "settled" : "pending" }),
-  // `SuiAddress.make` validates, it does not normalize: `"0x1"` is not a
-  // 32-byte address and `make` throws, which the `use` boundary then reports as
-  // a `TransportError` from a fake that never touched a network. Normalize
-  // first — or write the padded form out — whenever a literal address becomes a
-  // branded one.
-  resolveFeeCollector: async () => SuiAddress.make(normalizeSuiAddress("0x1"))
-})
-
-/**
- * The escrow extension.
- *
- * The identifier is `"<package>/<Name>"` and never changes after publication:
- * it is the runtime key every copy of this module agrees on.
- */
-export class Escrow extends Context.Service<Escrow, EscrowService>()(
-  "example-extension/Escrow"
-) {
-  /**
-   * The live layer. It requires `Sui` and nothing else — it never builds a
-   * client of its own — which is exactly what `SuiExtension.fromService` can
-   * satisfy from the client `$extend` was called on. Never fails.
-   */
-  static readonly layer = (options: EscrowOptions): Layer.Layer<Escrow, never, Sui> =>
-    Layer.effect(
-      Escrow,
-      make({
-        packageId: options.packageId,
-        ...(options.typeOrigin === undefined ? {} : { typeOrigin: options.typeOrigin }),
-        api: settlementApi({ url: options.url, apiKey: Redacted.value(options.apiKey) })
-      })
-    )
-
-  /**
-   * The same layer from the environment: `ESCROW_PACKAGE_ID`, `ESCROW_URL` and
-   * `ESCROW_API_KEY`, which is `Config.Redacted` because it is a secret.
-   *
-   * **The package id is read through its schema, not as a string.**
-   * `Config.schema(ObjectId, ...)` is the typed deployment path: an override
-   * that is not a 32-byte object id fails here, with the variable's name, at
-   * the moment the layer is built — instead of being carried into every
-   * `moveCall` target and every codec and surfacing three calls later as a Move
-   * abort nobody can trace back to an environment variable. Read every
-   * deployment value that has a branded schema this way.
-   *
-   * `Config.option` would be the wrong tool for any of these: it turns an
-   * **empty** variable into "unset", so `ESCROW_URL=""` would silently take a
-   * default rather than fail.
-   *
-   * Fails with: `ConfigError`.
-   */
-  static readonly layerConfig: Layer.Layer<Escrow, Config.ConfigError, Sui> = Layer.unwrap(
-    Effect.gen(function*() {
-      const options = yield* Config.all({
-        packageId: Config.schema(ObjectId, "PACKAGE_ID").pipe(
-          Config.withDefault(ObjectId.make(ESCROW_PACKAGE))
-        ),
-        url: Config.NonEmptyString("URL"),
-        apiKey: Config.Redacted("API_KEY")
-      }).pipe(Config.nested("ESCROW"))
-      return Escrow.layer(options)
-    })
-  )
-
-  /**
-   * The layer for whatever network the client is already on, from the table
-   * this release bundles.
-   *
-   * This is the shape every extension over a Move package wants: the consumer
-   * has already chosen a network by building a client, and the package id
-   * follows from it. `Layer.unwrap` is what lets the layer *read* `Sui` before
-   * deciding which layer to be, and the network that has no entry is a typed
-   * failure rather than an `undefined` that surfaces as a Move abort three
-   * calls later.
-   *
-   * `layerConfig` still earns its place beside this one when configuration
-   * carries something the table cannot: the operator URL of a private
-   * deployment, a credential, a package id under test. When the only
-   * configuration *is* the package id, this layer is the one to ship and
-   * `layerConfig` is the override.
-   *
-   * Fails with: `EscrowUnsupportedNetwork`.
-   */
-  static readonly layerBundled = (
-    options: { readonly apiKey: Redacted.Redacted<string> }
-  ): Layer.Layer<Escrow, EscrowUnsupportedNetwork, Sui> =>
-    Layer.unwrap(
-      Effect.gen(function*() {
-        const sui = yield* Sui
-        const deployment = DEPLOYMENTS[sui.network]
-        if (deployment === undefined) {
-          return yield* new EscrowUnsupportedNetwork({ network: sui.network })
-        }
-        return Escrow.layer({ ...deployment, apiKey: options.apiKey })
-      })
-    )
-
-  /**
-   * The test layer: the real service over an in-memory settlement service, so
-   * an extension test drives the production code path and never opens a socket.
-   * Compose it with `layerExtensionTest` from `@unconfirmed/sui-effect/testing`. Never fails.
-   */
-  static readonly layerTest = (
-    state: { readonly settled?: boolean } = {}
-  ): Layer.Layer<Escrow, never, Sui> =>
-    Layer.effect(
-      Escrow,
-      make({ packageId: ESCROW_PACKAGE, api: fakeApi(state.settled ?? true) })
-    )
-}
-```
-
-### `examples/extension-template/src/upstream.ts`
-
-```ts
-/**
- * A stand-in for the third-party Promise package an extension wraps.
- *
- * In a real extension this file does not exist: it is an `import` of the
- * upstream SDK (`@some-org/escrow-sdk`), and everything below is its surface.
- * It is here so the guide's "wrapping an upstream Promise package" section has
- * real code to point at: one helper that needs the SDK client object, and one
- * that does not.
- *
- * Note what it is not: it is not exported from `src/index.ts`. Upstream types
- * never reach a consumer of this package; they are narrowed to sui-effect
- * schemas first.
- */
-import type { ClientWithCoreApi } from "@mysten/sui/client"
-
-/** What the operator's settlement service answers with. Untyped on purpose: upstream JSON. */
-export interface SettlementResponse {
-  readonly status: string
-  readonly [key: string]: unknown
-}
-
-/** The upstream client surface. */
-export interface SettlementApi {
-  /**
-   * Tells the operator that a claim landed. Needs no Sui client: a pure
-   * Promise helper, which is the `Effect.tryPromise` case.
-   */
-  readonly notifyClaim: (
-    input: { readonly escrowId: string; readonly digest: string },
-    signal?: AbortSignal
-  ) => Promise<SettlementResponse>
-  /**
-   * Reads the fee collector the package was published with. Needs the SDK
-   * client object, which is the `SuiCore.use` case.
-   */
-  readonly resolveFeeCollector: (
-    client: ClientWithCoreApi,
-    packageId: string,
-    signal?: AbortSignal
-  ) => Promise<unknown>
-}
-
-/** The upstream constructor: a base URL and an API key. */
-export const settlementApi = (options: {
-  readonly url: string
-  readonly apiKey: string
-}): SettlementApi => ({
-  notifyClaim: async (input, signal) => {
-    const response = await fetch(`${options.url}/claims`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${options.apiKey}` },
-      body: JSON.stringify(input),
-      ...(signal === undefined ? {} : { signal })
-    })
-    if (!response.ok) throw new Error(`settlement service answered ${response.status}`)
-    return await response.json() as SettlementResponse
-  },
-  resolveFeeCollector: async (client, packageId, signal) => {
-    const { object } = await client.core.getObject({
-      objectId: packageId,
-      ...(signal === undefined ? {} : { signal })
-    })
-    const owner = object.owner
-    return owner.$kind === "AddressOwner" ? owner.AddressOwner : null
-  }
-})
-```
-
-### `examples/extension-template/src/extension.ts`
-
-```ts
-/**
- * The Promise face, derived rather than maintained.
- *
- * `SuiExtension.fromService` walks the service interface once: `Effect` members
- * become Promise methods, `Stream` members become `AsyncIterable`s, nested
- * namespaces are mapped recursively, plain values pass through, and a rejection
- * is the same tagged error instance an Effect caller would have caught, so a
- * Promise consumer can still switch on `_tag`.
- *
- * There is no second implementation to keep in step, which is the whole point.
- */
-import type { SuiExtensionOptions } from "@unconfirmed/sui-effect/extension"
-import { SuiExtension } from "@unconfirmed/sui-effect/extension"
-import type { EscrowOptions } from "./Escrow.ts"
-import { Escrow } from "./Escrow.ts"
-
-/** What a `$extend` registration needs beyond what the layer does. */
-export interface EscrowRegistrationOptions extends EscrowOptions {
-  /**
-   * The chain identifier the node must be on, as `getChainIdentifier` reports
-   * it.
-   *
-   * **Required on `devnet`, `localnet` and any custom network**, because a
-   * `warm` registration takes the chain id rather than asking for it and there
-   * is no built-in entry for those; `register` throws without it. On `mainnet`
-   * and `testnet` the built-in table answers and this is optional.
-   *
-   * Give the same id to **every** registration on one client. The base `Sui`
-   * and its transport are shared per client **per chain id**, so two
-   * registrations that disagree build two of them. (The sender lock is
-   * process-wide whatever the id, so two `Tx.run`s for one address serialize
-   * either way.)
-   */
-  readonly chainId?: string
-  /** Lifecycle overrides for every call (`SubmitConfig` fields, durations as `"10 seconds"`). */
-  readonly submit?: SuiExtensionOptions<Escrow, never>["submit"]
-  /** The journal every call records submissions in; durable for a restartable consumer. */
-  readonly journal?: SuiExtensionOptions<Escrow, never>["journal"]
-}
-
-/**
- * The registration a Promise consumer passes to `client.$extend(...)`.
- *
- * ```ts
- * const client = new SuiGrpcClient({ network: "testnet", baseUrl }).$extend(escrow(options))
- * const info = await client.escrow.get(id)
- * for await (const item of client.escrow.owned.stream(owner)) console.log(item.id)
- * await client.escrow.$dispose()
- * ```
- *
- * It is registered `warm`, like `platform` in `Platform.ts`: the service has
- * synchronous members — `packageId`, the `claim` recipe fragment, the codecs —
- * and a consumer that reads one the moment it registers should get the value
- * rather than a placeholder that throws `ExtensionNotReady`. Neither layer
- * touches the network at build, which is what `warm` requires.
- *
- * The runtime is built inside `register`, over `SuiCore.layerFromClient(client)`,
- * a `Sui` pinned to `options.chainId` and `Escrow.layer`, so the extension and
- * the consumer share one transport and one chain identity, and every face in the
- * process shares one sender lock.
- *
- * Throws out of `register` when the network has no built-in chain identifier
- * and `options.chainId` was not given.
- */
-export const escrow = (options: EscrowRegistrationOptions) =>
-  SuiExtension.fromService(Escrow, {
-    name: "escrow",
-    layer: Escrow.layer(options),
-    warm: options.chainId === undefined ? {} : { chainId: options.chainId },
-    ...(options.submit === undefined ? {} : { submit: options.submit }),
-    ...(options.journal === undefined ? {} : { journal: options.journal })
-  })
 ```

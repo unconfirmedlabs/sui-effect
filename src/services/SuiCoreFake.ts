@@ -386,7 +386,7 @@ export interface FakeScript {
    *
    * This is transport-error injection on a **read**: `FakeOutcome.transportError`
    * and `FakeOutcome.timeoutThen` are what it is for, and they are how a test
-   * drives `SuiCore`'s read retry policy or an extension's own fallback.
+   * drives `SuiCore`'s read retry policy or a program's own fallback.
    * `FakeOutcome.notFound` answers the way a missing object does
    * (`ObjectNotFound`). A `succeed` entry — and an empty or exhausted script —
    * means "serve the object map", which is the normal behaviour.
@@ -400,7 +400,7 @@ export interface FakeScript {
    * Unscripted, the method dies naming itself the way every uncovered method
    * does. Scripted, a coin type the record does not name answers
    * `{ coinMetadata: null }` — which is what a node says about a type that has
-   * no metadata object, and the case an extension that formats balances has to
+   * no metadata object, and the case a program that formats balances has to
    * handle.
    *
    * @since 0.1.1
@@ -473,7 +473,7 @@ export interface FakeScript {
    * `simulate: [FakeOutcome.failWith(...)]` surfaces through `Tx.build` too),
    * else not at all, and the budget comes from {@link gasBudget}. Script
    * `failWith` here to make `Tx.build` fail with `SimulationFailed` without
-   * touching the `simulate` script a later `Tx.verify` or `preflight` reads;
+   * touching the `simulate` script a later `approve` or `preflight` reads;
    * `timeoutThen` blocks the build until it is interrupted.
    *
    * Since 0.5.0 it also answers, in turn, an ordinary `simulateTransaction`
@@ -1052,9 +1052,9 @@ const unimplemented = (method: string): never => {
  * outside:
  *
  * - **Its `client` implements `$extend`.** `SuiCoreFakeState.client` is a
- *   `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` gives a
- *   derived Promise face over the fake and a test can exercise a registration
- *   exactly the way a consumer writes it, with no network.
+ *   `ClientWithCoreApi`, so `fake.client.$extend(myExtension(options))` runs an
+ *   SDK client extension over the fake exactly the way a consumer writes it,
+ *   with no network.
  * - **`listOwnedObjects` filters like a node.** The `type` option goes through
  *   the same `typeMatches` rule as the BCS bridge, so a bare tag matches every
  *   instantiation of a generic rather than only its own spelling.
@@ -1068,7 +1068,7 @@ const unimplemented = (method: string): never => {
  * - **Call recording is reached through `SuiTest.calls`.** Every call the fake
  *   received, oldest first, optionally filtered by method:
  *   `yield* SuiTest.calls("getDynamicField")`. That is how a test asserts what
- *   an extension *sent* — the include set on a read, the fact that a recipe
+ *   a program *sent* — the include set on a read, the fact that a recipe
  *   fragment reached exactly one `executeTransaction` — rather than only what it
  *   got back.
  * - **`getTransaction` can be answered by digest.** `FakeScript.transactions`
@@ -3152,8 +3152,8 @@ const makeInternal = (script: FakeScript, state: Mutable): InternalState => {
     core,
     tryGetPastObject,
     ...(ledgerService === undefined ? {} : { ledgerService }),
-    // The SDK's registration mechanism, implemented so an extension's derived
-    // Promise face can be tested exactly the way a consumer writes it:
+    // The SDK's registration mechanism, implemented so an SDK client extension
+    // can be tested exactly the way a consumer writes it:
     // `client.$extend(myExtension())` — variadic, and chainable, because the
     // SDK's is both and a test that chains two registrations must not silently
     // lose the first.

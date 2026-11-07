@@ -5,64 +5,135 @@ change, newest release first.
 
 ## 0.6.0
 
-Address aliases: an account can be signed for by another address — a
-weighted multisig of a passkey, a zkLogin session, a recovery phrase and a
-watchdog key, say — through Sui's `0x2::address_alias`, and the whole
-lifecycle (`Tx.run`, the sender lock, the journal, `Tx.attach`, `Verify`)
-keeps the account as the sender while the alias signs. `Signer.multisig`
-combines its members' signatures in the multisig's member order, which a
-validator requires. No peer dependency changes: `effect` stays
-`>=4.1.1 <4.2`, `@mysten/sui` `^2.28` (CI still proves 2.30.0 and 2.38.0).
-Two changes can break code; read "Migrating from 0.5.x".
+**sui-effect narrows to its purpose**: an Effect program to interact with the
+Sui blockchain, a light wrapper around the official `@mysten/sui` SDK that makes
+it safer to use and takes advantage of Effect for reliability, convenience and
+a better developer experience. 0.5.0 had grown a wallet core around that
+wrapper; 0.6.0 removes it (it moves to the miso wallet's own codebase) and
+keeps `SuiCore`, `Sui`, the domain layer, the `Tx` lifecycle, signers, the
+journal, `SubmitConfig`, `SuiGraphQL`, the metrics and the fake chain.
+
+It also adds **address aliases**: an account can be signed for by another
+address — a weighted multisig of a passkey, a zkLogin key, a recovery phrase
+and a watchdog key, say — through Sui's `0x2::address_alias`, and the whole
+lifecycle (`Tx.run`, the sender lock, the journal, `Tx.attach`, `Verify`) keeps
+the account as the sender while the alias signs. `Signer.multisig` combines its
+members' signatures in the multisig's member order, which a validator requires.
+
+Six subpaths are gone (`/gate`, `/keystore`, `/storage`, `/enoki`,
+`/extension`, `/script`); the four that remain are `.`, `/tx`, `/journal` and
+`/testing`. Peer dependencies are unchanged: `effect` `>=4.1.1 <4.2`,
+`@mysten/sui` `^2.28` (CI proves 2.30.0 and 2.38.0). `@scure/bip32` is no
+longer a dependency. Read "Migrating from 0.5.x" below; every removed or
+renamed export is in its table.
+
+### Removed
+
+- **`/keystore`**: `Keystore` (sealed keys at rest over `KeyValueStore`),
+  `Keystore.sealer`, `KeystoreError`, `KeystoreAccount`, `SealedKey`,
+  `SealedSecret` and the constants. Key storage is an application concern.
+- **`/storage`**: `layerIndexedDb`, `layerAsyncStorage`, `layerMmkv`,
+  `layerChromeStorage` and their structural platform types. The durable
+  journal runs over any `KeyValueStore`; one over a platform's storage is a few
+  lines with Effect's `KeyValueStore.makeStringOnly`.
+- **`/enoki`**: `Enoki` (`fromFlow`, `fromWallet`, `sponsor`, `execute`, `run`),
+  `EnokiError`. A hosted sponsor is `verifySponsored` + `Tx.attach` +
+  `Tx.submitVia`, which stay.
+- **`/script`**: `Script`, `ScriptReadOnly`, `Script.run`, `Script.report`,
+  `Script.exitCode`, `Script.layerStderrLogger`, and with them every error's
+  `exitCode` (`KeyError.exitCode`). A process entrypoint is the application's
+  (`BunRuntime.runMain`, `NodeRuntime.runMain`).
+- **`/extension`**: `SuiExtension.fromService` (the Promise face for
+  `client.$extend`), `SuiExtension.leaf`, `PromiseFace`, `FaceValue`,
+  `ExtensionNotReady`; the extension template under `examples/`, its guide
+  (`docs/extensions.md`) and generator; `layerExtensionTest` in `/testing`; and
+  `Sui.layerNoDepsPinned`, which existed only for a warm registration.
+- **`/gate` and declared intents**: `Gate`, the Jev screen (`layerJev`,
+  `layerJevConfig`, `makeJev`), `Intent`, `IntentClaims`, `OutflowClaim`,
+  `Verified`, `Verdict`, `Screening`, `checkClaims`, `describeEffects`,
+  `describeClaims`, `Tx.verify`, `Tx.run`'s and `Tx.foldCoins`' `intent`
+  option, and the public `Tx.prepare` (`Prepared` stays, as what `approve` is
+  shown, without `verified`).
+- **Account signers and key machinery**: `Signer.passkey`,
+  `Signer.createPasskey`, `Signer.wallet` (Wallet Standard), `PasskeyProvider`,
+  `StandardWallet`, `StandardWalletAccount`; `ZkLogin.save`/`load`/`remove`,
+  `ZkLoginSession`, `ZkLoginStoredSession`, `SecretSealer`; `Signer.fromConfig`;
+  `Signer.scoped`, `LockableSigner` and the held/wiped key machinery behind it,
+  and the `"locked"` `SigningFailureReason`. The SDK's `PasskeyKeypair` still
+  works, through `Signer.fromSdkSigner`.
+- **`Tx.sendAll`** (`SendAllSweep`, `SendAllResult`) and **`Tx.foldMovement`**
+  (`FoldMovement`): `FoldBatch.amount` is what a fold moves into the balance.
+- **`Tx.recorded`**: it was exactly `Journal.get`.
+- **The `…Pages` streams**: `Sui.streamEventPages`, `tailEventPages`,
+  `streamTransactionPages`, `tailTransactionPages` and the `ListPage` type. A
+  reader that commits its cursor pages through `sui.core.listEvents` /
+  `sui.core.listTransactions`, whose pages carry `endCursor`
+  (`examples/recipes/indexer.ts`); `tailEvents` / `tailTransactions` stay.
 
 ### Changed (breaking)
 
+- **`Tx.withSenderLock(address)(effect)` replaces `sui.withSenderLock(address)`.**
+  The lock is a lifecycle concern; `R` gains `Sui`. The locks are one
+  reference-counted semaphore per address per `SuiCore`, dropped as soon as
+  nobody holds or waits for one (an `RcMap` with a one-minute idle TTL
+  before). The span is `Tx.withSenderLock`; the metric is unchanged.
+- **`Tx.sendFunds` draws from the address balance only**: a `FundsWithdrawal`
+  (`tx.withdrawal`), `0x2::balance::redeem_funds`, `0x2::balance::send_funds`.
+  No coin or gas-coin fallback, and no `useGasCoin` option: a balance that
+  does not cover the amount is a `BuildError` ("Invalid withdraw
+  reservation") with nothing signed. Fold first (`Tx.foldCoins`), or write a
+  coin transfer with the SDK.
+- **`Signer.zkLogin` takes the SDK's option names and nothing about sessions**:
+  `Signer.zkLogin({ address, ephemeralSigner, inputs, maxEpoch })` (was
+  `{ session: { address, maxEpoch, proof, expiresAt? }, ephemeral }`). It is
+  signature assembly only; the wall-clock `expiresAt` check is gone, and a
+  passed `maxEpoch` is still refused (`SigningError { reason: "expired" }` for
+  bytes that cannot start in time, and before the build in `Tx.run`).
+- **`Signer.fromMnemonic` and `Signer.fromSecretKey` answer a plain `Signer`**
+  (was `LockableSigner`). The phrase is still checked (word count, word list,
+  checksum) before anything is derived; the derivation is now the SDK's own
+  `deriveKeypair`. `fromSecretKey` now also reads an `MLDSA65` Bech32 key
+  (imported on demand), which only `fromConfig` did.
 - **`Tx.attach` refuses a signer outside the sender's and gas owner's alias
   sets with `PolicyDenied { rule: "alias.signer" }`**, where it failed with
   `SigningError` before. It now also **accepts** a valid signature by a member
   of the sender's or the gas owner's alias set (one `AddressAliases` read per
   address, made only for a signature by neither). Its union is
-  `SigningError | PolicyDenied | TransportError`. Why: the signature is valid
-  and the question is whether the chain lets that key sign for the account,
-  which is policy read from an object, not a signing failure — and the same
-  tag `Tx.run` and `Verify` use for it. A `catchTag("SigningError", …)` around
-  `Tx.attach` that handled "the wrong party signed" no longer sees that case.
-- **`KeyErrorReason` gains `"invalidMultisig"`** (`Signer.multisig`). An
-  exhaustive `switch` over `KeyError.reason` needs the new case.
+  `SigningError | PolicyDenied | TransportError`.
+- **`KeyErrorReason` gains `"invalidMultisig"`** (`Signer.multisig`).
+- `SigningFailureReason` is `"expired" | "rejected" | "unavailable"`.
 
 ### Added
 
 - **`Signer.alias(address, signer)`**: a signer that signs transactions **as**
   `address` with `signer`'s key, for an address whose alias set lists that key
   — "sender A, signed by M". Its `address` is A and its `alias` the key's
-  address (the `Signer` interface gains an optional `alias?: SuiAddress`). Everything keyed on the sender is A's: `Tx.run`'s build,
-  **the sender lock** and the in-flight registry, `Built.sender`, the journal's
-  `signed.sender`, `onSigned`, the intent's and `approve`'s parties.
-  Personal messages are refused (`SigningError { reason: "unavailable" }`):
-  aliases cover transactions only.
-- **`Tx.run` and `Enoki.run` check an alias signer against the chain before
-  building**: one read of the account's `AddressAliases` object per
-  `Signer.alias` (signer, or a sponsor given as `Signer.alias(gasOwner, key)`),
-  after the intent gate and the locked-signer refusal, and a key the set does
-  not list is `PolicyDenied { rule: "alias.signer" }` with nothing built,
-  simulated, signed or journalled. A plain signer costs no read. Span
-  attribute `sui.signer_alias` on `Tx.run`, `Tx.sign` and `Tx.cosign`.
+  address (the `Signer` interface gains an optional `alias?: SuiAddress`).
+  Everything keyed on the sender is A's: `Tx.run`'s build, **the sender lock**
+  and the in-flight registry, `Built.sender`, the journal's `signed.sender`,
+  `onSigned` and `approve`'s `built.sender`. Personal messages are refused
+  (`SigningError { reason: "unavailable" }`): aliases cover transactions only.
+- **`Tx.run` checks an alias signer against the chain before building**: one
+  read of the account's `AddressAliases` object per `Signer.alias` (signer, or
+  a sponsor given as `Signer.alias(gasOwner, key)`), and a key the set does not
+  list is `PolicyDenied { rule: "alias.signer" }` with nothing built,
+  simulated, signed or journalled. A plain signer costs no read. Span attribute
+  `sui.signer_alias` on `Tx.run`, `Tx.sign` and `Tx.cosign`.
 - **`Signer.multisig(publicKey, signers)`**: a `MultiSig` signer over member
-  signers of any scheme (keys, `Signer.passkey`, `Signer.zkLogin`, wallets,
+  signers of any scheme (keys, the SDK's `PasskeyKeypair`, `Signer.zkLogin`,
   `Signer.remote`), signing sequentially and combining the partial signatures
-  **in the multisig's member order** whatever order the signers are given in
-  — the SDK's `combinePartialSignatures` keeps the order it is handed and a
+  **in the multisig's member order** whatever order the signers are given in —
+  the SDK's `combinePartialSignatures` keeps the order it is handed and a
   validator pairs the n-th signature with the n-th bitmap bit, so the SDK's own
   `MultiSigSigner` builds signatures a validator refuses unless its signers are
-  passed in member order. A non-member, a duplicate member or too little
-  weight is `KeyError { reason: "invalidMultisig" }`. `maxEpoch` is the
-  earliest member's; a structural `locked` is true when any member's is.
+  passed in member order. A non-member, a duplicate member or too little weight
+  is `KeyError { reason: "invalidMultisig" }`. `maxEpoch` is the earliest
+  member's.
 - **`AddressAlias`** on `/tx`, named after `sui::address_alias`:
   `aliasesId(address)` (the object derived from `0xa` at `AliasKey(address)`),
   `getAliases(address)` answering `AddressAliases` (`NotEnabled` or
-  `Enabled { id, version, aliases }`, a `Schema.TaggedUnion`), the pure
-  `allows(aliases, signer)`, `requireSigner(address, signer)` (`PolicyDenied {
-  rule: "alias.signer" }`), the constants `ADDRESS_ALIAS_STATE_ID`,
+  `Enabled { id, version, aliases }`), the pure `allows(aliases, signer)`,
+  `requireSigner(address, signer)`, the constants `ADDRESS_ALIAS_STATE_ID`,
   `ADDRESS_ALIASES_TYPE`, `MAX_ALIASES` and `AddressAliasesBcs`, and the
   recipes `enable()`, `add({ address, alias })`, `remove({ address, alias })`
   and `replaceAll({ address, aliases })`. Every check reads the **object**,
@@ -70,71 +141,103 @@ Two changes can break code; read "Migrating from 0.5.x".
 - **`Verify.verifyTransactionSignature(bytes, signature, { address,
   checkAddressAliases: true })`**: a validator's sender check — the signer must
   be in `address`'s alias set (or be `address` while it has none), always one
-  read, so an address that removed itself is refused — failing with `PolicyDenied
-  { rule: "alias.signer" }`; `PolicyDenied` is in the union only under that
-  literal (`VerifyTransactionOptions`, `VerifyTransactionSignature`).
-  `@mysten/sui/verify` has no alias-aware option (2.38).
+  read — failing with `PolicyDenied { rule: "alias.signer" }`; `PolicyDenied`
+  is in the union only under that literal. `@mysten/sui/verify` has no
+  alias-aware option (2.38).
 - **The fake models address alias sets.** `FakeScript.addressAliases`,
   `SuiTest.setAddressAliases(address, aliases | undefined)` and
   `SuiTest.addressAliases(address)` over an `AddressAliases` object at the
-  derived id (and `SuiCoreFakeState.setAddressAliases` / `readAddressAliases`);
-  `0xa` is served as the shared `AddressAliasState`, so `AddressAlias.enable()`
-  resolves; executed `enable`/`add`/`remove`/`replace_all` calls edit the sets
-  (Move's aborts are not modeled); and the signature check resolves aliases for
-  the sender and the gas owner the way a validator does, so a key outside the
-  set — A's own key once A removed itself included — is refused with
-  `INVALID_ARGUMENT`.
-- A recipe, `examples/recipes/account-alias.ts` (hand an account over to a
-  multisig, then pay as the account), quoted in `LLMS.md`; DESIGN §21; README
-  "Address aliases and multisig accounts"; `docs/extensions.md` §5 and the
-  fake's notes.
+  derived id; `0xa` is served as the shared `AddressAliasState`; executed
+  `enable`/`add`/`remove`/`replace_all` calls edit the sets (Move's aborts are
+  not modeled); and the signature check resolves aliases for the sender and
+  the gas owner the way a validator does. The fake reads a **multisig**
+  signature's address off its public key (it used to stand the address check
+  down for any multisig).
+- `Tx.withSenderLock` (see above); `Signer.zkLogin`'s options type
+  `ZkLoginSignerOptions` and `ZkLoginSignatureInputs` stay on `/tx`.
+- Recipes: `examples/recipes/account-alias.ts` (hand an account over to a
+  multisig, then pay as the account), `examples/recipes/durable-journal.ts`
+  (was `durable-journal-script.ts`, now without `Script`), and the indexer
+  recipe over `sui.core.listEvents`.
 
-### Changed
+### Docs
 
-- The fake's signature check reads a **multisig** signature's address off its
-  public key (it used to stand the address check down for any multisig), so a
-  multisig signature for an address it does not cover is refused. A zkLogin
-  signature still stands it down.
-- The extension template's `@unconfirmed/sui-effect` peer range is
-  `>=0.6.0 <0.7.0`.
+- README, `DESIGN.md` (renumbered: §12 `SuiGraphQL`, §13 testing, §14 address
+  aliases, §15 out of scope), `AGENTS.md` and `docs/llms-head.md` are
+  rewritten around the narrower purpose; `LLMS.md` is regenerated. The
+  historical work plan, debate log, research notes and review reports under
+  `docs/` are removed (git history keeps them).
 
 ### Testing
 
 - `test/address-alias-0-6-0.test.ts` (fake): the derived id, the read and the
   check, the recipes; `Signer.multisig` member order (a reversed SDK combine
   fails `Verify`), its construction refusals, a personal message, a passkey
-  member and a zkLogin member on their bits, a locked member; `Signer.alias`;
-  `Tx.run` as A signed by M with the journal's `Signed` entry naming A and the
-  sender lock A's (M's stays free); a key A does not list refused before any
-  simulate; an alias sponsor; enable → add M → remove A → run as M → the old
-  key refused (`INVALID_ARGUMENT`, settled refused); `Tx.attach` and `Verify`
-  against the set.
+  member (`PasskeyKeypair` through `fromSdkSigner`) and a zkLogin member on
+  their bits; `Signer.alias`; `Tx.run` as A signed by M with the journal's
+  `Signed` entry naming A and the sender lock A's; a key A does not list
+  refused before any simulate; an alias sponsor; enable → add M → remove A →
+  run as M → the old key refused; `Tx.attach` and `Verify` against the set.
 - `test/live.localnet-alias.test.ts`, behind `SUI_LOCALNET=1`: on a validator,
   `enable` creates the object at `AddressAlias.aliasesId(A)`; `add(M)` +
   `remove(A)` in one transaction; `Tx.run` with `Signer.alias(A,
   Signer.multisig(…))` given two members out of order lands; the same two
-  combined in the given order are refused by the validator; `Tx.build` → sign
-  → `Tx.attach` → `Tx.submit` lands; A's old key is refused by the node and by
-  `Verify` with `checkAddressAliases`, and a key A does not list by `Tx.run`
-  before building.
+  combined in the given order are refused; `Tx.build` → sign → `Tx.attach` →
+  `Tx.submit` lands; A's old key is refused by the node and by `Verify`.
+- `test/live.localnet-signers.test.ts` (was `live.localnet-wallet`) keeps the
+  mnemonic signers, the SDK passkey signer, the sponsored flows, the durable
+  journal over one `KeyValueStore` and the zkLogin `maxEpoch` bound;
+  `test/live.localnet.test.ts` proves `Tx.sendFunds` refuses a coin-only
+  account at the build. `test/approve-0-5-0.test.ts` (was `prepare-0-5-0`)
+  keeps `approve`, `Built.gas`, `Built.simulation`, the `maxEpoch` bound and
+  the shared accessors.
 
-**Not proven**: a zkLogin member's signature accepted on chain (no prover, as in
-0.5.0); a real WebAuthn authenticator as a multisig member (a software P-256
-authenticator signs in the fake test).
+**Not proven**: a zkLogin member's signature accepted on chain (no prover); a
+real WebAuthn authenticator (a software P-256 authenticator signs in the
+tests).
 
 ### Migrating from 0.5.x
 
-1. Code that catches `SigningError` from `Tx.attach` to detect "signed by the
-   wrong party" catches `PolicyDenied` with `rule === "alias.signer"` instead
-   (`SigningError` still means an empty, unparseable or invalid signature).
-2. An exhaustive match on `KeyError.reason` adds `"invalidMultisig"`.
-3. An extension package built from `examples/extension-template` moves its
-   `@unconfirmed/sui-effect` peer range to `">=0.6.0 <0.7.0"`.
-4. Signing as an aliased account used to bypass sui-effect (the SDK client's
-   `executeTransaction` with a hand-combined multisig signature). Replace it
-   with `Tx.run(recipe, { signer: Signer.alias(account, yield*
-   Signer.multisig(publicKey, members)) })`, which also journals the
-   submission, takes the account's lock and combines in member order.
+Every removed or renamed export, and its replacement. "Application concern"
+means the code moves to your application (the miso wallet takes 0.5.0's from
+git history).
+
+| 0.5.x | 0.6.0 |
+|---|---|
+| `sui.withSenderLock(address)(effect)` | `Tx.withSenderLock(address)(effect)` (`R` gains `Sui`) |
+| `sui.streamEventPages(filter, opts)` / `sui.tailEventPages` | `sui.core.listEvents({ filter, after })`, committing `endCursor`; `sui.streamEvents` / `sui.tailEvents` for items |
+| `sui.streamTransactionPages` / `sui.tailTransactionPages` | `sui.core.listTransactions({ filter, after })`; `sui.streamTransactions` / `sui.tailTransactions` for items |
+| `ListPage` | the SDK's `ListEventsResponse` / `ListTransactionsResponse` |
+| `Sui.layerNoDepsPinned(chainId)` | `Sui.layerNoDepsWith({ chainId })` (asks the node once) |
+| `Tx.recorded(digest)` | `Journal.get`: `(yield* Journal).get(digest)` |
+| `Tx.prepare(input, opts)` | `Tx.build(input, opts)` then `sui.simulate(built.bytes)`; or `Tx.run(recipe, { approve })` |
+| `Prepared.verified` | removed: there is no verified intent |
+| `Tx.verify`, `Intent`, `IntentAuthor`, `IntentClaims`, `OutflowClaim`, `Verified`, `Verdict`, `Parties`, `ClaimViolation`, `checkClaims`, `describeEffects`, `describeClaims`, `Screening`, `ScreenedLine` | application concern: removed (check `prepared.simulation` inside `approve`) |
+| `Tx.run({ intent })`, `Tx.foldCoins({ intent })` | removed; use `approve` |
+| `Gate`, `GateService`, `ScreenRequest`, `/gate` (`layerJev`, `layerJevConfig`, `makeJev`, `JevOptions`) | application concern: removed |
+| `Tx.sendAll(opts)`, `SendAllSweep`, `SendAllResult` | application concern: removed (`Tx.foldCoins` then `Tx.sendFunds`, or a recipe of your own) |
+| `Tx.foldMovement(batch, effects)`, `FoldMovement` | `batch.amount` (what moves into the balance) and `simulation.balanceChange(owner, coinType)` (the net gas) |
+| `Tx.sendFunds({ …, useGasCoin })` | `Tx.sendFunds({ coinType?, amount, recipient })`, address balance only; a coin transfer is the SDK's `tx.splitCoins` / `tx.transferObjects` |
+| `Signer.fromConfig(name?)` | `Config.Redacted(name).pipe(Effect.flatMap(Signer.fromSecretKey))` (fails with `ConfigError` or `KeyError`) |
+| `Signer.scoped(acquire)`, `LockableSigner`, `signer.lock`, `signer.locked` | removed: `fromMnemonic` / `fromSecretKey` answer a plain `Signer` |
+| `SigningError { reason: "locked" }` | removed |
+| `Signer.passkey({ publicKey, provider })` | `Signer.fromSdkSigner(new PasskeyKeypair(publicKey, provider))` (the official SDK: `@mysten/sui/keypairs/passkey`) |
+| `Signer.createPasskey(provider)`, `PasskeyProvider` | the official SDK: `PasskeyKeypair.getPasskeyInstance(provider)`, `PasskeyProvider` from `@mysten/sui/keypairs/passkey` |
+| `Signer.wallet({ wallet, account, chain })`, `StandardWallet`, `StandardWalletAccount` | application concern: removed (the wallet signs bytes you `Tx.attach`, or wrap it in `Signer.remote`) |
+| `Signer.zkLogin({ session: { address, maxEpoch, proof, expiresAt }, ephemeral })` | `Signer.zkLogin({ address, maxEpoch, inputs: proof, ephemeralSigner: ephemeral })` |
+| `ZkLogin.save` / `load` / `remove`, `ZkLoginSession`, `ZkLoginStoredSession`, `SecretSealer` | application concern: removed |
+| `/keystore`: `Keystore`, `Keystore.sealer`, `KeystoreError`, `KeystoreErrorReason`, `KeystoreAccount`, `KeystoreOptions`, `KeystoreService`, `SealedKey`, `SealedSecret`, `DEFAULT_ITERATIONS`, `DEFAULT_PREFIX`, `KEYSTORE_VERSION`, `MIN_LAYER_ITERATIONS` | application concern: removed |
+| `KeyError`, `KeyErrorReason` from `/keystore` | the same names from `@unconfirmed/sui-effect` |
+| `KeyError.exitCode` | removed (with `Script`) |
+| `/storage`: `layerIndexedDb`, `layerAsyncStorage`, `layerMmkv`, `layerChromeStorage` and their `…Like` / `IndexedDb…` types | application concern: removed (`KeyValueStore.makeStringOnly` over the platform's store) |
+| `/enoki`: `Enoki` (`fromFlow`, `fromWallet`, `sponsor`, `execute`, `run`), `EnokiClient`, `EnokiFlow`, `EnokiError` | application concern: removed (`verifySponsored`, `Tx.attach`, `Tx.submitVia`) |
+| `/script`: `Script`, `ScriptReadOnly`, `ScriptService`, `ScriptReadOnlyService`, `Script.run`, `report`, `exitCode`, `readNetwork`, `ScriptRunOptions`, `ReportOptions`, `SignalSource`, `Script.layerStderrLogger` | application concern: removed (`Sui.layerConfig` + `BunRuntime.runMain`; `SuiError.outcome` for the exit axis) |
+| `/extension`: `SuiExtension`, `SuiExtensionOptions`, `fromService`, `leaf`, `Leaf`, `PromiseFace`, `FaceValue`, `ExtensionFace` | removed: an Effect service built on `Sui` is the library; a Promise face is the consumer's `ManagedRuntime` |
+| `ExtensionNotReady` | removed |
+| `layerExtensionTest(layer, script, { extra })` | `layer.pipe(Layer.provideMerge(layerTest(script)))` (plus `SuiGraphQL.layerUnavailable` when the layer needs it) |
+| `Tx.attach` failing with `SigningError` for a wrong party | `PolicyDenied { rule: "alias.signer" }` |
+| an exhaustive match on `KeyError.reason` | add `"invalidMultisig"` |
+| signing as an aliased account through the SDK client directly | `Tx.run(recipe, { signer: Signer.alias(account, yield* Signer.multisig(publicKey, members)) })` |
 
 ## 0.5.0
 

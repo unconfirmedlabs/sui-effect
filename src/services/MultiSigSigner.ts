@@ -7,7 +7,7 @@
  * of passkey, zkLogin, recovery-phrase and watchdog keys. A transaction's
  * sender is A and its signature is M's, which is
  * `Signer.alias(A, yield* Signer.multisig(publicKey, [passkey, phrase]))`.
- * DESIGN §21.
+ * DESIGN §14.
  *
  * @since 0.6.0
  */
